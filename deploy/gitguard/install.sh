@@ -64,9 +64,12 @@ run_check() {
   fi
 
   # .gitignore 覆盖检查
+  # 注意：IGNORE_NEED 里是「模式」（带前导 /），check-ignore 要的是「路径」。
+  # 直接把 /settings.json 当路径传进去会被当成绝对路径 → 永远不匹配，
+  # 于是体检恒报「缺 7 条规则」。必须剥掉前导斜杠。
   local miss=0 p
   for p in "${IGNORE_NEED[@]}"; do
-    git -C "$ROOT" check-ignore -q "$p" 2>/dev/null || { miss=$((miss + 1)); }
+    git -C "$ROOT" check-ignore -q "${p#/}" 2>/dev/null || { miss=$((miss + 1)); }
   done
   if [ "$miss" -eq 0 ]; then ok ".gitignore 覆盖全部含密钥文件（${#IGNORE_NEED[@]} 条）"
   else no ".gitignore 缺 $miss 条规则（含密钥文件可能被误提交）"; bad=1; fi
