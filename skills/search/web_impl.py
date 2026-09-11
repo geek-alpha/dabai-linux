@@ -342,11 +342,15 @@ def _parse_brave(text: str) -> list:
     return out
 
 
+# 引擎顺序即排序权重（round-robin 合并按此交错，第一个引擎的 0 号结果排第一）。
+# 实测：Brave 精准（技术词、连字符、多词全部命中），Bing RSS 只认「第一个词」——
+# 搜 sing-box hysteria2 config 返回电影《Sing》，加引号与 site: 限定均无效。
+# 所以 Brave 主、Bing 副（中文查询 Bing 分词语义正常，仍有价值）。
 _ENGINES = [
-    ("bing-rss", "https://www.bing.com/search?q={q}&format=rss&count=20",
-     _parse_bing_rss, 12.0),
     ("brave", "https://search.brave.com/search?q={q}",
      _parse_brave, 12.0),
+    ("bing-rss", "https://www.bing.com/search?q={q}&format=rss&count=20",
+     _parse_bing_rss, 12.0),
     ("ddg", "https://html.duckduckgo.com/html/?q={q}",
      _regex_parser(_DDG_PAT, ddg=True), 12.0),
     ("bing-cn", "https://cn.bing.com/search?q={q}&setlang=zh-CN",
@@ -358,6 +362,53 @@ _ENGINES = [
 # 每次搜索都要白等一轮连接超时。成功一次即解除。
 _COOLDOWN = {}
 _COOLDOWN_SEC = 300
+
+
+# Bing 把查询里的连字符当「排除运算符」：搜 sing-box 被理解成「sing 且不含 box」，
+# 于是返回电影《Sing》——实测前 3 条全是噪音，官方文档被挤到第 4 位之后。
+# 技术词（sing-box / asyncio-timeout / x86-64）必须加引号锁成短语。
+_HYPHEN_TOKEN = re.compile(r'(?<![\w"-])([A-Za-z0-9][\w.+]*(?:-[\w.+]+)+)(?![\w"-])')
+_STOP = {"the", "a", "an", "of", "and", "or", "for", "to", "in", "on", "vs", "with"}
+
+
+def _tokens(query: str) -> list:
+    """查询分词：去引号、小写、丢停用词与单字符（中文单字保留）。"""
+    raw = re.sub(r'["\']', " ", query).lower()
+    out = []
+    for t in re.split(r"[^\w\u4e00-\u9fff.+]+", raw):
+        if not t or t in _STOP:
+            continue
+        if len(t) > 1 or "\u4e00" <= t[0] <= "\u9fff":
+            out.append(t)
+    return out
+
+
+def _shape_query(engine: str, query: str) -> str:
+    """按引擎语法微调查询串：Bing 系给含连字符的技术词加引号，其余引擎原样透传。"""
+    if not engine.startswith("bing") or '"' in query:
+        return query
+    return _HYPHEN_TOKEN.sub(lambda m: '"' + m.group(1) + '"', query)
+
+
+def _relevance_ok(query: str, title: str, snip: str, min_ratio: float = 0.4) -> bool:
+    """宽泛引擎的相关性闸门：命中词占比过低 = 降级结果，丢弃。
+
+    实测 Bing RSS 只按首词检索，搜 sing-box hysteria2 config 返回电影《Sing》——
+    标题里只有 sing 命中，4 个词命中 1 个，明显是降级产物。Brave 不过闸门（它可信）。
+    """
+    toks = _tokens(query)
+    if len(toks) < 2:  # 单关键词查询无从判别，放行
+        return True
+    blob = (title + " " + snip).lower()
+    return sum(1 for t in toks if t in blob) / len(toks) >= min_ratio
+
+
+def _as_int(v, default: int) -> int:
+    """容错取整：调用方（LLM/上层）可能传 'abc'、None、''，不能让搜索因此崩掉。"""
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
 
 
 def _cooled(name: str) -> bool:
@@ -407,14 +458,13 @@ async def web_search(args: dict) -> str:
     query = str(args.get("query") or "").strip()
     if not query:
         return "错误：query 不能为空"
-    max_results = max(1, min(int(args.get("max_results") or 5), 10))
-    q = requests.utils.quote(query)
+    max_results = max(1, min(_as_int(args.get("max_results"), 5), 10))
 
     async def run(engine):
         name, tpl, parser, timeout = engine
         if _cooled(name):  # 熔断：近期连续失败，本次直接跳过，不白等连接超时
             return name, [], f"{name}: 熔断中（近期连续失败，5 分钟后自动重试）"
-        url = tpl.format(q=q)
+        url = tpl.format(q=requests.utils.quote(_shape_query(name, query)))
         try:
             r = await asyncio.to_thread(_session_get, url, timeout)
         except Exception as e:  # noqa: BLE001
@@ -427,6 +477,10 @@ async def web_search(args: dict) -> str:
             return name, [], f"{name}: 解析异常 {type(e).__name__} {str(e)[:50]}"
         if not items:
             return name, [], f"{name}: 返回页面但无结果（HTTP {r.status_code}, {len(r.text)} 字节）"
+        if name.startswith("bing"):  # 宽泛引擎过相关性闸门（全滤掉=该引擎降级，不给噪音）
+            items = [it for it in items if _relevance_ok(query, it[0], it[2])]
+            if not items:
+                return name, [], f"{name}: 结果全为降级噪音（{len(r.text)} 字节页面里无相关性命中）"
         _COOLDOWN.pop(name, None)
         return name, items, ""
 
