@@ -1,0 +1,659 @@
+{
+  "name": "tasks",
+  "title": "任务与执行（长任务/批量/TODO/定时）",
+  "version": "2.1.0",
+  "description": "长任务/批量任务（harness 任务系统）+ TODO 任务清单 + 定时任务：多步骤长任务后台执行、断点续跑、任务分解与提醒、按固定间隔自动执行。",
+  "author": "dabai",
+  "enabled": true,
+  "disclosure": "on_demand",
+  "prompt": "【技能 任务与执行】多步骤长任务用 harness_flow_plan 规划（autostart=true 直接开跑）或 harness_flow_submit 提交后台执行（断点续跑）；批量并行用 harness_batch_submit；进度用 harness_task_status/list 查询，危险步骤用 harness_task_confirm 批准。TODO 清单用 todo_create/plan/list/get/update/subtask/remind/delete；定时任务用 sched_add/list/run_now/toggle/remove。",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "harness_flow_plan",
+        "description": "规划长任务（只规划不执行）：产出理解复述+多步骤方案，自动校验工具名与必填参数；autostart=true 直接开跑。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "goal": {
+              "type": "string",
+              "description": "用户的原始需求（尽量用用户原话，规划与后续执行都围绕它）"
+            },
+            "hints": {
+              "type": "string",
+              "description": "补充约束（如用户偏好、范围限制），可选"
+            },
+            "autostart": {
+              "type": "boolean",
+              "description": "true=校验通过后直接提交执行，返回任务ID；false=只返回方案"
+            },
+            "policy": {
+              "type": "string",
+              "enum": [
+                "abort",
+                "continue"
+              ]
+            }
+          },
+          "required": [
+            "goal"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "harness_flow_submit",
+        "description": "提交多步骤长任务后台执行（断点续跑）。goal=用户原话必填；steps 按依赖编排，危险动作加 confirm 字段；需求模糊先 harness_flow_plan。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string",
+              "description": "任务名称（给用户看的）"
+            },
+            "goal": {
+              "type": "string",
+              "description": "任务目标（用户原话/你对需求的一句话复述）"
+            },
+            "steps": {
+              "type": "array",
+              "description": "步骤列表，按依赖自动编排。每步：{id, deps:[前置步骤id], action, ...}。action 四类：tool（tool=工具名, args=参数，必填参数缺一不可）；llm（prompt=指令，可引用 {{步骤id.result}}；自动携带任务目标与已完成步骤摘要）；batch（tool=工具名, items=参数数组, concurrency=并发数）；handler（预留）。危险动作（删除/覆盖/发送/花钱）在该步加 confirm:\"危险性说明\"，执行前需用户批准。步骤失败会自动反思重规划（默认开启）。",
+              "items": {
+                "type": "object"
+              }
+            },
+            "policy": {
+              "type": "string",
+              "enum": [
+                "abort",
+                "continue"
+              ],
+              "description": "失败策略：abort=任一步失败即中止全部（默认）；continue=只放弃失败分支，独立分支继续"
+            },
+            "timeout": {
+              "type": "number",
+              "description": "整体超时秒数（默认 3600）"
+            }
+          },
+          "required": [
+            "name",
+            "goal",
+            "steps"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "harness_flow_dsl_submit",
+        "description": "提交声明式 Flow 类（Python 代码）后台执行：@start/@listen 装饰器定义步骤，断点续跑/失败反思生效。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "flow_code": {
+              "type": "string",
+              "description": "定义 Flow 子类的 Python 代码，如：class 调研(Flow):\n    @start\n    def 开始(self): return \"需求\"\n    @listen(开始)\n    def 搜索(self, 需求): return f\"已搜：{需求}\""
+            },
+            "name": {
+              "type": "string",
+              "description": "任务名称（给用户看的）"
+            },
+            "goal": {
+              "type": "string",
+              "description": "任务目标（用户原话/一句话复述）"
+            }
+          },
+          "required": [
+            "flow_code"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "harness_batch_submit",
+        "description": "提交批量任务：一个工具并行应用到一批参数（并发受控、单条失败不影响其它）。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string",
+              "description": "任务名称"
+            },
+            "tool": {
+              "type": "string",
+              "description": "要批量执行的工具名"
+            },
+            "items": {
+              "type": "array",
+              "description": "参数列表，每个元素是该工具的一次完整参数对象",
+              "items": {
+                "type": "object"
+              }
+            },
+            "concurrency": {
+              "type": "integer",
+              "description": "批内并发数（默认 3）"
+            }
+          },
+          "required": [
+            "name",
+            "tool",
+            "items"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "harness_task_status",
+        "description": "查询长任务/批量任务的进度与结果（含每步骤/条目状态）。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "task_id": {
+              "type": "string",
+              "description": "任务ID（提交时返回）"
+            }
+          },
+          "required": [
+            "task_id"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "harness_task_list",
+        "description": "列出最近任务（可按状态过滤：pending/running/succeeded/failed/cancelled）。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "state": {
+              "type": "string",
+              "enum": [
+                "pending",
+                "running",
+                "succeeded",
+                "failed",
+                "cancelled"
+              ]
+            },
+            "limit": {
+              "type": "integer",
+              "description": "返回条数（默认 10）"
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "harness_task_confirm",
+        "description": "批准/拒绝流程中等待确认的危险步骤。approve=true 继续，false 拒绝。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "task_id": {
+              "type": "string"
+            },
+            "approve": {
+              "type": "boolean",
+              "description": "true=批准该步骤继续，false=拒绝"
+            },
+            "note": {
+              "type": "string",
+              "description": "备注（拒绝原因等），可选"
+            }
+          },
+          "required": [
+            "task_id",
+            "approve"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "harness_task_cancel",
+        "description": "取消运行中/排队的任务（连带取消未完成步骤）。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "task_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "task_id"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "harness_task_retry",
+        "description": "重试失败/取消的任务：保留已成功步骤结果，只补跑失败部分。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "task_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "task_id"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "todo_breakdown",
+        "description": "解析一句/一段复杂任务描述，自动识别关键任务与子任务，并按先后依赖生成可执行计划；默认直接落库创建。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "task_text": {
+              "type": "string",
+              "description": "用户的复杂任务描述，例如：\"明天前整理项目资料，先收集需求文档，然后整理成PPT，最后做评审汇报（加急）。\""
+            },
+            "create": {
+              "type": "boolean",
+              "description": "是否直接创建成任务，默认 true"
+            }
+          },
+          "required": [
+            "task_text"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "todo_create",
+        "description": "创建一个任务（可带子任务、优先级、截止时间、依赖）。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "title": {
+              "type": "string",
+              "description": "任务标题"
+            },
+            "description": {
+              "type": "string",
+              "description": "任务描述"
+            },
+            "priority": {
+              "type": "string",
+              "enum": [
+                "high",
+                "medium",
+                "low"
+              ],
+              "description": "优先级：高/中/低"
+            },
+            "status": {
+              "type": "string",
+              "enum": [
+                "todo",
+                "in_progress",
+                "done"
+              ],
+              "description": "状态：待办/进行中/已完成，默认待办"
+            },
+            "due_date": {
+              "type": "string",
+              "description": "截止时间，如 \"2026-08-23 18:00\"、\"明天\"、\"周五18点\""
+            },
+            "subtasks": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "子任务标题列表（按顺序自动建立先后依赖）"
+            },
+            "depends_on": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "依赖的任务 id 列表"
+            }
+          },
+          "required": [
+            "title"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "todo_plan",
+        "description": "根据任务/子任务依赖关系生成执行计划（建议先做哪个，按顺序列出）。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "task_id": {
+              "type": "string",
+              "description": "只规划某个任务下的子任务时填任务 id；缺省规划全部"
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "todo_list",
+        "description": "查询任务清单，可按状态/优先级/关键词过滤，返回进度概览。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "enum": [
+                "todo",
+                "in_progress",
+                "done"
+              ],
+              "description": "按状态过滤（待办/进行中/已完成）"
+            },
+            "priority": {
+              "type": "string",
+              "enum": [
+                "high",
+                "medium",
+                "low"
+              ],
+              "description": "按优先级过滤"
+            },
+            "keyword": {
+              "type": "string",
+              "description": "按关键词搜索标题/描述"
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "todo_get",
+        "description": "查看单个任务的详情（含子任务、优先级、截止时间、提醒）。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "task_id": {
+              "type": "string",
+              "description": "任务 id"
+            }
+          },
+          "required": [
+            "task_id"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "todo_update",
+        "description": "更新任务：状态（待办/进行中/已完成）、优先级、截止时间等。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "task_id": {
+              "type": "string",
+              "description": "任务 id"
+            },
+            "status": {
+              "type": "string",
+              "enum": [
+                "todo",
+                "in_progress",
+                "done"
+              ]
+            },
+            "priority": {
+              "type": "string",
+              "enum": [
+                "high",
+                "medium",
+                "low"
+              ]
+            },
+            "due_date": {
+              "type": "string",
+              "description": "新截止时间"
+            },
+            "title": {
+              "type": "string",
+              "description": "新标题"
+            }
+          },
+          "required": [
+            "task_id"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "todo_subtask",
+        "description": "更新某个子任务的状态/优先级（父任务状态会自动汇总）。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "task_id": {
+              "type": "string",
+              "description": "父任务 id"
+            },
+            "subtask_id": {
+              "type": "string",
+              "description": "子任务 id"
+            },
+            "status": {
+              "type": "string",
+              "enum": [
+                "todo",
+                "in_progress",
+                "done"
+              ]
+            }
+          },
+          "required": [
+            "task_id",
+            "subtask_id"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "todo_remind",
+        "description": "设置任务提醒（一次性或每天/每周/每隔N天重复），或清除提醒。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "task_id": {
+              "type": "string",
+              "description": "任务 id"
+            },
+            "at": {
+              "type": "string",
+              "description": "提醒时刻，如 \"18:30\"、\"明天9点\"、\"周五下午2点\""
+            },
+            "repeat": {
+              "type": "string",
+              "enum": [
+                "none",
+                "hourly",
+                "daily",
+                "weekly"
+              ],
+              "description": "重复周期（none=一次性，默认）"
+            },
+            "repeat_every": {
+              "type": "integer",
+              "description": "周期倍数，如每隔2天提醒 → daily + 2"
+            },
+            "clear": {
+              "type": "boolean",
+              "description": "true 表示清除提醒"
+            }
+          },
+          "required": [
+            "task_id"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "todo_delete",
+        "description": "删除一个任务（连同子任务，其它任务的依赖引用随之清理）。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "task_id": {
+              "type": "string",
+              "description": "任务 id"
+            }
+          },
+          "required": [
+            "task_id"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "sched_add",
+        "description": "创建定时任务：每隔 interval 自动执行一次 task（由子智能体后台完成，完成后自动汇报）。创建后立即触发第一次。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string",
+              "description": "任务名（简短，如 服务器健康检查）"
+            },
+            "task": {
+              "type": "string",
+              "description": "自包含的任务描述：要查什么/用什么工具/结果怎么汇报，写清验收标准"
+            },
+            "interval": {
+              "type": "string",
+              "description": "执行间隔：秒数（如 60）或中文（如 30秒/5分钟/1小时/1天），最短 30 秒"
+            },
+            "enabled": {
+              "type": "boolean",
+              "description": "是否立即启用（默认 true）"
+            }
+          },
+          "required": [
+            "name",
+            "task",
+            "interval"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "sched_list",
+        "description": "列出全部定时任务：下次执行时间、执行次数、最近一次结果、启停状态。",
+        "parameters": {
+          "type": "object",
+          "properties": {},
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "sched_run_now",
+        "description": "立即触发某个定时任务一次（不等下一个周期；执行中则忽略）。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "job_id": {
+              "type": "string",
+              "description": "任务 id（sched_list 可查）"
+            }
+          },
+          "required": [
+            "job_id"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "sched_toggle",
+        "description": "启用/暂停某个定时任务（暂停后不再自动执行，已登记的任务保留）。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "job_id": {
+              "type": "string",
+              "description": "任务 id"
+            },
+            "enabled": {
+              "type": "boolean",
+              "description": "true=启用，false=暂停"
+            }
+          },
+          "required": [
+            "job_id",
+            "enabled"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "sched_remove",
+        "description": "删除定时任务（破坏性操作，无回收站，必须 confirm=true）。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "job_id": {
+              "type": "string",
+              "description": "任务 id"
+            },
+            "confirm": {
+              "type": "boolean",
+              "description": "确认删除，必须为 true"
+            }
+          },
+          "required": [
+            "job_id",
+            "confirm"
+          ]
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "builtin": {
+    "bilibili": true,
+    "acfun": true,
+    "xvideos": false,
+    "youtube": false
+  },
+  "custom": []
+}

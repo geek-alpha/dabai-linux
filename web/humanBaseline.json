@@ -1,0 +1,22 @@
+{
+  "treasure_hunt": {
+    "avgTimeSec": 90,
+    "successRate": 0.8,
+    "note": "人类通关迷宫寻宝的平均用时与成功率（本地演示基准）"
+  },
+  "sandbox": {
+    "avgTimeSec": 120,
+    "successRate": 0.7,
+    "note": "人类在沙盒世界完成核心采集目标的基准"
+  },
+  "mario": {
+    "avgTimeSec": 60,
+    "successRate": 0.65,
+    "note": "人类在马里奥跑酷存活一段距离的基准"
+  },
+  "moba_5v5": {
+    "avgTimeSec": 300,
+    "successRate": 0.5,
+    "note": "人类在 5v5 对局中取得有效推进的基准"
+  }
+}

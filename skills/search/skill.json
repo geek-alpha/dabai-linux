@@ -1,0 +1,393 @@
+{
+  "name": "search",
+  "title": "统一搜索（anysearch/tavily/exa/web 四引擎合一）",
+  "version": "1.0.0",
+  "description": "四引擎统一搜索：anysearch（通用+垂直域+批量+URL提取，匿名可用）、tavily（LLM优化搜索/提取/爬取/深度研究，需 tvly CLI+key）、exa（语义搜索/答案/相似页，需 EXA_API_KEY）、web（DuckDuckGo+Bing 直连/代理自动切换+读网页+天气+翻墙）。",
+  "author": "dabai",
+  "enabled": true,
+  "disclosure": "on_demand",
+  "prompt": "【技能 统一搜索】查信息/新闻/文档/教程：优先 search_web（anysearch 引擎，匿名可用，支持垂直域 finance/academic/code 等，垂直域先 search_subdomains 拿参数）；需要语义搜索/找相似页用 search_exa（需 EXA_API_KEY）；需要深度研究/爬站用 search_tavily（需 tvly CLI+TAVILY_API_KEY）；读网页正文用 read_web（web 引擎，JS 渲染自动无头 Chrome）；天气用 weather_check；翻墙/代理用 fq_ctl/proxy_test。查实时信息先搜再答，不凭空编造。",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "search_web",
+        "description": "通用/垂直域搜索（anysearch 引擎，匿名可用）。通用搜索直接传 query；垂直域（finance/academic/code/legal/health 等）先调 search_subdomains 拿 sub_domain 与参数格式，再传 domain/sub_domain/params。支持 --zone cn/intl、--language 指定语言。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string",
+              "description": "搜索关键词或垂直域查询串"
+            },
+            "domain": {
+              "type": "string",
+              "enum": ["general", "resource", "social_media", "finance", "academic", "legal", "health", "business", "security", "ip", "code", "energy", "environment", "agriculture", "travel", "film", "gaming"],
+              "description": "垂直域（可选）。垂直搜索前必须先 search_subdomains 确认 sub_domain"
+            },
+            "sub_domain": {
+              "type": "string",
+              "description": "垂直域子路由（如 finance.quote），由 search_subdomains 返回"
+            },
+            "params": {
+              "type": "string",
+              "description": "垂直域参数，JSON 或 key=value（如 type=stock,symbol=AAPL,cn_code=）"
+            },
+            "zone": {
+              "type": "string",
+              "enum": ["cn", "intl"],
+              "description": "区域偏好：cn 或 intl"
+            },
+            "language": {
+              "type": "string",
+              "description": "结果语言，如 zh-CN 或 en"
+            },
+            "max_results": {
+              "type": "integer",
+              "description": "最多返回几条（1-10，默认 10）"
+            }
+          },
+          "required": ["query"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "search_batch",
+        "description": "并行批量搜索（anysearch 引擎）：一次最多 5 个独立查询，单条失败不阻塞其他。传 JSON 数组或重复 --query。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "queries": {
+              "type": "string",
+              "description": "JSON 数组，如 [{\"query\":\"AAPL\"},{\"query\":\"GOOG\"}]；每项支持 query/domain/sub_domain/sub_domain_params/max_results"
+            },
+            "query": {
+              "type": "array",
+              "items": {"type": "string"},
+              "description": "简写：多个独立查询串（最多 5 个）"
+            },
+            "max_results": {
+              "type": "integer",
+              "description": "共享的返回条数（1-10），注入所有查询项"
+            }
+          },
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "search_subdomains",
+        "description": "列出垂直域的子域/查询格式/参数 schema（anysearch 引擎）。垂直搜索前必须先调用。支持单域或批量（最多 5 域）。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "domain": {
+              "type": "string",
+              "enum": ["general", "resource", "social_media", "finance", "academic", "legal", "health", "business", "security", "ip", "code", "energy", "environment", "agriculture", "travel", "film", "gaming"],
+              "description": "单个垂直域"
+            },
+            "domains": {
+              "type": "string",
+              "description": "批量：逗号分隔或 JSON 数组，最多 5 个域"
+            }
+          },
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "search_extract",
+        "description": "提取 URL 全文（anysearch 引擎，输出 Markdown）。支持 HTML/纯文本/JSON/Markdown；不支持 PDF/图片/音视频等二进制。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "url": {
+              "type": "string",
+              "description": "网页完整地址（http:// 或 https:// 开头）"
+            }
+          },
+          "required": ["url"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "search_exa",
+        "description": "Exa 语义搜索：按含义而非关键词检索，返回标题/URL/摘要。需 EXA_API_KEY（未配置会报错）。查询要『描述想找的页面』而非关键词。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string",
+              "description": "描述想找的页面，如 '关于量子计算的最新研究论文'"
+            },
+            "num": {
+              "type": "integer",
+              "description": "返回条数（默认 10）"
+            },
+            "category": {
+              "type": "string",
+              "enum": ["company", "news", "research paper", "github", "pdf"],
+              "description": "分类聚焦（可选）"
+            }
+          },
+          "required": ["query"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "search_exa_answer",
+        "description": "Exa 直接问答：给出带引用的答案。需 EXA_API_KEY。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "question": {
+              "type": "string",
+              "description": "要回答的问题"
+            }
+          },
+          "required": ["question"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "search_exa_similar",
+        "description": "Exa 找相似页面：给定 URL 找内容相近的页面。需 EXA_API_KEY。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "url": {
+              "type": "string",
+              "description": "参考页面 URL"
+            },
+            "num": {
+              "type": "integer",
+              "description": "返回条数（默认 10）"
+            }
+          },
+          "required": ["url"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "search_tavily",
+        "description": "Tavily 搜索（LLM 优化）：支持 advanced 深度、time-range 时间过滤、include-domains 限定站点。需安装 tvly CLI 并配置 TAVILY_API_KEY。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string",
+              "description": "搜索关键词"
+            },
+            "depth": {
+              "type": "string",
+              "enum": ["basic", "advanced"],
+              "description": "搜索深度（默认 basic，advanced 更全面）"
+            },
+            "time_range": {
+              "type": "string",
+              "enum": ["day", "week", "month", "year"],
+              "description": "时间过滤（可选）"
+            },
+            "include_domains": {
+              "type": "string",
+              "description": "限定站点域名，逗号分隔"
+            },
+            "max_results": {
+              "type": "integer",
+              "description": "最多返回几条（默认 5）"
+            }
+          },
+          "required": ["query"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "search_tavily_extract",
+        "description": "Tavily 提取 URL 正文（支持 JS 渲染页）。需 tvly CLI + TAVILY_API_KEY。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "url": {
+              "type": "string",
+              "description": "网页完整地址"
+            }
+          },
+          "required": ["url"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "search_tavily_research",
+        "description": "Tavily 深度研究：多源聚合带引用（30-120s）。需 tvly CLI + TAVILY_API_KEY。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "topic": {
+              "type": "string",
+              "description": "研究主题"
+            },
+            "model": {
+              "type": "string",
+              "description": "模型（默认 pro）"
+            }
+          },
+          "required": ["topic"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "web_search",
+        "description": "按关键词搜索网页（DuckDuckGo 主 + Bing 兜底，直连/代理自动切换），返回标题/链接/摘要。查实时信息、新闻、文档先查证不编造。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string",
+              "description": "搜索关键词（中文/英文均可）"
+            },
+            "max_results": {
+              "type": "integer",
+              "description": "最多返回几条（默认 5，最大 10）"
+            }
+          },
+          "required": ["query"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "read_web",
+        "description": "读取网页：mode=text 正文 / links 链接清单 / headings 标题大纲 / tables 表格 / html 原始结构；JS 渲染页面自动用无头 Chrome；keyword 站内定位关键词。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "url": {
+              "type": "string",
+              "description": "网页完整地址（http:// 或 https:// 开头）"
+            },
+            "mode": {
+              "type": "string",
+              "enum": ["text", "links", "headings", "tables", "html"],
+              "description": "挖法：text 正文（默认）/ links 链接清单 / headings 标题大纲 / tables 表格 / html 原始 HTML"
+            },
+            "keyword": {
+              "type": "string",
+              "description": "站内定位：在正文中找这个关键词并返回上下文（可选）"
+            },
+            "js": {
+              "type": "string",
+              "enum": ["auto", "true", "false"],
+              "description": "是否用无头 Chrome 渲染 JS：auto（默认，内容自动太少启用）/ true / false"
+            },
+            "max_chars": {
+              "type": "integer",
+              "description": "最多返回多少字符（默认 3000，最大 8000）"
+            }
+          },
+          "required": ["url"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "weather_check",
+        "description": "查询指定城市的实时天气（温度、天气现象、体感、湿度、风速）。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": {
+              "type": "string",
+              "description": "城市名（中文或拼音均可），如 '北京'、'Shanghai'。"
+            }
+          },
+          "required": ["city"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "fq_ctl",
+        "description": "控制翻墙启动器：list/status 查看、start 启动、stop 停止、test 测连通、update 换IP配置、chrome 开便携浏览器、sysproxy 系统代理开关。协议：clash/xray/hysteria/hysteria2/singbox/naive/juicity/mieru/shadowquic 或编号1-9。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "enum": ["list", "status", "start", "stop", "test", "update", "chrome", "sysproxy"],
+              "description": "要执行的操作。list=全部协议概览；status=进程+端口详情；start=启动核心；stop=停止；test=走代理访问gstatic(204=通)；update=云端拉新IP配置；chrome=只开便携Chrome；sysproxy=系统代理开关。"
+            },
+            "target": {
+              "type": "string",
+              "description": "目标协议（名称或编号）或 all；sysproxy 时填 on/off/status。start/update 必须指定单个协议；status/test/stop/chrome 可用 all 或省略。"
+            },
+            "ip_source": {
+              "type": "integer",
+              "description": "可选。start/update 前先用第 N 个云端 IP 源更新配置（封锁后换 IP 用，1..6）。仅在用户明确要求换 IP 时使用。"
+            },
+            "no_chrome": {
+              "type": "boolean",
+              "description": "start 时是否不启动便携 Chrome（默认 true，只起代理端口）。"
+            },
+            "no_elevate": {
+              "type": "boolean",
+              "description": "start 时是否跳过 UAC 提权（默认 true；纯 socks/http 协议不需要管理员）。设 false 会弹 UAC 窗口，需要用户手动点『是』。"
+            },
+            "keep_chrome": {
+              "type": "boolean",
+              "description": "stop 时是否保留便携 Chrome 继续运行（默认 false 连浏览器一起关）。"
+            },
+            "confirm_update": {
+              "type": "boolean",
+              "description": "update 操作的显式确认（会备份并覆盖现有配置文件）。必须用户明确要求换 IP 后才传 true。"
+            }
+          },
+          "required": ["action"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "proxy_test",
+        "description": "探测本地代理端口可用性：走代理请求拿出口 IP；不传参自动探测常见端口（fq 各协议+dev-sidecar）。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "proxy": {
+              "type": "string",
+              "description": "代理地址，如 http://127.0.0.1:7890 或 socks5h://127.0.0.1:1080；也可直接填协议别名（clash/xray/hy2/mieru/shadowquic/sidecar）。省略则探测全部常见端口。"
+            },
+            "url": {
+              "type": "string",
+              "description": "可选，测试目标 URL（默认 https://httpbin.org/ip 查出口 IP）。"
+            }
+          },
+          "required": []
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,4 @@
+# 统一行尾：避免 shell 脚本在 Linux 上因 CRLF 报 bad interpreter / $'\r': command not found
+*.sh  text eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf

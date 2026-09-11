@@ -1,0 +1,158 @@
+{
+  "name": "project_build",
+  "title": "从零构建大型项目（规格矩阵 / 增量实现 / 验收核算）",
+  "version": "1.1.0",
+  "description": "从零构建大型项目：想法→带ID的规格矩阵→按模块增量实现→验收核算，面面俱到又省 token。",
+  "author": "dabai",
+  "enabled": true,
+  "disclosure": "on_demand",
+  "prompt": "【技能 从零构建大型项目】用户要「从零做一个项目 / 大型功能 / 多模块系统」时，禁止直接开写：\n① project_spec_init(idea) —— 把想法拆成带 ID 的功能清单与模块划分（spec.json 是唯一真相源，SPEC.md 只是人读视图）；\n② 循环：project_next 取「当前模块」上下文 → 只实现该模块列出的文件 → 跑验收命令 → project_verify(module_id, evidence)；\n③ 收尾 project_matrix 核对覆盖率 100%、无「已实现未验收」。\n并行加速（可选，但大项目强烈建议）：project_dispatch 把「依赖就绪 + 写集互不相交」的多个模块派给配置好的子智能体并行做——派活前先用 agent_profile_list 看有哪些角色（coder/tester/researcher/writer），可按模块类型自动选人；子智能体交回「改动文件 + 验收命令 + 关键输出」四行回报，主智能体跑命令后统一 project_verify（不要让子智能体自己 verify）。\n省 token 的硬规则：\n- 需求只用 ID 引用（F-003 / M-002），不要把需求原文反复贴进上下文；\n- 一次只做一个模块，不要把所有模块的契约一次性读进来；\n- evidence 必须是真实命令输出，没跑就不许调 project_verify（工具会拒绝空证据）；\n- FAIL 时按返回的结构化反思改，同一错误连续两次就停下诊断根因，不要反复硬试。",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "project_spec_init",
+        "description": "从零构建项目的第一步：把一句模糊想法/需求清单拆成带 ID 的功能矩阵（F-001…）与模块划分（M-001…，数据→核心→接口→界面→测试→文档），落盘 spec.json（唯一真相源）+ SPEC.md（人读）+ 目录骨架。已有规格默认拒绝覆盖（overwrite=true 才重建）。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "idea": {
+              "type": "string",
+              "description": "项目想法：一句话或一段需求清单（换行/分号/编号列表都会被拆成独立功能条目）"
+            },
+            "project_dir": {
+              "type": "string",
+              "description": "项目目录（默认当前工作目录）；规格存 <project_dir>/.project_build/spec.json"
+            },
+            "name": {
+              "type": "string",
+              "description": "项目名（默认取目录名）"
+            },
+            "overwrite": {
+              "type": "boolean",
+              "description": "已有规格时是否覆盖重建（默认 false 拒绝，防止丢失进度）"
+            },
+            "scaffold_dirs": {
+              "type": "boolean",
+              "description": "是否创建模块目录骨架（默认 true；只建目录不建空文件，避免假实现）"
+            }
+          },
+          "required": ["idea"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "project_next",
+        "description": "取「下一个该做的模块」的上下文：只注入该模块的目标、涉及文件、依赖契约、验收标准与纪律（默认 6000 字预算，超限自动降级截断），其他模块只留 ID。不传 module_id 时自动挑依赖已完成的模块；无就绪模块会报告阻塞原因。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "project_dir": {
+              "type": "string",
+              "description": "项目目录（默认当前工作目录）"
+            },
+            "module_id": {
+              "type": "string",
+              "description": "可选：指定要做的模块（如 M-002）；不传则自动按构建顺序挑就绪模块"
+            },
+            "budget": {
+              "type": "integer",
+              "description": "本次注入的字符预算（默认 6000；越小越省 token）"
+            }
+          },
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "project_verify",
+        "description": "记录验收结果并更新覆盖矩阵。evidence 必填（真实命令+关键输出）——没跑命令不许说完成，工具会拒绝空证据。通过则功能置为已验证、模块全验证后置完成；失败则回退状态并返回结构化反思（失败类型+关键行+下一步），PASS 时零反思开销。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "module_id": {
+              "type": "string",
+              "description": "验收的模块（如 M-002）；与 feature_id 至少给一个"
+            },
+            "feature_id": {
+              "type": "string",
+              "description": "可选：只验收单条功能（如 F-003）"
+            },
+            "evidence": {
+              "type": "string",
+              "description": "验收证据：执行的命令 + 关键输出摘要（必填，可截断到几十字）"
+            },
+            "result": {
+              "type": "string",
+              "enum": ["pass", "fail"],
+              "description": "验收结果（默认 pass）"
+            },
+            "reflection": {
+              "type": "string",
+              "description": "可选：失败时你自己的诊断结论，会并入结构化反思"
+            },
+            "project_dir": {
+              "type": "string",
+              "description": "项目目录（默认当前工作目录）"
+            }
+          },
+          "required": ["evidence"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "project_matrix",
+        "description": "覆盖率核算：功能已验证/总数、模块进度、已实现但未验收、无验收标准、悬空模块引用、无效依赖、未完成功能清单与下一步建议。verbose=true 时逐模块逐功能列出明细。收尾前必调，核对是否真的面面俱到。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "project_dir": {
+              "type": "string",
+              "description": "项目目录（默认当前工作目录）"
+            },
+            "verbose": {
+              "type": "boolean",
+              "description": "是否逐模块逐功能列明细（默认 false 只给汇总）"
+            }
+          },
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "project_dispatch",
+        "description": "并行派发：把多个「依赖已就绪 + 写集互不相交」的模块交给子智能体同时做（按模块类型自动选智能体档案：core→coder、test→tester、doc→writer）。写集相交的模块会被自动跳过（并行改同一文件必然互相覆盖）。dry_run=true 先预演不派发。子智能体完成后交回四行回报，主智能体跑验收命令再 project_verify。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "count": {
+              "type": "integer",
+              "description": "最多并行几个模块（默认 2，上限 8；实际并发还受 settings.json 的 sub_max_concurrent 限制）"
+            },
+            "profile": {
+              "type": "string",
+              "description": "可选：强制所有模块都用这个智能体档案（如 coder/tester/researcher/writer）；不传则按模块类型自动推荐"
+            },
+            "dry_run": {
+              "type": "boolean",
+              "description": "true=只预演分配方案（哪些模块可并行、各用哪个档案），不真正下发"
+            },
+            "project_dir": {
+              "type": "string",
+              "description": "项目目录（默认当前工作目录）"
+            }
+          },
+          "required": []
+        }
+      }
+    }
+  ]
+}

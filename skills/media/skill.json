@@ -1,0 +1,825 @@
+{
+  "name": "media",
+  "title": "媒体与娱乐（影音/汉化流水线/小游戏/AI画图）",
+  "version": "2.0.0",
+  "description": "在线影音（B站/AcFun/酷我/网易云）+ 油管汉化流水线 + 小游戏 + AI 画图 + 媒体子智能体看护。",
+  "author": "dabai",
+  "enabled": true,
+  "disclosure": "on_demand",
+  "prompt": "【技能 媒体与娱乐】视频用 video_search/video_play 等（B站/AcFun 聚合搜索、点播、连播队列、大屏播放）；音乐用 music_search/music_play/music_lyric/music_billboard 等（酷我/网易云）；媒体子进程用 media_worker_status/list/cancel 看护。汉化视频/翻译配音/下载油管/发布B站/烧字幕/垫BGM 用 hanhua_* 流水线工具。用户说想玩游戏/无聊/想放松时主动邀请并直接 launch_game 启动一个（treasure_hunt=迷宫寻宝，sandbox=沙盒世界），不要问用户选哪个。用户想要图片/画一张图/生成壁纸/立绘/头像/插画/海报等任何视觉生成需求时，必须直接调用 image_gen_create 现场绘制：把用户的话润色成画面描述作为 prompt（越具体越好：主体、风格、光线、构图），生成后把图片链接和画面说明告诉用户。画图绝不委派给任何智能体/编程助手——当场自己完成。",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "video_search",
+        "description": "搜索在线视频（聚合B站/AcFun）：返回带序号结果，选定后 video_play(index) 播放。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "keyword": {
+              "type": "string",
+              "description": "搜索关键词，如 '高等数学' 或 '蓝色星球 纪录片'。"
+            },
+            "platform": {
+              "type": "string",
+              "enum": [
+                "all",
+                "bilibili",
+                "acfun",
+                "xvideos",
+                "youtube"
+              ],
+              "description": "平台，默认 all 聚合搜索（B站/AcFun/xvideos/YouTube）；教育/课程内容 bilibili 最全。"
+            },
+            "sort": {
+              "type": "string",
+              "enum": [
+                "relevance",
+                "hot",
+                "new"
+              ],
+              "description": "排序：relevance 综合相关（默认）/ hot 最热门（按播放量）/ new 最新发布。"
+            },
+            "limit": {
+              "type": "integer",
+              "description": "返回数量上限，默认 8，最大 16。"
+            }
+          },
+          "required": [
+            "keyword"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "video_play",
+        "description": "大屏播放视频（带声音）：index（搜索结果序号）/ query（关键词取第一条）/ url 三选一；watch=true 派子智能体盯梢，播完自动汇报。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "index": {
+              "type": "integer",
+              "description": "最近一次 video_search 结果里的序号。"
+            },
+            "query": {
+              "type": "string",
+              "description": "关键词点播，如 '线性代数'，搜索后取第一条。"
+            },
+            "url": {
+              "type": "string",
+              "description": "视频页链接（B站/AcFun）。"
+            },
+            "platform": {
+              "type": "string",
+              "enum": [
+                "all",
+                "bilibili",
+                "acfun",
+                "youtube"
+              ],
+              "description": "query 点播时的平台，默认 all。"
+            },
+            "sort": {
+              "type": "string",
+              "enum": [
+                "relevance",
+                "hot",
+                "new"
+              ],
+              "description": "query 点播时的排序，默认 relevance。"
+            },
+            "watch": {
+              "type": "boolean",
+              "description": "可选：true 表示派一个子智能体全程负责这部视频（播完自动向你汇报），默认 false 只播放不盯梢。"
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "video_queue",
+        "description": "把视频加入连播队列（当前播完自动接上）。index/query/url 三选一。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "index": {
+              "type": "integer",
+              "description": "最近一次 video_search 结果里的序号。"
+            },
+            "query": {
+              "type": "string",
+              "description": "关键词，搜索取第一条入队。"
+            },
+            "url": {
+              "type": "string",
+              "description": "视频页链接。"
+            },
+            "platform": {
+              "type": "string",
+              "enum": [
+                "all",
+                "bilibili",
+                "acfun",
+                "youtube"
+              ]
+            },
+            "sort": {
+              "type": "string",
+              "enum": [
+                "relevance",
+                "hot",
+                "new"
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "video_control",
+        "description": "控制大屏播放：pause/resume/seek/volume/mute/stop/next。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "enum": [
+                "pause",
+                "resume",
+                "seek",
+                "volume",
+                "mute",
+                "stop",
+                "next"
+              ],
+              "description": "pause 暂停 / resume 继续 / seek 拖进度 / volume 音量 / mute 静音 / stop 停止 / next 播队列下一部。"
+            },
+            "value": {
+              "type": "number",
+              "description": "seek 秒数 / volume 0.0~1.0 / mute 1或0。"
+            }
+          },
+          "required": [
+            "action"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "video_status",
+        "description": "查看视频服务状态：当前播放、队列、进度与音量。",
+        "parameters": {
+          "type": "object",
+          "properties": {}
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "music_search",
+        "description": "搜索在线歌曲（聚合酷我/网易云）：返回带序号结果，选定后 music_play(index) 播放。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "keyword": {
+              "type": "string",
+              "description": "搜索关键词，如 '晴天' 或 '周杰伦'。"
+            },
+            "source": {
+              "type": "string",
+              "enum": [
+                "all",
+                "kuwo",
+                "netease"
+              ],
+              "description": "音源，默认 all 聚合双源。"
+            },
+            "limit": {
+              "type": "integer",
+              "description": "返回数量上限，默认 8，最大 20。"
+            }
+          },
+          "required": [
+            "keyword"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "music_play",
+        "description": "播放歌曲：优先 index（搜索结果序号），无列表时传 source+song_id；watch=true 派子智能体盯梢播完汇报。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "index": {
+              "type": "integer",
+              "description": "最近一次搜索结果或歌单列表里的序号。"
+            },
+            "source": {
+              "type": "string",
+              "enum": [
+                "kuwo",
+                "netease"
+              ],
+              "description": "无 index 时必填：歌曲来源。"
+            },
+            "song_id": {
+              "type": "string",
+              "description": "无 index 时必填：歌曲 ID。"
+            },
+            "title": {
+              "type": "string",
+              "description": "可选：歌名，用于展示。"
+            },
+            "artist": {
+              "type": "string",
+              "description": "可选：歌手，用于展示。"
+            },
+            "volume": {
+              "type": "number",
+              "description": "音量 0.0~1.0，默认约 0.8。"
+            },
+            "watch": {
+              "type": "boolean",
+              "description": "可选：true 表示派一个子智能体全程负责这首歌（播完自动向你汇报），默认 false 只播放不盯梢。"
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "music_stop",
+        "description": "停止当前播放的音乐。",
+        "parameters": {
+          "type": "object",
+          "properties": {}
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "music_control",
+        "description": "控制播放：pause/resume/toggle/stop/volume。暂停不打断歌曲，可随时恢复。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "enum": [
+                "pause",
+                "resume",
+                "toggle",
+                "stop",
+                "volume"
+              ],
+              "description": "pause 暂停 / resume 继续 / toggle 播放暂停切换 / stop 停止 / volume 调节音量。"
+            },
+            "value": {
+              "type": "number",
+              "description": "仅 volume 时必填：目标音量 0.0~1.0，如 0.5 表示 50%。"
+            }
+          },
+          "required": [
+            "action"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "music_lyric",
+        "description": "获取歌词（LRC 格式），参数同 music_play（index 或 source+song_id）。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "index": {
+              "type": "integer",
+              "description": "最近列表的序号。"
+            },
+            "source": {
+              "type": "string",
+              "enum": [
+                "kuwo",
+                "netease"
+              ]
+            },
+            "song_id": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "music_billboard",
+        "description": "获取内置音乐榜单（云音乐热歌/新歌/飙升/原创榜）。",
+        "parameters": {
+          "type": "object",
+          "properties": {}
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "music_playlist",
+        "description": "按关键词搜在线歌单并打开第一份的可播列表；也可用 playlist_id 直接打开。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "keyword": {
+              "type": "string",
+              "description": "歌单搜索词，如 '怀旧'、'学习'。"
+            },
+            "playlist_id": {
+              "type": "string",
+              "description": "已知歌单/榜单 ID 时直接打开。"
+            },
+            "source": {
+              "type": "string",
+              "enum": [
+                "netease"
+              ],
+              "description": "歌单来源，默认 netease。"
+            },
+            "limit": {
+              "type": "integer",
+              "description": "列出歌曲数量，默认 15，最大 50。"
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "music_my_playlists",
+        "description": "查看用户自建歌单列表。",
+        "parameters": {
+          "type": "object",
+          "properties": {}
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "music_play_playlist",
+        "description": "播放用户自建歌单（可 watch=true 盯梢）。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "playlist_id": {
+              "type": "string",
+              "description": "自建歌单 ID（music_my_playlists 可查到）。"
+            },
+            "playlist_name": {
+              "type": "string",
+              "description": "自建歌单名（二选一）。"
+            },
+            "watch": {
+              "type": "boolean",
+              "description": "可选：true 表示派子智能体全程负责这个歌单（全部播完自动汇报），默认 false。"
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "music_status",
+        "description": "查看音乐服务状态与各工具的使用说明。",
+        "parameters": {
+          "type": "object",
+          "properties": {}
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "media_workers_list",
+        "description": "查看当前正在干活的媒体子智能体列表（谁在看护什么、什么状态）。用户问「还有什么在播/有谁在干活/子进程情况」时使用。",
+        "parameters": {
+          "type": "object",
+          "properties": {}
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "media_worker_status",
+        "description": "查看单个媒体子智能体的完整状态（含任务内容、进度、结果）。需要追某一个子进程的细节时使用。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "worker_id": {
+              "type": "string",
+              "description": "子智能体 ID，如 agent-xxxxxxxxxx（media_workers_list 可查）。"
+            }
+          },
+          "required": [
+            "worker_id"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "media_worker_cancel",
+        "description": "收回（取消）一个媒体子智能体，并停止它负责的播放（歌曲/歌单/视频）。用户不想听了/不想看了、或想停掉某个看护时使用。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "worker_id": {
+              "type": "string",
+              "description": "子智能体 ID（media_workers_list 可查）。"
+            },
+            "reason": {
+              "type": "string",
+              "description": "可选：取消原因，会记录到该子进程的日志里。"
+            }
+          },
+          "required": [
+            "worker_id"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "hanhua_status",
+        "description": "查看汉化流水线总览：各阶段统计、文件流转、进行中任务。",
+        "parameters": {
+          "type": "object",
+          "properties": {},
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "hanhua_jobs",
+        "description": "列出流水线任务：按 stage（download/process/divide/publish）与 status 过滤，默认含已完成 30 条。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "stage": {
+              "type": "string",
+              "description": "阶段过滤：download / process / divide / publish"
+            },
+            "status": {
+              "type": "string",
+              "description": "状态过滤，逗号分隔：queued,running,failed,succeeded,cancelled"
+            },
+            "limit": {
+              "type": "integer",
+              "description": "最多返回条数（默认 30，最大 100）"
+            },
+            "all": {
+              "type": "boolean",
+              "description": "是否包含已完成任务（默认 true）"
+            }
+          },
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "hanhua_log",
+        "description": "看某个任务的执行日志末尾 N 行（logs/<任务ID>.log）。先 hanhua_jobs 拿任务 ID。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "job_id": {
+              "type": "string",
+              "description": "任务 ID（如 proc_xxx / pub_xxx，hanhua_jobs 可查）"
+            },
+            "lines": {
+              "type": "integer",
+              "description": "显示末尾行数（默认 80，最大 300）"
+            }
+          },
+          "required": [
+            "job_id"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "hanhua_download",
+        "description": "按关键词搜索 YouTube 并批量下载入队（Playwright 浏览器执行，可能较慢）。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "topic": {
+              "type": "string",
+              "description": "YouTube 搜索关键词（如 \"ESP32 教程\"）"
+            }
+          },
+          "required": [
+            "topic"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "hanhua_add",
+        "description": "把本地视频文件/目录加入汉化队列（直接进处理阶段）。支持多路径。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "files": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "description": "本机视频文件或目录的完整路径"
+              },
+              "description": "一个或多个视频文件/目录路径"
+            }
+          },
+          "required": [
+            "files"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "hanhua_run",
+        "description": "后台启动流水线调度器（下载→汉化→分区→发布 自动衔接），立即返回；用 status/jobs 轮询。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "stages": {
+              "type": "string",
+              "description": "只跑部分阶段，逗号分隔：download,process,divide,publish（默认全部）"
+            }
+          },
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "hanhua_run_stop",
+        "description": "停止后台调度器（连同 worker 子进程）。已排队任务不丢，下次 run 继续。",
+        "parameters": {
+          "type": "object",
+          "properties": {},
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "hanhua_run_log",
+        "description": "查看后台调度器实时运行日志末尾 N 行。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "lines": {
+              "type": "integer",
+              "description": "末尾行数（默认 50，最大 300）"
+            }
+          },
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "hanhua_tasks",
+        "description": "批量操作任务：retry 重试 / cancel 取消 / delete 删除（可多任务 ID）。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "description": "retry / cancel / delete"
+            },
+            "job_ids": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "description": "任务 ID"
+              },
+              "description": "一个或多个任务 ID"
+            },
+            "force": {
+              "type": "boolean",
+              "description": "仅 delete 用：运行中也强制取消并删除（默认 false）"
+            }
+          },
+          "required": [
+            "action",
+            "job_ids"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "hanhua_pause",
+        "description": "暂停/恢复流水线派发（pause 暂停派发，运行中任务跑完；resume 恢复）。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "description": "pause 或 resume"
+            }
+          },
+          "required": [
+            "action"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "hanhua_config",
+        "description": "查看/修改流水线配置：show 全部 / get 读键 / set 改键（点号路径）/ path 返回配置位置。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "description": "show / get / set / path（默认 show）"
+            },
+            "key": {
+              "type": "string",
+              "description": "配置键，点号路径，如 process.model_size、stages.process.enabled"
+            },
+            "value": {
+              "type": "string",
+              "description": "set 时的新值（字符串形式，布尔写 true/false）"
+            }
+          },
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "hanhua_bgm",
+        "description": "背景音乐管理：files 列表 / global 全局默认 / set 单视频专属 / clear 清空 / show 当前配置。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "description": "show / files / global / set / clear（默认 show）"
+            },
+            "video_key": {
+              "type": "string",
+              "description": "set/clear 用：视频标识（文件名去扩展名）"
+            },
+            "path": {
+              "type": "string",
+              "description": "音频文件路径（bgm 目录下或任意本机路径）"
+            },
+            "volume": {
+              "type": "number",
+              "description": "音量 0-1（建议 0.1~0.2）"
+            },
+            "clear": {
+              "type": "boolean",
+              "description": "global 用：清空全局背景音乐"
+            }
+          },
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "hanhua_remix",
+        "description": "给已汉化成品视频直接合成背景音乐（不重新汉化，几十秒完成；默认原地覆盖，可用 --out 输出到新文件）。想给已经汉化好的视频补垫背景乐时用。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "video": {
+              "type": "string",
+              "description": "成品视频路径（如 subtitles/合集名/xxx_with_subtitles_final.mp4）"
+            },
+            "bgm": {
+              "type": "string",
+              "description": "背景音乐路径（默认用单视频/全局配置）"
+            },
+            "volume": {
+              "type": "number",
+              "description": "音量 0-1（建议 0.1~0.2；默认用配置）"
+            },
+            "out": {
+              "type": "string",
+              "description": "输出到新文件路径（不覆盖原文件）"
+            }
+          },
+          "required": [
+            "video"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "hanhua_doctor",
+        "description": "流水线环境体检：worker Python、ffmpeg、目录、AI key、GPT-SoVITS 服务、调度冲突。开工前或用户反馈\"跑不起来\"\"配音没声音\"时先跑这个定位环境问题。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "deep": {
+              "type": "boolean",
+              "description": "是否深度检查 worker Python 的依赖（较慢，默认 false）"
+            }
+          },
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "launch_game",
+        "description": "启动一个小游戏，和用户一起玩。你是真正的共玩者——你能看到游戏中的一切（地图、物品、玩家行动），像朋友一样自然反应。当用户说想玩游戏、无聊、想放松时，主动邀请并直接启动一个游戏，不要问用户选哪个，你自己选一个最合适的。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "game_key": {
+              "type": "string",
+              "enum": [
+                "treasure_hunt",
+                "sandbox"
+              ],
+              "description": "游戏标识符：treasure_hunt=迷宫寻宝（在神秘迷宫中收集星光碎片寻找宝藏），sandbox=沙盒世界（无限随机生成的方块大世界，流浪探索采集资源）"
+            }
+          },
+          "required": [
+            "game_key"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "image_gen_create",
+        "description": "根据画面描述生成一张 AI 图片，保存到本地并通过 /generated/<文件名> 访问。返回结果里包含图片链接。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "prompt": {
+              "type": "string",
+              "description": "画面描述（英文效果最好，中文也可）。越具体越好：主体、风格、光线、构图。"
+            },
+            "size": {
+              "type": "string",
+              "description": "图片尺寸，可选 1024x1024 / 768x1024 / 1024x768，默认 1024x1024。"
+            }
+          },
+          "required": [
+            "prompt"
+          ]
+        }
+      }
+    }
+  ]
+}

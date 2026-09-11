@@ -1,0 +1,827 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="theme-color" content="#0f0f1e">
+    <title>白头凤【BattlePhoenix】</title>
+    <link rel="stylesheet" href="/static/style.css?v=33">
+    <!-- Three.js importmap：用 ES module 加载 three 与扩展 -->
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "/static/vendor/three/build/three.module.js",
+            "three/addons/": "/static/vendor/three/examples/jsm/",
+            "@pixiv/three-vrm": "/static/vendor/three-vrm/lib/three-vrm.module.min.js"
+        }
+    }
+    </script>
+</head>
+<body>
+    <div id="app">
+        <!-- 3D 角色舞台 -->
+        <section id="stage">
+            <canvas id="three-canvas"></canvas>
+            <div id="status-badge" class="status-badge"><span class="status-dot"></span>连接中…</div>
+            <div id="subtitle" class="subtitle"></div>
+
+            <!-- 顶部右侧工具栏：侧边竖排，可上下滚动（默认收缩在右上角） -->
+            <div class="stage-tools collapsed" id="stage-tools">
+                <button id="stage-tools-toggle" class="stage-tools-toggle" title="展开工具栏">
+                    <svg class="icon-open" viewBox="0 0 24 24" width="16" height="16"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" d="M5 7h14M5 12h14M5 17h14"/></svg>
+                    <svg class="icon-close" viewBox="0 0 24 24" width="16" height="16"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" d="M6 6l12 12M18 6L6 18"/></svg>
+                </button>
+                <button id="wheel-up-btn" class="stage-tools-arrow" title="上一组">▲</button>
+                <div class="stage-tools-ring" id="stage-tools-ring">
+                <button id="role-card-btn" class="stage-tool-btn" title="角色卡片：一键切换形象/声音/称呼/人设">
+                    <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M4 4h7v7H4V4zm9 0h7v7h-7V4zM4 13h7v7H4v-7zm9 0h7v7h-7v-7z"/></svg>
+                </button>
+                <button id="llm-provider-btn" class="stage-tool-btn" title="模型供应商：添加/管理全局 LLM 供应商（Ollama 本地 / 自定义 API）">
+                    <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M7 4v7h-1.5A2.5 2.5 0 0 0 3 13.5V15a2 2 0 0 0 2 2h1.5v3h2v-3H13.5a2 2 0 0 0 2-2v-1.5A2.5 2.5 0 0 0 13 11H11V4h2a1 1 0 0 0 0-2H6a1 1 0 0 0 0 2h1z"/><path fill="currentColor" d="M19 10.5c0-1.38-1.12-2.5-2.5-2.5S14 9.12 14 10.5v3.6c0 .5.18.96.5 1.32V15H16v.5c.36.32.82.5 1.32.5h.36A2.32 2.32 0 0 0 20 13.68V10.5z" transform="translate(0 -1)"/></svg>
+                </button>
+                <button id="bg-btn" class="stage-tool-btn" title="背景场景">
+                    <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M20 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 14H4V6h16v12zm-9-3l-2-2.5L7 16h10l-3.5-4.5z"/></svg>
+                </button>
+                <button id="move-btn" class="stage-tool-btn" title="移动模式：选中并拖动模型/背景">
+                    <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M13 6v5h5V7.75L22.25 12 18 16.25V13h-5v5h3.25L12 22.25 7.75 18H11v-5H6v3.25L1.75 12 6 7.75V11h5V6H7.75L12 1.75 16.25 6H13z"/></svg>
+                </button>
+                <button id="fpv-btn" class="stage-tool-btn" title="机位调整">
+                    <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z"/></svg>
+                </button>
+                <button id="reset-cam-btn" class="stage-tool-btn" title="重置视角">
+                    <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M12 5V1L7 6l5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z"/></svg>
+                </button>
+                <button id="cam-settings-btn" class="stage-tool-btn" title="相机设置">
+                    <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M12 15.5A3.5 3.5 0 1 1 12 8.5a3.5 3.5 0 0 1 0 7z"/><path fill="currentColor" d="M20 4h-3.17L15 2H9L7.17 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm-8 13c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5z"/></svg>
+                </button>
+                <button id="gyro-btn" class="stage-tool-btn" title="VR模式：WebXR 沉浸体验" style="display:none">
+                    <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M18.57 4C17.71 3.38 16.65 3 15.5 3c-1.15 0-2.21.38-3.07 1C11.57 3.38 10.51 3 9.36 3S7.15 3.38 6.29 4C4.96 5.33 4.5 8.38 4.5 12s.46 6.67 1.79 8c.86.62 1.92 1 3.07 1s2.21-.38 3.07-1c.86.62 1.92 1 3.07 1s2.21-.38 3.07-1c1.33-1.33 1.79-4.38 1.79-8s-.46-6.67-1.79-8zM12 18c-2.21 0-4-2.69-4-6s1.79-6 4-6 4 2.69 4 6-1.79 6-4 6zm5.5-4c.83 0 1.5-.67 1.5-1.5S18.33 11 17.5 11 16 11.67 16 12.5s.67 1.5 1.5 1.5z"/></svg>
+                </button>
+                <button id="fullscreen-btn" class="stage-tool-btn" title="全屏">
+                    <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z"/></svg>
+                </button>
+                <button id="music-btn" class="stage-tool-btn" title="在线音乐：搜索 / 歌单">
+                    <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M9 3v10.55A4 4 0 1 0 11 17V7h4V3H9z"/></svg>
+                </button>
+                <button id="video-btn" class="stage-tool-btn" title="在线视频：搜索 / 播放">
+                    <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M10 8.64L15.27 12 10 15.36V8.64zM12 3C7.03 3 3 7.03 3 12s4.03 9 9 9 9-4.03 9-9-4.03-9-9-9zm0 16.2c-3.97 0-7.2-3.23-7.2-7.2s3.23-7.2 7.2-7.2 7.2 3.23 7.2 7.2-3.23 7.2-7.2 7.2z"/></svg>
+                </button>
+                <button id="workspace-btn" class="stage-tool-btn" title="工作区：设置智能体工作目录">
+                    <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M10 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/></svg>
+                </button>
+                <button id="session-btn" class="stage-tool-btn" title="对话历史">
+                    <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M13 3a9 9 0 0 0-9 9H1l3.89 3.89.07.14L9 12H6c0-3.87 3.13-7 7-7s7 3.13 7 7-3.13 7-7 7c-1.93 0-3.68-.79-4.94-2.06l-1.42 1.42A8.954 8.954 0 0 0 13 21a9 9 0 0 0 0-18zm-1 5v5l4.28 2.54.72-1.21-3.5-2.08V8H12z"/></svg>
+                </button>
+                <button id="fps-btn" class="stage-tool-btn" title="帧率调节：点击切换60/30/20fps">
+                    <span id="fps-label" class="fps-label">60</span>
+                </button>
+                <button id="immerse-btn" class="stage-tool-btn" title="沉浸模式：隐藏所有按钮，专注对话与角色">
+                    <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M21 4H3c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h18c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 14H3V6h18v12zm-2-9H5v6h14V9z"/></svg>
+                </button>
+                </div><!-- /stage-tools-ring -->
+                <button id="wheel-down-btn" class="stage-tools-arrow" title="下一组">▼</button>
+                <button id="lock-mode-btn" class="stage-tool-btn stage-tools-fixed" title="锁屏模式：锁定屏幕防误触，仅可语音对话，再按一次解锁">
+                    <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm-6 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm3.1-9H8.9V6c0-1.71 1.39-3.1 3.1-3.1 1.71 0 3.1 1.39 3.1 3.1v2z"/></svg>
+                </button>
+                <div class="stage-tools-label" id="stage-tools-label"></div>
+            </div>
+
+            <!-- 拖拽导入提示 -->
+            <div id="drop-hint" class="drop-hint">
+                <div class="drop-hint-inner">
+                    <svg viewBox="0 0 24 24" width="48" height="48"><path fill="currentColor" d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/></svg>
+                    <div>松开以导入 3D 模型</div>
+                    <div class="drop-sub">支持 .glb / .gltf / .vrm</div>
+                </div>
+            </div>
+
+            <!-- 模型加载进度 -->
+            <div id="model-loading" class="model-loading">
+                <div class="spinner"></div>
+                <div id="model-loading-text">加载模型中…</div>
+            </div>
+
+            <!-- 机位调整模式退出按钮 -->
+            <button id="fpv-exit" class="fpv-exit" style="display:none">保存机位</button>
+            <!-- 机位调整模式手机端方向键 -->
+            <div id="cam-dpad" class="cam-dpad" style="display:none">
+                <div class="dpad-ring">
+                    <button class="dpad-btn dpad-up" data-dir="up">
+                        <svg viewBox="0 0 24 24"><path d="M12 4l-8 8h5v8h6v-8h5z" fill="currentColor"/></svg>
+                    </button>
+                    <button class="dpad-btn dpad-down" data-dir="down">
+                        <svg viewBox="0 0 24 24"><path d="M12 20l8-8h-5V4H9v8H4z" fill="currentColor"/></svg>
+                    </button>
+                    <button class="dpad-btn dpad-left" data-dir="left">
+                        <svg viewBox="0 0 24 24"><path d="M4 12l8-8v5h8v6h-8v5z" fill="currentColor"/></svg>
+                    </button>
+                    <button class="dpad-btn dpad-right" data-dir="right">
+                        <svg viewBox="0 0 24 24"><path d="M20 12l-8 8v-5H4V9h8V4z" fill="currentColor"/></svg>
+                    </button>
+                </div>
+                <div class="dpad-zoom-row">
+                    <button class="dpad-btn dpad-zoom dpad-zoomin" data-dir="zoomin">
+                        <svg viewBox="0 0 24 24"><path d="M7.41 15.41L12 10.83l4.59 4.58L18 14l-6-6-6 6z" fill="currentColor"/></svg>
+                    </button>
+                    <button class="dpad-btn dpad-zoom dpad-zoomout" data-dir="zoomout">
+                        <svg viewBox="0 0 24 24"><path d="M7.41 8.59L12 13.17l4.59-4.58L18 10l-6 6-6-6z" fill="currentColor"/></svg>
+                    </button>
+                </div>
+            </div>
+        </section>
+
+        <!-- 聊天消息区（初始收起隐藏，点右下角聊天按钮展开到 38%） -->
+        <section id="chat-panel" class="collapsed">
+            <div id="chat-head" class="chat-head">
+                <div class="chat-head-title">
+                    <span class="chat-head-dot"></span>
+                    <span>大白 · 对话</span>
+                    <span id="chat-head-count" class="chat-head-count" title="消息数">0</span>
+                    <span id="chat-token-meter" class="chat-token-meter" title="上下文 / Token 用量">—</span>
+                </div>
+                <div class="chat-head-actions">
+                    <button id="chat-height-btn" class="chat-head-btn" title="全屏聊天（点击展开）">⤢</button>
+                    <button id="chat-close-btn" class="chat-head-btn" title="收起聊天">▾</button>
+                </div>
+            </div>
+            <div id="messages" class="messages"></div>
+            <div id="scroll-hint" class="scroll-hint">↓</div>
+        </section>
+
+        <!-- 输入控制区（初始收起隐藏，点右下角聊天按钮才出现） -->
+        <section id="controls" class="collapsed">
+            <button id="voice-mode-btn" class="btn-icon voice-mode" title="切换：按住说话 / 自动对话">
+                <svg viewBox="0 0 24 24" width="18" height="18"><path fill="currentColor" d="M3 12h2v6H3v-6zm4-6h2v12H7V6zm4 3h2v9h-2V9zm4-3h2v12h-2V6zm4 4h2v8h-2v-8z"/></svg>
+            </button>
+            <textarea id="text-input" rows="1" placeholder="打字和我说说…" autocomplete="off" enterkeyhint="send"></textarea>
+            <button id="voice-btn" class="btn-icon voice" title="按住说话">
+                <svg viewBox="0 0 24 24" width="22" height="22"><path fill="currentColor" d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm5.3-3c0 3-2.54 5.1-5.3 5.1S6.7 14 6.7 11H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c3.28-.49 6-3.31 6-6.72h-1.7z"/></svg>
+            </button>
+            <button id="send-btn" class="btn-icon" title="发送">
+                <svg viewBox="0 0 24 24" width="22" height="22"><path fill="currentColor" d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+            </button>
+            <button id="task-btn" class="btn-icon task-center-btn" title="任务中心：查看 AI 助手们的进度">
+                <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M3 13h8V3H3v10zm0 8h8v-6H3v6zm10 0h8V11h-8v10zm0-18v6h8V3h-8z"/></svg>
+            </button>
+        </section>
+    </div>
+
+    <!-- 全屏模式聊天切换按钮 -->
+    <button id="chat-toggle" title="显示/隐藏聊天">
+        <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M20 2H4c-1.1 0-1.99.9-1.99 2L2 22l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-2 12H6v-2h12v2zm0-3H6V9h12v2zm0-3H6V6h12v2z"/></svg>
+    </button>
+
+    <!-- 角色卡片弹窗 -->
+    <div id="role-card-modal" class="modal">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>角色卡片</h3>
+                <button id="role-card-modal-close" class="modal-close">×</button>
+            </div>
+            <div class="modal-body">
+                <div id="role-card-list" class="model-list">
+                    <div style="text-align:center;color:var(--text-dim);padding:20px">加载中…</div>
+                </div>
+                <button id="role-card-create-btn" class="upload-card" style="width:100%">
+                    <div class="upload-icon">+</div>
+                    <div>从当前配置新建角色卡片</div>
+                    <div class="upload-sub">捕获当前形象 / 声音 / 系统提示词</div>
+                </button>
+            </div>
+            <div class="modal-footer">
+                <span class="modal-tip">点击卡片一键切换：外形 + 声音 + 人设</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- 模型供应商弹窗（全局资源） -->
+    <div id="provider-modal" class="modal">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>模型供应商 <span id="provider-modal-active" class="tts-tip" style="margin-left:6px"></span></h3>
+                <button id="provider-modal-close" class="modal-close">×</button>
+            </div>
+            <div class="modal-body">
+                <div id="provider-list" class="model-list">
+                    <div style="text-align:center;color:var(--text-dim);padding:20px">加载中…</div>
+                </div>
+                <div class="tts-field" style="margin-top:12px">
+                    <label for="llm-proxy-mode">云端 API 网络代理（LLM / TTS / STT / 画图）</label>
+                    <div style="display:flex;gap:8px;align-items:center">
+                        <select id="llm-proxy-mode" style="flex:1">
+                            <option value="off">直连（不走代理）</option>
+                            <option value="auto">自动（fq 代理，未启动自动拉起 Clash）</option>
+                            <option value="custom">自定义代理地址…</option>
+                        </select>
+                        <button id="llm-proxy-save" type="button" style="background:linear-gradient(135deg,#7c5cff,#a78bfa);border:none;border-radius:8px;color:#fff;font-size:12px;padding:8px 14px;cursor:pointer;white-space:nowrap">保存</button>
+                    </div>
+                    <input id="llm-proxy-url" type="text" placeholder="http://127.0.0.1:7890 或 socks5://127.0.0.1:1080" style="display:none;margin-top:6px;width:100%">
+                    <div class="tts-tip" id="llm-proxy-status"></div>
+                </div>
+                <button id="provider-create-btn" class="upload-card" style="width:100%">
+                    <div class="upload-icon">+</div>
+                    <div>添加模型供应商</div>
+                    <div class="upload-sub">Ollama 本地 / 任意 OpenAI 兼容 API（如 DeepSeek、SiliconFlow、OpenCode…）</div>
+                </button>
+            </div>
+            <div class="modal-footer">
+                <span class="modal-tip">供应商只是凭证库：只存名称/类型/地址/密钥；模型、TTS、STT 等应用配置都在角色卡片里设置</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- 供应商编辑弹窗 -->
+    <div id="provider-edit-modal" class="modal">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3 id="provider-edit-title">添加模型供应商</h3>
+                <button id="provider-edit-close" class="modal-close">×</button>
+            </div>
+            <div class="modal-body">
+                <div class="tts-field">
+                    <label for="provider-name">供应商名称</label>
+                    <input id="provider-name" type="text" maxlength="30" placeholder="例如：Ollama 本地 / DeepSeek / 硅基流动…">
+                </div>
+                <div class="tts-field">
+                    <label for="provider-kind">类型</label>
+                    <select id="provider-kind">
+                        <option value="custom">自定义 API（OpenAI 兼容）</option>
+                        <option value="ollama">Ollama 本地</option>
+                    </select>
+                    <div class="tts-tip">Ollama 本地不需要 API Key，会自动放行</div>
+                </div>
+                <div class="tts-field">
+                    <label for="provider-base-url">Base URL</label>
+                    <input id="provider-base-url" type="text" placeholder="http://localhost:11434/v1 或 https://api.deepseek.com/v1">
+                </div>
+                <div class="tts-field">
+                    <label for="provider-api-key">API Key</label>
+                    <input id="provider-api-key" type="password" placeholder="sk-...（Ollama 可留空）">
+                </div>
+                <div class="tts-field">
+                    <label for="provider-default-model">默认模型（可选）</label>
+                    <input id="provider-default-model" type="text" placeholder="留空 = 应用卡片时再选模型">
+                    <div class="tts-tip">填写后，应用未指定模型的角色卡片时会自动使用它</div>
+                </div>
+                <div class="tts-field">
+                    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+                        <button id="provider-test-btn" type="button" style="background:rgba(124,92,255,0.15);border:1px solid rgba(124,92,255,0.5);border-radius:8px;color:var(--accent);font-size:12px;padding:6px 12px;cursor:pointer">测试并加载模型</button>
+                        <span class="tts-tip" id="provider-test-result">按上方地址测试连通性，成功后可选默认模型</span>
+                    </div>
+                    <select id="provider-models" style="width:100%;margin-top:6px;display:none"></select>
+                </div>
+            </div>
+            <div class="modal-footer" style="display:flex;gap:8px;justify-content:flex-end;align-items:center">
+                <button id="provider-delete-btn" type="button" style="background:rgba(239,68,68,0.15);border:1px solid rgba(239,68,68,0.4);border-radius:8px;color:#f87171;font-size:12px;padding:6px 12px;cursor:pointer;display:none">删除</button>
+                <span style="flex:1"></span>
+                <button id="provider-save-btn" type="button" style="background:linear-gradient(135deg,#7c5cff,#a78bfa);border:none;border-radius:8px;color:#fff;font-size:12px;padding:8px 16px;cursor:pointer">保存</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 角色卡片编辑弹窗 -->
+    <div id="role-card-edit-modal" class="modal">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3 id="role-card-edit-title">新建角色卡片</h3>
+                <button id="role-card-edit-close" class="modal-close">×</button>
+            </div>
+            <div class="modal-body">
+                <div class="tts-field">
+                    <label for="rc-name">卡片名称</label>
+                    <input id="rc-name" type="text" maxlength="20" placeholder="例如：小爱 / 可莉 / 夜乃樱…">
+                </div>
+                <div class="tts-field">
+                    <label for="rc-role-name">角色名（AI 自称）</label>
+                    <input id="rc-role-name" type="text" maxlength="20" placeholder="例如：小爱">
+                </div>
+                <div class="tts-field">
+                    <label for="rc-user-name">对你的称呼</label>
+                    <input id="rc-user-name" type="text" maxlength="12" placeholder="想让 AI 怎么称呼你？例如：宝贝 / 主人 / 阿杰…">
+                    <div class="tts-tip">设置后 AI 会用这个称呼叫你；留空则 AI 不会随便起称呼，只称"你"。</div>
+                </div>
+                <div class="tts-field">
+                    <label for="rc-model-select">外形（3D 模型）</label>
+                    <div style="display:flex;gap:8px;align-items:stretch">
+                        <select id="rc-model-select" style="flex:1"></select>
+                        <button id="rc-model-upload-btn" type="button" title="上传新模型" style="flex:0 0 44px;background:rgba(124,92,255,0.15);border:1px dashed rgba(124,92,255,0.5);border-radius:8px;color:var(--accent);font-size:20px;cursor:pointer;line-height:1">+</button>
+                    </div>
+                    <input id="rc-model-file-input" type="file" accept=".glb,.gltf,.vrm" hidden>
+                    <div class="tts-tip">支持 GLB / GLTF / VRM，单文件 ≤ 80MB</div>
+                </div>
+                <div class="tts-field">
+                    <label>大语言模型（选供应商 + 模型；供应商是全局资源，可在「大厅 → 供应商」添加管理）</label>
+                    <div style="display:flex;gap:8px;align-items:center">
+                        <select id="rc-llm-provider-select" style="flex:1;min-width:0"><option value="">（跟随全局当前供应商）</option></select>
+                        <button id="rc-llm-manage-btn" type="button" title="打开供应商管理（大厅的「供应商」按钮）" style="flex:0 0 auto;background:rgba(124,92,255,0.15);border:1px dashed rgba(124,92,255,0.5);border-radius:8px;color:var(--accent);font-size:12px;padding:6px 10px;cursor:pointer;white-space:nowrap">管理供应商</button>
+                    </div>
+                    <div class="tts-tip">留空「供应商」= 跟随当前全局使用的供应商；选好后下方自动加载它的模型列表</div>
+                </div>
+                <div class="tts-field">
+                    <label for="rc-llm-model">模型</label>
+                    <div style="display:flex;gap:8px;align-items:stretch">
+                        <select id="rc-llm-model" style="flex:1"><option value="">（选择供应商后加载模型…）</option></select>
+                        <button id="rc-llm-refresh-btn" type="button" title="从所选供应商刷新模型列表" style="flex:0 0 44px;background:rgba(124,92,255,0.15);border:1px dashed rgba(124,92,255,0.5);border-radius:8px;color:var(--accent);font-size:18px;cursor:pointer;line-height:1">↻</button>
+                    </div>
+                    <div class="tts-tip" id="rc-llm-tip">模型只从所选供应商加载，不会串用其它提供方的模型</div>
+                </div>
+                <div class="tts-field">
+                    <label for="rc-llm-temperature" style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0">
+                        <span>温度（模型创造力）</span>
+                        <span id="rc-llm-temp-val">0.20</span>
+                    </label>
+                    <input id="rc-llm-temperature" type="range" min="0" max="2" step="0.05" value="0.2" style="margin-top:6px">
+                    <div class="tts-tip">越低越稳定听话，越高越自由放飞（0 ~ 2）；保存后该卡片应用时生效</div>
+                </div>
+                <div class="tts-field">
+                    <label>声音</label>
+                    <div class="tts-engine-tabs" id="rc-tts-tabs">
+                        <button class="tts-tab active" data-engine="edge_tts">Edge 在线</button>
+                        <button class="tts-tab" data-engine="gpt_sovits">GPT-SoVITS</button>
+                        <button class="tts-tab" data-engine="api">API 供应商</button>
+                    </div>
+                </div>
+                <div id="rc-tts-edge-panel" class="tts-panel">
+                    <div class="tts-field">
+                        <label for="rc-voice-select">音色</label>
+                        <select id="rc-voice-select"></select>
+                    </div>
+                    <div class="tts-field">
+                        <label for="rc-rate-range">语速 <span id="rc-rate-val">+8%</span></label>
+                        <input id="rc-rate-range" type="range" min="-30" max="60" step="5" value="8">
+                    </div>
+                </div>
+                <div id="rc-tts-gso-panel" class="tts-panel" style="display:none">
+                    <div class="tts-field">
+                        <label for="rc-gso-url">服务地址</label>
+                        <input id="rc-gso-url" type="text" placeholder="http://127.0.0.1:7860/" value="http://127.0.0.1:7860/">
+                    </div>
+                    <div class="tts-field">
+                        <label for="rc-gso-ref">参考音频路径（可选）</label>
+                        <input id="rc-gso-ref" type="text" placeholder="留空用服务端默认音色">
+                    </div>
+                    <div class="tts-field">
+                        <label for="rc-gso-char">角色名</label>
+                        <input id="rc-gso-char" type="text" placeholder="星见雅">
+                    </div>
+                </div>
+                <div id="rc-tts-api-panel" class="tts-panel" style="display:none">
+                    <div class="tts-field">
+                        <label for="rc-tts-api-url">TTS 接口地址（OpenAI 兼容 /audio/speech）</label>
+                        <input id="rc-tts-api-url" type="text" placeholder="https://api.siliconflow.cn/v1/audio/speech">
+                        <div class="tts-tip">应用配置都在角色卡片；地址 / 密钥 / 模型 / 音色按本卡片保存并生效</div>
+                    </div>
+                    <div class="tts-field">
+                        <label for="rc-tts-api-key">API Key</label>
+                        <input id="rc-tts-api-key" type="password" placeholder="sk-...">
+                    </div>
+                    <div class="tts-field">
+                        <label for="rc-tts-api-model">模型</label>
+                        <input id="rc-tts-api-model" type="text" placeholder="FunAudioLLM/CosyVoice2-0.5B">
+                    </div>
+                    <div class="tts-field">
+                        <label for="rc-tts-api-voice">音色</label>
+                        <input id="rc-tts-api-voice" type="text" placeholder="alice">
+                    </div>
+                </div>
+                <div class="tts-field">
+                    <label>语音识别（你说的话 → 文字，全局生效）</label>
+                    <div class="tts-engine-tabs" id="rc-stt-tabs">
+                        <button type="button" class="tts-tab active" data-provider="cloud">仅云端</button>
+                        <button type="button" class="tts-tab" data-provider="auto">自动</button>
+                    </div>
+                    <div class="tts-tip">云端识别（本地引擎已移除，启动更快）；自动 = 云端优先，失败重试</div>
+                </div>
+                <div id="rc-stt-cloud-panel" class="tts-panel">
+                    <div class="tts-field">
+                        <label for="rc-stt-api-url">识别 API 地址</label>
+                        <input id="rc-stt-api-url" type="text" placeholder="https://api.siliconflow.cn/v1/audio/transcriptions">
+                    </div>
+                    <div class="tts-field">
+                        <label for="rc-stt-api-key">识别 API Key（单独填写）</label>
+                        <input id="rc-stt-api-key" type="password" placeholder="sk-...">
+                        <div class="tts-tip">语音转文字专用的 Key，与大语言模型的 Key 相互独立；留空则沿用大语言模型的 Key</div>
+                    </div>
+                    <div class="tts-field">
+                        <label for="rc-stt-model">识别模型</label>
+                        <input id="rc-stt-model" type="text" placeholder="FunAudioLLM/SenseVoiceSmall">
+                    </div>
+                </div>
+                <div class="tts-field">
+                    <div style="display:flex;gap:8px;align-items:center">
+                        <button id="rc-stt-save-btn" type="button" style="background:linear-gradient(135deg,#7c5cff,#a78bfa);border:none;border-radius:8px;color:#fff;font-size:12px;padding:6px 12px;cursor:pointer;white-space:nowrap">保存语音识别设置</button>
+                        <span id="rc-stt-tip" class="tts-tip" style="margin:0"></span>
+                    </div>
+                </div>
+                <div class="tts-field tools-field">
+                    <label style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0">
+                        <span>工具调用</span>
+                        <label class="switch">
+                            <input type="checkbox" id="rc-tools-enabled" checked>
+                            <span class="slider"></span>
+                        </label>
+                    </label>
+                    <div class="tts-tip" style="margin-top:4px">开启后，该角色可自主调用下方勾选的能力（换装 / 切场景 / 放音乐 / 查信息 / 玩游戏等）</div>
+                </div>
+                <div class="tts-field" id="rc-tools-field">
+                    <label>允许调用的工具</label>
+                    <div id="rc-tools-list" class="tools-list"></div>
+                </div>
+                <div class="tts-field anim-config-field">
+                    <div class="anim-config-header">
+                        <div class="anim-config-title">
+                            <span class="anim-config-icon">🎭</span>
+                            <span>专属动作</span>
+                        </div>
+                        <label class="switch">
+                            <input type="checkbox" id="rc-anim-enabled" checked>
+                            <span class="slider"></span>
+                        </label>
+                    </div>
+                    <div class="tts-tip">开启后，该角色只执行下方勾选的动作（待机/情绪/手势等都会从勾选的动作里挑）；关闭或未勾选任何动作 = 执行全部动作</div>
+                </div>
+                <div class="tts-field" id="rc-anim-field">
+                    <div class="anim-list-header">
+                        <label>允许执行的动作</label>
+                        <span class="anim-count" id="rc-anim-count">0 / 0</span>
+                    </div>
+                    <div id="rc-anim-list" class="tools-list anim-list"></div>
+                </div>
+                <div class="tts-field">
+                    <label for="rc-system-prompt">系统提示词（角色设定）</label>
+                    <textarea id="rc-system-prompt" rows="6" placeholder="描述这个角色的性格、语气、说话风格、与用户的关系…"></textarea>
+                </div>
+            </div>
+            <div class="modal-footer" style="display:flex;gap:8px;align-items:stretch">
+                <button id="rc-delete-btn" class="btn-danger" style="flex:0 0 74px;display:none">删除</button>
+                <button id="rc-apply-btn" class="btn-primary" style="flex:1">保存并切换</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 录音遮罩 -->
+    <div id="recording-overlay" class="recording-overlay">
+        <div class="mic-pulse"></div>
+        <div class="rec-text">正在聆听…</div>
+        <div class="rec-hint">松开发送 · 上滑取消</div>
+    </div>
+
+    <!-- 背景场景选择弹窗 -->
+    <div id="bg-modal" class="modal">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>背景场景</h3>
+                <button id="bg-modal-close" class="modal-close">×</button>
+            </div>
+            <div class="modal-body">
+                <div id="bg-list" class="model-list"></div>
+                <label class="upload-card" for="bg-file-input">
+                    <div class="upload-icon">+</div>
+                    <div>导入 3D 背景模型</div>
+                    <div class="upload-sub">点击选择 · 或拖拽到舞台</div>
+                </label>
+                <input id="bg-file-input" type="file" accept=".glb,.gltf,.vrm" hidden>
+            </div>
+            <div class="modal-footer">
+                <span class="modal-tip">支持 GLB / GLTF / VRM 格式 · 背景会自动放大并环绕角色</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- 在线音乐弹窗（搜索 / 自建歌单） -->
+    <div id="music-modal" class="modal">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>在线音乐</h3>
+                <button id="music-modal-close" class="modal-close">×</button>
+            </div>
+            <div class="modal-body">
+                <div class="music-tabs">
+                    <button id="music-tab-search" class="music-tab active">搜索歌曲</button>
+                    <button id="music-tab-playlists" class="music-tab">我的歌单</button>
+                    <button id="music-tab-boards" class="music-tab">热门榜单</button>
+                </div>
+
+                <div id="music-pane-search" class="music-pane">
+                    <div class="music-search-box">
+                        <svg class="music-search-icon" viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M15.5 14h-.79l-.28-.27a6.5 6.5 0 1 0-.7.7l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0A4.5 4.5 0 1 1 14 9.5 4.5 4.5 0 0 1 9.5 14z"/></svg>
+                        <input id="music-search-input" class="music-search-input" type="text"
+                               placeholder="想听什么？搜歌名 / 歌手…" autocomplete="off">
+                        <button id="music-search-btn" class="music-search-go">搜索</button>
+                    </div>
+                    <div id="music-search-results" class="model-list music-results">
+                        <div style="text-align:center;color:#8888aa;padding:22px">在上方搜索你喜欢的歌，点「播放」直接听</div>
+                    </div>
+                </div>
+
+                <div id="music-pane-playlists" class="music-pane" style="display:none">
+                    <div class="music-search-box">
+                        <svg class="music-search-icon" viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"/></svg>
+                        <input id="music-playlist-name" class="music-search-input" type="text"
+                               placeholder="新歌单名字…" autocomplete="off">
+                        <button id="music-playlist-create" class="music-search-go">创建</button>
+                    </div>
+                    <div id="music-playlists" class="model-list music-results">
+                        <div style="text-align:center;color:#8888aa;padding:22px">还没有歌单，先创建一个吧</div>
+                    </div>
+                </div>
+
+                <div id="music-pane-boards" class="music-pane" style="display:none">
+                    <div class="music-boards-tip">云音乐热歌 / 新歌 / 飙升 / 原创榜单 · 点击榜单查看歌曲</div>
+                    <div id="music-boards" class="model-list music-results">
+                        <div style="text-align:center;color:#8888aa;padding:22px">榜单加载中…</div>
+                    </div>
+                </div>
+
+                <!-- 正在播放：进度条 + 暂停/继续 + 停止 + 音量（状态与播放器实时同步） -->
+                <div id="music-now-playing" class="music-np" style="display:none">
+                    <div class="music-np-head">
+                        <span class="music-np-icon">🎵</span>
+                        <span id="music-np-title" class="music-np-title" title="">未在播放</span>
+                        <span id="music-np-state" class="music-np-state">—</span>
+                    </div>
+                    <!-- 可拖动进度条：拖动预览，松手跳转 -->
+                    <div class="music-np-track" id="music-np-track" title="拖动跳转进度">
+                        <div class="music-np-fill" id="music-np-fill"></div>
+                        <div class="music-np-knob" id="music-np-knob"></div>
+                    </div>
+                    <div class="music-np-time-row">
+                        <span id="music-np-time" class="music-np-time">— / —</span>
+                    </div>
+                    <div class="music-np-controls">
+                        <button id="music-np-toggle" class="music-act-btn music-np-btn" type="button" title="暂停">⏸</button>
+                        <button id="music-np-stop" class="music-act-btn music-np-btn" type="button" title="停止播放">⏹</button>
+                        <input id="music-np-vol" class="music-np-vol" type="range" min="0" max="100" value="30" title="音量">
+                        <span id="music-np-vol-label" class="music-np-vol-label">30%</span>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <span class="modal-tip">搜索来自酷我/网易云免费曲库 · 歌单保存在本地 music_playlists.json · 弹窗内可暂停/继续/停止/调音量</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- 在线视频弹窗（搜索 / 播放 / 收藏夹，能力来自 video 技能：B站/AcFun 聚合） -->
+    <div id="video-modal" class="modal">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>在线视频</h3>
+                <button id="video-modal-close" class="modal-close">×</button>
+            </div>
+            <div class="modal-body">
+                <div class="music-tabs">
+                    <button id="video-tab-search" class="music-tab active">搜索视频</button>
+                    <button id="video-tab-favorites" class="music-tab">我的收藏</button>
+                    <button id="video-tab-history" class="music-tab">观看历史</button>
+                    <button id="video-tab-sources" class="music-tab">视频源</button>
+                </div>
+
+                <div id="video-pane-search" class="music-pane">
+                    <div class="music-search-box">
+                        <svg class="music-search-icon" viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M15.5 14h-.79l-.28-.27a6.5 6.5 0 1 0-.7.7l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0A4.5 4.5 0 1 1 14 9.5 4.5 4.5 0 0 1 9.5 14z"/></svg>
+                        <input id="video-search-input" class="music-search-input" type="text"
+                               placeholder="想看什么？搜视频 / UP主…" autocomplete="off">
+                        <button id="video-search-btn" class="music-search-go">搜索</button>
+                        <button id="video-refresh-btn" class="music-search-go video-refresh-btn" type="button" title="刷新当前列表（热门/搜索结果）">🔄</button>
+                    </div>
+                    <!-- 视频源选择：全部聚合 / 单平台；切换后重新搜索当前关键词 -->
+                    <div id="video-platform-chips" class="video-platform-chips">
+                        <button class="video-plat-chip active" data-plat="all" type="button">全部</button>
+                        <button class="video-plat-chip" data-plat="bilibili" type="button">B站</button>
+                        <button class="video-plat-chip" data-plat="acfun" type="button">AcFun</button>
+                        <button class="video-plat-chip" data-plat="xvideos" type="button">XVideos</button>
+                        <button class="video-plat-chip" data-plat="youtube" type="button">YouTube</button>
+                        <span class="video-sort-label">排序</span>
+                        <button class="video-plat-chip active" data-sort="relevance" type="button">综合</button>
+                        <button class="video-plat-chip" data-sort="new" type="button">最新</button>
+                        <button class="video-plat-chip" data-sort="hot" type="button">热门</button>
+                    </div>
+                    <!-- 连播队列：排队多部视频，当前播完自动按顺序接下一部 -->
+                    <div id="video-queue-panel" class="video-queue-panel" style="display:none">
+                        <div class="video-np-head">
+                            <span class="video-queue-badge">🎬 连播队列</span>
+                            <span class="video-queue-hint">播完自动接下一部</span>
+                            <button id="video-queue-clear" class="music-act-btn video-np-btn" type="button" title="清空队列">清空</button>
+                        </div>
+                        <div id="video-queue-list" class="video-queue-list"></div>
+                    </div>
+                    <!-- 正在大屏播放的视频：暂停/继续 + 可拖动进度条（画面在大白身后的直播大屏） -->
+                    <div id="video-now-playing" class="video-now-playing" style="display:none">
+                        <div class="video-np-head">
+                            <span class="video-np-title" id="video-np-title">—</span>
+                            <span class="video-np-badge">大白影院</span>
+                        </div>
+                        <div class="video-np-row">
+                            <button id="video-np-toggle" class="music-act-btn video-np-btn" type="button" title="暂停/继续">⏸</button>
+                            <div id="video-np-track" class="video-np-track" title="拖动跳转进度">
+                                <div id="video-np-fill" class="video-np-fill"></div>
+                                <div id="video-np-knob" class="video-np-knob"></div>
+                            </div>
+                            <span id="video-np-time" class="video-np-time">00:00 / 00:00</span>
+                            <button id="video-np-fav" class="music-act-btn video-np-btn" type="button" title="收藏当前播放的视频">☆</button>
+                            <button id="video-np-next" class="music-act-btn video-np-btn" type="button" title="下一集（先接连播队列，队列为空则按搜索结果顺序）">⏭</button>
+                            <button id="video-np-stop" class="music-act-btn video-np-btn" type="button" title="停止播放">⏹</button>
+                        </div>
+                        <div class="video-np-row video-np-row-vol">
+                            <button id="video-np-mute" class="music-act-btn video-np-btn" type="button" title="静音/取消静音">🔊</button>
+                            <input id="video-np-vol" class="video-np-vol" type="range" min="0" max="100" value="80" step="1" title="音量">
+                            <span class="video-np-vol-hint">音量</span>
+                        </div>
+                    </div>
+                    <div id="video-search-results" class="model-list music-results video-grid">
+                        <div style="text-align:center;color:#8888aa;padding:22px">在上方搜索想看的视频，点「▶」投到大屏观看（播完自动按搜索顺序连播），点「☆」一键收藏</div>
+                    </div>
+                </div>
+
+                <div id="video-pane-favorites" class="music-pane" style="display:none">
+                    <div class="music-search-box">
+                        <svg class="music-search-icon" viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M12 21l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.18L12 21z"/></svg>
+                        <input id="video-fav-category-input" class="music-search-input" type="text"
+                               placeholder="新分类名字…（如：纪录片 / 教程 / 下饭）" autocomplete="off">
+                        <button id="video-fav-category-create" class="music-search-go">新建分类</button>
+                    </div>
+                    <div id="video-fav-categories" class="video-fav-cats"></div>
+                    <div id="video-fav-list" class="model-list music-results video-grid">
+                        <div style="text-align:center;color:#8888aa;padding:22px">收藏夹是空的，去「搜索视频」页把喜欢的视频收藏起来吧</div>
+                    </div>
+                </div>
+
+                <div id="video-pane-history" class="music-pane" style="display:none">
+                    <div class="video-history-head">
+                        <span class="video-history-badge">🕘 观看历史</span>
+                        <span class="video-history-hint">最多保留最近 1000 条 · 点 ▶ 可再次回味</span>
+                        <button id="video-history-clear" class="music-act-btn video-np-btn" type="button" title="清空观看历史">清空</button>
+                    </div>
+                    <div id="video-history-list" class="model-list music-results video-grid">
+                        <div style="text-align:center;color:#8888aa;padding:22px">还没有观看记录，去「搜索视频」页看一部片子吧</div>
+                    </div>
+                </div>
+            <div id="video-pane-sources" class="music-pane" style="display:none">
+                    <div class="video-src-head">
+                        <span class="video-src-badge">📡 视频源</span>
+                        <span class="video-src-hint">关闭的视频源不出现在搜索页，也不参与聚合搜索/热门</span>
+                    </div>
+                    <div class="video-src-section-title">内置平台</div>
+                    <div id="video-src-builtin" class="video-src-builtin"></div>
+                    <div class="video-src-section-title">自定义视频源</div>
+                    <div class="music-search-box">
+                        <input id="video-src-name" class="music-search-input" type="text"
+                               placeholder="源名称（如：我的小站）" autocomplete="off">
+                        <input id="video-src-url" class="music-search-input video-src-url" type="text"
+                               placeholder="搜索链接，含 {kw}（如 https://example.com/search?q={kw}）" autocomplete="off">
+                        <button id="video-src-add" class="music-search-go">添加</button>
+                    </div>
+                    <div id="video-src-custom" class="video-src-custom"></div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <span class="modal-tip">搜索来自 B站 / AcFun · 播放画面投到直播大屏（大白影院），声音同步播放 · 收藏保存在本地 video_favorites.json</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- 工作区弹窗（设置 DSH / Codex / OpenCode / shell 的全局工作目录） -->
+    <div id="workspace-modal" class="modal">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>工作区设置</h3>
+                <button id="workspace-modal-close" class="modal-close">×</button>
+            </div>
+            <div class="modal-body">
+                <div class="workspace-current">
+                    <div class="workspace-current-label">当前工作区</div>
+                    <div id="workspace-current-path" class="workspace-current-path">加载中…</div>
+                </div>
+                <div class="ws-field">
+                    <label for="workspace-path-input">工作区路径</label>
+                    <div style="display:flex;gap:8px;align-items:stretch">
+                        <input id="workspace-path-input" class="music-search-input"
+                               placeholder="D:\projects\my-project 或 /sdcard/Download" style="background:#14142c;border:1px solid rgba(124,92,255,0.4);border-radius:10px;height:42px;padding:0 12px">
+                        <button id="workspace-browse-btn" type="button" title="选择常用目录"
+                                style="flex:0 0 44px;background:rgba(124,92,255,0.15);border:1px dashed rgba(124,92,255,0.5);border-radius:10px;color:var(--accent);font-size:18px;cursor:pointer;line-height:1">📁</button>
+                    </div>
+                    <div class="tts-tip">电脑端可直接粘贴完整路径（如 D:\AI\dabai）；手机端可从下方常用目录选择</div>
+                </div>
+                <div class="ws-field">
+                    <label>已保存的工作区（点击「使用」直接切换）</label>
+                    <div id="workspace-saved-list" class="ws-saved-list">
+                        <div style="text-align:center;color:#8888aa;padding:12px">加载中…</div>
+                    </div>
+                    <div class="tts-tip" style="margin-top:6px">选中目录点「收藏」可保存到这里，下次随时一键切换</div>
+                </div>
+                <div class="ws-field">
+                    <label>目录浏览（点目录进入，点「选」填入路径）</label>
+                    <div class="ws-browse-bar">
+                        <button id="workspace-up-btn" type="button" class="ws-up-btn" title="返回上级">⬆ 上级</button>
+                        <span class="ws-browse-path">根目录</span>
+                    </div>
+                    <div id="workspace-roots" class="ws-roots">
+                        <div style="text-align:center;color:#8888aa;padding:14px">加载中…</div>
+                    </div>
+                    <div class="tts-tip" style="margin-top:6px">手机端：跟着目录一层层点进去，找到目标文件夹点右下角「选」即可填入路径</div>
+                </div>
+                <div class="modal-footer" style="padding:0;margin-top:6px">
+                    <button id="workspace-save-btn" type="button" class="music-search-go" style="width:100%;height:44px">保存工作区</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 相机设置弹窗 -->
+    <div id="cam-settings-modal" class="modal">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>相机设置</h3>
+                <button id="cam-settings-modal-close" class="modal-close">×</button>
+            </div>
+            <div class="modal-body">
+                <div class="tts-field">
+                    <label for="cam-height-range">相机高度 <span id="cam-height-val">2.55</span></label>
+                    <input id="cam-height-range" type="range" min="0.1" max="10.0" step="0.05" value="2.55">
+                    <div class="tts-tip">默认 2.55</div>
+                </div>
+                <div class="tts-field">
+                    <label for="cam-distance-range">相机距离 <span id="cam-distance-val">2.50</span></label>
+                    <input id="cam-distance-range" type="range" min="0.1" max="10.0" step="0.1" value="2.5">
+                    <div class="tts-tip">相机到角色的距离，默认 2.5</div>
+                </div>
+                <div class="tts-field">
+                    <label for="cam-tilt-range">倾斜角度 <span id="cam-tilt-val">9°</span></label>
+                    <input id="cam-tilt-range" type="range" min="-80" max="80" step="1" value="9">
+                    <div class="tts-tip">正值向上仰视，负值向下俯视</div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button id="cam-settings-save-btn" class="btn-primary">保存</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 引导提示 -->
+    <div id="toast" class="toast"></div>
+
+    <!-- 会话管理弹窗（完整会话管理面板：搜索/新建/切换/重命名/置顶/归档/删除） -->
+    <div id="session-modal" class="modal">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content session-modal-content">
+            <div class="modal-header">
+                <h3>对话历史</h3>
+                <button id="session-modal-close" class="modal-close">×</button>
+            </div>
+            <div class="modal-body">
+                <div class="session-toolbar">
+                    <input id="session-search-input" class="session-search" type="text"
+                           placeholder="搜索标题 / 消息内容…" autocomplete="off" />
+                    <button id="session-archive-toggle" class="session-archive-toggle" title="查看归档会话">🗄</button>
+                </div>
+                <div id="session-list" class="model-list session-list">
+                    <div style="text-align:center;color:var(--text-dim);padding:20px">加载中…</div>
+                </div>
+                <button id="new-session-btn" class="upload-card" style="width:100%">
+                    <div class="upload-icon">+</div>
+                    <div>开始新对话</div>
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- DSH 桥接确认弹窗（AI 助手任务） -->
+    <div id="harness-modal" class="modal" style="display:none">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>🤖 AI 助手 · 任务确认</h3>
+                <button id="harness-modal-close" class="modal-close">×</button>
+            </div>
+            <div class="modal-body">
+                <div class="harness-task">…</div>
+                <div id="harness-reply" class="harness-reply" style="display:none"></div>
+                <div id="harness-actions" class="harness-actions">
+                    <button id="harness-cancel-btn" class="harness-btn harness-btn-ghost">取消</button>
+                    <button id="harness-approve-btn" class="harness-btn harness-btn-ok">确认执行</button>
+                </div>
+                <div id="harness-hint" class="harness-hint"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- VR 模式叠加层（WebXR 沉浸时显示，含退出提示） -->
+    <div id="vr-overlay" class="vr-overlay" style="display:none">
+        <button id="vr-exit-btn" class="vr-btn vr-exit">退出 VR</button>
+        <div id="vr-hint" class="vr-hint"></div>
+    </div>
+
+    <script type="module" src="/static/app.ts?v=170"></script>
+</body>
+</html>

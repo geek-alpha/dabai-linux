@@ -1,0 +1,109 @@
+# Python 运行时缓存
+__pycache__/
+*.py[cod]
+
+# Node 工具链（TS 迁移阶段 0 引入）
+node_modules/
+dist/
+
+# todo_list 插件运行时数据（用户任务数据，勿提交）
+# harness 任务系统运行时日志（断点续跑状态，勿提交）
+harness_tasks.json
+harness_tasks.json.tmp
+harness_task_memory.json
+harness_task_memory.json.tmp
+
+# 编译探针残留（调试会话产生的重命名 .pyc，无运行价值）
+*.pyc-check
+
+# 视频收藏夹运行时数据（用户收藏数据，勿提交；歌单 music_playlists.json 同例）
+video_favorites.json
+video_favorites.json.tmp
+
+# codex/opencode 独立进程运行时状态与日志（热重载断点续跑，勿提交）
+codex_runtime.json
+codex_runtime.json.tmp
+codex_logs/
+
+# 角色对话轮断点（热重载续跑运行时状态，勿提交）
+data/turn_checkpoints/
+
+# 前缀断点探针状态（只存消息指纹与工具清单，跨轮比对用，勿提交）
+data/prefix_state.json
+
+# ---------- 多智能体并发治理：统一忽略运行产物（2026-08-27） ----------
+# 编辑器/并发任务备份残留
+*.bak
+*.bak-*
+*.testbak
+# 运行日志（根目录滚动日志与 _server 变体）
+restart_check.log
+server_restart.log
+server_stdout.log
+server_stderr.log
+_server_restart.log
+_server_stderr.log
+*.log
+# 聊天/状态数据库
+chat_memory.db
+chat_memory.db-shm
+chat_memory.db-wal
+# 构建/缓存
+.ruff_cache/
+web/generated/
+# 异常目录残留（占位/临时）
+%TEMP%/
+undefined/
+web/vendor/
+
+# 一次性调试/输出残留
+temp_vh*.txt
+out.txt
+%TEMP%app_ts_probe.txt
+.trae-html-share-packages/
+harness_state.json
+skills/todo/data/  
+
+# 轮次效率指标与执行日志（运行时观测数据，勿提交；用于本地看趋势）
+data/turn_metrics.jsonl
+data/execution_logs.jsonl
+# 现场诊断日志：前缀断点归因 / 工具集变化归因（同上，勿提交）
+data/hist_view_trace.jsonl
+data/tools_trace.jsonl
+# 历史视图的跨进程状态（运行时产物，存盘只为扛住进程重启）
+data/hist_view_state.json
+data/hist_view_state.json.tmp
+# 技能激活集的跨进程状态（同上：重启不该等于「忘了自己会用哪个技能」）
+data/skills_state.json
+data/skills_state.json.tmp
+# ---------- 运行时数据不入库（2026-09-09 清理）----------
+# TTS 音频缓存（每次合成生成的临时音频，删了会自动重建）
+audio_cache/
+# 强化学习推荐器运行时状态（本地学习进度，跨机器无意义）
+rl_bandit.json
+rl_interval.json
+video_history.json
+# 强化学习模式统计 / 推拉策略状态（同上：运行中自行覆写的小文件）
+rl_mode_stats.json
+rl_pushpull.json
+# Blender MMD 插件（第三方 clone，本地保留、不入库）
+mmd_tools_new/
+
+# ---------- 版本控制初始化（2026-09-11）：大体积资产与凭证不入库 ----------
+# Python 虚拟环境（本地环境，跨机器无意义，625M）
+venv/
+.venv/
+# 角色模型 / 背景场景等外观资源（大体积二进制资产，378M+11M；磁盘保留、不入库）
+models/
+backgrounds/
+# 烘焙动画片段（由 bake_animations.mjs 生成，可重建）
+web/anim/
+# 本地 TLS 自签证书与私钥（凭证，勿提交）
+*.pem
+key.pem
+cert.pem
+# mixamo 登录态 Cookie（凭证，勿提交）
+data/mixamo_cookies.json
+# 任务断点续跑状态（运行时产物）
+data/task_resume_states.json
+data/task_resume_states.json.tmp

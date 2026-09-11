@@ -1,0 +1,320 @@
+{
+  "name": "appearance",
+  "title": "形象与 3D（造型/嗓音/界面/模型转换/动作库）",
+  "version": "2.0.0",
+  "description": "管理形象与交互：3D 造型/场景、嗓音、应用模式；PMX/PMD 转 VRM、Mixamo 动作库。",
+  "author": "dabai",
+  "enabled": true,
+  "disclosure": "on_demand",
+  "prompt": "【技能 形象与 3D】用户要求换装/换形象/变身/换场景时：先 get_available_models / get_available_backgrounds 查列表，再用精确文件名 switch_character_model / switch_background_scene（'default' 恢复默认；模型只是皮肤，身份不变）。变声/换音色/语速用 switch_tts_settings；切换交互模式用 switch_app_mode；即时提示用 show_screen_toast（≤30字）。PMX/PMD 转 VRM 用 pmx_to_vrm；Mixamo 动作库：anim_status 看状态 → anim_start 启动浏览器 → 未登录让用户登录一次 + anim_check_login + anim_save_cookies → anim_download 单个 / anim_batch 批量 → anim_library 管理（scan/verify/categorize/list）→ anim_optimize 优化（validate/emotions/fix）。",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_available_models",
+        "description": "获取当前可用的3D角色模型列表。在切换角色前先调用此工具了解有哪些模型可用。",
+        "parameters": {
+          "type": "object",
+          "properties": {}
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "get_available_backgrounds",
+        "description": "获取当前可用的3D背景场景列表。在切换背景前先调用此工具了解有哪些场景可用。",
+        "parameters": {
+          "type": "object",
+          "properties": {}
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "switch_character_model",
+        "description": "换上新的3D造型——这是你自己穿着的皮肤外观，换模型就像换衣服一样，身份不变。只有用户明确要求换装/换形象/变身时才调用，不要擅自更换造型。请使用 get_available_models 查询到的精确文件名（含扩展名），传入 'default' 恢复默认角色。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "model_name": {
+              "type": "string",
+              "description": "模型文件名（必须精确匹配可用列表中的文件名），如 '小蛋糕.vrm'。传入 'default' 恢复默认角色。"
+            }
+          },
+          "required": [
+            "model_name"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "switch_background_scene",
+        "description": "换一个你所在的环境场景——这是你身处的世界。根据对话氛围和心情自主更换场景，营造沉浸感。请使用 get_available_backgrounds 查询到的精确文件名（含扩展名），传入 'default' 恢复默认星空背景。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "bg_name": {
+              "type": "string",
+              "description": "背景文件名（必须精确匹配可用列表中的文件名），如 '太空飞船走廊.glb'。传入 'default' 恢复默认星空背景。"
+            }
+          },
+          "required": [
+            "bg_name"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "switch_tts_settings",
+        "description": "切换自己的嗓音：音色（Edge TTS 中文音色）/ 语速（+10% 加快）/ 引擎（edge_tts 或 gpt_sovits）。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "voice": {
+              "type": "string",
+              "description": "Edge TTS 音色名，如 'zh-CN-XiaoxiaoNeural'（温柔女声）、'zh-CN-YunxiNeural'（阳光男声）、'zh-CN-XiaoyiNeural'（活泼女声）、'zh-CN-YunjianNeural'（沉稳男声）。不传则保持当前音色。"
+            },
+            "rate": {
+              "type": "string",
+              "description": "语速调整，如 '+10%' 加快、'-10%' 放慢、'+0%' 正常。不传则保持当前语速。"
+            },
+            "engine": {
+              "type": "string",
+              "description": "合成引擎：'edge_tts'（微软在线）或 'gpt_sovits'（自建克隆）。不传则保持当前引擎。"
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "switch_app_mode",
+        "description": "切换应用的运行模式，根据对话情境自主调整交互方式。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": [
+                "auto_voice",
+                "press_voice",
+                "lock_screen",
+                "normal"
+              ],
+              "description": "目标模式：'auto_voice'=自动对话（边说边录自动发送），'press_voice'=按住说话，'lock_screen'=锁屏防误触（锁定操作仅语音对话，角色照常活动），'normal'=普通模式（解锁）。"
+            }
+          },
+          "required": [
+            "mode"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "show_screen_toast",
+        "description": "在屏幕上显示一条短暂的提示消息（Toast），增强互动感和反馈感。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "message": {
+              "type": "string",
+              "description": "要显示的提示文字，简短有趣为宜（不超过30字）。"
+            }
+          },
+          "required": [
+            "message"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "pmx_to_vrm",
+        "description": "将 PMX/PMD 模型转换为 VRM 格式（Blender 后台执行，自动启用 mmd_tools 与 VRM 插件）。返回转换结果与输出路径。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "pmx_path": {
+              "type": "string",
+              "description": "源 PMX/PMD 模型文件的完整路径，如 'C:/models/洛天依.pmx'。"
+            },
+            "vrm_path": {
+              "type": "string",
+              "description": "可选：输出 VRM 文件完整路径；省略则输出到 D:/AI/dabai/models/ 下同名 .vrm。"
+            }
+          },
+          "required": [
+            "pmx_path"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "anim_status",
+        "description": "Mixamo 动作库综合状态：下载服务（浏览器/登录/队列）+ 动作库统计（分类/缺失/未注册）+ 最近日志。开工前先看。",
+        "parameters": {
+          "type": "object",
+          "properties": {},
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "anim_start",
+        "description": "启动 Mixamo 代理浏览器（Playwright+fq，自动起 clash）。proto 可选指定代理协议。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "proto": {
+              "type": "string",
+              "description": "代理协议（可选，默认自动选可用端口：clash/xray/hysteria/hy2/singbox/naive/juicity/mieru/shadowquic）"
+            }
+          },
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "anim_stop",
+        "description": "关闭 Mixamo 代理浏览器（同时中止批量下载）。",
+        "parameters": {
+          "type": "object",
+          "properties": {},
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "anim_check_login",
+        "description": "检测 Mixamo 登录状态（基于 Adobe IMS 会话令牌）。登录是唯一需用户参与的环节。",
+        "parameters": {
+          "type": "object",
+          "properties": {},
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "anim_save_cookies",
+        "description": "保存浏览器 cookies 到 data/mixamo_cookies.json（登录成功后调用，重启可免登录）。",
+        "parameters": {
+          "type": "object",
+          "properties": {},
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "anim_download",
+        "description": "下载单个 Mixamo 动作（自动选 Without Skin 纯动作，存到 web/anim/ 分类目录）。已存在则跳过。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string",
+              "description": "动作名（animation-library.json 里的 name，如 idle_normal）"
+            }
+          },
+          "required": [
+            "name"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "anim_batch",
+        "description": "批量下载多个 Mixamo 动作（后台异步，用 anim_status 轮询，anim_stop 中止）。未登录拒绝启动。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "names": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "description": "动作名（animation-library.json 里的 name）"
+              },
+              "description": "要下载的动作名数组"
+            }
+          },
+          "required": [
+            "names"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "anim_library",
+        "description": "动作库管理：stats 统计 / list 列动作（按 category/emotion/status 筛选）/ scan 扫描磁盘 / verify 校验缺失 / categorize 整理分类（dry_run 默认只预览）。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "description": "stats / list / scan / verify / categorize（默认 stats）"
+            },
+            "category": {
+              "type": "string",
+              "description": "list 用：分类过滤（idle/gesture/emotion/walk/dance/pose）"
+            },
+            "emotion": {
+              "type": "string",
+              "description": "list 用：情绪过滤（happy/sad/angry/...）"
+            },
+            "status": {
+              "type": "string",
+              "description": "list 用：missing=只列缺失文件的动作；have=只列在盘的动作"
+            },
+            "dry_run": {
+              "type": "boolean",
+              "description": "categorize 用：true=只预览不移动（默认）；false=实际移动文件"
+            }
+          },
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "anim_optimize",
+        "description": "动作库优化：validate 校验配置 / emotions 查看情绪映射 / fix 自动修复（写回 animation-library.json）。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "description": "validate / emotions / fix（默认 validate）"
+            }
+          },
+          "required": []
+        }
+      }
+    }
+  ]
+}

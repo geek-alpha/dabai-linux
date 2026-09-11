@@ -1,0 +1,131 @@
+# 大白在 Linux 上运行
+
+> 目标：**核心能力在 Linux 上可跑**（Web 界面 + 3D 角色 + 对话 + 技能 + agent/harness + 任务中心）。
+> 依赖 Windows 专有软件的能力（汉化流水线、便携 Chrome、Blender 便携版）自动降级或明确报错，
+> 不会把整个服务拖崩。
+
+## 1. 快速开始
+
+```bash
+# 真·一键（首次跑这条就够：建 venv → 装依赖 → 自检 → 启动；幂等，重复跑安全）
+./dabai.sh --setup
+```
+
+想分步、或排查问题：
+
+```bash
+# 0) 系统依赖（Debian/Ubuntu）
+sudo apt-get install -y python3-venv python3-dev ffmpeg ripgrep
+
+# 1) 建 venv + 装依赖（逐包安装，装不上的会汇总提示，不中断）
+./tools/linux_setup.sh --venv
+
+# 2) 环境自检（推荐每次启动前跑）
+./dabai.sh --check        # 或 python3 tools/linux_selfcheck.py
+
+# 3) 启动
+./dabai.sh
+```
+
+系统包也想自动装：`./tools/linux_setup.sh --all`（sudo 装系统包 + venv + 自检）。
+
+## 2. 环境变量
+
+| 变量 | 作用 | 默认 |
+|---|---|---|
+| `DABAI_PYTHON` | 指定解释器 | `venv/bin/python` → `python3` |
+| `DABAI_BLENDER` | Blender 可执行文件（PMX→VRM 技能用） | 自动探测 `PATH` / 常见路径 |
+| `DABAI_CHROME` | Chrome/Chromium（网页深挖用） | 自动探测 `PATH` / 常见路径 |
+| `DABAI_HANHUA_ROOT` | 外部汉化项目根目录 | `D:\AI\油管视频汉化`（仅 Windows 存在） |
+| `DABAI_SEARCH_ENGINES` | anysearch/exa 搜索引擎脚本根目录 | `skills/search/engines/`（缺失时给可诊断提示） |
+| `DABAI_FQ_ROOT` | fq 翻墙启动器所在目录 | Windows 默认 `D:\AI\Chrome141_AllNew_2025.10.3`；POSIX 探测 `/opt/fq` 等 |
+| `DISPLAY` / `WAYLAND_DISPLAY` | 图形会话（截屏用） | 无则截屏明确报错 |
+
+## 3. 平台差异都收敛在哪
+
+**唯一平台出口：`platform_compat.py`**（项目根）。业务代码不再自己判断 `os.name`，
+需要平台分支时调它：
+
+| 能力 | 函数 | Windows | Linux/macOS |
+|---|---|---|---|
+| 隐藏控制台 | `no_window_flags` / `spawn_kwargs` | `CREATE_NO_WINDOW` | 返回 0 / `start_new_session` |
+| 整树终止 | `terminate_tree` | `taskkill /T /F` | `killpg(SIGTERM→SIGKILL)` |
+| 单进程强杀 | `kill_pid` | `TerminateProcess` | `SIGKILL` |
+| 退出码 | `process_exit_code` | `GetExitCodeProcess` | `/proc/<pid>/stat` |
+| 进程清单 | `list_processes` | `tasklist /FO CSV` | `ps -eo pid,comm,args` |
+| 监听端口 | `list_listening_ports` | `netstat -ano -n` | `ss -ltnp` → `netstat -ltnp` |
+| 磁盘空间 | `disk_free` | `GetDiskFreeSpaceExW` | `shutil.disk_usage` |
+| 跨进程文件锁 | `lock_file` / `unlock_file` | `msvcrt.locking` | `fcntl.flock` |
+| 用户目录 | `user_dir` / `search_roots` | `Desktop/Downloads/...` + 盘符 | XDG / 本地化名 + `/mnt` |
+
+## 4. 各能力的平台状态
+
+| 能力 | Linux | 说明 |
+|---|---|---|
+| Web 服务 / 3D 角色 / 对话 | ✅ 完整 | 纯 Python + 浏览器 |
+| 代码工程技能（检索/改码/git/工作树） | ✅ 完整 | 子进程标志与进程终止走兼容层 |
+| 任务中心 / 独立进程任务 | ✅ 完整 | 跨进程文件锁已支持 `fcntl` |
+| 系统体检（进程/端口/磁盘） | ✅ 完整 | 换 `ps` / `ss` / `shutil` |
+| 系统文件搜索（sys_find/sys_recent/sys_locate） | ✅ 完整 | 扫主目录 + `/mnt`、`/media` 挂载点；`sys_locate` 按可执行位判定，不依赖 `where` |
+| 工作区面板 / 手机端目录下钻 | ✅ 完整 | 常用目录走 XDG + 本地化名，根目录为主目录 + 挂载点（`platform_compat.browse_roots`） |
+| 联网搜索 | ⚠️ 视引擎 | `web_search`/`read_web` 自带实现可用；anysearch/exa 引擎脚本需放到 `skills/search/engines/`，tavily 需 `tvly` CLI；JS 深挖需系统 Chrome |
+| 翻墙代理（fq_ctl / proxy_test） | ⚠️ 需自备 fq | 设 `DABAI_FQ_ROOT` 或把 `fq` 放进 PATH；未配置时明确报错 |
+| 截屏 | ⚠️ 需图形会话 | `mss` → `PIL.ImageGrab` → `pyautogui` 三级回退 |
+| 语音（TTS/ASR） | ⚠️ 视依赖 | `edge-tts` / `faster-whisper` 均支持 Linux；麦克风需 PulseAudio |
+| PMX→VRM 模型转换 | ⚠️ 需系统 Blender | 装 Blender 后设 `DABAI_BLENDER` |
+| 油管视频汉化 | ❌ 仅 Windows | 依赖外部 Windows 项目，需 `DABAI_HANHUA_ROOT` 才有意义 |
+| Minecraft 陪玩 | 视模块 | 纯网络协议，与平台无关 |
+
+## 5. 验证记录（真实执行结果）
+
+**环境**：Docker `python:3.11-slim`（Linux 内核，挂载本仓库）＋ Windows 主机回归。
+
+| 验证项 | 命令 | 结果 |
+|---|---|---|
+| 兼容层冒烟 14 项（双平台同一套用例） | `python tools/linux_smoke_test.py` | Windows 11 **14/14 PASS**（验 `taskkill` / `tasklist` / `creationflags` 分支）；Linux（`python:3.11-slim` 容器）**14/14 PASS**（验 `/proc` / 进程组 / `fcntl` 分支） |
+| 启动脚本语法 | `bash -n dabai.sh` / `bash -n tools/linux_setup.sh` | 均通过 |
+| 环境自检 | `bash dabai.sh --check` | 20 项检查；缺依赖时正确报阻塞并退出码 1 |
+| 全项目语法 | `python -m compileall`（排除归档/资源目录） | `COMPILE_OK` |
+| Windows 回归 | `list_processes` / `list_listening_ports` / `disk_free` / `terminate_tree` / `system_check` | 373 进程、88 端口、`taskkill /T /F 成功`（探针父子进程残留为空），与改造前一致 |
+
+冒烟明细（当前平台分支逐条真跑，不是“能 import”就算过）：
+平台识别、子进程参数、进程清单、监听端口、磁盘空间、进程存活探测、整树终止进程、
+单进程强杀、退出码读取、跨进程文件锁、搜索根目录、Windows 常量隔离、
+技能层 `system_check`、技能层 `find_file`。
+
+跨平台说明：用例期望值按当前系统切换（Windows 不要求 pid1、不要求 `start_new_session`），
+所以两个平台都应该是全绿；只在一个平台上绿 = 兼容层走了错分支。
+
+调试中发现并修掉的两个真问题（值得记住）：
+1. `ps` 在精简镜像里不存在 → 进程清单改为**优先读 `/proc`**，`ps` 仅作 macOS 回退；
+2. **僵尸进程被误判为存活** → `pid_alive` 把 `/proc/<pid>/stat` 的 `Z` 状态视为已退出，
+   否则“杀完还认为活着”，会导致反复重试终止、任务中心误报任务仍在运行。
+
+### 第二轮：技能层全量适配
+
+技能层不再出现盘符与 Windows 专有命令，差异继续收敛到 `platform_compat.py`。
+
+| 改动点 | 文件 | 实测结果 |
+|---|---|---|
+| 文本搜索兜底 | `skills/code_ops/shell_impl.py` | Windows `findstr` / POSIX `grep -rnI`；并过滤 `$ cmd` 回显行 |
+| 可执行程序定位 | `skills/code_ops/sys_search_impl.py` | 弃用 `where` → 枚举 PATH + 可执行位：`python3` → `/usr/bin/python3`、`/bin/python3` |
+| 全盘搜索根目录 | `skills/code_ops/sys_search_impl.py` | 原 `os.listdrives()` 在 Linux 恒为空（功能等于不可用）→ 改为主目录 + `/mnt`、`/media`：实测返回 6 个真实目录 |
+| 搜索引擎路径 | `skills/search/skill.py` | 去掉 `D:\AI\...` 硬编码 → 环境变量/技能目录探测；缺失时提示不再指向 Windows 路径 |
+| fq 翻墙 | `skills/search/fq_impl.py` | `cmd /c fq.cmd` → 平台分派；未配置时返回明确降级提示 |
+| ffmpeg 枚举 | `skills/media/video_lib.py` | POSIX 按可执行位判定、路径区分大小写：`/usr/bin/ffmpeg`、`/bin/ffmpeg` |
+| 工作区根目录 | `server.py` + `platform_compat.browse_roots` | 常用目录走 XDG/本地化名，根目录为主目录 + 挂载点：实测 `['/home/wxf', '/mnt', '/media', '/opt', '/srv']` |
+| 工具描述文案 | `skills/*/skill.json`、`references/*.md` | 去掉“Windows 命令 / dir / tasklist / 盘符”表述，避免模型在 Linux 上瞎用 Windows 命令 |
+
+回归：`python tools/linux_smoke_test.py` **14/14 PASS**（含技能层 `system_check`、`find_file`）；
+`server.py` / `platform_compat.py` 语法通过；技能模块 import 冒烟 4/4 通过。
+
+## 6. 回滚
+
+改动在隔离工作树分支 `codex/linux-compat` 上开发，已合并回 `20260909`（merge commit `748d9d2`）。
+
+- 整体回退：`git revert -m 1 748d9d2`
+- 只撤单个文件：`git checkout 748d9d2^ -- <文件>`
+- 新增文件（`platform_compat.py` / `dabai.sh` / `tools/linux_*` / `LINUX.md`）直接删除即可，不影响原有能力
+
+注意：临时 `.bak-<时间戳>` 备份已清理，回滚请依赖 git 历史，不要依赖备份文件。
+行尾已由 `.gitattributes` 固定（`*.sh` = LF），克隆到 Linux 不会出现 `bad interpreter`。

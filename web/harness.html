@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>大白 Harness 管理台</title>
+<style>
+  :root {
+    --bg: #0b1020; --panel: #141b31; --panel2: #1a2340;
+    --border: #26355c; --text: #dfe7f7; --dim: #8b98b8;
+    --accent: #5fd3ff; --accent2: #9d7bff; --ok: #4ade80; --err: #f87171;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: radial-gradient(1200px 600px at 20% -10%, #1b2a52 0%, var(--bg) 55%);
+    color: var(--text); font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    min-height: 100vh; padding: 24px; max-width: 1180px; margin: 0 auto;
+  }
+  h1 { font-size: 22px; letter-spacing: 1px; }
+  h1 .harness-tag { color: var(--accent2); font-weight: 400; }
+  .sub { color: var(--dim); font-size: 13px; margin-top: 4px; }
+  .statbar { display: flex; gap: 12px; flex-wrap: wrap; margin: 18px 0 4px; }
+  .stat {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 10px 16px; font-size: 13px; display: flex; gap: 8px; align-items: center;
+  }
+  .badge { display: inline-block; width: 10px; height: 10px; border-radius: 50%; }
+  .badge.ok { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+  .badge.err { background: var(--err); box-shadow: 0 0 8px var(--err); }
+  .badge.warn { background: #fbbf24; box-shadow: 0 0 8px #fbbf24; }
+  h2 { font-size: 16px; margin: 26px 0 12px; color: var(--accent); display: flex; align-items: center; gap: 8px; }
+  h2 .count { color: var(--dim); font-weight: 400; font-size: 13px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 12px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 14px;
+    padding: 14px 16px; display: flex; flex-direction: column; gap: 8px;
+  }
+  .card.broken { border-color: #7f1d1d; background: #1c1318; }
+  .card-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; }
+  .card-title { font-weight: 600; font-size: 15px; }
+  .card-title .ver { color: var(--dim); font-weight: 400; font-size: 12px; margin-left: 6px; }
+  .card-desc { color: var(--dim); font-size: 12.5px; line-height: 1.5; min-height: 34px; }
+  .tools { display: flex; flex-wrap: wrap; gap: 4px; }
+  .tool-chip {
+    background: var(--panel2); border: 1px solid var(--border); border-radius: 999px;
+    font-size: 11px; padding: 2px 8px; color: var(--accent);
+  }
+  .actions { display: flex; gap: 8px; margin-top: 4px; }
+  button {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 9px; padding: 7px 12px; font-size: 12.5px; cursor: pointer;
+    transition: all .15s ease;
+  }
+  button:hover { border-color: var(--accent); color: var(--accent); }
+  button.primary { background: linear-gradient(135deg, #17365e, #23367a); border-color: #3a4f8f; }
+  button.enabled { background: linear-gradient(135deg, #14532d, #1a4a2a); border-color: #2f8f4f; color: var(--ok); }
+  button.disabled { background: linear-gradient(135deg, #4b1f24, #3c2027); border-color: #8f3a46; color: var(--err); }
+  button:active { transform: scale(.97); }
+  .error-text { color: var(--err); font-size: 12px; }
+  .pbar { height: 8px; background: var(--panel2); border-radius: 6px; overflow: hidden; }
+  .pbar > div { height: 100%; background: linear-gradient(90deg, #2f8f4f, #4ade80); transition: width .3s ease; }
+  .pbar.failed > div { background: linear-gradient(90deg, #8f3a46, #f87171); }
+  .events {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 10px 14px; font-size: 12.5px; line-height: 1.9;
+  }
+  .events .ts { color: var(--dim); margin-right: 8px; }
+  .events .k { color: var(--accent2); margin-right: 6px; }
+  .toolbar { display: flex; gap: 10px; align-items: center; margin: 14px 0 0; flex-wrap: wrap; }
+  #toast {
+    position: fixed; right: 18px; bottom: 18px; background: #123d34; color: #b9f6d0;
+    border: 1px solid #2f8f4f; padding: 10px 16px; border-radius: 10px; font-size: 13px;
+    opacity: 0; pointer-events: none; transition: opacity .25s ease;
+  }
+  #toast.err { background: #461f22; color: #ffd0d0; border-color: #8f3a46; }
+  #loading { color: var(--dim); padding: 40px; text-align: center; }
+</style>
+</head>
+<body>
+  <h1>🔌 大白 <span class="harness-tag">Harness 管理台</span></h1>
+  <div class="sub">技能（Skill）与插件（Plugin）的启停、热重载与健康状态 —— 所有改动即时生效并持久化。</div>
+
+  <div class="statbar" id="statbar"></div>
+
+  <div class="toolbar">
+    <button class="primary" onclick="reloadAll()">⟳ 热重载全部</button>
+    <button onclick="refresh()">↻ 刷新状态</button>
+    <button onclick="location.href='/'" title="回到大白主页">🏠 返回大白</button>
+    <span id="updated" class="sub"></span>
+  </div>
+
+  <h2>🧩 技能 Skills <span class="count" id="skillCount"></span></h2>
+  <div class="grid" id="skillsGrid"></div>
+
+  <h2>🧪 插件 Plugins <span class="count" id="pluginCount"></span></h2>
+  <div class="grid" id="pluginsGrid"></div>
+
+  <h2>⚙️ Agent 运行时 <span class="count" id="runtimeCount"></span></h2>
+  <div class="sub" style="margin-bottom:10px">LLM 渠道与工具调用的监督统计：熔断器、耗时、token 用量、在途/最近对话轮 —— 大白 Agent 的全部执行都受 harness 控制。</div>
+  <div class="grid" id="runtimeGrid"></div>
+
+  <h2>🗂 任务与队列 <span class="count" id="taskCount"></span></h2>
+  <div class="sub" style="margin-bottom:10px">长任务（DAG 流程）与批量任务：断点续跑、失败重试、并发受控；队列可暂停/恢复，任务可取消/重试。</div>
+  <div class="grid" id="queuesGrid"></div>
+  <div class="grid" id="jobsGrid" style="margin-top:12px"></div>
+
+  <h2>📡 最近事件</h2>
+  <div class="events" id="events"></div>
+
+  <div id="toast"></div>
+  <script>
+    async function api(path, opts) {
+      const resp = await fetch(path, opts);
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error(data.message || ("HTTP " + resp.status));
+      return data;
+    }
+    function toast(msg, isErr) {
+      const t = document.getElementById("toast");
+      t.textContent = msg; t.className = isErr ? "err" : "";
+      t.style.opacity = "1";
+      setTimeout(() => (t.style.opacity = "0"), 2600);
+    }
+    function esc(s) {
+      return String(s == null ? "" : s).replace(/[&<>"]/g, c =>
+        ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+    }
+    function cardHtml(item, kind) {
+      const state = item.enabled ? "启用中" : "已禁用";
+      const toggleLabel = item.enabled ? "🔴 禁用" : "🟢 启用";
+      const toggleCls = item.enabled ? "disabled" : "enabled";
+      const broken = item.broken
+        ? '<div class="error-text">⚠ 加载失败：' + esc(item.error) + "</div>" : "";
+      const tools = (item.tools || []).map(t =>
+        '<span class="tool-chip">' + esc(t) + "</span>").join("");
+      return (
+        '<div class="card' + (item.broken ? " broken" : "") + '">' +
+          '<div class="card-head">' +
+            '<div class="card-title">' + esc(item.title) +
+              '<span class="ver">v' + esc(item.version) + "</span>" +
+              (item.disclosure === "on_demand" ? '<span class="tool-chip" title="渐进式披露：一句话摘要 + skill_help 按需拉取说明书">on_demand</span>' : "") +
+              "</div>" +
+            '<span class="badge ' + (item.broken ? "err" : item.enabled ? "ok" : "warn") +
+              '" title="' + state + '"></span>' +
+          "</div>" +
+          '<div class="card-desc">' + esc(item.description || "（无描述）") + "</div>" +
+          (tools ? '<div class="tools">' + tools + "</div>" : "") +
+          broken +
+          '<div class="actions">' +
+            '<button class="' + toggleCls + '" data-kind="' + kind + '" data-name="' + esc(item.name) +
+              '" data-action="' + (item.enabled ? "disable" : "enable") +
+              '" onclick="toggle(this.dataset.name, this.dataset.kind, this.dataset.action)">' +
+              toggleLabel + "</button>" +
+            '<button data-kind="' + kind + '" data-name="' + esc(item.name) +
+              '" onclick="reloadOne(this.dataset.name, this.dataset.kind)">⟳ 重载</button>' +
+          "</div>" +
+        "</div>");
+    }
+    function render(j) {
+      document.getElementById("skillCount").textContent = "· " + j.skills.length + " 个";
+      document.getElementById("pluginCount").textContent = "· " + j.plugins.length + " 个";
+      document.getElementById("skillsGrid").innerHTML =
+        j.skills.map(s => cardHtml(s, "skills")).join("");
+      document.getElementById("pluginsGrid").innerHTML =
+        j.plugins.map(p => cardHtml(p, "plugins")).join("");
+      renderRuntime(j.runtime);
+      renderTasks(j.tasks);
+      const tc = j.tool_count || {};
+      const okBadge = j.ok ? '<span class="badge ok"></span> 健康' : '<span class="badge err"></span> 有异常';
+      document.getElementById("statbar").innerHTML =
+        '<div class="stat">' + okBadge + "</div>" +
+        '<div class="stat">⏱ 运行 ' + Math.round(j.uptime_seconds) + "s</div>" +
+        '<div class="stat">🧩 技能 ' + j.skills.length + '（启用 ' + j.skills.filter(s => s.enabled).length + "）</div>" +
+        '<div class="stat">🧪 插件 ' + j.plugins.length + '（启用 ' + j.plugins.filter(p => p.enabled).length + "）</div>" +
+        '<div class="stat">🛠 工具 ' + (tc.skill || 0) + " 技能 + " + (tc.plugin || 0) + " 插件</div>" +
+        runtimeStatHtml(j.runtime);
+      const evts = (j.recent_events || []).slice().reverse().map(e =>
+        '<div><span class="ts">' + esc(new Date(e.at * 1000).toLocaleTimeString()) +
+        '</span><span class="k">[' + esc(e.kind) + "]</span>" + esc(e.message) + "</div>").join("");
+      document.getElementById("events").innerHTML =
+        evts || '<div class="sub">暂无事件</div>';
+      document.getElementById("updated").textContent =
+        "更新于 " + new Date().toLocaleTimeString();
+      document.getElementById("loading")?.remove();
+    }
+    function breakerBadge(st) {
+      const cls = st === "open" ? "err" : st === "half-open" ? "warn" : "ok";
+      const label = st === "closed" ? "正常" : st === "degraded" ? "偶发失败" :
+                    st === "half-open" ? "探测中" : "已熔断";
+      return '<span class="badge ' + cls + '" title="熔断器：' + label + '"></span><span class="sub"> ' + label + "</span>";
+    }
+    function meterCards(meters, prefix) {
+      const keys = Object.keys(meters || {});
+      if (!keys.length) return "";
+      return keys.map(k => {
+        const m = meters[k];
+        const full = prefix + ":" + k;
+        const failing = (m.failures || m.timeouts) ? '<span class="error-text">失败 ' + m.failures + " / 超时 " + m.timeouts + "</span>" : "";
+        return '<div class="card">' +
+          '<div class="card-head"><div class="card-title">' + esc(full) + "</div>" +
+          breakerBadge((m.breaker || {}).state) + "</div>" +
+          '<div class="card-desc">调用 ' + m.calls + " 次 · 平均 " + m.avg_ms + "ms · 最长 " + m.max_ms + "ms " + failing + "</div>" +
+          ((m.breaker || {}).state !== "closed"
+            ? '<div class="actions"><button onclick="resetBreaker(this.dataset.name)" data-name="' + esc(full) + '">⚡ 复位熔断器</button></div>'
+            : "") +
+          "</div>";
+      }).join("");
+    }
+    function runtimeStatHtml(rt) {
+      if (!rt) return "";
+      const u = rt.usage_total || {};
+      return '<div class="stat">🤖 Agent ' + (rt.agents || []).length + "</div>" +
+        '<div class="stat">⚡ 在途对话 ' + (rt.active_runs || []).length + "</div>" +
+        '<div class="stat">📊 token ' + (u.total || 0) + "</div>";
+    }
+    function renderRuntime(rt) {
+      const el = document.getElementById("runtimeGrid");
+      const cnt = document.getElementById("runtimeCount");
+      if (!el) return;
+      if (!rt) {
+        el.innerHTML = '<div class="sub">运行时数据不可用（服务版本过旧？）</div>';
+        if (cnt) cnt.textContent = "";
+        return;
+      }
+      const agents = (rt.agents || []).map(a =>
+        "· " + esc(a.user_id) + "（" + esc(a.model || "?") + "）").join("<br>") || "暂未注册";
+      const usageRows = Object.keys(rt.usage || {}).map(k => {
+        const u = rt.usage[k] || {};
+        const hitMiss = (u.cache_hit || u.cache_miss)
+          ? ` · 缓存命中 ${Math.round((u.cache_hit || 0) * 100 / Math.max(1, (u.cache_hit || 0) + (u.cache_miss || 0)))}%`
+          : "";
+        return "· " + esc(k) + "：" + (u.total || 0) + " tokens / " + (u.calls || 0) + " 次" + hitMiss;
+      }).join("<br>") || "暂无用量";
+      const runs = (rt.recent_runs || []).slice().reverse().slice(0, 8).map(r =>
+        "· [" + esc(r.kind) + "/" + esc(r.mode) + "] " + r.duration + "s · " + r.rounds +
+        " 轮 · " + r.tool_calls + " 工具" + (r.ok === false ? ' · <span class="error-text">异常</span>' : "")).join("<br>") || "暂无运行";
+      el.innerHTML =
+        '<div class="card"><div class="card-title">🤖 受监督 Agent</div><div class="card-desc">' + agents + "</div></div>" +
+        '<div class="card"><div class="card-title">📊 token 用量（合计 ' + ((rt.usage_total || {}).total || 0) + "）</div><div class=\"card-desc\">" + usageRows + "</div></div>" +
+        '<div class="card"><div class="card-title">⚡ 最近对话轮（在途 ' + (rt.active_runs || []).length + "）</div><div class=\"card-desc\">" + runs + "</div></div>" +
+        meterCards(rt.llm, "llm") + meterCards(rt.tools, "tool");
+      if (cnt) cnt.textContent =
+        "· LLM 渠道 " + Object.keys(rt.llm || {}).length + " · 工具 " + Object.keys(rt.tools || {}).length;
+    }
+    function stateBadge(s) {
+      const map = { running: "ok", pending: "warn", succeeded: "ok", failed: "err", cancelled: "warn" };
+      const label = { running: "执行中", pending: "排队", succeeded: "成功", failed: "失败", cancelled: "已取消" };
+      return '<span class="badge ' + (map[s] || "warn") + '"></span><span class="sub"> ' + (label[s] || s) + "</span>";
+    }    function renderTasks(tk) {
+      const qEl = document.getElementById("queuesGrid");
+      const jEl = document.getElementById("jobsGrid");
+      const cnt = document.getElementById("taskCount");
+      if (!qEl || !jEl) return;
+      if (!tk) { qEl.innerHTML = ""; jEl.innerHTML = ""; if (cnt) cnt.textContent = ""; return; }
+      const qs = Object.keys(tk.queues || {});
+      qEl.innerHTML = qs.length ? qs.map(qn => {
+        const q = tk.queues[qn] || {};
+        return '<div class="card">' +
+          '<div class="card-head"><div class="card-title">📡 ' + esc(qn) +
+            (q.paused ? "（已暂停）" : "") + "</div>" +
+            (q.paused
+              ? '<button data-q="' + esc(qn) + '" data-act="resume" onclick="queueAction(this.dataset.q, this.dataset.act)">▶ 恢复</button>'
+              : '<button data-q="' + esc(qn) + '" data-act="pause" onclick="queueAction(this.dataset.q, this.dataset.act)">⏸ 暂停</button>') +
+          "</div>" +
+          '<div class="card-desc">worker ' + (q.workers || 0) + " · 排队 " + (q.waiting || 0) +
+            " · 运行 " + (q.running || 0) +
+            (q.min_interval ? " · 限速 " + q.min_interval + "s" : "") + "</div>" +
+        "</div>";
+      }).join("") : '<div class="sub">暂无队列</div>';
+      const jobs = tk.jobs || [];
+      jEl.innerHTML = jobs.length ? jobs.map(t => {
+        const cls = t.state === "failed" ? " failed" : "";
+        const badge = t.waiting_confirm
+          ? '<span class="badge warn"></span><span class="sub"> 待确认</span>'
+          : stateBadge(t.state);
+        let actions = "";
+        if (t.waiting_confirm) {
+          actions = '<button data-t="' + esc(t.id) + '" data-act="approve" onclick="taskAction(this.dataset.t, this.dataset.act)">✅ 批准</button>' +
+            '<button data-t="' + esc(t.id) + '" data-act="reject" onclick="taskAction(this.dataset.t, this.dataset.act)">🚫 拒绝</button>';
+        }
+        if (t.state === "running" || t.state === "pending") {
+          actions += '<button data-t="' + esc(t.id) + '" data-act="cancel" onclick="taskAction(this.dataset.t, this.dataset.act)">✖ 取消</button>';
+        } else if (t.state === "failed" || t.state === "cancelled") {
+          actions += '<button data-t="' + esc(t.id) + '" data-act="retry" onclick="taskAction(this.dataset.t, this.dataset.act)">↻ 重试</button>';
+        }
+        return '<div class="card">' +
+          '<div class="card-head"><div class="card-title">' + esc(t.name) +
+            '<span class="ver">' + esc(t.kind) + " · " + esc(t.id) + "</span></div>" +
+            badge + "</div>" +
+          '<div class="pbar' + cls + '"><div style="width:' + (t.progress || 0) + '%"></div></div>' +
+          '<div class="card-desc">' + esc(t.status || "") +
+            (t.error ? ' · <span class="error-text">' + esc(t.error) + "</span>" : "") + "</div>" +
+          (actions ? '<div class="actions">' + actions + "</div>" : "") +
+        "</div>";
+      }).join("") : '<div class="sub">暂无任务（对话里让大白提交长任务/批量任务即可看到）</div>';
+      if (cnt) cnt.textContent = "· 运行中 " + ((tk.by_state || {}).running || 0);
+    }
+    async function taskAction(tid, act) {
+      try {
+        const j = await api("/api/harness/tasks/" + encodeURIComponent(tid) + "/" + act, { method: "POST" });
+        toast(j.message || "已" + act);
+        refresh();
+      } catch (e) { toast("操作失败：" + e.message, true); }
+    }
+    async function queueAction(qn, act) {
+      try {
+        const j = await api("/api/harness/queues/" + encodeURIComponent(qn) + "/" + act, { method: "POST" });
+        toast(j.message || "已更新");
+        refresh();
+      } catch (e) { toast("操作失败：" + e.message, true); }
+    }
+    async function resetBreaker(name) {
+      try {
+        const j = await api("/api/harness/runtime/reset", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name: name })
+        });
+        toast(j.message || "已复位");
+        refresh();
+      } catch (e) { toast("复位失败：" + e.message, true); }
+    }
+    async function refresh() {
+      try {
+        const j = await api("/api/harness/status");
+        render(j);
+      } catch (e) {
+        toast("加载状态失败：" + e.message, true);
+      }
+    }
+    async function toggle(name, kind, action) {
+      try {
+        const j = await api("/api/harness/" + kind + "/" + encodeURIComponent(name) + "/" + action, { method: "POST" });
+        toast(j.message || "已" + (action === "enable" ? "启用" : "禁用") + " " + name);
+        refresh();
+      } catch (e) { toast("操作失败：" + e.message, true); }
+    }
+    async function reloadOne(name, kind) {
+      try {
+        const j = await api("/api/harness/" + kind + "/" + encodeURIComponent(name) + "/reload", { method: "POST" });
+        toast(j.message || "已重载 " + name);
+        refresh();
+      } catch (e) { toast("重载失败：" + e.message, true); }
+    }
+    async function reloadAll() {
+      try {
+        const j = await api("/api/harness/reload", { method: "POST" });
+        toast(j.message || "已热重载全部");
+        refresh();
+      } catch (e) { toast("重载失败：" + e.message, true); }
+    }
+    refresh();
+  </script>
+</body>
+</html>

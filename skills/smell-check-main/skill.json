@@ -1,0 +1,13 @@
+{
+  "name": "smell-check-main",
+  "title": "smell-check-main",
+  "version": "1.0.0",
+  "description": "p align=\"center\"",
+  "author": "Zhen-Bo",
+  "enabled": true,
+  "prompt": "【技能 smell-check-main】已就绪：使用说明见本目录 SKILL.md；涉及 p align=\"center\" 等需求时，先调用 skill_help('smell-check-main') 读取说明书再执行。",
+  "tools": [],
+  "_pulled_from": "Zhen-Bo/smell-check",
+  "_pulled_path": ".",
+  "disclosure": "on_demand"
+}

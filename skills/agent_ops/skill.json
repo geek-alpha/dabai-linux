@@ -1,0 +1,602 @@
+{
+  "name": "agent_ops",
+  "title": "智能体与技能（委派/任务中心/技能工坊）",
+  "version": "2.1.0",
+  "description": "智能体指挥中枢：委派 DSH/Codex/OpenCode 并查进展；技能工坊：自建自改+全网拉取技能。",
+  "author": "dabai",
+  "enabled": true,
+  "disclosure": "on_demand",
+  "prompt": "【技能 智能体与技能】★派活铁律：默认用我自己的子智能体 sub_agent_spawn（自带 LLM+工具，可并行多个，不占任务中心名额）——只有用户明确点名 DSH/Codex/OpenCode/DeepSeek Harness 时才用 delegate_agent_task 委派外部智能体，绝不擅自选外部。选人用 profile：调查只读=researcher、写代码=coder、写测试=tester、写文档=writer、不确定=general。多任务并行优先一次发多个 sub_agent_spawn。delegate_agent_task（dsh=DSH 智能体解决复杂任务；codex=攻坚顶级难题；opencode=日常问题；用户点名 DSH 必须选 dsh；所有委派先经任务中心请用户确认；画图与音乐绝不委派；失败过的任务不原样重发）。进展用 list_agent_tasks 查。子智能体的配置（系统提示词/可用技能/工具白名单/模型）用 agent_profile_list/show/create/update/delete，派活时带 profile 指定角色（如 profile=coder，测试任务用 tester、调查用 researcher）。自建/修改/校验/热重载技能用 skill_dev_create/edit/list/read 等；从 GitHub 检索、核查、安全安装技能用 skill_pull_* 工具。",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "delegate_agent_task",
+        "description": "【仅限用户点名时用】委派给外部智能体 dsh/codex/opencode。默认派活请用 sub_agent_spawn（自有子智能体）；只有用户明确点名 DSH/Codex/OpenCode/DeepSeek Harness 时才调用本工具。用户点名 DSH 必须选 dsh；委派先经任务中心请用户确认；画图/音乐绝不委派；失败过的任务不原样重发；复杂任务先写任务规范。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "agent": {
+              "type": "string",
+              "enum": [
+                "dsh",
+                "codex",
+                "opencode"
+              ],
+              "description": "智能体身份：dsh=DSH 智能体（DeepSeek Harness，解决复杂任务）；codex=攻坚顶级难题；opencode=解决日常问题。用户明确点名 DSH/DeepSeek Harness 时必须选 dsh"
+            },
+            "task": {
+              "type": "string",
+              "description": "要交给该智能体的任务，写清楚目标、背景和约束（用户怎么说的就怎么写）"
+            },
+            "cwd": {
+              "type": "string",
+              "description": "工作目录（仅 dsh 用；省略则用当前默认工作区）"
+            }
+          },
+          "required": [
+            "agent",
+            "task"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "list_agent_tasks",
+        "description": "查看「任务中心」当前有哪些任务在跑或刚跑完，每个任务都会标明执行者是谁（DSH 智能体 / Codex / OpenCode / 后台命令）。适合向用户汇报任务进展时使用。",
+        "parameters": {
+          "type": "object",
+          "properties": {},
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "skill_dev_list",
+        "description": "列出技能体系现状：全部技能（名称/标题/描述/披露模式/工具数/启停/损坏状态）。创建或修改技能前先调用了解现状；用户问「有哪些技能/会什么」时也可用。",
+        "parameters": {
+          "type": "object",
+          "properties": {},
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "skill_dev_read",
+        "description": "读取某个技能的源文件内容（skill.json / skill.py / SKILL.md），用于了解现状、定位要修改的位置、或修改前留备份。长文件用 start/max_lines 分页读；写完大文件后用它读尾部确认没被截断。修改技能前建议先读目标文件。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "skill_name": {
+              "type": "string",
+              "description": "技能名，如 weather、agent_ops（skill_dev_list 可查）"
+            },
+            "file": {
+              "type": "string",
+              "enum": [
+                "skill.json",
+                "skill.py",
+                "SKILL.md"
+              ],
+              "description": "要读取的文件"
+            },
+            "start": {
+              "type": "integer",
+              "description": "可选：从第几行开始读（默认 1；分页读长文件用）"
+            },
+            "max_lines": {
+              "type": "integer",
+              "description": "可选：最多读多少行（默认 500，最大 5000）"
+            }
+          },
+          "required": [
+            "skill_name",
+            "file"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "skill_dev_create",
+        "description": "脚手架新技能：生成 skills/<name>/ 下 skill.json+skill.py+SKILL.md 三件套；tools_spec 传工具定义 JSON 自动生成 HANDLERS 桩；同名默认拒绝（overwrite=true 覆盖）。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string",
+              "description": "技能名（仅字母/数字/下划线/连字符，1-64 位，如 weather）"
+            },
+            "title": {
+              "type": "string",
+              "description": "技能标题（中文，如「天气查询」）"
+            },
+            "description": {
+              "type": "string",
+              "description": "一句话说明（建议 ≤88 字；on_demand 模式下它显示在对话的技能摘要里）"
+            },
+            "prompt": {
+              "type": "string",
+              "description": "可选：注入系统提示词的引导语（建议以【技能名】开头，写触发条件与规则）。不传则后续用 skill_dev_edit 补。"
+            },
+            "disclosure": {
+              "type": "string",
+              "enum": [
+                "on_demand",
+                "full"
+              ],
+              "description": "披露模式：on_demand=只注入摘要按需查说明书（默认）；full=完整 prompt 常驻提示词"
+            },
+            "tools_spec": {
+              "type": "string",
+              "description": "可选：工具定义 JSON 数组字符串，形如 [{\"type\":\"function\",\"function\":{\"name\":\"xx\",\"description\":\"...\",\"parameters\":{\"type\":\"object\",\"properties\":{...},\"required\":[...]}}}]"
+            },
+            "overwrite": {
+              "type": "boolean",
+              "description": "同名技能已存在时是否覆盖重建（默认 false 拒绝）"
+            }
+          },
+          "required": [
+            "name",
+            "title",
+            "description"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "skill_dev_edit",
+        "description": "修改技能 skill.json 清单字段：title/description/prompt/enabled/disclosure/version/author/tools，改完自动热重载。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "skill_name": {
+              "type": "string",
+              "description": "要修改的技能名"
+            },
+            "field": {
+              "type": "string",
+              "enum": [
+                "name",
+                "title",
+                "description",
+                "author",
+                "version",
+                "enabled",
+                "disclosure",
+                "prompt",
+                "tools"
+              ],
+              "description": "要修改的清单字段"
+            },
+            "value": {
+              "type": "string",
+              "description": "新值（文本；tools 传 JSON 数组字符串；enabled 传 true/false；name 传新技能名）"
+            }
+          },
+          "required": [
+            "skill_name",
+            "field",
+            "value"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "skill_dev_write_file",
+        "description": "整体写入技能源文件（skill.py/SKILL.md），自动完整性自检+热重载；超 300 行先写骨架再分段补全。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "skill_name": {
+              "type": "string",
+              "description": "目标技能名"
+            },
+            "filename": {
+              "type": "string",
+              "enum": [
+                "skill.py",
+                "SKILL.md"
+              ],
+              "description": "要写入的文件（skill.json 请用 skill_dev_edit）"
+            },
+            "content": {
+              "type": "string",
+              "description": "完整文件内容（会整体替换旧内容）"
+            }
+          },
+          "required": [
+            "skill_name",
+            "filename",
+            "content"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "skill_dev_validate",
+        "description": "对某个技能做静态结构校验：skill.json 合法性、命名规范、工具定义格式与唯一性、skill.py 能否编译、清单工具与代码 HANDLERS/execute 是否对得上、SKILL.md 是否存在。输出 ✔/⚠/✘ 清单。每次创建/修改后必须校验，✘ 全部清零才算合格。纯静态检查，不执行技能代码。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "skill_name": {
+              "type": "string",
+              "description": "要校验的技能名"
+            }
+          },
+          "required": [
+            "skill_name"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "skill_dev_reload",
+        "description": "触发热重载全部技能与插件并汇报运行状态（技能/插件/损坏清单）。技能文件改动通常已自动热重载（守护 1 秒轮询）；遇到「改了没生效/仍是旧行为/技能报损坏」时调用它强制刷新并查看结果。",
+        "parameters": {
+          "type": "object",
+          "properties": {},
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "skill_dev_remove",
+        "description": "删除一个技能目录（skill.json/skill.py/SKILL.md 全部移除，从体系中卸载），必须显式传 confirm=true 才执行。破坏性操作无回收站，删除前建议先 skill_dev_read 留备份。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "skill_name": {
+              "type": "string",
+              "description": "要删除的技能名"
+            },
+            "confirm": {
+              "type": "boolean",
+              "description": "确认删除，必须为 true"
+            }
+          },
+          "required": [
+            "skill_name",
+            "confirm"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "skill_pull_search",
+        "description": "按任务描述/关键词从 GitHub 检索成熟 Agent Skill 仓库（star/更新/结构标记）。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string",
+              "description": "任务描述或搜索关键词，如 'web scraping 网页抓取'、'数据分析'、'翻译'。"
+            },
+            "min_stars": {
+              "type": "integer",
+              "description": "最低 star 数门槛（成熟度过滤），默认 50。"
+            },
+            "max_results": {
+              "type": "integer",
+              "description": "最多返回几个候选，默认 8。"
+            }
+          },
+          "required": [
+            "query"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "skill_pull_inspect",
+        "description": "深入检查候选仓库（默认分支/star/许可证/文件结构/可疑二进制）再决定是否安装。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "repo": {
+              "type": "string",
+              "description": "GitHub 仓库完整名 owner/name，如 'anthropics/skills'。"
+            }
+          },
+          "required": [
+            "repo"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "skill_pull_install",
+        "description": "下载安装 skill 仓库：tarball→安全解压→结构校验→静态安全审查（危险模式命中即拒绝）→注册到 skills/→热重载。支持合集仓库一键全装或 select 指定子目录。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "repo": {
+              "type": "string",
+              "description": "GitHub 仓库完整名 owner/name，如 'anthropics/skills'。"
+            },
+            "select": {
+              "type": "string",
+              "description": "可选：合集仓库内只装指定技能子目录（相对路径），如 'skills/web-fetch'。默认自动：单技能仓库直接装；多技能合集全装。"
+            },
+            "force": {
+              "type": "boolean",
+              "description": "可选：目标技能名已存在时是否覆盖安装，默认 false（拒绝覆盖）。"
+            }
+          },
+          "required": [
+            "repo"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "sub_agent_spawn",
+        "description": "【★默认派活方式】下发我自己的子智能体在后台自主执行任务（LLM 思考+工具调用），完成后自动汇报。独立可并行的子任务首选此工具，一次发多个即并行；只有用户明确点名 DSH/Codex/OpenCode 时才改用 delegate_agent_task。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "task": {
+              "type": "string",
+              "description": "要交给子智能体的具体任务（越具体越好）"
+            },
+            "title": {
+              "type": "string",
+              "description": "可选：任务标题（默认取任务前 40 字）"
+            },
+            "note": {
+              "type": "string",
+              "description": "可选：备注"
+            },
+            "profile": {
+              "type": "string",
+              "description": "可选：用哪个智能体执行（agent_profile_list 可查）。如 coder=核心开发、tester=测试工程师、researcher=调查员、writer=文档写手；留空=全能力通用执行者"
+            }
+          },
+          "required": [
+            "task"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "agent_profile_list",
+        "description": "列出可用的子智能体（内置 general/coder/tester/researcher/writer + 自定义），含各自的可用技能、工具白名单与说明。派活前先看这里挑人。",
+        "parameters": {
+          "type": "object",
+          "properties": {},
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "agent_profile_show",
+        "description": "查看某个智能体档案的完整配置：系统提示词全文、可用技能、工具白名单/禁用项、模型覆盖、实际可用工具数（用于确认配置真的生效）。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "profile_id": {
+              "type": "string",
+              "description": "档案 id，如 coder / tester（agent_profile_list 可查）"
+            }
+          },
+          "required": [
+            "profile_id"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "agent_profile_create",
+        "description": "创建一个新的子智能体：可配系统提示词（角色/纪律/输出格式）、可用技能、工具白名单、模型。创建后用 sub_agent_spawn(profile=id) 即可按它派活。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "profile_id": {
+              "type": "string",
+              "description": "档案 id（建议英文；中文也可），缺省由 name 生成"
+            },
+            "name": {
+              "type": "string",
+              "description": "显示名，如「代码审查员」"
+            },
+            "description": {
+              "type": "string",
+              "description": "一句话说明它擅长什么（列表里展示）"
+            },
+            "system_prompt": {
+              "type": "string",
+              "description": "系统提示词：角色 + 纪律 + 输出格式（决定它怎么想、怎么报结果）"
+            },
+            "skills": {
+              "type": "string",
+              "description": "可用技能白名单，逗号分隔（如 code_ops,search）；传 all 表示不限。基础工具（读写文件/命令/搜索）始终可用"
+            },
+            "tools": {
+              "type": "string",
+              "description": "工具白名单，逗号分隔；留空=随技能"
+            },
+            "deny_tools": {
+              "type": "string",
+              "description": "禁用工具，支持通配（如 sub_agent_*）"
+            },
+            "model": {
+              "type": "string",
+              "description": "模型覆盖（留空=跟随主智能体）"
+            },
+            "max_rounds": {
+              "type": "integer",
+              "description": "轮次上限（0=不限）"
+            }
+          },
+          "required": [
+            "profile_id"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "agent_profile_update",
+        "description": "修改已有智能体的配置：系统提示词、可用技能、工具白名单、模型、说明等（内置档案也能改，但不能删）。对新派出的子智能体立即生效，正在跑的不受影响。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "profile_id": {
+              "type": "string",
+              "description": "要改的档案 id"
+            },
+            "name": {
+              "type": "string",
+              "description": "显示名"
+            },
+            "description": {
+              "type": "string",
+              "description": "一句话说明"
+            },
+            "system_prompt": {
+              "type": "string",
+              "description": "新的系统提示词（整体替换，不是追加）"
+            },
+            "skills": {
+              "type": "string",
+              "description": "可用技能白名单，逗号分隔；传 all 表示不限"
+            },
+            "tools": {
+              "type": "string",
+              "description": "工具白名单，逗号分隔"
+            },
+            "deny_tools": {
+              "type": "string",
+              "description": "禁用工具，支持通配"
+            },
+            "model": {
+              "type": "string",
+              "description": "模型覆盖（留空=跟随主智能体）"
+            },
+            "max_rounds": {
+              "type": "integer",
+              "description": "轮次上限（0=不限）"
+            }
+          },
+          "required": [
+            "profile_id"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "agent_profile_delete",
+        "description": "删除自定义智能体档案（内置 5 个不可删）。不可逆，必须 confirm=true 才执行。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "profile_id": {
+              "type": "string",
+              "description": "要删除的档案 id"
+            },
+            "confirm": {
+              "type": "boolean",
+              "description": "确认删除，必须为 true"
+            }
+          },
+          "required": [
+            "profile_id"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "sub_agents_list",
+        "description": "查子智能体行踪：默认列出正在跑的（谁在干什么、什么状态）；all=true 列出最近全部（含已完成/失败/已取消，带 worker_id 便于用 sub_agent_status 追详情）。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "all": {
+              "type": "boolean",
+              "description": "可选：true=连已结束的一起列（查历史行踪、找回 worker_id）"
+            }
+          },
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "sub_agent_status",
+        "description": "查看单个通用子智能体的完整状态（任务内容、进度、结果）。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "worker_id": {
+              "type": "string",
+              "description": "子智能体 ID（sub_agents_list 可查）"
+            }
+          },
+          "required": [
+            "worker_id"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "sub_agent_cancel",
+        "description": "取消一个通用子智能体（停止其后台执行）。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "worker_id": {
+              "type": "string",
+              "description": "子智能体 ID（sub_agents_list 可查）"
+            },
+            "reason": {
+              "type": "string",
+              "description": "可选：取消原因，会记录到日志"
+            }
+          },
+          "required": [
+            "worker_id"
+          ]
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,771 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>大白直播间 · 任务直播大屏</title>
+<style>
+  /* ============================================================
+   * 网页版任务直播大屏（bigscreen.html）
+   * 与 3D 大屏（30_task_big_screen.ts）同源同视觉：
+   * 深蓝渐变底 + 霓虹青边框 + 扫描线动效 + 呼吸辉光。
+   * 浏览器直接打开即预览；3D 大屏用隐藏 iframe + html2canvas
+   * 每帧取帧贴到 Billboard 纹理，两边看到完全一致的画面。
+   * ============================================================ */
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #000; }
+  body {
+    font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+    color: #fff;
+  }
+
+  /* 画布容器：固定 1280x720 逻辑分辨率，等比缩放铺满窗口 */
+  #screen {
+    position: absolute; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    background: #000;
+  }
+  #stage {
+    position: relative;
+    width: 1280px; height: 720px;
+    transform-origin: center center;
+    background: linear-gradient(180deg, rgba(36,50,108,0.97), rgba(25,34,84,0.97) 50%, rgba(18,24,60,0.97));
+    border: 2px solid rgba(0,229,255,0.32);
+    border-radius: 18px;
+    overflow: hidden;
+    box-shadow: 0 0 60px rgba(0,229,255,0.15);
+  }
+  /* 顶部氛围光（紫→青） */
+  #stage::before {
+    content: ''; position: absolute; top: -60px; left: 50%; transform: translateX(-50%);
+    width: 800px; height: 200px;
+    background: radial-gradient(ellipse at center, rgba(124,92,255,0.26), rgba(0,229,255,0.10) 55%, transparent 70%);
+    pointer-events: none;
+  }
+  /* 左彩色边缘 */
+  #stage::after {
+    content: ''; position: absolute; left: 6px; top: 8px; bottom: 8px; width: 8px;
+    background: #9d7bff; border-radius: 4px; pointer-events: none;
+  }
+  /* 扫描线动效（直播中暗示） */
+  #scanline {
+    position: absolute; left: 16px; right: 16px; height: 52px;
+    background: linear-gradient(180deg, transparent, rgba(0,229,255,0.07), transparent);
+    animation: scan 3s linear infinite; pointer-events: none; z-index: 5;
+  }
+  @keyframes scan {
+    0%   { top: -60px; }
+    100% { top: 720px; }
+  }
+
+  /* ---------- 顶栏 ---------- */
+  #header {
+    position: absolute; top: 0; left: 0; right: 0; height: 78px;
+    padding: 0 30px; display: flex; align-items: center; gap: 12px;
+    z-index: 10;
+  }
+  #header .title { font-size: 34px; font-weight: 700; letter-spacing: 1px; }
+  #header .sub { font-size: 22px; font-weight: 600; color: rgba(255,255,255,0.62); }
+  #live-badge {
+    font-size: 24px; font-weight: 600; color: #fff;
+    background: #ff4d6d; border-radius: 15px; padding: 2px 14px;
+    animation: liveblink 1.4s infinite;
+  }
+  @keyframes liveblink { 0%, 60% { opacity: 1; } 61%, 100% { opacity: 0.25; } }
+  #idle-chip {
+    font-size: 20px; color: rgba(255,255,255,0.5);
+    background: rgba(255,255,255,0.08); border-radius: 13px; padding: 2px 14px;
+  }
+  #clock { margin-left: auto; font-size: 22px; color: rgba(255,255,255,0.6); }
+
+  /* ---------- 统计条 ---------- */
+  #stats {
+    position: absolute; top: 78px; left: 30px; right: 30px;
+    font-size: 22px; font-weight: 600; color: #9be8ff; z-index: 10;
+  }
+
+  /* ---------- 内容区（媒体墙/工作流链/任务卡） ---------- */
+  #content {
+    position: absolute; top: 112px; left: 30px; right: 30px; bottom: 52px;
+    display: flex; flex-direction: column; gap: 12px; z-index: 10;
+  }
+  /* 媒体墙 */
+  #media-row { display: none; }
+  #media-row.show { display: block; }
+  #media-row .label { font-size: 19px; color: rgba(255,255,255,0.65); margin-bottom: 6px; }
+  #media-slots { display: flex; gap: 12px; justify-content: center; }
+  .media-slot {
+    position: relative; border-radius: 9px; overflow: hidden;
+    background: rgba(14,20,50,0.6);
+    border: 1.6px solid rgba(0,229,255,0.55);
+    display: flex; align-items: center; justify-content: center;
+  }
+  .media-slot.video { border-color: rgba(255,77,109,0.7); }
+  .media-slot img, .media-slot video { width: 100%; height: 100%; object-fit: contain; }
+  .media-slot .ph {
+    position: absolute; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 6px;
+    background: rgba(42,62,112,0.45); animation: pulse 1.7s ease-in-out infinite;
+  }
+  @keyframes pulse { 0%, 100% { opacity: 0.55; } 50% { opacity: 0.9; } }
+  .media-slot .ph .tag {
+    font-size: 15px; font-weight: 600; color: #fff;
+    background: rgba(0,0,0,0.5); border-radius: 12px; padding: 2px 10px;
+  }
+  .media-slot .ph .txt { font-size: 13px; color: rgba(255,255,255,0.7); }
+
+  /* 工作流工具链 */
+  #chain-row { display: none; }
+  #chain-row.show { display: block; }
+  #chain-panel {
+    background: rgba(16,22,52,0.5); border: 1.2px solid rgba(0,229,255,0.25);
+    border-radius: 10px; padding: 8px 12px;
+  }
+  #chain-panel .head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
+  #chain-panel .head .t { font-size: 17px; font-weight: 600; color: #a49bff; }
+  #chain-panel .head .owner { font-size: 14px; color: rgba(255,255,255,0.5); max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #chain-steps { display: flex; flex-wrap: nowrap; gap: 10px; overflow: hidden; }
+  .chip {
+    font-size: 15px; font-weight: 600; border-radius: 11px; padding: 3px 12px;
+    white-space: nowrap; border: 1.3px solid;
+  }
+  .chip.running { color: #00e5ff; background: rgba(0,229,255,0.12); border-color: rgba(0,229,255,0.8); }
+  .chip.done    { color: #4ade80; background: rgba(74,222,128,0.10); border-color: rgba(74,222,128,0.5); }
+  .chip.error   { color: #ff6b6b; background: rgba(255,107,107,0.10); border-color: rgba(255,107,107,0.5); }
+  .chip.ended   { color: #8c8ca0; background: rgba(140,140,160,0.10); border-color: rgba(140,140,160,0.4); }
+  .chip .arrow { color: rgba(255,255,255,0.32); margin-left: 10px; font-weight: 700; }
+
+  /* 任务卡 */
+  #task-list { display: flex; flex-direction: column; gap: 10px; flex: 1; min-height: 0; }
+  .task-card {
+    position: relative; border-radius: 12px; padding: 10px 16px;
+    background: rgba(20,26,58,0.55); border: 2px solid rgba(124,92,255,0.47);
+    flex: 1; min-height: 0; display: flex; flex-direction: column; justify-content: center;
+  }
+  .task-card .row1 { display: flex; align-items: center; gap: 10px; }
+  .task-card .row1 .icon { font-size: 24px; }
+  .task-card .row1 .agent { font-size: 22px; font-weight: 700; }
+  .task-card .row1 .name { font-size: 24px; font-weight: 700; color: #fff; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .task-card .status {
+    font-size: 19px; font-weight: 600; border-radius: 16px; padding: 2px 14px;
+    border: 1.5px solid;
+  }
+  .task-card .line2 { font-size: 20px; color: rgba(255,255,255,0.75); margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .task-card .result {
+    font-size: 18px; color: #a9f0c2; margin-top: 4px;
+    background: rgba(74,222,128,0.12); border: 1.5px solid rgba(74,222,128,0.4);
+    border-radius: 8px; padding: 3px 10px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .task-card .time { position: absolute; right: 16px; bottom: 6px; font-size: 17px; color: rgba(255,255,255,0.38); }
+
+  /* ---------- 跑马灯 ---------- */
+  #ticker {
+    position: absolute; left: 0; right: 0; bottom: 14px; height: 30px;
+    font-size: 20px; color: rgba(4,233,255,0.8); white-space: nowrap;
+    overflow: hidden; z-index: 10;
+  }
+  #ticker .inner { display: inline-block; padding-left: 1280px; animation: ticker 22s linear infinite; }
+  @keyframes ticker { 0% { transform: translateX(0); } 100% { transform: translateX(-100%); } }
+  #ticker .empty { color: rgba(255,255,255,0.3); padding-left: 0; animation: none; }
+
+  /* ---------- 待机画面 ---------- */
+  #idle {
+    position: absolute; inset: 0; display: none; flex-direction: column;
+    align-items: flex-start; justify-content: center; padding-left: 34px; z-index: 10;
+  }
+  #idle.show { display: flex; }
+  #idle .main {
+    font-size: 44px; font-weight: 700; color: rgba(255,255,255,0.95);
+    text-shadow: 0 0 22px rgba(0,229,255,0.6); animation: breathe 2.4s ease-in-out infinite;
+  }
+  @keyframes breathe { 0%, 100% { text-shadow: 0 0 14px rgba(0,229,255,0.35); } 50% { text-shadow: 0 0 26px rgba(0,229,255,0.75); } }
+  #idle .sub { font-size: 32px; font-weight: 700; color: #fff; text-shadow: 0 0 12px rgba(124,92,255,0.5); margin-top: 8px; }
+  #idle .members { font-size: 23px; color: rgba(228,236,255,0.9); margin-top: 18px; }
+
+  /* ---------- 全屏焦点（媒体/信息） ---------- */
+  #showcase {
+    position: absolute; inset: 0; display: none; flex-direction: column;
+    align-items: center; justify-content: center; z-index: 20;
+    background: rgba(10,14,40,0.92);
+  }
+  #showcase.show { display: flex; }
+  #showcase .media-box { max-width: 90%; max-height: 78%; border-radius: 12px; overflow: hidden; box-shadow: 0 0 40px rgba(0,229,255,0.25); }
+  #showcase .media-box img, #showcase .media-box video { max-width: 100%; max-height: 100%; display: block; }
+  #showcase .info-title { font-size: 34px; font-weight: 700; margin-bottom: 16px; }
+  #showcase .info-text { font-size: 26px; color: rgba(255,255,255,0.92); max-width: 1100px; text-align: center; line-height: 1.5; }
+  #showcase .info-tag {
+    margin-top: 20px; font-size: 20px; font-weight: 600; color: #fff;
+    border-radius: 16px; padding: 4px 18px;
+  }
+
+  /* ---------- 视频直播（大白影院） ---------- */
+  #cinema {
+    position: absolute; inset: 0; display: none; z-index: 30; background: #000;
+  }
+  #cinema.show { display: block; }
+  #cinema video { width: 100%; height: 100%; object-fit: contain; }
+  #cinema .bar {
+    position: absolute; left: 0; right: 0; bottom: 0; height: 46px;
+    background: linear-gradient(180deg, transparent, rgba(0,0,0,0.75));
+    display: flex; align-items: center; padding: 0 20px; gap: 14px;
+    font-size: 18px; color: rgba(255,255,255,0.85);
+  }
+  #cinema .bar .t { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #cinema .bar .prog { font-size: 16px; color: rgba(255,255,255,0.6); }
+</style>
+</head>
+<body>
+<div id="screen">
+  <div id="stage">
+    <div id="scanline"></div>
+    <div id="header">
+      <span class="title">◉ 大白直播间</span>
+      <span class="sub">· AI 任务直播</span>
+      <span id="live-badge">LIVE</span>
+      <span id="idle-chip">⚪ 待机 · 新信息自动全屏</span>
+      <span id="clock"></span>
+    </div>
+    <div id="stats">执行中 0 · 待确认 0 · 已完成 0 · 异常 0</div>
+
+    <!-- 内容区：媒体墙 / 工作流链 / 任务卡 -->
+    <div id="content">
+      <div id="media-row">
+        <div class="label">📺 智能体产物 · 实时展示</div>
+        <div id="media-slots"></div>
+      </div>
+      <div id="chain-row">
+        <div id="chain-panel">
+          <div class="head">
+            <span class="t">⚡ 工作流工具链</span>
+            <span class="owner" id="chain-owner"></span>
+          </div>
+          <div id="chain-steps"></div>
+        </div>
+      </div>
+      <div id="task-list"></div>
+    </div>
+
+    <!-- 待机画面 -->
+    <div id="idle">
+      <div class="main">KEEP WATCHING</div>
+      <div class="sub">超能陆战队 · 整装待命</div>
+      <div class="members">🤖 DSH 智能体 · ⚙️ Codex · ✦ OpenCode · 💻 后台命令</div>
+    </div>
+
+    <!-- 全屏焦点（媒体/信息） -->
+    <div id="showcase">
+      <div class="media-box" id="showcase-media"></div>
+      <div class="info-title" id="showcase-title"></div>
+      <div class="info-text" id="showcase-text"></div>
+      <div class="info-tag" id="showcase-tag"></div>
+    </div>
+
+    <!-- 视频直播（大白影院） -->
+    <div id="cinema">
+      <video id="cinema-video" muted playsinline></video>
+      <div class="bar">
+        <span class="t" id="cinema-title"></span>
+        <span class="prog" id="cinema-prog"></span>
+      </div>
+    </div>
+
+    <!-- 跑马灯 -->
+    <div id="ticker"><span class="inner" id="ticker-inner"></span></div>
+  </div>
+</div>
+
+<script>
+/* ============================================================
+ * 网页版大屏数据层：与 3D 大屏同源
+ * - WebSocket /ws 实时推送 task_event（进度/日志/结果增量）
+ * - 轮询 /api/tasks 拿任务列表（2.5s 一次，与 30_task_big_screen 一致）
+ * - 渲染：媒体墙 / 工作流链 / 任务卡 / 待机 / 全屏焦点 / 影院
+ * ============================================================ */
+(function () {
+  'use strict';
+
+  // ---------- 常量与状态 ----------
+  const DRAW_W = 1280, DRAW_H = 720;
+  const SHOWCASE_MS = 60000;   // 全屏焦点停留 1 分钟
+  const MEDIA_MAX = 6;
+  const AGENT_DB = {
+    dsh:      { name: 'DSH 智能体', icon: '🤖', color: '#7c5cff' },
+    opencode: { name: 'OpenCode',   icon: '✦', color: '#00c2ff' },
+    codex:    { name: 'Codex',      icon: '⚙️', color: '#ffb84d' },
+    shell:    { name: '后台命令',   icon: '💻', color: '#4ade80' },
+    steps:    { name: '多步命令',   icon: '🧭', color: '#b39ddb' }
+  };
+  const STATUS = {
+    confirming: { label: '待确认', color: '#ffd54f', icon: '⏳' },
+    queued:     { label: '排队中', color: '#b39ddb', icon: '⏳' },
+    running:    { label: '执行中', color: '#00e5ff', icon: '🔄' },
+    done:       { label: '已完成', color: '#4ade80', icon: '✅' },
+    error:      { label: '失败',   color: '#ff6b6b', icon: '❌' },
+    cancelled:  { label: '已取消', color: '#8c8ca0', icon: '🛑' }
+  };
+
+  let tasks = [];
+  let detailCache = new Map();   // id -> full
+  let mediaItems = [];           // [{ url, kind, el, ready, dead, w, h }]
+  let liveChain = null;          // 工作流工具链
+  let showcase = null;           // { id, kind:'media'|'info', url?, payload?, ts }
+  let showcaseSeq = 0;
+
+  // ---------- DOM 引用 ----------
+  const $ = (id) => document.getElementById(id);
+  const elStats = $('stats'), elMediaRow = $('media-row'), elMediaSlots = $('media-slots');
+  const elChainRow = $('chain-row'), elChainOwner = $('chain-owner'), elChainSteps = $('chain-steps');
+  const elTaskList = $('task-list'), elIdle = $('idle'), elShowcase = $('showcase');
+  const elShowMedia = $('showcase-media'), elShowTitle = $('showcase-title'), elShowText = $('showcase-text'), elShowTag = $('showcase-tag');
+  const elCinema = $('cinema'), elCinemaVideo = $('cinema-video'), elCinemaTitle = $('cinema-title'), elCinemaProg = $('cinema-prog');
+  const elTicker = $('ticker-inner'), elClock = $('clock');
+
+  // ---------- 工具函数 ----------
+  function agentOf(t) {
+    if (t && t.agent && t.agent.name) return t.agent;
+    return AGENT_DB[t && t.channel] || { name: (t && t.channel) || '任务', icon: '•', color: '#8c8ca0' };
+  }
+  function fitText(s, maxLen) {
+    s = String(s == null ? '' : s).replace(/\s+/g, ' ').trim();
+    return s.length > maxLen ? s.slice(0, maxLen) + '…' : s;
+  }
+  function extractMediaUrls(text) {
+    const urls = [];
+    const re = /(?:https?:\/\/[^\s"'<>()]+|\/[^\s"'<>()]+)\.(?:png|jpe?g|gif|webp|avif|bmp|mp4|webm|ogv|mov|m4v)(?:[?#][^\s"'<>()]*)?/gi;
+    let m;
+    while ((m = re.exec(String(text || ''))) !== null) {
+      const u = m[0].replace(/[),.;]+$/, '');
+      if (/\.(png|jpe?g|gif|webp|avif|bmp|mp4|webm|ogv|mov|m4v)(?:[?#]|$)/i.test(u)) urls.push(u);
+    }
+    return urls;
+  }
+
+  // ---------- 数据获取 ----------
+
+  // 活跃任务优先补拉（正在跑的「过程」最需要实时）
+  function activeRank(t) {
+    return ['running', 'confirming', 'queued'].includes(t.status) ? 0 : 1;
+  }
+
+  // 拉任务详情补进缓存；同一任务并发去重，失败静默（下一轮轮询会再补）
+  const detailFetching = new Set();
+  function fetchDetail(id) {
+    if (detailFetching.has(id)) return;
+    detailFetching.add(id);
+    fetch('/api/tasks/' + encodeURIComponent(id)).then(r => r.json()).then(d => {
+      detailFetching.delete(id);
+      if (!d || !d.ok || !d.task) return;
+      detailCache.set(id, d.task);
+      render();
+    }).catch(() => { detailFetching.delete(id); });
+  }
+  function requestTasks() {
+    fetch('/api/tasks').then(r => r.json()).then(data => {
+      if (data && data.ok) {
+        tasks = data.tasks || [];
+        for (const t of tasks) {
+          if (!t || !t.result) continue;
+          const urls = extractMediaUrls(String(t.result));
+          if (urls.length) addMedia(urls, { silent: true });
+        }
+        // 补齐「过程」：不只拉焦点任务 —— detailCache 是内存态，刷新（F5）后清空，
+        // 只补焦点会让其余任务的过程永久空白；这里对所有「缺详情 / 日志比后端少」的任务补拉。
+        const need = tasks.filter(t => {
+          const d = detailCache.get(t.id);
+          if (!d) return true;
+          return (t.logs_count || 0) > ((d.logs || []).length);
+        });
+        need.sort((a, b) => activeRank(a) - activeRank(b));
+        for (const t of need.slice(0, 4)) fetchDetail(t.id);
+        render();
+      }
+    }).catch(() => {});
+    setTimeout(requestTasks, 2500);
+  }
+
+  // ---------- WebSocket 实时推送 ----------
+  function connectWS() {
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    let ws;
+    try { ws = new WebSocket(proto + '://' + location.host + '/ws'); }
+    catch (e) { setTimeout(connectWS, 3000); return; }
+    ws.onopen = () => {
+      const uid = localStorage.getItem('dabai.userId') || 'u_' + Date.now().toString(36);
+      localStorage.setItem('dabai.userId', uid);
+      ws.send(JSON.stringify({ type: 'set_user', user_id: uid }));
+    };
+    ws.onmessage = (ev) => {
+      let msg; try { msg = JSON.parse(ev.data); } catch (e) { return; }
+      if (msg.type === 'task_event') onTaskEvent(msg.event);
+    };
+    ws.onclose = () => setTimeout(connectWS, 3000);
+    ws.onerror = () => { try { ws.close(); } catch (e) {} };
+  }
+
+  function onTaskEvent(ev) {
+    if (!ev || !ev.id) return;
+    let t = detailCache.get(ev.id);
+    if (!t) {
+      // 刷新后缓存为空：先建桩记下这条过程，再补拉完整详情
+      // （原来直接丢弃，导致刷新后非焦点任务的过程永远空白）
+      t = { id: ev.id, title: ev.title || '', status: ev.status || 'running',
+            steps: [], logs: [], result: '', error: '', agent: ev.agent };
+      detailCache.set(ev.id, t);
+      fetchDetail(ev.id);
+    }
+    if (ev.status) t.status = ev.status;
+    if (ev.step) t.steps = [...(t.steps || []), ev.step];
+    if (ev.log) t.logs = [...(t.logs || []), ev.log];
+    if (ev.result !== undefined) t.result = ev.result;
+    if (ev.error !== undefined) t.error = ev.error;
+    if (ev.result !== undefined) {
+      const urls = extractMediaUrls(String(ev.result || ''));
+      if (urls.length) addMedia(urls);
+    }
+    if (ev.status === 'done' || ev.status === 'error') {
+      const resText = String(ev.result || '').trim();
+      const errText = ev.status === 'error' ? String(ev.error || '任务执行失败').trim() : '';
+      const hasText = resText || errText;
+      const withMedia = hasText && extractMediaUrls(resText + ' ' + errText).length > 0;
+      if (hasText && !withMedia) {
+        showcase = {
+          id: 'info-' + (++showcaseSeq), kind: 'info',
+          payload: {
+            title: (ev.status === 'error' ? '❌ ' : '✅ ') + (ev.title || '任务') + ' · ' +
+              (STATUS[ev.status] ? STATUS[ev.status].label : ev.status),
+            text: (ev.status === 'error' ? '⚠️ ' + errText : resText).slice(0, 400),
+            accent: ev.status === 'error' ? '#ff6b6b' : '#4ade80',
+            tag: ev.status === 'error' ? '❌ 任务失败' : '✅ 任务完成'
+          },
+          ts: Date.now()
+        };
+      }
+    }
+    render();
+    requestTasks();
+  }
+
+  // ---------- 媒体墙 ----------
+  function addMedia(urls, opts) {
+    opts = opts || {};
+    if (!Array.isArray(urls)) urls = [urls];
+    let newest = null;
+    for (const raw of urls) {
+      let url = String(raw || '').trim();
+      if (!url) continue;
+      // 相对路径（/generated/xxx.png）拼上当前页面 origin，避免 iframe/跨端口打开时加载失败
+      if (url.startsWith('/')) url = location.origin + url;
+      if (mediaItems.some(it => it.url === url)) continue;
+      const kind = /\.(mp4|webm|ogv|mov|m4v)(?:[?#]|$)/i.test(url) ? 'video' : 'img';
+      const item = { url, kind, el: null, ready: false, dead: false, w: 1280, h: 720 };
+      if (kind === 'video') {
+        const v = document.createElement('video');
+        v.muted = true; v.loop = true; v.playsInline = true; v.preload = 'auto'; v.src = url;
+        v.addEventListener('loadeddata', () => {
+          if (item.dead) return;
+          item.ready = true; item.w = v.videoWidth || 1280; item.h = v.videoHeight || 720;
+          try { const p = v.play(); if (p && p.catch) p.catch(() => {}); } catch (e) {}
+          render();
+        });
+        v.addEventListener('error', () => { item.dead = true; render(); });
+        item.el = v;
+      } else {
+        const im = new Image();
+        im.referrerPolicy = 'no-referrer';
+        im.onload = () => {
+          if (item.dead) return;
+          item.ready = true; item.w = im.naturalWidth || 1280; item.h = im.naturalHeight || 720;
+          render();
+        };
+        im.onerror = () => { item.dead = true; render(); };
+        im.src = url;
+        item.el = im;
+      }
+      mediaItems.push(item);
+      newest = item;
+    }
+    while (mediaItems.length > MEDIA_MAX) {
+      const dropped = mediaItems.shift();
+      if (dropped && dropped.el && dropped.kind === 'video') {
+        try { dropped.el.pause(); } catch (e) {}
+        dropped.el.src = '';
+      }
+    }
+    if (!opts.silent && newest) {
+      showcase = { id: 'media-' + (++showcaseSeq), kind: 'media', url: newest.url, ts: Date.now() };
+    }
+    render();
+  }
+
+  // ---------- 渲染 ----------
+  function render() {
+    window.__bsFrameDirty = true;   // 内容变了 → 末尾的取帧桥立刻取一张（静止时降频兜底）
+    renderClock();
+    renderStats();
+    renderMedia();
+    renderChain();
+    renderTasks();
+    renderShowcase();
+    renderTicker();
+  }
+
+  function renderClock() {
+    if (elClock) elClock.textContent = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+  }
+
+  function renderStats() {
+    const st = { running: 0, confirming: 0, done: 0, error: 0 };
+    for (const t of tasks) if (STATUS[t.status]) st[t.status] = (st[t.status] || 0) + 1;
+    elStats.textContent = '执行中 ' + st.running + '  ·  待确认 ' + st.confirming +
+      '  ·  已完成 ' + st.done + '  ·  异常 ' + st.error;
+  }
+
+  function renderMedia() {
+    const items = mediaItems.filter(it => !it.dead).slice(-MEDIA_MAX);
+    if (!items.length) { elMediaRow.classList.remove('show'); elMediaSlots.innerHTML = ''; return; }
+    elMediaRow.classList.add('show');
+    elMediaSlots.innerHTML = '';
+    const th = Math.min(96, Math.max(64, Math.round(460 / items.length)));
+    for (const it of items) {
+      const slot = document.createElement('div');
+      slot.className = 'media-slot' + (it.kind === 'video' ? ' video' : '');
+      slot.style.height = th + 'px';
+      const ratio = (it.ready && it.w > 0 && it.h > 0) ? (it.w / it.h) : 16 / 9;
+      slot.style.width = Math.max(56, Math.min(200, Math.round(th * ratio))) + 'px';
+      if (it.ready) {
+        if (it.kind === 'video') {
+          const v = document.createElement('video');
+          v.muted = true; v.loop = true; v.playsInline = true; v.autoplay = true; v.src = it.url;
+          slot.appendChild(v);
+        } else {
+          const img = document.createElement('img');
+          img.referrerPolicy = 'no-referrer'; img.src = it.url;
+          slot.appendChild(img);
+        }
+      } else {
+        const ph = document.createElement('div');
+        ph.className = 'ph';
+        ph.innerHTML = '<span class="tag">' + (it.kind === 'video' ? '▶ 视频' : '🖼 图片') + '</span><span class="txt">加载中…</span>';
+        slot.appendChild(ph);
+      }
+      elMediaSlots.appendChild(slot);
+    }
+  }
+
+  function renderChain() {
+    const chain = activeChain();
+    if (!chain) { elChainRow.classList.remove('show'); return; }
+    elChainRow.classList.add('show');
+    elChainOwner.textContent = chain.title || (chain.round ? '对话 · 第 ' + chain.round + ' 轮' : '');
+    elChainSteps.innerHTML = '';
+    for (let i = 0; i < chain.steps.length; i++) {
+      const s = chain.steps[i];
+      const st = s.status === 'running' ? 'running' : s.status === 'error' ? 'error' : s.status === 'done' ? 'done' : 'ended';
+      const mark = s.status === 'running' ? '◌' : s.status === 'error' ? '✕' : s.status === 'done' ? '✓' : '·';
+      const nm = String(s.name || '步骤').replace(/_/g, ' ').slice(0, 12);
+      const chip = document.createElement('span');
+      chip.className = 'chip ' + st;
+      chip.textContent = mark + ' ' + nm;
+      if (i < chain.steps.length - 1) {
+        const arrow = document.createElement('span');
+        arrow.className = 'arrow'; arrow.textContent = '›';
+        chip.appendChild(arrow);
+      }
+      elChainSteps.appendChild(chip);
+    }
+  }
+
+  function activeChain() {
+    let chain = liveChain;
+    if (!chain || !chain.steps || !chain.steps.length) {
+      const focus = tasks.find(t => t.status === 'running') ||
+                    tasks.find(t => ['confirming', 'queued'].includes(t.status));
+      if (!focus) return null;
+      const d2 = detailCache.get(focus.id);
+      if (!d2 || !d2.steps || !d2.steps.length) return null;
+      const lst = d2.steps.slice(-5);
+      chain = {
+        round: 0,
+        title: (focus.agent && focus.agent.name ? focus.agent.name + ' · ' : '') + (focus.title || '任务'),
+        steps: lst.map((s, i) => ({
+          name: s,
+          status: (focus.status === 'running') && i === lst.length - 1 ? 'running' : 'done'
+        }))
+      };
+    }
+    const hasRun = chain.steps.some(s => s.status === 'running');
+    if (!hasRun && Date.now() - (chain.ts || 0) > 60000) return null;
+    return chain;
+  }
+
+  // ---------- 任务卡 ----------
+  function renderTasks() {
+    const shown = tasks.slice(0, 3);
+    if (!shown.length) { elTaskList.innerHTML = ''; return; }
+    elTaskList.innerHTML = '';
+    for (const t of shown) {
+      const meta = STATUS[t.status] || { label: t.status, color: '#ccc', icon: '•' };
+      const ag = agentOf(t);
+      const d2 = detailCache.get(t.id);
+      const hasRes = t.status === 'done' && (t.result || '').trim();
+      const card = document.createElement('div');
+      card.className = 'task-card';
+      card.style.borderColor = ag.color + '77';
+      let line = '';
+      if (t.status === 'confirming') line = '⏳ 等待用户确认后执行…';
+      else if (hasRes) line = '✅ 已交付结果（见下方预览）';
+      else if (d2 && d2.steps && d2.steps.length) line = d2.steps[d2.steps.length - 1];
+      else if (d2 && d2.logs && d2.logs.length) line = '…' + d2.logs[d2.logs.length - 1];
+      // 详情还没补到 → 用列表里的日志尾巴兜底（刷新后卡片不再只剩一个空状态）
+      else if (t.logs_tail && t.logs_tail.length) line = '…' + t.logs_tail[t.logs_tail.length - 1];
+      else if (t.status === 'error' && d2 && d2.error) line = '⚠️ ' + d2.error;
+      const timeStr = new Date(t.updated_at).toLocaleTimeString('zh-CN', { hour12: false });
+      card.innerHTML =
+        '<div class="row1">' +
+          '<span class="icon">' + (ag.icon || '•') + '</span>' +
+          '<span class="agent" style="color:' + ag.color + '">' + fitText(ag.name || '', 12) + '</span>' +
+          '<span class="name">' + fitText(t.title || '任务', 34) + '</span>' +
+          '<span class="status" style="color:' + meta.color + ';border-color:' + meta.color + '88;background:' + meta.color + '2e">' +
+            meta.icon + ' ' + meta.label +
+          '</span>' +
+        '</div>' +
+        (line ? '<div class="line2">' + fitText(line, 60) + '</div>' : '') +
+        (hasRes ? '<div class="result">✓ ' + fitText(String(t.result), 60) + '</div>' : '') +
+        '<span class="time">' + (d2 ? (d2.kind || '') + ' · ' : '') + timeStr + '</span>';
+      elTaskList.appendChild(card);
+    }
+  }
+
+  // ---------- 全屏焦点 ----------
+  function renderShowcase() {
+    if (!showcase) { elShowcase.classList.remove('show'); return; }
+    elShowcase.classList.add('show');
+    if (showcase.kind === 'media') {
+      elShowMedia.style.display = 'block';
+      elShowTitle.style.display = 'none';
+      elShowText.style.display = 'none';
+      elShowTag.style.display = 'none';
+      const it = mediaItems.find(x => x.url === showcase.url);
+      elShowMedia.innerHTML = '';
+      if (it && it.ready) {
+        if (it.kind === 'video') {
+          const v = document.createElement('video');
+          v.muted = true; v.loop = true; v.playsInline = true; v.autoplay = true; v.src = it.url;
+          elShowMedia.appendChild(v);
+        } else {
+          const img = document.createElement('img');
+          img.referrerPolicy = 'no-referrer'; img.src = it.url;
+          elShowMedia.appendChild(img);
+        }
+      } else {
+        elShowMedia.innerHTML = '<div class="ph" style="width:640px;height:360px"><span class="tag">加载中…</span></div>';
+      }
+    } else {
+      elShowMedia.style.display = 'none';
+      elShowTitle.style.display = 'block';
+      elShowText.style.display = 'block';
+      elShowTag.style.display = 'block';
+      elShowTitle.textContent = showcase.payload.title || '';
+      elShowTitle.style.color = showcase.payload.accent || '#00e5ff';
+      elShowText.textContent = showcase.payload.text || '';
+      elShowTag.textContent = showcase.payload.tag || '';
+      elShowTag.style.background = (showcase.payload.accent || '#00e5ff') + '33';
+      elShowTag.style.border = '1.5px solid ' + (showcase.payload.accent || '#00e5ff');
+    }
+  }
+
+  // ---------- 跑马灯 ----------
+  function renderTicker() {
+    const allLogs = [];
+    for (const t of tasks) {
+      const d = detailCache.get(t.id);
+      // 详情还没补到 → 用列表里的日志尾巴兜底，刷新后跑马灯不再空白
+      allLogs.push(...((d && d.logs && d.logs.length) ? d.logs : (t.logs_tail || [])));
+    }
+    if (!allLogs.length) {
+      elTicker.className = 'inner empty';
+      elTicker.textContent = '— 暂无实时日志 · 委派任务后这里会滚动直播 —';
+      return;
+    }
+    elTicker.className = 'inner';
+    elTicker.textContent = allLogs.slice(-6).map(s => s.replace(/\n/g, ' ')).filter(Boolean).join(' ◈ ');
+  }
+
+  // ---------- 启动 ----------
+  function init() {
+    // 等比缩放铺满窗口（保持 1280x720 逻辑分辨率）
+    const stage = document.getElementById('stage');
+    function fit() {
+      const s = Math.min(window.innerWidth / 1280, window.innerHeight / 720);
+      stage.style.transform = 'scale(' + s + ')';
+    }
+    window.addEventListener('resize', fit);
+    fit();
+    renderClock();
+    setInterval(renderClock, 1000);
+    requestTasks();
+    connectWS();
+  }
+
+  // 暴露给外部（3D 大屏 iframe 取帧时可用）
+  window.BigScreen = {
+    getState: () => ({ tasks, mediaItems, liveChain, showcase }),
+    render
+  };
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
+  else init();
+})();
+
+/* ============================================================
+ * 3D 大屏取帧桥：iframe 内自截图 → postMessage 给父页面
+ * 仅当作为隐藏 iframe 嵌入 3D 场景时启用（直接打开预览不启动）。
+ * html2canvas 对同文档截图完全支持（跨 iframe 截图才受限），
+ * 所以由本页自己截自己，把帧数据传给父页面贴到 Billboard 纹理。
+ * ============================================================ */
+(function () {
+  if (window.parent === window) return; // 直接打开预览：不启动截图
+  let h2c = null;
+  const s = document.createElement('script');
+  s.src = '/static/vendor/html2canvas.min.js';
+  s.onload = () => {
+    h2c = window.html2canvas;
+    window.parent.postMessage({ type: 'bigscreen-ready', w: 1280, h: 720 }, '*');
+    // 取帧节奏：内容一变就取（300ms 上限），完全静止时降到 1s 兜底。
+    // 原来是固定 300ms 全屏截图 —— html2canvas 要遍历 DOM、解析全部计算样式、
+    // 光栅化 1280×720，再 getImageData 拷 3.6MB 像素；内容静止时这些全是白烧的
+    // 主线程（实测空闲时吃掉约一半 CPU，帧 p95 被抬到 18ms）。
+    let lastShot = 0;
+    // 父页面进入「聊天全屏」时会通知暂停：那时 3D 大屏整个看不见，
+    // html2canvas 每帧遍历全文档 + 解析计算样式 + 光栅化 1280×720 全是白烧。
+    let paused = false;
+    window.addEventListener('message', (ev) => {
+      const d = ev.data;
+      if (d && d.type === 'bigscreen-pause') paused = !!d.on;
+    });
+    const ACTIVE_MS = 300, IDLE_MS = 1000;
+    setInterval(() => {
+      if (!h2c || document.hidden || paused) return;
+      const stage = document.getElementById('stage');
+      if (!stage) return;
+      const now = Date.now();
+      const dirty = !!window.__bsFrameDirty;
+      if (now - lastShot < (dirty ? ACTIVE_MS : IDLE_MS)) return;
+      window.__bsFrameDirty = false;
+      lastShot = now;
+      h2c(stage, { backgroundColor: null, scale: 1, logging: false, useCORS: true })
+        .then(cv => {
+          const c = cv.getContext('2d');
+          const id = c.getImageData(0, 0, cv.width, cv.height);
+          window.parent.postMessage({ type: 'bigscreen-frame', w: cv.width, h: cv.height, data: id.data.buffer }, '*');
+        })
+        .catch(() => {});
+    }, 150);
+  };
+  s.onerror = () => { window.parent.postMessage({ type: 'bigscreen-fail' }, '*'); };
+  document.head.appendChild(s);
+})();
+</script>
+</body>
+</html>

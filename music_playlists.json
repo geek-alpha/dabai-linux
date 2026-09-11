@@ -1,0 +1,58 @@
+[
+  {
+    "id": "800905a82cc7",
+    "name": "owl city",
+    "created": 1787419332,
+    "songs": [
+      {
+        "source": "netease",
+        "id": "1807794",
+        "name": "Enchanted",
+        "artists": "Owl City"
+      },
+      {
+        "source": "netease",
+        "id": "27090406",
+        "name": "Live It Up",
+        "artists": "Owl City"
+      },
+      {
+        "source": "netease",
+        "id": "1894008176",
+        "name": "Unbelievable",
+        "artists": "Owl City/Hanson"
+      },
+      {
+        "source": "netease",
+        "id": "3395378720",
+        "name": "Good Time",
+        "artists": "Owl City/Carly Rae Jepsen"
+      },
+      {
+        "source": "kuwo",
+        "id": "151374150",
+        "name": "Beautiful Times",
+        "artists": "Owl City\\/Lindsey Stirling"
+      }
+    ]
+  },
+  {
+    "id": "88ea4f7c59e2",
+    "name": "毛不易",
+    "created": 1787420381,
+    "songs": [
+      {
+        "source": "netease",
+        "id": "569200213",
+        "name": "消愁",
+        "artists": "毛不易"
+      },
+      {
+        "source": "netease",
+        "id": "569213220",
+        "name": "像我这样的人",
+        "artists": "毛不易"
+      }
+    ]
+  }
+]

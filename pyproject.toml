@@ -1,0 +1,31 @@
+[tool.pytest.ini_options]
+# mmd_tools_new 是外部参考代码（Blender 的 MMD 插件），它的 tests 依赖 bpy——
+# 只有 Blender 自带的那份 Python 才有这个模块。
+#
+# 留着它，任何一次裸跑 pytest 都会以
+#     Interrupted: 3 errors during collection
+# 收场：一个测试都没跑，退出码却是失败——看起来像整个测试套坏了。
+# 这类「假警报」比没有测试更糟，它会训练人忽略失败。
+#
+# 为什么用 pyproject.toml 而不是 pytest.ini：pytest.ini 由 iniconfig 读取，
+# 编码跟随系统 locale（Windows 中文 = GBK）。本文件第一版写的就是 pytest.ini，
+# 中文注释直接被 GBK 解码成 UnicodeDecodeError，配置解析失败、收集全崩。
+# TOML 规范强制 UTF-8，中文注释安全——想写清楚理由，就只能用它。
+#
+# norecursedirs 一旦显式设置就会覆盖 pytest 默认值，
+# 所以默认那几个（.* build dist venv *.egg）必须一起写回来。
+norecursedirs = [
+    "mmd_tools_new",
+    "node_modules",
+    ".*",
+    "build",
+    "dist",
+    "venv",
+    "*.egg",
+    "__pycache__",
+    "audio_cache",
+]
+
+# 收集阶段不因单个模块导入失败而中断——一个坏模块不该挡住其余测试。
+# 兜底用：将来若又混进需要特殊运行时的目录，也不会再出现「全中断」。
+addopts = "--continue-on-collection-errors"

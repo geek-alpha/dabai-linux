@@ -1,0 +1,162 @@
+{
+    "三月七": {
+        "ref_audio_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\三月七\\你看你看，小家伙有反应了！看来它也很喜欢这个名字～.wav",
+        "prompt_text": "你看你看，小家伙有反应了！看来它也很喜欢这个名字～",
+        "GPT_weights_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\三月七\\三月七-e10.ckpt",
+        "Sovits_weights_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\三月七\\三月七_e10_s1460.pth",
+        "character_style": "俏皮女声",
+        "face": "猫耳女王"
+    },
+    "元太": {
+        "ref_audio_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\元太\\呀呀呀呀呀，这个可恶的九条天狗，居然给老大定了这种重罪！.wav",
+        "prompt_text": "呀呀呀呀呀，这个可恶的九条天狗，居然给老大定了这种重罪！",
+        "GPT_weights_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\元太\\元太_ZH-e10.ckpt",
+        "Sovits_weights_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\元太\\元太_ZH_e10_s160_l32.pth",
+        "character_style": "直来直往的热血易怒的少年声音",
+        "face": "牛角剑客"
+    },
+    "光头强": {
+        "ref_audio_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\光头强\\没人哪，难道我听错了？算了，吃饱了睡会儿去，晚上还得干活.wav",
+        "prompt_text": "没人哪，难道我听错了？算了，吃饱了睡会儿去，晚上还得干活",
+        "GPT_weights_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\光头强\\guangtouqiang-e15.ckpt",
+        "Sovits_weights_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\光头强\\guangtouqiang_e4_s100.pth",
+        "character_style": "这个音色是男声，适合表现憨厚、愚蠢、倒霉的角色。声音浑厚、低沉，带有一定的亲和力和幽默感，适合表现屌丝。",
+        "face": "奶龙"
+    },
+    "凯亚": {
+        "ref_audio_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\凯亚\\嗯，在峡谷出现之前，我隐约听到了某种东西转动的声响。.wav",
+        "prompt_text": "嗯，在峡谷出现之前，我隐约听到了某种东西转动的声响。",
+        "GPT_weights_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\凯亚\\凯亚_ZH-e10.ckpt",
+        "Sovits_weights_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\凯亚\\凯亚_ZH_e10_s1130_l32.pth",
+        "character_style": "坚毅果敢的男声",
+        "face": "牛角剑客"
+    },
+    "凯撒": {
+        "ref_audio_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\凯撒\\沈家要拍的话，能不能稍微拍的可爱点儿？.wav",
+        "prompt_text": "沈家要拍的话，能不能稍微拍的可爱点儿？",
+        "GPT_weights_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\凯撒\\凯撒-e10.ckpt",
+        "Sovits_weights_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\凯撒\\凯撒_e10_s520_l32.pth",
+        "character_style": "这个适合表现责任感强的女角色",
+        "face": "zzz妮可"
+    },
+    "刻晴": {
+        "ref_audio_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\刻晴\\这么多式样、这么多质地、这么多选择…啊，这就是「消费」呀，真是令人难以抵御的魅力。.wav",
+        "prompt_text": "这么多式样、这么多质地、这么多选择…啊，这就是「消费」呀，真是令人难以抵御的魅力。",
+        "GPT_weights_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\刻晴\\刻晴_ZH-e10.ckpt",
+        "Sovits_weights_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\刻晴\\刻晴_ZH_e10_s490_l32.pth",
+        "character_style": "这个适合表现责任感强的女角色",
+        "face": "王者荣耀-王昭君-偶像歌手"
+    },
+    "可莉": {
+        "ref_audio_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\可莉\\玩得太开心，忘、忘在脑后了….wav",
+        "prompt_text": "玩得太开心，忘、忘在脑后了…",
+        "GPT_weights_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\可莉\\可莉_ZH-e10.ckpt",
+        "Sovits_weights_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\可莉\\可莉_ZH_e10_s530_l32.pth",
+        "character_style": "这个声音适合表现可爱的萝莉",
+        "face": "zzz安比"
+    },
+    "吴船长": {
+        "ref_audio_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\吴船长\\茶馆的小菜虽然便宜但不好吃，我去买点水果请你们，你们等着。.wav",
+        "prompt_text": "茶馆的小菜虽然便宜但不好吃，我去买点水果请你们，你们等着。",
+        "GPT_weights_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\吴船长\\吴船长_ZH-e10.ckpt",
+        "Sovits_weights_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\吴船长\\吴船长_ZH_e10_s150_l32.pth",
+        "character_style": "豪爽的中年船长的的声音",
+        "face": "黑多客船长"
+    },
+    "奶龙": {
+        "ref_audio_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\奶龙\\啊！这是什么枪？帅是帅，但你肯定没用过工兵铲，给你换一下.wav",
+        "prompt_text": "啊！这是什么枪？帅是帅，但你肯定没用过工兵铲，给你换一下",
+        "GPT_weights_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\奶龙\\奶龙-e40.ckpt",
+        "Sovits_weights_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\奶龙\\奶龙_e20_s500.pth",
+        "character_style": "这个奶龙的声音适合搞怪",
+        "face": "奶龙"
+    },
+    "娜塔莎": {
+        "ref_audio_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\娜塔莎\\哈哈，我觉得这几位都是心地善良的人哦。.wav",
+        "prompt_text": "哈哈，我觉得这几位都是心地善良的人哦。",
+        "GPT_weights_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\娜塔莎\\娜塔莎-e10.ckpt",
+        "Sovits_weights_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\娜塔莎\\娜塔莎_e10_s270.pth",
+        "character_style": "这个奶龙的声音适合搞怪",
+        "face": "娜塔莎"
+    },
+    "开拓者(男)": {
+        "ref_audio_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\开拓者(男)\\对了，我要是抡起球棒一砸，你就不得不请人来核计损失索赔吧？这样一来，岂不就省去了安全检查？.wav",
+        "prompt_text": "对了，我要是抡起球棒一砸，你就不得不请人来核计损失索赔吧？这样一来，岂不就省去了安全检查？",
+        "GPT_weights_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\开拓者(男)\\开拓者(男)-e10.ckpt",
+        "Sovits_weights_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\开拓者(男)\\开拓者(男)_e10_s470.pth",
+        "character_style": "机灵睿智又有点浮夸的男声",
+        "face": "秦彻"
+    },
+    "星见雅": {
+        "ref_audio_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\星见雅\\你所谓真正的正义和普通的正义区别，为何难道就像是真正的蜜瓜和蜜瓜味棒棒糖那样的区别吗？.wav",
+        "prompt_text": "你所谓真正的正义和普通的正义区别，为何难道就像是真正的蜜瓜和蜜瓜味棒棒糖那样的区别吗？",
+        "GPT_weights_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\星见雅\\雅-e10.ckpt",
+        "Sovits_weights_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\星见雅\\雅_e10_s170.pth",
+        "character_style": "这个音色是女声，有点高冷、清冷的感觉，适合表现独立、坚强、聪明的女性角色。",
+        "face": "星见雅"
+    },
+    "比利": {
+        "ref_audio_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\比利\\等等殿长，你们到底在说什么？为什么会提到瑞恩？.wav",
+        "prompt_text": "等等殿长，你们到底在说什么？为什么会提到瑞恩？",
+        "GPT_weights_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\比利\\比利-e10.ckpt",
+        "Sovits_weights_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\比利\\比利_e10_s700_l32.pth",
+        "character_style": "狂拽酷又搞笑的男声",
+        "face": "京田四郎"
+    },
+    "爱莲": {
+        "ref_audio_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\爱莲\\嗯，幽灵小姐狼人先生和巨子少女。.wav",
+        "prompt_text": "嗯，幽灵小姐狼人先生和巨子少女。",
+        "GPT_weights_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\爱莲\\艾莲-e10.ckpt",
+        "Sovits_weights_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\爱莲\\艾莲_e10_s450_l32.pth",
+        "character_style": "这个适合表现脾气火爆的女角色",
+        "face": "zzz鲨鱼妹"
+    },
+    "胡桃": {
+        "ref_audio_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\胡桃\\嘿嘿，毕竟找活人不是我擅长的事嘛，如果让我找的是「边界」另一边的人….wav",
+        "prompt_text": "嘿嘿，毕竟找活人不是我擅长的事嘛，如果让我找的是「边界」另一边的人…",
+        "GPT_weights_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\胡桃\\胡桃_ZH-e10.ckpt",
+        "Sovits_weights_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\胡桃\\胡桃_ZH_e10_s860_l32.pth",
+        "character_style": "俏皮的女孩",
+        "face": "瘦弱女学生"
+    },
+    "艾丝妲": {
+        "ref_audio_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\艾丝妲\\怎么会呢，螺丝咕姆先生，欢迎您造访黑塔空间站。.wav",
+        "prompt_text": "怎么会呢，螺丝咕姆先生，欢迎您造访黑塔空间站。",
+        "GPT_weights_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\艾丝妲\\艾丝妲-e10.ckpt",
+        "Sovits_weights_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\艾丝妲\\艾丝妲_e10_s170.pth",
+        "character_style": "矜持礼貌温和的女声",
+        "face": "星穹铁道翁法洛斯"
+    },
+    "芙宁娜": {
+        "ref_audio_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\芙宁娜\\根据故事走向，前往特定情景吗？听起来挺新颖。所以信封里写了什么？.wav",
+        "prompt_text": "根据故事走向，前往特定情景吗？听起来挺新颖。所以信封里写了什么？",
+        "GPT_weights_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\芙宁娜\\芙宁娜_ZH-e10.ckpt",
+        "Sovits_weights_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\芙宁娜\\芙宁娜_ZH_e10_s950_l32.pth",
+        "character_style": "阳光开朗的女孩",
+        "face": "水神芙芙"
+    },
+    "苍角": {
+        "ref_audio_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\苍角\\另外关于吃的我完全没有忌口，只要是好吃的，我什么都可以吃啊。.wav",
+        "prompt_text": "另外关于吃的我完全没有忌口，只要是好吃的，我什么都可以吃啊。",
+        "GPT_weights_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\苍角\\苍角-e10.ckpt",
+        "Sovits_weights_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\苍角\\苍角_e10_s110.pth",
+        "character_style": "这个音色是童声，适合表现活泼、可爱、天真无邪的角色。声音清脆、明亮，带有一定的稚气和童趣，适合表现童真、纯真、快乐等特质。",
+        "face": "小公主"
+    },
+    "莱卡恩": {
+        "ref_audio_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\莱卡恩\\不过如果真如阁下所说，这位发帖人只是在恶作剧的话，倒也无妨。.wav",
+        "prompt_text": "不过如果真如阁下所说，这位发帖人只是在恶作剧的话，倒也无妨。",
+        "GPT_weights_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\莱卡恩\\莱卡恩-e10.ckpt",
+        "Sovits_weights_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\莱卡恩\\莱卡恩_e10_s560.pth",
+        "character_style": "这个音色是男声，适合冷静、理智、沉稳的角色，声音清晰、低沉，带有一定的磁性和深度，适合表现智慧、权威、神秘等特质。",
+        "face": "牛角剑客"
+    },
+    "鼹鼠先生": {
+        "ref_audio_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\鼹鼠先生\\那么事不宜迟，升降下一个性标的放置也多亏你呃，冬眠了。.wav",
+        "prompt_text": "那么事不宜迟，升降下一个性标的放置也多亏你呃，冬眠了。",
+        "GPT_weights_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\鼹鼠先生\\「鼹鼠先生」-e10.ckpt",
+        "Sovits_weights_path": "D:\\AI\\GPT-SoVITS-v3lora-20250228\\refer_audio\\鼹鼠先生\\「鼹鼠先生」_e10_s210_l32.pth",
+        "character_style": "中年男声，成熟稳重",
+        "face": "鼹鼠先生"
+    }
+}
