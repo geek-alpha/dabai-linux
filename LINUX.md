@@ -333,6 +333,24 @@ sudo -n /usr/local/sbin/dabai-secrets sync     # 免密（只给 sync 免密，s
 ```
 
 
+**源配置快照**：`settings.json` / `nodes.json` 既含密钥又**未被 git 跟踪** ——
+git 救不了它们。实测事故：一条 `>` 重定向覆盖 + 一次 `rm`，`settings.json` 就彻底没了
+（靠清理前的 `~/dabai-backup/configs-*/` 才捞回来，逐字节一致）。
+
+现在每次同步顺带做一份滚动快照到 `/var/backups/dabai-configs/`（0700 / 文件 0600，
+最近 20 份，仅在内容或文件集合变化时新增，目录名 = 时间戳-内容摘要前 8 位）。
+回退一份：
+
+```bash
+sudo ls -1t /var/backups/dabai-configs/
+sudo cp /var/backups/dabai-configs/<份>/settings.json ~/dabai/settings.json
+sudo -n /usr/local/sbin/dabai-secrets sync
+```
+
+**教训**：测试「文件被误加进暂存区」这类场景时，我用 `>` 重定向和 `rm -f` 去构造现场，
+直接毁掉了活的配置文件。构造破坏性场景必须在临时副本上做，绝不动真实文件。
+
+
 ### 6.8 仓库密钥防线（`deploy/gitguard/`）
 
 **背景**：仓库 11 个提交里一直带着明文 API key。`.gitignore` 只能拦

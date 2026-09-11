@@ -35,12 +35,15 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 VERSION = "1.0.0"
@@ -78,6 +81,23 @@ NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 SAFE_VALUE_RE = re.compile(r"^[A-Za-z0-9._~+/=:@%\-]*$")
 
 SOURCES = ("settings.json", "codex_config.json", "stt_config.json")
+
+# ---------- 源文件快照（防误删 / 改坏）----------
+
+# settings.json / nodes.json 这类文件既含密钥又未被 git 跟踪 —— git 救不了它们。
+# 实测事故：一条 `>` 重定向覆盖 + 一次 rm，settings.json 就彻底没了。
+# 所以每次同步顺带做一份滚动快照。
+SNAPSHOT_DIR = Path(os.environ.get("DABAI_SNAPSHOT_DIR") or "/var/backups/dabai-configs")
+SNAPSHOT_KEEP = 20
+SNAPSHOT_STATE = Path(
+    os.environ.get("DABAI_SNAPSHOT_STATE") or "/var/lib/dabai-configs-snapshot.sha256"
+)
+SNAPSHOT_FILES = (
+    "settings.json", "codex_config.json", "stt_config.json", "tts_config.json",
+    "cards.json", "character_cards.json", "nodes.json",
+)
+# 只认自己建的目录（清理时不会被别的目录干扰）
+SNAPSHOT_NAME_RE = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{8}$")
 
 
 class SecretError(Exception):
@@ -384,8 +404,86 @@ def apply_perms() -> list[str]:
     return notes
 
 
+def snapshot_sources(repo: Path, *, quiet: bool = False) -> dict:
+    """把源配置快照进 SNAPSHOT_DIR；内容没变就不落盘。
+
+    只在「内容或文件集合发生变化」时存一份，保留最近 SNAPSHOT_KEEP 份，
+    目录 0700 / 文件 0600。失败一律不抛异常 —— 快照是兜底，
+    绝不能因为它坏了而连累主同步链。
+    """
+    files: dict[str, bytes] = {}
+    for name in SNAPSHOT_FILES:
+        p = repo / name
+        try:
+            if p.is_file():
+                files[name] = p.read_bytes()
+        except OSError:
+            pass
+    if not files:
+        return {"saved": False, "reason": "无源文件可快照"}
+
+    digest = hashlib.sha256()
+    for name in sorted(files):
+        digest.update(name.encode("utf-8"))
+        digest.update(files[name])
+    cur = digest.hexdigest()
+
+    try:
+        if SNAPSHOT_STATE.is_file() and SNAPSHOT_STATE.read_text().strip() == cur:
+            return {"saved": False, "reason": "内容未变"}
+    except OSError:
+        pass
+
+    # 已有同内容的快照 → 不重复存（否则「内容改回去」会把滚动窗口撑满重复份）
+    try:
+        if SNAPSHOT_DIR.is_dir():
+            for d in SNAPSHOT_DIR.iterdir():
+                if (d.is_dir() and SNAPSHOT_NAME_RE.match(d.name)
+                        and d.name.endswith(cur[:8])):
+                    try:
+                        SNAPSHOT_STATE.parent.mkdir(parents=True, exist_ok=True)
+                        SNAPSHOT_STATE.write_text(cur, encoding="utf-8")
+                    except OSError:
+                        pass
+                    return {"saved": False, "reason": "同内容快照已存在", "dir": str(d)}
+    except OSError:
+        pass
+
+    # 名字带内容摘要：同一秒内多次变化不会互相覆盖，内容相同则天然去重
+    dest = SNAPSHOT_DIR / (time.strftime("%Y%m%d-%H%M%S") + "-" + cur[:8])
+    try:
+        SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+        os.chmod(SNAPSHOT_DIR, 0o700)
+        dest.mkdir(mode=0o700, exist_ok=True)
+        for name, data in files.items():
+            f = dest / name
+            f.write_bytes(data)
+            os.chmod(f, 0o600)
+        SNAPSHOT_STATE.parent.mkdir(parents=True, exist_ok=True)
+        SNAPSHOT_STATE.write_text(cur, encoding="utf-8")
+    except OSError as exc:
+        return {"saved": False, "reason": f"写入失败：{exc}"}
+
+    removed: list[str] = []
+    try:
+        snaps = sorted(
+            d for d in SNAPSHOT_DIR.iterdir()
+            if d.is_dir() and SNAPSHOT_NAME_RE.match(d.name)
+        )
+        for old in snaps[:-SNAPSHOT_KEEP]:
+            shutil.rmtree(old, ignore_errors=True)
+            removed.append(old.name)
+    except OSError:
+        pass
+
+    if not quiet:
+        print(f"✓ 配置快照 → {dest}（{len(files)} 个文件；保留最近 {SNAPSHOT_KEEP} 份）")
+    return {"saved": True, "dir": str(dest), "count": len(files), "removed": removed}
+
+
 def sync(repo: Path, *, dry_run: bool = False, quiet: bool = False) -> dict:
     """核心同步：采集 → 渲染 → 与现有内容比对 → 仅在变化时原子写。"""
+    snap = snapshot_sources(repo, quiet=quiet)
     items, warnings = collect(repo)
     new_block = render_block(items, repo)
     existing = read_target() if TARGET.is_file() else ""
@@ -398,6 +496,7 @@ def sync(repo: Path, *, dry_run: bool = False, quiet: bool = False) -> dict:
         "items": items,
         "warnings": warnings,
         "target": str(TARGET),
+        "snapshot": snap,
     }
 
     if dry_run:

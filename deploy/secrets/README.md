@@ -32,6 +32,8 @@
 | `/etc/profile.d/00-dabai-secrets.sh` | 登录 shell 注入（先判 `[ -r ]`） | `root:root 644` |
 | `/etc/systemd/system/myservice.service.d/30-secrets.conf` | `EnvironmentFile=-/etc/dabai/secrets.env` | `root:root 644` |
 | `/etc/sudoers.d/dabai-secrets` | 只给 `sync` 免密 | `root:root 0440` |
+| `/var/backups/dabai-configs/` | **源配置滚动快照**（最近 20 份，只在内容变化时新增） | `root:root 0700` |
+| `/var/lib/dabai-configs-snapshot.sha256` | 快照去重用的内容摘要 | `root:root 0644` |
 
 ## 变量命名
 
@@ -61,6 +63,35 @@ sudo -n /usr/local/sbin/dabai-secrets set GITHUB_TOKEN ghp_xxx
 
 变量名有白名单（`DABAI_` / `EXA_` / `TAVILY_` / `GITHUB_` / `OPENAI_` / `ANTHROPIC_` / `HF_` …），
 `PATH` / `LD_PRELOAD` / `IFS` 一律拒绝 —— 否则这个文件就成了注入任意环境变量的提权跳板。
+
+## 源配置快照（防误删 / 改坏）
+
+`settings.json` / `nodes.json` 这类文件**既含密钥又未被 git 跟踪** —— git 救不了它们。
+实测事故：一条 `>` 重定向覆盖 + 一次 `rm`，`settings.json` 就彻底没了。
+
+所以每次同步顺带做一份滚动快照：
+
+```
+/var/backups/dabai-configs/20260912-004007-8ba3a388/
+    settings.json  codex_config.json  stt_config.json  tts_config.json
+    cards.json     character_cards.json  nodes.json
+```
+
+设计要点：
+
+- **只在内容或文件集合变化时新增**，保留最近 20 份（内容改回去不会重复占位）
+- 目录名 = `时间戳-内容摘要前8位`，所以**同一秒内多次变化不会互相覆盖**
+  （第一版只用时间戳，实测同一秒内 3 次变化只剩 1 份 —— 直接丢掉了可回退的历史）
+- 快照失败**绝不抛异常**：它是兜底，不能因为它坏了而连累主同步链
+- 清理只认自己建的目录名（正则匹配），不碰目录里别的东西
+
+回退一份配置：
+
+```bash
+sudo ls -1t /var/backups/dabai-configs/            # 按时间列快照
+sudo cp /var/backups/dabai-configs/<快照>/settings.json ~/dabai/settings.json
+sudo -n /usr/local/sbin/dabai-secrets sync          # 让派生变量跟上
+```
 
 ## 常用命令
 
