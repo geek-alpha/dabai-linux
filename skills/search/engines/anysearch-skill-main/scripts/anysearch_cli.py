@@ -76,10 +76,14 @@ def _get(url: str, params: dict | None = None, headers: dict | None = None,
     if headers:
         h.update(headers)
     last = None
-    for proxies in web_impl._proxy_candidates():
+    for proxies in web_impl._proxy_candidates(url):
         try:
-            r = requests.get(url, params=params, headers=h, timeout=timeout, proxies=proxies)
-            if r.status_code == 200:
+            # connect 超时压到 6s：被墙域名直连会挂到超时，不压短就是白等。
+            r = requests.get(url, params=params, headers=h,
+                             timeout=(min(6.0, float(timeout)), float(timeout)),
+                             proxies=proxies)
+            # 2xx 而非仅 200：DDG 等站点对爬虫会返回 202，只认 200 会误判为失败。
+            if 200 <= r.status_code < 300:
                 return r
             last = RuntimeError(f"HTTP {r.status_code}")
         except Exception as e:  # noqa: BLE001

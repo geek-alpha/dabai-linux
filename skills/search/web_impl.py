@@ -15,8 +15,9 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from html.parser import HTMLParser
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit
 
 try:
     import requests
@@ -31,6 +32,32 @@ _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 # 原实现无条件把代理排进候选链：代理没起时每次失败都要再白等一轮 connect 超时。
 _PROXY_URL = "http://127.0.0.1:7890"
 
+# 直连必失败的墙外域名（实测：直连 000 / DNS 投毒）。命中则代理优先，
+# 不再先白等一轮直连超时——这是搜索慢的主因。
+_PROXY_FIRST_HOSTS = (
+    # bing.com 也在内：国内 IP 直连会被降级成「主关键词」宽泛结果
+    # （实测搜 python asyncio tutorial 只给 python.org 首页），走代理才是真实排序。
+    "bing.com",
+    "brave.com",
+    "google.com", "gstatic.com", "googleapis.com", "googlevideo.com",
+    "youtube.com", "ytimg.com", "duckduckgo.com", "wikipedia.org",
+    "wikimedia.org", "arxiv.org", "huggingface.co", "hf.co",
+    "githubusercontent.com", "twitter.com", "x.com", "openai.com",
+    "anthropic.com", "reddit.com", "medium.com", "semanticscholar.org",
+    "sciencedirect.com", "springer.com", "nature.com", "quora.com",
+    "telegram.org", "discord.com",
+)
+
+
+def _needs_proxy(url: str) -> bool:
+    """目标域名是否属于墙外（后缀精确匹配，避免 x.com 误伤 v2x.com 这类）。"""
+    try:
+        host = (urlsplit(url).hostname or "").lower()
+    except Exception:  # noqa: BLE001
+        return False
+    return bool(host) and any(host == h or host.endswith("." + h)
+                              for h in _PROXY_FIRST_HOSTS)
+
 
 def _proxy_alive(host: str = "127.0.0.1", port: int = 7890, timeout: float = 0.4) -> bool:
     """探测本地代理端口是否真的在监听（0.4s 连不上即视为不可用）。"""
@@ -42,11 +69,18 @@ def _proxy_alive(host: str = "127.0.0.1", port: int = 7890, timeout: float = 0.4
         return False
 
 
-def _proxy_candidates() -> list:
-    """返回本次请求的代理候选链：直连，代理仅在监听时追加。"""
-    if _proxy_alive():
-        return [None, {"http": _PROXY_URL, "https": _PROXY_URL}]
-    return [None]
+def _proxy_candidates(url: str = "") -> list:
+    """返回本次请求的代理候选链。
+
+    墙外域名代理优先且不兜底直连（直连必失败，兜底只会白等一轮 6s 连接超时）；
+    其余直连优先、代理兜底。代理未监听时一律直连，不引入额外超时。
+    """
+    if not _proxy_alive():
+        return [None]
+    proxy = {"http": _PROXY_URL, "https": _PROXY_URL}
+    if url and _needs_proxy(url):
+        return [proxy]
+    return [None, proxy]
 def _find_chrome() -> str:
     """定位可用的 Chrome/Chromium（跨平台）：环境变量 DABAI_CHROME → 常见路径 → PATH。"""
     env = (os.environ.get("DABAI_CHROME") or "").strip().strip('"')
@@ -87,11 +121,14 @@ def _session_get(url: str, timeout: float = 20.0):
     if not _HAS_REQUESTS:
         raise RuntimeError("requests 未安装")
     last = None
-    for proxies in _proxy_candidates():
+    # connect 超时压到 6s：被墙的直连会在 TCP/TLS 阶段挂死，不压短就是白等。
+    tmo = (min(6.0, float(timeout)), float(timeout))
+    for proxies in _proxy_candidates(url):
         try:
             r = requests.get(url, headers={"User-Agent": _UA},
-                             timeout=timeout, proxies=proxies)
-            if r.status_code == 200:
+                             timeout=tmo, proxies=proxies)
+            # 2xx 而非仅 200：DDG 对爬虫正常返回 202，只认 200 会把它误判为失败。
+            if 200 <= r.status_code < 300:
                 return r
             last = RuntimeError(f"HTTP {r.status_code}")
         except Exception as e:
@@ -112,8 +149,11 @@ def _chrome_dom(url: str, timeout: float = 30.0) -> str:
             cmd.append("--portable")
         cmd += ["--headless=new", "--disable-gpu", "--no-sandbox", "--no-first-run",
                 "--no-default-browser-check", "--disable-extensions",
-                "--disable-dev-shm-usage", "--virtual-time-budget=8000",
-                "--dump-dom", f"--user-data-dir={_CHROME_PROFILE}", url]
+                "--disable-dev-shm-usage", "--virtual-time-budget=8000"]
+        # 墙外页面必须让浏览器自己也走代理，否则 Chrome 直连照样拿不到 DOM。
+        if _proxy_alive() and _needs_proxy(url):
+            cmd.append(f"--proxy-server={_PROXY_URL}")
+        cmd += ["--dump-dom", f"--user-data-dir={_CHROME_PROFILE}", url]
         p = subprocess.run(cmd, capture_output=True, timeout=timeout)
         return p.stdout.decode("utf-8", "replace")
     except Exception:
@@ -247,13 +287,85 @@ _DDG_LITE_PAT = re.compile(
     r'<a[^>]*class="result-link"[^>]*href="([^"]+)"[^>]*>(.*?)</a>.*?'
     r'<td[^>]*class="result-snippet"[^>]*>(.*?)</td>', re.S)
 
-# (引擎名, URL 模板, 解析正则, 单次超时秒)
+# (引擎名, URL 模板, 解析器, 单次超时秒)
+# 前两个并行主力，其余降级兜底。实测（2026-09-11）：
+#   bing-rss 是唯一稳定拿到「真实排序」的通道——HTML 页在爬虫模式下会被降级；
+#   ddg 质量最好但公共出口 IP 会被反爬挑战页拦截（保留为机会型副引擎）。
+def _parse_bing_rss(text: str) -> list:
+    """Bing RSS 通道（format=rss）：主引擎。
+
+    HTML 页在爬虫模式下会被降级成「主关键词」宽泛结果（搜 asyncio 教程只返回
+    python.org 首页），RSS 通道返回的才是真实排序；且 XML 结构稳定，不受前端改版影响。
+    """
+    out = []
+    for item in re.findall(r"<item>(.*?)</item>", text, re.S):
+        ti = re.search(r"<title>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</title>", item, re.S)
+        li = re.search(r"<link>(.*?)</link>", item, re.S)
+        de = re.search(r"<description>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</description>", item, re.S)
+        if not (ti and li):
+            continue
+        url = li.group(1).strip()
+        if not url.startswith("http"):
+            continue
+        out.append((_clean_text(ti.group(1)), url,
+                    _clean_text(de.group(1))[:200] if de else ""))
+    return out
+
+
+def _regex_parser(pat, ddg: bool = False):
+    """把「正则命中」包装成与 _parse_bing_rss 同签名的解析器。"""
+    def _parse(text: str) -> list:
+        return _hits_structured(pat.findall(text), ddg=ddg, limit=12)
+    return _parse
+
+
+def _parse_brave(text: str) -> list:
+    """Brave Search：能正确理解 sing-box 这类连字符词的免费通道（实测）。
+
+    Bing 把 `sing-box` 里的 `-box` 当排除运算符，搜「sing-box hysteria2 config」
+    返回电影《Sing》；Brave 同一条查询直接命中 sing-box 官方文档。
+    Svelte SSR 结构：<div class="snippet" data-type="web"> 内 <a href> 带 URL 与标题，
+    紧随其后的 generic-snippet 是摘要。
+    """
+    out = []
+    for blk in re.split(r'<div class="snippet[^"]*"[^>]*data-type="web"', text)[1:]:
+        m = re.search(r'<a href="(https?://[^"]+)"[^>]*>.*?'
+                      r'<div class="title search-snippet-title[^"]*"[^>]*>(.*?)</div>',
+                      blk, re.S)
+        if not m:
+            continue
+        url, title = m.group(1), _clean_text(m.group(2))
+        dm = re.search(r'<div class="content [^"]*"[^>]*>(.*?)</div>', blk, re.S)
+        snip = _clean_text(dm.group(1))[:200] if dm else ""
+        if title and url:
+            out.append((title, url, snip))
+    return out
+
+
 _ENGINES = [
-    ("bing-cn", "https://cn.bing.com/search?q={q}&setlang=zh-CN", _BING_PAT, 12.0),
-    ("bing", "https://www.bing.com/search?q={q}&setlang=en", _BING_PAT, 12.0),
-    ("ddg-lite", "https://lite.duckduckgo.com/lite/?q={q}", _DDG_LITE_PAT, 8.0),
-    ("ddg", "https://html.duckduckgo.com/html/?q={q}", _DDG_PAT, 8.0),
+    ("bing-rss", "https://www.bing.com/search?q={q}&format=rss&count=20",
+     _parse_bing_rss, 12.0),
+    ("brave", "https://search.brave.com/search?q={q}",
+     _parse_brave, 12.0),
+    ("ddg", "https://html.duckduckgo.com/html/?q={q}",
+     _regex_parser(_DDG_PAT, ddg=True), 12.0),
+    ("bing-cn", "https://cn.bing.com/search?q={q}&setlang=zh-CN",
+     _regex_parser(_BING_PAT), 12.0),
 ]
+
+
+# 引擎熔断：公共搜索通道会按 IP 限流（Brave/DDG 实测），不熔断的话
+# 每次搜索都要白等一轮连接超时。成功一次即解除。
+_COOLDOWN = {}
+_COOLDOWN_SEC = 300
+
+
+def _cooled(name: str) -> bool:
+    return time.time() < _COOLDOWN.get(name, 0)
+
+
+def _mark_fail(name: str) -> None:
+    _COOLDOWN[name] = time.time() + _COOLDOWN_SEC
 
 
 def _clean_text(s: str) -> str:
@@ -262,8 +374,8 @@ def _clean_text(s: str) -> str:
     return re.sub(r"\s+", " ", t).strip()
 
 
-def _format_hits(hits: list, max_results: int, ddg: bool = False) -> list:
-    """把正则命中格式化成结果行；按 URL 去重（Bing 同页常出现重复链接）。"""
+def _hits_structured(hits: list, ddg: bool = False, limit: int = 10) -> list:
+    """把正则命中规整成 (title, url, snippet) 三元组，按 URL 去重。"""
     out, seen = [], set()
     for href, title, snip in hits:
         title, snip = _clean_text(title), _clean_text(snip)
@@ -272,47 +384,96 @@ def _format_hits(hits: list, max_results: int, ddg: bool = False) -> list:
         if ddg:
             m = re.search(r"uddg=([^&]+)", href)
             href = unquote(m.group(1)) if m else href
+        if href.startswith("//"):
+            href = "https:" + href
         if href in seen:
             continue
         seen.add(href)
-        out.append(f"{len(out) + 1}. {title}\n   {href}\n   {snip[:200]}")
-        if len(out) >= max_results:
+        out.append((title, href, snip[:200]))
+        if len(out) >= limit:
             break
     return out
 
 
+def _format_hits(hits: list, max_results: int, ddg: bool = False) -> list:
+    """把正则命中格式化成结果行（保留：供其它调用方复用）。"""
+    return [f"{i}. {t}\n   {u}\n   {s}"
+            for i, (t, u, s) in enumerate(
+                _hits_structured(hits, ddg=ddg, limit=max_results), 1)]
+
+
 async def web_search(args: dict) -> str:
-    """按关键词搜索网页：多引擎链，前一个没结果自动降级到下一个。"""
+    """按关键词搜索网页：主力引擎并行合并去重，失败自动降级到剩余引擎。"""
     query = str(args.get("query") or "").strip()
     if not query:
         return "错误：query 不能为空"
     max_results = max(1, min(int(args.get("max_results") or 5), 10))
     q = requests.utils.quote(query)
 
-    diag = []
-    for name, tpl, pat, timeout in _ENGINES:
+    async def run(engine):
+        name, tpl, parser, timeout = engine
+        if _cooled(name):  # 熔断：近期连续失败，本次直接跳过，不白等连接超时
+            return name, [], f"{name}: 熔断中（近期连续失败，5 分钟后自动重试）"
         url = tpl.format(q=q)
         try:
             r = await asyncio.to_thread(_session_get, url, timeout)
-        except Exception as e:
-            diag.append(f"{name}: {type(e).__name__} {str(e)[:70]}")
-            continue
+        except Exception as e:  # noqa: BLE001
+            _mark_fail(name)
+            return name, [], f"{name}: {type(e).__name__} {str(e)[:70]}"
         try:
-            hits = pat.findall(r.text)
-        except Exception as e:
-            diag.append(f"{name}: 解析异常 {type(e).__name__} {str(e)[:50]}")
-            continue
-        items = _format_hits(hits, max_results, ddg=name.startswith("ddg"))
-        if items:
-            src = f"（引擎：{name}）"
-            if diag:
-                src += "｜降级记录：" + "；".join(diag)
-            return f"搜索结果（{query}）{src}：\n" + "\n".join(items)
-        diag.append(f"{name}: 返回页面但无结果（HTTP {r.status_code}, {len(r.text)} 字节）")
+            items = parser(r.text)[:max_results]
+        except Exception as e:  # noqa: BLE001
+            _mark_fail(name)
+            return name, [], f"{name}: 解析异常 {type(e).__name__} {str(e)[:50]}"
+        if not items:
+            return name, [], f"{name}: 返回页面但无结果（HTTP {r.status_code}, {len(r.text)} 字节）"
+        _COOLDOWN.pop(name, None)
+        return name, items, ""
 
-    return (f"没有搜到「{query}」的相关结果。\n引擎诊断：\n"
-            + "\n".join("  - " + d for d in diag)
-            + "\n（可换关键词重试，或用 read_web / search_extract 直接读指定 URL）")
+    # 主引擎并行：Bing RSS 快而广、Brave 精而准，单引擎必然偏科
+    # （实测 Bing 搜「sing-box hysteria2」返回电影《Sing》，Brave 直中官方文档）。
+    merged, seen, used, diag = [], set(), [], []
+    pools = []
+    for name, items, err in await asyncio.gather(*[run(e) for e in _ENGINES[:2]]):
+        if err:
+            diag.append(err)
+            continue
+        used.append(name)
+        pools.append(items)
+
+    # 交错合并（round-robin）：Bing 广、Brave 准，顺序拼接会让 Bing 的宽泛结果把
+    # Brave 的精准命中挤出 max_results（实测搜 sing-box 时前 3 条全是《Sing》电影）。
+    for i in range(max((len(p) for p in pools), default=0)):
+        for pool in pools:
+            if i >= len(pool):
+                continue
+            title, href, snip = pool[i]
+            if href in seen:
+                continue
+            seen.add(href)
+            merged.append((title, href, snip))
+
+    if not merged:  # 主力全挂/全空 → 逐个试剩余引擎
+        for engine in _ENGINES[2:]:
+            name, items, err = await run(engine)
+            if err:
+                diag.append(err)
+                continue
+            used.append(name)
+            merged = items
+            break
+
+    if not merged:
+        return (f"没有搜到「{query}」的相关结果。\n引擎诊断：\n"
+                + "\n".join("  - " + d for d in diag)
+                + "\n（可换关键词重试，或用 read_web / search_extract 直接读指定 URL）")
+
+    out = [f"{i}. {t}\n   {u}\n   {s}"
+           for i, (t, u, s) in enumerate(merged[:max_results], 1)]
+    src = "（引擎：" + " + ".join(used) + "）"
+    if diag:
+        src += "｜降级记录：" + "；".join(diag)
+    return f"搜索结果（{query}）{src}：\n" + "\n".join(out)
 
 
 async def read_web(args: dict) -> str:
