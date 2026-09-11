@@ -107,3 +107,10 @@ data/mixamo_cookies.json
 # 任务断点续跑状态（运行时产物）
 data/task_resume_states.json
 data/task_resume_states.json.tmp
+/settings.json
+/codex_config.json
+/stt_config.json
+/tts_config.json
+/cards.json
+/character_cards.json
+/nodes.json

@@ -1,0 +1,14 @@
+#!/bin/sh
+# 提交前密钥拦截 —— 扫的是「暂存内容」而非工作区：
+# 用户还没 git add 的本地改动不应该阻断提交（否则钩子天天喊狼来了）。
+#
+# 绕过方式：git commit --no-verify
+#   —— 只在确认误报、且已想清楚后果时用。用多了钩子就废了，
+#      所以误报要么加 `allowlist secret` 注释，要么写进 .gitguard-allow。
+set -e
+
+root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+scanner="$root/deploy/gitguard/secretscan.py"
+[ -f "$scanner" ] || exit 0
+
+exec python3 "$scanner" --staged

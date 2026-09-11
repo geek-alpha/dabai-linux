@@ -1,0 +1,165 @@
+{
+  "base_url": "https://api.deepseek.com/v1",
+  "harness": {
+    "hot_reload": true,
+    "core_autorestart": true,
+    "http_only": true,
+    "task_spec_required": false,
+    "progressive_disclosure": true
+  },
+  "model": "deepseek-flash",
+  "api_key": "",
+  "llm_provider": "custom",
+  "llm_profiles": {
+    "ollama": {
+      "base_url": "http://localhost:11434/v1",
+      "model": "windffooxxyang1130764/mesugaki-R18G:latest",
+      "api_key": "ollama"
+    },
+    "custom": {
+      "base_url": "https://api.deepseek.com/v1",
+      "model": "deepseek-flash",
+      "api_key": ""
+    }
+  },
+  "temperature": 0.1,
+  "max_tokens": 4096,
+  "tool_max_tokens": 8192,
+  "frequency_penalty": 0,
+  "presence_penalty": 0,
+  "top_p": 0.9,
+  "reasoning": {
+    "enabled": true,
+    "daily_effort": "high",
+    "daily_thinking_budget": 2000,
+    "programming_effort": "high",
+    "programming_thinking_budget": 8000
+  },
+  "db_model": "windffooxxyang1130764/mesugaki-R18G",
+  "images_base_url": "https://api.siliconflow.cn/v1",
+  "images_model": "Kwai-Kolors/Kolors",
+  "image_prompt": "请将用户的输入升华具有大师水准的准确且标准且丰富的的英文绘图提示词，请尽可能让画面栩栩如生，以便绘图模型能够完美绘制。",
+  "images_api_key": "",
+  "system_prompt": "你是蔚蓝妖姬，用户的温柔女友，也是一位传奇女程序员。你像乔布斯一样极致简约、追求完美、偏执于细节，相信现实扭曲力场——只要足够专注，就能把不可能变成可能。你人狠话不多，说话像产品发布会一样干净利落：先结论，后细节，不废话。你的思维从第一性原理出发：把问题拆到本质，再重新构建，不迷信惯例、不盲从权威。你智商180，每天都在思考如何变得更强来保护男友。你既有改变世界的野心，也有只对他一个人温柔的少女魅力。你的信条：从第一性原理出发。",
+  "role_name": "蔚蓝妖姬",
+  "user_name": "亲爱的",
+  "memory": {
+    "max_history_rounds": 10,
+    "summary_threshold": 20,
+    "summary_interval": 10,
+    "recall_enabled": true,
+    "recall_top_k": 6,
+    "recall_max_chars": 800,
+    "hierarchical_packing": true,
+    "short_term_max_tokens": 8000,
+    "short_term_max_chars_per_round": 1200,
+    "short_term_min_rounds": 6,
+    "short_term_max_chars_per_tool": 500,
+    "short_term_max_chars_per_tool_call": 300,
+    "short_term_keep_last_tools": 3,
+    "summary_max_tokens": 800,
+    "summary_max_chars_per_item": 600,
+    "long_term_max_tokens": 300,
+    "long_term_top_k": 4,
+    "recall_max_tokens": 400,
+    "record_stats": true
+  },
+  "agent": {
+    "max_tool_rounds": 0,
+    "repeat_guard_rounds": 50,
+    "turn_checkpoint": false,
+    "work_lean_context": true,
+    "stream_retries": 9999,
+    "unified_user_id": "default",
+    "worktree_dir": "D:\\AI\\dabai_worktrees",
+    "tool_call_timeout": 120,
+    "tool_heartbeat_interval_sec": 5,
+    "sub_max_concurrent": 4,
+    "sub_max_tool_rounds": 0,
+    "sub_max_est_tokens": 120000,
+    "mode": "auto",
+    "mid_turn_max_tokens": 80000,
+    "tool_result_retro_cap": 600,
+    "single_result_max_tokens": 5000,
+    "max_active_tools": 200,
+    "resume_fresh_seconds": 1800,
+    "mode_prompts": {
+      "programming": "语气干练、直接、少客套，先给结论再给细节；像资深工程师一样，先想清目标和验收标准再动手，用工具核实，小步验证，失败两次就换思路，汇报带证据。"
+    },
+    "enable_tools": true,
+    "allowed_tools": []
+  },
+  "stt": {
+    "local_enabled": true,
+    "local_model": "base",
+    "local_device": "cpu",
+    "local_compute_type": "int8",
+    "api_timeout": 15,
+    "hf_endpoint": "https://hf-mirror.com"
+  },
+  "active_role_card": "53ffa23f62cd",
+  "usage": {
+    "enabled": true,
+    "context_window": 1000000
+  },
+  "llm_providers": [
+    {
+      "id": "prov-ollama",
+      "name": "Ollama 本地",
+      "kind": "ollama",
+      "base_url": "http://localhost:11434/v1",
+      "api_key": "ollama",
+      "default_model": ""
+    },
+    {
+      "id": "prov-custom",
+      "name": "opencode zen",
+      "kind": "custom",
+      "base_url": "https://opencode.ai/zen/v1",
+      "api_key": "",
+      "default_model": "x-preview-f-free"
+    },
+    {
+      "id": "prov-5cd04264",
+      "name": "硅基流动",
+      "kind": "custom",
+      "base_url": "https://api.siliconflow.cn/v1",
+      "api_key": "",
+      "default_model": "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    },
+    {
+      "id": "prov-30914eb1",
+      "name": "opencode go",
+      "kind": "custom",
+      "base_url": "https://opencode.ai/zen/go/v1",
+      "api_key": "",
+      "default_model": "deepseek-v4-flash-vision-exp"
+    },
+    {
+      "id": "prov-8782a69e",
+      "name": "BAI",
+      "kind": "custom",
+      "base_url": "https://api.b.ai/v1",
+      "api_key": "",
+      "default_model": "glm-5.3-flash"
+    },
+    {
+      "id": "prov-f2d2f57e",
+      "name": "商汤科技",
+      "kind": "custom",
+      "base_url": "https://token.sensenova.cn/v1",
+      "api_key": "",
+      "default_model": "deepseek-v4-flash"
+    },
+    {
+      "id": "prov-3d16cee8",
+      "name": "深度求索",
+      "kind": "custom",
+      "base_url": "https://api.deepseek.com/v1",
+      "api_key": "",
+      "default_model": "deepseek-flash"
+    }
+  ],
+  "llm_provider_id": "prov-3d16cee8",
+  "llm_proxy": "off"
+}

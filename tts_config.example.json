@@ -1,0 +1,12 @@
+{
+  "engine": "edge_tts",
+  "edge_voice": "zh-CN-XiaoyiNeural",
+  "edge_rate": "+50%",
+  "gptsovits_url": "http://127.0.0.1:7860/",
+  "gptsovits_ref_audio": "",
+  "gptsovits_character": "星见雅",
+  "api_url": "",
+  "api_key": "",
+  "api_model": "",
+  "api_voice": ""
+}

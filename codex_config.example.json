@@ -1,0 +1,32 @@
+{
+  "agent": {
+    "name": "dabai-web",
+    "work_dir": "/home/wxf/dabai",
+    "sync_timeout_sec": 120,
+    "max_reply_chars": 3800,
+    "tool_progress_interval_sec": 60,
+    "tools": {
+      "ai": {
+        "cmd": [
+          "opencode",
+          "run",
+          "--auto"
+        ],
+        "timeout_sec": 900
+      },
+      "cx": {
+        "cmd": [
+          "codex",
+          "exec",
+          "--approve-for-me"
+        ],
+        "timeout_sec": 900
+      }
+    }
+  },
+  "llm": {
+    "base_url": "https://api.siliconflow.cn/v1",
+    "api_key": "",
+    "model": "Qwen/Qwen3-30B-A3B-Instruct-2507"
+  }
+}

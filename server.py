@@ -5947,7 +5947,9 @@ async def websocket_endpoint(ws: WebSocket):
 # ==================== 百科题库服务（寻宝游戏答题） ====================
 # 题目来源：天行数据「百科题库」接口（答案与解析保存在服务端，答完才下发），
 # 接口不可用时自动回退到内置本地题库，保证游戏始终可玩。
-TIANAPI_QUIZ_KEY = "***REMOVED***"
+# 密钥不再硬编码：由 deploy/secrets 注入环境变量（systemd EnvironmentFile）。
+# 取不到时 _fetch_tianapi 直接返回 None，自动回退内置本地题库，功能不中断。
+TIANAPI_QUIZ_KEY = os.environ.get("DABAI_TIANAPI_QUIZ_KEY", "").strip()
 TIANAPI_QUIZ_HOST = "apis.tianapi.com"
 TIANAPI_QUIZ_PATH = "/baiketiku/index"
 QUIZ_PENDING_TTL = 3600  # 待校验题目保留时长（秒）
@@ -6020,6 +6022,8 @@ class QuizService:
     # ---------- 天行数据接口 ----------
     def _fetch_tianapi(self, timeout: float = 6.0):
         """调用天行数据百科题库接口，返回单题 dict（含 answer/analytic），失败返回 None。"""
+        if not TIANAPI_QUIZ_KEY:
+            return None          # 未注入密钥 → 静默走本地题库
         try:
             import http.client
             import urllib.parse as _up
