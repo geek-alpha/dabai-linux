@@ -3,7 +3,7 @@
     "bilibili": true,
     "acfun": true,
     "xvideos": false,
-    "youtube": false
+    "youtube": true
   },
   "custom": []
 }
