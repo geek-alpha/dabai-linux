@@ -256,6 +256,83 @@ journalctl --user-unit=dabai-health.service -n 20          # 看历史趋势
 **一个工具行为要记住**：同一参数重复调用 `linux_*` 工具会返回**缓存结果**（harness 行为）。
 所以**改完代码要用 shell 直接跑验证**，不能靠再调一次工具 —— 那会拿到旧结果，误以为改动没生效。
 
+### 6.7 API 密钥环境变量化（`deploy/secrets/`）
+
+把散落在 3 个 JSON 里的 7 个唯一 API Key（展开 34 个变量）汇聚成一份
+系统环境变量文件，并在配置变化时**实时同步**。
+
+**架构：单向派生，不是双向同步**（双真源必然产生「改了哪边才算数」的歧义）
+
+```
+真源   settings.json / codex_config.json / stt_config.json / tts_config.json
+  │
+  │  sync_secrets.py      ← JSON 一变就重新生成
+  ▼
+派生   /etc/dabai/secrets.env        root:wxf 0640
+  ├── systemd  EnvironmentFile=      → myservice 及其全部子进程
+  └── login    /etc/profile.d/*.sh   → wxf 的交互式 shell
+```
+
+**实时同步的实现**：`dabai-secrets.path`（systemd path unit）监听 4 个 JSON 的
+`PathModified`，变化即触发 `dabai-secrets-sync.service` 重新生成。再加 10 分钟
+timer 兜底（inotify 在网络文件系统上可能漏事件）。同步器**幂等**——内容无变化
+时不写盘，否则 path unit 会被自己触发成死循环。
+
+**变量命名**（用供应商 `id` 而非中文名派生，改显示名不会断掉变量）
+
+| 变量 | 来源 |
+|---|---|
+| `DABAI_API_KEY` / `_BASE_URL` / `_MODEL` | `settings.json` 顶层 |
+| `DABAI_IMAGES_API_KEY` / `_BASE_URL` | `settings.json` 图像生成 |
+| `DABAI_PROV_<ID>_API_KEY` / `_BASE_URL` / `_MODEL` | `llm_providers[]`（`prov-5cd04264` → `5CD04264`） |
+| `DABAI_ACTIVE_*` | 当前激活供应商（`llm_provider_id` 指向的那个） |
+| `DABAI_CODEX_*` / `DABAI_STT_API_KEY` / `DABAI_TTS_API_KEY` | 对应配置文件 |
+
+**手工变量共存**：`EXA_API_KEY` / `TAVILY_API_KEY` / `GITHUB_TOKEN` 这类没有 JSON
+真源的密钥，写在 `MANAGED` 标记块**之外**，同步器永不触碰。变量名有白名单
+（`DABAI_`/`EXA_`/`TAVILY_`/`GITHUB_`/…），`PATH`/`LD_PRELOAD`/`IFS` 一律拒绝。
+
+#### 安全设计（每条都有实测依据）
+
+| 决定 | 依据 |
+|---|---|
+| 用 `EnvironmentFile=`，**不用** `Environment=` | `systemctl show` 把 `Environment=` 明文列给任何用户；`EnvironmentFile=` 只暴露路径（已实测对比） |
+| **不写** `/etc/environment` | 那是 0644 全局可读 |
+| `profile.d` 钩子先判 `[ -r ]` | 文件 0640 `root:wxf`，非 wxf 组用户判 false 静默跳过（已用 `nobody` 实测拒绝） |
+| 值只接受安全字符集，越界直接报错 | systemd `EnvironmentFile` 与 POSIX shell 的转义规则**不同**，硬转义就是在赌 |
+| 原子写 + 先落权限 | `mkstemp`→`fsync`→`chmod 0640`→`os.replace`，消除「先写后 chmod」的 0644 窗口期 |
+| `apply_perms` **不碰目录权限** | 目标路径可由 `DABAI_SECRETS_FILE` 指向任意位置；实测隔离测试时它试图 `chmod /tmp` 被拒 |
+| 改 myservice 配置后**不重启** | `MainPID` 就是大白本体，重启 = 杀掉调用方自己 |
+
+#### 验证记录（真实执行）
+
+```
+安装体检          6 个文件 + 权限 + 服务 + 一致性 + 注入 → 全部通过
+行为测试          24 项（幂等/手工变量存活/值校验/名白名单/边界）→ 全绿
+实时同步端到端    改 stt_config.json → 5 秒内 secrets.env 自动更新 → 恢复后自动跟上
+权限边界          nobody 读不到 ✓   wxf 能读 ✓
+shell 兼容        bash 34 个变量 ✓   dash 34 个变量 ✓
+profile.d 注入    登录 shell 拿到 ✓   nobody 登录 shell 拿不到 ✓
+泄漏检查          systemctl show 无明文 ✓
+```
+
+#### 已知边界
+
+- **已运行的 myservice 进程不会热更新环境变量**。Linux 没有「给运行中进程加环境
+  变量」的接口（`/proc/PID/environ` 只影响后续 exec 的子进程，且有长度限制）。
+  新变量下次重启生效；要立刻用：`dabai-secrets env` 或 `. /etc/profile.d/00-dabai-secrets.sh`。
+- **JSON 真源里仍是明文**（`settings.json` 等 0644）。要彻底消除需清空 JSON 并改
+  `server.py` 的 `load_config()` 改为只从环境变量读 —— 风险更高（加载失败即瘫痪），单独评估。
+
+常用命令：
+
+```bash
+sudo bash deploy/secrets/install-secrets.sh [--check|--uninstall|--purge]
+sudo -n /usr/local/sbin/dabai-secrets sync     # 免密（只给 sync 免密，set 仍要密码）
+/usr/local/sbin/dabai-secrets list|check|show|env
+```
+
+
 ## 7. 回滚（Linux 兼容层，§1–§5）
 
 改动在隔离工作树分支 `codex/linux-compat` 上开发，已合并回 `20260909`（merge commit `748d9d2`）。
