@@ -21,7 +21,9 @@
 # ============================================================
 set -euo pipefail
 
-SRC_DIR=/home/wxf/dabai/deploy/systemd
+# 源目录可用 DABAI_SRC_DIR 覆盖：安装到 /usr/local/sbin 的特权副本会指向
+# /usr/local/lib/dabai-linux-native（root 拥有），绝不消费用户可写路径。
+SRC_DIR=${DABAI_SRC_DIR:-/home/wxf/dabai/deploy/systemd}
 DROPIN_SRC="$SRC_DIR/myservice.service.d/20-linux-native.conf"
 DROPIN_DST=/etc/systemd/system/myservice.service.d/20-linux-native.conf
 CMDLINE=/boot/firmware/cmdline.txt
@@ -35,6 +37,40 @@ warn() { printf '  \033[1;33m!\033[0m %s\n' "$*"; }
 die()  { printf '  \033[1;31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 
 [ "$(id -u)" -eq 0 ] || die "需要 root 权限，请用：sudo bash $0 $STEP"
+
+# ------------------------------------------------------------
+# 特权模式守卫（安全边界，别删）
+# 一旦源目录被显式指定（= 免密副本模式），就要求它 root 拥有且非他人可写。
+# 否则任何 wxf 权限的进程（一个恶意 npm 包、一次 curl|bash）只要改一下源
+# 文件，就能借 root 之手往 systemd 塞任意 drop-in（如 User=root +
+# 自定义 ExecStart）—— 那就是一步提权。
+if [ -n "${DABAI_SRC_DIR:-}" ]; then
+  _owner=$(stat -c '%U' "$SRC_DIR" 2>/dev/null || echo '?')
+  [ "$_owner" = root ] || die "特权模式：$SRC_DIR 属主是 $_owner，必须 root，拒绝执行"
+  if [ -n "$(find "$SRC_DIR" -perm /022 -print -quit 2>/dev/null)" ]; then
+    die "特权模式：$SRC_DIR 下存在他人可写文件，拒绝执行"
+  fi
+fi
+
+# ------------------------------------------------------------
+# 自我保护：若 myservice 的 MainPID 是本进程的祖先，说明正跑在大白自己
+# 拉起的 shell 里 —— 重启 myservice = 杀掉自己的父进程（回复断在半路），
+# 自动跳过重启，不必人工记得加 NO_RESTART=1。
+if [ "${NO_RESTART:-0}" != "1" ] && [ "${DABAI_NO_AUTODETECT:-0}" != "1" ]; then
+  _mp=$(systemctl show myservice.service -p MainPID --value 2>/dev/null || true)
+  if [ -n "${_mp:-}" ] && [ "$_mp" != "0" ]; then
+    _p=$$
+    while [ "${_p:-0}" -gt 1 ]; do
+      _p=$(ps -o ppid= -p "$_p" 2>/dev/null | tr -d ' ' || true)
+      [ -z "${_p:-}" ] && break
+      if [ "$_p" = "$_mp" ]; then
+        NO_RESTART=1
+        warn "检测到大白本体是本进程祖先 —— 自动跳过重启（避免自杀）"
+        break
+      fi
+    done
+  fi
+fi
 
 # ------------------------------------------------------------
 step1() {

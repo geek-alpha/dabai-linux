@@ -50,6 +50,44 @@ sudo bash /home/wxf/dabai/deploy/systemd/apply-linux-native.sh all
 脚本参数：`1` 主服务 drop-in ｜ `2` 内存 cgroup（改 cmdline.txt）｜ `3` zram sysctl 调优
 ｜ `all` = 1+2（默认）。
 
+### 2.1 免密执行（可选；注意是「装副本」而不是「给仓库脚本免密」）
+
+```bash
+sudo bash /home/wxf/dabai/deploy/systemd/install-privileged.sh   # 安装/更新
+sudo -n /usr/local/sbin/dabai-linux-native all                   # 之后免密执行
+sudo bash .../install-privileged.sh --check                      # 只校验一致性，不改动
+sudo bash .../install-privileged.sh --uninstall                  # 撤销，回到输密码模式
+```
+
+**为什么必须装副本**：仓库脚本在 `/home/wxf/dabai`，属主 `wxf`、可写。给它免密
+= 任何 wxf 权限的进程（一个恶意 npm 包、一次 `curl|bash`）只要改一下脚本内容，
+就能借 root 之手执行任意命令 —— 等于没上锁。所以**被授权的那个文件必须在 root
+拥有、wxf 改不动的位置**，并且只消费 root 拥有的源文件。
+
+| 位置 | 内容 | 权限 |
+|---|---|---|
+| `/usr/local/sbin/dabai-linux-native` | 脚本副本（源目录被强制改写为下方路径） | root:root 755 |
+| `/usr/local/lib/dabai-linux-native/` | drop-in 源文件 | root:root 644 |
+| `/etc/sudoers.d/dabai-linux-native` | 唯一一条 `NOPASSWD` 规则，无通配符 | root:root 0440 |
+
+两道保险（缺一条就是假安全）：
+
+1. 副本里 `DABAI_SRC_DIR` 被**强制**指向 root 拥有的源目录，外部传入无效
+   （`sudo` 的 `env_reset` 是第一道，这是第二道）；
+2. **特权模式守卫**：源目录属主不是 root、或其中存在他人可写文件 → 直接拒绝执行。
+
+> 实测负向验证：`DABAI_SRC_DIR=/home/wxf/dabai/deploy/systemd`（wxf 属主）
+> → `✗ 特权模式：属主是 wxf，必须 root，拒绝执行`。守卫生效。
+
+⚠️ **改过 `apply-linux-native.sh` 后必须重跑安装脚本**，否则 `/usr/local/sbin`
+那份是旧快照 —— `--check` 会报「快照漂移」并把退出码置 1。
+
+**自我保护（自动跳过自杀）**：脚本会检查 `myservice.service` 的 `MainPID` 是不是
+自己的祖先进程。是的话说明正跑在大白自己拉起的 shell 里，重启 myservice =
+杀掉自己的父进程（回复会断在半路），于是**自动**跳过重启，不必人工记得加
+`NO_RESTART=1`。
+
+
 <details><summary>手动等价操作（不想用脚本时）</summary>
 
 ```bash
