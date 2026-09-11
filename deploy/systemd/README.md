@@ -20,25 +20,49 @@
 
 只查 `systemctl --user` 是看不见大白的（它是系统级 unit）。这是本项目最早踩的坑。
 
+**第二个坑：systemd 不支持跨 scope 依赖。** sing-box 是**用户级** unit
+（`~/.config/systemd/user/sing-box.service`），大白是**系统级**。所以在 drop-in 里写
+`After=sing-box.service` / `Wants=sing-box.service` 全是死代码：前者被静默忽略，
+后者 `daemon-reload` 报 `Unit not found` 且依赖永不生效。
+代理未就绪的正确应对是**运行时降级**（大白自己探测 `127.0.0.1:7890`，不通就直连），
+而不是靠启动顺序保证。要让依赖真生效，得把 sing-box 提升为系统级 unit。
+
 ---
 
 ## 1. 本目录内容
 
 | 文件 | 作用 | 安装方式 |
 |---|---|---|
-| `myservice.service.d/20-linux-native.conf` | 大白主服务的增量增强（日志标识/PATH/CPU 权重/加固） | **需 sudo**，见 §2 |
+| `apply-linux-native.sh` | **一键应用脚本**（幂等 / 自动备份 / 校验失败就不落地） | **需 sudo**，见 §2 |
+| `myservice.service.d/20-linux-native.conf` | 大白主服务的增量增强（日志标识/PATH/CPU 权重/加固） | 由脚本安装，见 §2 |
 | `dabai-health.service` + `.timer` | 定期体检：写 journald + 异常弹通知 | 免 sudo（用户级），见 §3 |
 
 ---
 
 ## 2. 主服务增强（需 sudo，一次性）
 
+**推荐：跑一键脚本**（幂等，重复执行安全；改前自动备份；unit 校验失败就中止不重启）：
+
 ```bash
-# 应用
+sudo bash /home/wxf/dabai/deploy/systemd/apply-linux-native.sh all
+```
+
+脚本参数：`1` 主服务 drop-in ｜ `2` 内存 cgroup（改 cmdline.txt）｜ `3` zram sysctl 调优
+｜ `all` = 1+2（默认）。
+
+<details><summary>手动等价操作（不想用脚本时）</summary>
+
+```bash
 sudo install -Dm644 /home/wxf/dabai/deploy/systemd/myservice.service.d/20-linux-native.conf \
      /etc/systemd/system/myservice.service.d/20-linux-native.conf
 sudo systemctl daemon-reload
 sudo systemctl restart myservice
+```
+</details>
+
+**应用前已验证**（合并 10-recovery + 20-linux-native 两个 drop-in 后）：
+```bash
+systemd-analyze verify /tmp/v2/myservice.service   # 无输出 = exit 0，全部指令合法
 ```
 
 **改了什么：**
@@ -126,9 +150,13 @@ journalctl --user-unit=dabai-health.service | grep -o "temp=[0-9.]*C" | tail -20
 905MB 内存的机器上无法给大白设内存天花板，只能靠 OOM killer 事后收尸。
 
 ```bash
-# 在 /boot/firmware/cmdline.txt 末尾（同一行，不要换行）追加：
-cgroup_enable=memory cgroup_memory=1
+# 一键（脚本会先备份、并校验写入后仍是单行）：
+sudo bash /home/wxf/dabai/deploy/systemd/apply-linux-native.sh 2
 sudo reboot
+
+# 手动等价：在 /boot/firmware/cmdline.txt 末尾（**同一行**，不要换行）追加
+cgroup_enable=memory cgroup_memory=1
+
 # 重启后验证：cat /sys/fs/cgroup/cgroup.controllers  应出现 memory
 ```
 
