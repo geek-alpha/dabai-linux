@@ -27,8 +27,26 @@ except ImportError:  # pragma: no cover
 
 _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/125.0 Safari/537.36")
-# 直连优先，失败自动走本地代理 127.0.0.1:7890（被墙/翻墙场景兜底）
-_PROXIES = [None, {"http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890"}]
+# 直连优先；本地代理（127.0.0.1:7890）只在确实监听时才作为兜底尝试。
+# 原实现无条件把代理排进候选链：代理没起时每次失败都要再白等一轮 connect 超时。
+_PROXY_URL = "http://127.0.0.1:7890"
+
+
+def _proxy_alive(host: str = "127.0.0.1", port: int = 7890, timeout: float = 0.4) -> bool:
+    """探测本地代理端口是否真的在监听（0.4s 连不上即视为不可用）。"""
+    import socket
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _proxy_candidates() -> list:
+    """返回本次请求的代理候选链：直连，代理仅在监听时追加。"""
+    if _proxy_alive():
+        return [None, {"http": _PROXY_URL, "https": _PROXY_URL}]
+    return [None]
 def _find_chrome() -> str:
     """定位可用的 Chrome/Chromium（跨平台）：环境变量 DABAI_CHROME → 常见路径 → PATH。"""
     env = (os.environ.get("DABAI_CHROME") or "").strip().strip('"')
@@ -69,7 +87,7 @@ def _session_get(url: str, timeout: float = 20.0):
     if not _HAS_REQUESTS:
         raise RuntimeError("requests 未安装")
     last = None
-    for proxies in _PROXIES:
+    for proxies in _proxy_candidates():
         try:
             r = requests.get(url, headers={"User-Agent": _UA},
                              timeout=timeout, proxies=proxies)
@@ -214,49 +232,87 @@ def _page_title(html_text: str, url: str) -> str:
     return html_mod.unescape(m.group(1)).strip()[:120] if m else url
 
 
+# ---------- 搜索引擎链（按本机实测可用性排序）----------
+# 实测（树莓派 aarch64 / Debian 13 / 国内直连）：
+#   DuckDuckGo 全站不可达（html. 与 lite. 均连接超时）；cn.bing.com 正常，0.2s 返回 10 条。
+#   故 Bing 置主引擎、DDG 降为兜底；失败原因全程留痕（不再静默吞异常导致「没搜到」误报）。
+_BING_PAT = re.compile(
+    r'<li[^>]*class="b_algo".*?'
+    r'<h2[^>]*>\s*<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>.*?'
+    r'<p\b[^>]*>(.*?)</p>', re.S)
+_DDG_PAT = re.compile(
+    r'<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>.*?'
+    r'<a[^>]*class="result__snippet"[^>]*>(.*?)</a>', re.S)
+_DDG_LITE_PAT = re.compile(
+    r'<a[^>]*class="result-link"[^>]*href="([^"]+)"[^>]*>(.*?)</a>.*?'
+    r'<td[^>]*class="result-snippet"[^>]*>(.*?)</td>', re.S)
+
+# (引擎名, URL 模板, 解析正则, 单次超时秒)
+_ENGINES = [
+    ("bing-cn", "https://cn.bing.com/search?q={q}&setlang=zh-CN", _BING_PAT, 12.0),
+    ("bing", "https://www.bing.com/search?q={q}&setlang=en", _BING_PAT, 12.0),
+    ("ddg-lite", "https://lite.duckduckgo.com/lite/?q={q}", _DDG_LITE_PAT, 8.0),
+    ("ddg", "https://html.duckduckgo.com/html/?q={q}", _DDG_PAT, 8.0),
+]
+
+
+def _clean_text(s: str) -> str:
+    """去标签 + 反转义 + 压空白（Bing 标题内嵌 <strong> 高亮、摘要带 &ensp;）。"""
+    t = html_mod.unescape(re.sub(r"<[^>]+>", "", s or ""))
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _format_hits(hits: list, max_results: int, ddg: bool = False) -> list:
+    """把正则命中格式化成结果行；按 URL 去重（Bing 同页常出现重复链接）。"""
+    out, seen = [], set()
+    for href, title, snip in hits:
+        title, snip = _clean_text(title), _clean_text(snip)
+        if not title or not href:
+            continue
+        if ddg:
+            m = re.search(r"uddg=([^&]+)", href)
+            href = unquote(m.group(1)) if m else href
+        if href in seen:
+            continue
+        seen.add(href)
+        out.append(f"{len(out) + 1}. {title}\n   {href}\n   {snip[:200]}")
+        if len(out) >= max_results:
+            break
+    return out
+
+
 async def web_search(args: dict) -> str:
-    """按关键词搜索网页：DuckDuckGo 主引擎，无结果自动换 Bing。"""
+    """按关键词搜索网页：多引擎链，前一个没结果自动降级到下一个。"""
     query = str(args.get("query") or "").strip()
     if not query:
         return "错误：query 不能为空"
     max_results = max(1, min(int(args.get("max_results") or 5), 10))
     q = requests.utils.quote(query)
 
-    # 1) DuckDuckGo
-    items = []
-    try:
-        r = await asyncio.to_thread(_session_get, "https://html.duckduckgo.com/html/?q=" + q, 20.0)
-        raw = r.text
-        items = re.findall(
-            r'<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>.*?'
-            r'<a[^>]*class="result__snippet"[^>]*>(.*?)</a>',
-            raw, re.S)
-    except Exception:
-        items = []
-
-    # 2) Bing 兜底
-    if not items:
+    diag = []
+    for name, tpl, pat, timeout in _ENGINES:
+        url = tpl.format(q=q)
         try:
-            r = await asyncio.to_thread(_session_get, "https://www.bing.com/search?q=" + q, 20.0)
-            raw = r.text
-            items = re.findall(
-                r'<li class="b_algo".*?<h2><a href="([^"]+)"[^>]*>(.*?)</a>.*?'
-                r'<p[^>]*>(.*?)</p>',
-                raw, re.S)
-        except Exception:
-            items = []
+            r = await asyncio.to_thread(_session_get, url, timeout)
+        except Exception as e:
+            diag.append(f"{name}: {type(e).__name__} {str(e)[:70]}")
+            continue
+        try:
+            hits = pat.findall(r.text)
+        except Exception as e:
+            diag.append(f"{name}: 解析异常 {type(e).__name__} {str(e)[:50]}")
+            continue
+        items = _format_hits(hits, max_results, ddg=name.startswith("ddg"))
+        if items:
+            src = f"（引擎：{name}）"
+            if diag:
+                src += "｜降级记录：" + "；".join(diag)
+            return f"搜索结果（{query}）{src}：\n" + "\n".join(items)
+        diag.append(f"{name}: 返回页面但无结果（HTTP {r.status_code}, {len(r.text)} 字节）")
 
-    out = []
-    for href, title, snip in items[:max_results]:
-        title = html_mod.unescape(re.sub(r"<[^>]+>", "", title)).strip()
-        snip = html_mod.unescape(re.sub(r"<[^>]+>", "", snip)).strip()
-        m = re.search(r"uddg=([^&]+)", href or "")
-        if m:
-            href = unquote(m.group(1))
-        out.append(f"{len(out) + 1}. {title}\n   {href}\n   {snip[:200]}")
-    if not out:
-        return f"没有搜到「{query}」的相关结果（可换关键词再试）"
-    return f"搜索结果（{query}）：\n" + "\n".join(out)
+    return (f"没有搜到「{query}」的相关结果。\n引擎诊断：\n"
+            + "\n".join("  - " + d for d in diag)
+            + "\n（可换关键词重试，或用 read_web / search_extract 直接读指定 URL）")
 
 
 async def read_web(args: dict) -> str:
