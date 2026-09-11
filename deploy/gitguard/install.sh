@@ -98,8 +98,10 @@ run_check() {
   # 钩子是否真能拦住（正向功能测试，而不是只看文件在不在）
   if [ -x "$HOOK" ]; then
     local tmpf="$ROOT/.gitguard-selftest.tmp"
-    # 这行是钩子功能测试用的假密钥，必须显式标记，否则扫描器会拦下自己的安装脚本
-    printf 'api_key = "***REMOVED***"\n' > "$tmpf"  # allowlist secret
+    # 假密钥在运行时拼出来，源码里不留任何「像密钥」的字面量 ——
+    # 否则每次扫历史都会多一条噪音，久而久之就没人认真看扫描结果了。
+    local fake="sk-selftest$(printf '0%.0s' $(seq 1 25))"
+    printf 'api_key = "%s"\n' "$fake" > "$tmpf"
     if (cd "$ROOT" && git add -f "$tmpf" >/dev/null 2>&1); then
       if (cd "$ROOT" && python3 "$SCANNER" --staged >/dev/null 2>&1); then
         no "钩子功能测试失败：造了个假密钥却没被扫出来"
