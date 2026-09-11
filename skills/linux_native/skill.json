@@ -1,12 +1,12 @@
 {
   "name": "linux_native",
   "title": "Linux 原生（系统感官/服务托管/桌面集成）",
-  "version": "1.0.0",
-  "description": "把大白与所在 Linux 系统打通：读硬件状态（温度/欠压/内存/负载）、管 systemd 服务、发桌面通知、控媒体播放。",
+  "version": "1.1.0",
+  "description": "把大白与所在 Linux 系统打通：读硬件状态（温度/欠压/内存/负载）、管 systemd 服务、控 GPIO 硬件、管进程调度、审网络暴露面、查存储去向、做安全审计。",
   "author": "dabai",
   "enabled": true,
   "disclosure": "on_demand",
-  "prompt": "【技能 Linux 原生】大白跑在一台真实机器上（树莓派），可以感知它、操作它。\n- 想知道机器状态/卡不卡/热不热/内存够不够 → linux_senses（一次拿到温度、欠压降频、内存、Swap、负载、磁盘、自身开销 + 判定与建议）。\n- **派重活前先自检**：要跑编译/批量任务/多智能体并行/模型推理/大文件下载前，先 linux_guard(need='heavy')；被拒绝就说明机器过热或内存告急，改成分批做或先告诉用户。\n- 服务挂了/要看日志/重启服务 → linux_service（action=list 列服务，status 查状态，logs 读该服务日志，events 看全系统近期错误，restart/start/stop 控制）。\n- 需要让用户看到提醒 → linux_notify（桌面通知，会弹在用户屏幕上；只在真正重要时用，别刷屏）。\n- 用户在听/看什么、要暂停或切歌 → linux_media。\n- 用户说机器热/卡/慢/风扇响/要不要加散热时，主动 linux_senses 给数据，不要空口安慰。",
+  "prompt": "【技能 Linux 原生】大白跑在一台真实机器上（树莓派），可以感知它、支配它。\n- 想知道机器状态/卡不卡/热不热/内存够不够 → linux_senses（一次拿到温度、欠压降频、内存、Swap、负载、磁盘、自身开销 + 判定与建议）。\n- **派重活前先自检**：要跑编译/批量任务/多智能体并行/模型推理/大文件下载前，先 linux_guard(need='heavy')；被拒绝就说明机器过热或内存告急，改成分批做或先告诉用户。\n- 服务挂了/要看日志/重启服务 → linux_service（action=list 列服务，status 查状态，logs 读该服务日志，events 看全系统近期错误，restart/start/stop 控制）。\n- 需要让用户看到提醒 → linux_notify（桌面通知，会弹在用户屏幕上；只在真正重要时用，别刷屏）。\n- 用户在听/看什么、要暂停或切歌 → linux_media。\n- 用户说机器热/卡/慢/风扇响/要不要加散热时，主动 linux_senses 给数据，不要空口安慰。\n- **硬件/GPIO/引脚/树莓派排针/LED/接传感器/闪灯** → linux_gpio（先 action=summary 看支配面，list 看全部引脚，read 读电平，write 驱动输出，blink 闪灯，led 控板载 ACT/PWR 灯）。HAT EEPROM/SPI/UART/I2C/电源管理/SD 控制器等 27 个专用脚会被拒绝写入，这是故意的。\n- **卡住了/谁在吃 CPU/内存去哪了/进程占资源** → linux_process（list 排行，detail 看单个进程，signal 发信号，tune 调 nice 与 CPU 亲和性）。把重活绑到指定核用 tune(pid, affinity=\"2,3\")。不许杀 PID 1/自己/祖先链/内核线程，闸门会拦住。\n- **端口/连接/谁在监听/网络暴露面/防火墙** → linux_net（ports 监听端口，conns 连接，ifaces 接口流量，exposure 暴露面审计）。\n- **磁盘满了/空间去哪了/清理** → linux_storage（overview 使用率+inode+SD 卡磨损，usage 目录排行，bigfiles 大文件，clean 清理候选——clean 只统计不删，删不删让用户定）。\n- **安全审计/有没有漏洞/被入侵了吗/暴露面检查** → linux_audit（暴露面、SSH、账号与提权、SUID、可疑进程、失败服务，按 高危/中危/提示/正常 分级）。全只读。",
   "tools": [
     {
       "type": "function",
@@ -120,6 +120,167 @@
               "description": "操作，默认 now。"
             }
           }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "linux_gpio",
+        "description": "树莓派 GPIO 硬件支配——大白伸进物理世界的入口。action=list 列全部引脚（功能/电平/上下拉，标注哪些可写）；summary 一句话硬件概览；read 读单脚；write 驱动输出；blink 闪灯（接线确认用）；led 看/控板载 ACT 与 PWR 灯（写 brightness 需 root）。安全边界：HAT EEPROM(0/1)、I2C、SPI、UART、PWM、电源管理(46/47)、SD 控制器(48-53) 等 27 个专用脚一律拒绝写入。写之前还会检查该脚是否已被别的驱动占用。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "enum": ["list", "summary", "read", "write", "blink", "led"],
+              "description": "操作，默认 list。"
+            },
+            "pin": {
+              "type": "integer",
+              "description": "BCM 引脚编号（如 17）。read/write/blink 必填。可写范围：4,5,6,12,13,16,17,18,19,20,21,22,23,24,25,26,27。"
+            },
+            "value": {
+              "type": ["integer", "string"],
+              "description": "write 时传 0 或 1（1=高 3.3V / 0=低 0V）。led 时传字符串 on/off/blink/heartbeat/activity/default。"
+            },
+            "only_general": {
+              "type": "boolean",
+              "description": "list 时只显示可写的通用 IO，默认 false。"
+            },
+            "release": {
+              "type": "boolean",
+              "description": "write 完成后把引脚放回 input（避免悬空烧外设），默认 false。"
+            },
+            "times": {
+              "type": "integer",
+              "description": "blink 次数，默认 3，上限 20。"
+            },
+            "interval": {
+              "type": "number",
+              "description": "blink 间隔秒数，默认 0.3。"
+            },
+            "led": {
+              "type": "string",
+              "description": "led 操作时的灯名：ACT（绿色活动灯）/ PWR（红色电源灯）。留空则列出所有灯。"
+            }
+          },
+          "required": ["action"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "linux_process",
+        "description": "进程支配：看排行、查详情、发信号、调调度。action=list 排行（sort_by=cpu/mem/rss/time）；detail 单进程详情（命令行/cwd/可执行/线程/fd/CPU 亲和）；signal 发信号（默认 TERM）；tune 调 nice 优先级与 CPU 亲和性。安全闸门：拒绝向 PID 1、大白自己、自己的祖先链、内核线程发信号——杀祖先链会让这次回复断在半路。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "enum": ["list", "detail", "signal", "tune"],
+              "description": "操作，默认 list。"
+            },
+            "pid": {
+              "type": "integer",
+              "description": "目标进程 PID。detail/signal/tune 必填。"
+            },
+            "sort_by": {
+              "type": "string",
+              "enum": ["cpu", "mem", "rss", "time"],
+              "description": "list 的排序依据，默认 cpu。"
+            },
+            "limit": {
+              "type": "integer",
+              "description": "返回条数，默认 15，上限 60。"
+            },
+            "signal": {
+              "type": "string",
+              "enum": ["TERM", "KILL", "HUP", "INT", "USR1", "USR2", "CONT", "STOP"],
+              "description": "信号名，默认 TERM（可被捕获，进程有机会清理现场）。KILL 不可捕获。"
+            },
+            "nice": {
+              "type": "integer",
+              "description": "tune 时的优先级：-20（最高）..19（最低）。提高优先级需 root；同一用户内只能降低。"
+            },
+            "affinity": {
+              "type": "string",
+              "description": "tune 时的 CPU 亲和性，如 \"2,3\" 或 \"0-1\"。本机 4 核（0-3）。把重活绑到部分核可避免干扰其他服务。"
+            }
+          },
+          "required": ["action"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "linux_net",
+        "description": "网络支配：谁在听端口、连接状况、接口流量、暴露面审计。action=ports 监听端口（exposure_only=true 只看对外）；conns 连接状态分布 + 对端 Top；ifaces 接口地址/累计流量/错误包 + 云端兜底通道检测；exposure 暴露面审计（对外 vs 回环、主机防火墙、已知高危端口风险提示）。IPv4/IPv6 双栈监听自动合并，不会同一服务报两遍。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "enum": ["ports", "conns", "ifaces", "exposure"],
+              "description": "操作，默认 ports。"
+            },
+            "exposure_only": {
+              "type": "boolean",
+              "description": "ports 时只列对外（非 127.0.0.1）暴露的端口，默认 false。"
+            },
+            "limit": {
+              "type": "integer",
+              "description": "conns 返回的对端条数，默认 15。"
+            }
+          },
+          "required": ["action"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "linux_storage",
+        "description": "存储支配：空间去哪了。action=overview 各挂载点使用率 + inode 使用率 + SD 卡磨损档位；usage 目录占用排行；bigfiles 找大文件；clean 缓存清理候选。clean 只统计不删除——删不删由用户决定，不要自作主张 rm。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "enum": ["overview", "usage", "bigfiles", "clean"],
+              "description": "操作，默认 overview。"
+            },
+            "path": {
+              "type": "string",
+              "description": "usage/bigfiles 的目标目录，默认 /home/wxf。"
+            },
+            "depth": {
+              "type": "integer",
+              "description": "usage 的目录深度，默认 1（上限 4）。"
+            },
+            "min_mb": {
+              "type": "integer",
+              "description": "bigfiles 的最小文件大小（MB），默认 50。"
+            },
+            "limit": {
+              "type": "integer",
+              "description": "返回条数，默认 12（usage）/ 15（bigfiles）。"
+            }
+          },
+          "required": ["action"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "linux_audit",
+        "description": "系统安全审计（全只读，不改任何配置）：暴露面（rpcbind/telnet/SMB/数据库端口的风险判定）、SSH 配置（密码登录/root 登录）、账号与提权（sudo 组、可交互登录账号、空密码账号）、SUID 提权面（区分系统自带与异常项）、可疑进程（从 /tmp 运行、可执行文件已删除）、失败服务与自动安全更新。按 高危/中危/提示/正常 四级给结论。",
+        "parameters": {
+          "type": "object",
+          "properties": {}
         }
       }
     }
