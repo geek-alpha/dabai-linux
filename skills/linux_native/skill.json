@@ -1,0 +1,127 @@
+{
+  "name": "linux_native",
+  "title": "Linux 原生（系统感官/服务托管/桌面集成）",
+  "version": "1.0.0",
+  "description": "把大白与所在 Linux 系统打通：读硬件状态（温度/欠压/内存/负载）、管 systemd 服务、发桌面通知、控媒体播放。",
+  "author": "dabai",
+  "enabled": true,
+  "disclosure": "on_demand",
+  "prompt": "【技能 Linux 原生】大白跑在一台真实机器上（树莓派），可以感知它、操作它。\n- 想知道机器状态/卡不卡/热不热/内存够不够 → linux_senses（一次拿到温度、欠压降频、内存、Swap、负载、磁盘、自身开销 + 判定与建议）。\n- **派重活前先自检**：要跑编译/批量任务/多智能体并行/模型推理/大文件下载前，先 linux_guard(need='heavy')；被拒绝就说明机器过热或内存告急，改成分批做或先告诉用户。\n- 服务挂了/要看日志/重启服务 → linux_service（action=list 列服务，status 查状态，logs 读该服务日志，events 看全系统近期错误，restart/start/stop 控制）。\n- 需要让用户看到提醒 → linux_notify（桌面通知，会弹在用户屏幕上；只在真正重要时用，别刷屏）。\n- 用户在听/看什么、要暂停或切歌 → linux_media。\n- 用户说机器热/卡/慢/风扇响/要不要加散热时，主动 linux_senses 给数据，不要空口安慰。",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "linux_senses",
+        "description": "读取本机真实硬件状态：SoC 温度、欠压/降频标志、CPU 频率与调频策略、内存与 Swap、zram 压缩比、负载、磁盘余量、自身进程开销，并给出判定（healthy/notice/strained/critical）与可执行建议。任何一项读不到都会明确标注，不会假装健康。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "full": {
+              "type": "boolean",
+              "description": "是否包含 PSI 压力指标（内核真实阻塞时长，比 load 更准）。默认 true。"
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "linux_guard",
+        "description": "派重活前的资源自检闸门。返回是否放行 + 理由。编译/批量任务/多智能体并行/模型推理/大文件下载前先调它，避免把 905MB 内存的树莓派拖进 OOM 或热降频。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "need": {
+              "type": "string",
+              "enum": ["light", "normal", "heavy"],
+              "description": "任务重量：light=闲聊/搜索；normal=改码/普通任务；heavy=编译/模型/批量/多智能体。默认 normal。"
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "linux_service",
+        "description": "systemd 服务管理（自动识别系统级/用户级 scope）。action=list 列出服务（含运行状态）；status 查单个服务（状态/PID/重启次数/CPU/开机自启）；logs 读该服务日志；events 看全系统近期错误事件；start/stop/restart/reload 控制服务。大白自己的服务是系统级 myservice.service，控制它需要 sudo（会明确提示）。对大白自己执行 stop 会被拒绝（需 confirm=true），因为 stop 后不会自动恢复。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "enum": ["list", "status", "logs", "events", "start", "stop", "restart", "reload"],
+              "description": "操作类型。默认 status。"
+            },
+            "unit": {
+              "type": "string",
+              "description": "服务名，如 dabai.service / sing-box.service（可省略 .service 后缀）。list/events 可省略。"
+            },
+            "lines": {
+              "type": "integer",
+              "description": "logs/events 返回行数，默认 40（logs）/ 30（events）。"
+            },
+            "since": {
+              "type": "string",
+              "description": "events 的时间范围，如 30min / 2h / 1d（会自动规范成 journalctl 要的 -2h 形式）。默认 2h。"
+            },
+            "scope": {
+              "type": "string",
+              "enum": ["all", "user", "system"],
+              "description": "list 的范围：all=用户级全部+系统级运行中的（默认）；user=只看用户级；system=只看系统级。"
+            },
+            "confirm": {
+              "type": "boolean",
+              "description": "对大白自己的服务执行 stop 时必须显式传 true。"
+            }
+          },
+          "required": ["action"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "linux_notify",
+        "description": "向用户的 Linux 桌面发送通知（走 D-Bus，会真的弹在屏幕上）。仅在需要用户立刻知道时使用：任务完成、需要决策、系统告警。不要用来刷存在感。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "title": {
+              "type": "string",
+              "description": "通知标题。"
+            },
+            "body": {
+              "type": "string",
+              "description": "通知正文。"
+            },
+            "urgency": {
+              "type": "string",
+              "enum": ["low", "normal", "critical"],
+              "description": "紧急程度，默认 normal。critical 会常驻直到用户处理。"
+            }
+          },
+          "required": ["title"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "linux_media",
+        "description": "MPRIS 媒体控制：知道用户当前在听/看什么（now），列出播放器（list），或控制播放（play/pause/next/prev）。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "enum": ["now", "list", "play", "pause", "next", "prev"],
+              "description": "操作，默认 now。"
+            }
+          }
+        }
+      }
+    }
+  ]
+}

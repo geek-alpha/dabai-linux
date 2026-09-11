@@ -1,0 +1,20 @@
+[Unit]
+# 大白系统体检 —— 由 dabai-health.timer 触发（oneshot，跑完即退，零常驻内存）
+#
+# 安装： ln -sf /home/wxf/dabai/deploy/systemd/dabai-health.service ~/.config/systemd/user/
+#        ln -sf /home/wxf/dabai/deploy/systemd/dabai-health.timer   ~/.config/systemd/user/
+#        systemctl --user daemon-reload && systemctl --user enable --now dabai-health.timer
+# 查看： systemctl --user list-timers dabai-health.timer
+#        journalctl --user-unit=dabai-health.service -n 20
+Description=大白系统体检（写 journald + 异常通知）
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/wxf/dabai
+ExecStart=/home/wxf/dabai/venv/bin/python /home/wxf/dabai/tools/linux_health.py --alert
+SyslogIdentifier=dabai-health
+# 体检本身要尽量轻：低 CPU 权重，别跟主服务抢
+CPUWeight=20
+IOSchedulingClass=idle
+# 失败不重试（下次 timer 会再来），也不影响别的单元
+Restart=no

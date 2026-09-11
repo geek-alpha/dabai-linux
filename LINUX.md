@@ -119,7 +119,91 @@ sudo apt-get install -y python3-venv python3-dev ffmpeg ripgrep
 回归：`python tools/linux_smoke_test.py` **14/14 PASS**（含技能层 `system_check`、`find_file`）；
 `server.py` / `platform_compat.py` 语法通过；技能模块 import 冒烟 4/4 通过。
 
-## 6. 回滚
+## 6. Linux 原生集成（让大白成为系统的一部分）
+
+> 目标升级：不只是「能跑」，而是**与系统一体** —— 被 systemd 守护、能感知硬件、
+> 能操作服务、能跟桌面会话对话。工具入口 `skills/linux_native/`，
+> 部署件在 `deploy/systemd/`（详见 `deploy/systemd/README.md`）。
+
+### 6.1 三个实测发现（不是推测，都会改变做法）
+
+| 发现 | 后果 |
+|---|---|
+| 大白**已经**由**系统级** `/etc/systemd/system/myservice.service` 托管（enabled + active，User=wxf） | 不要再建用户级 unit —— 会抢 `8000/8001` 端口造成双实例互踢。只查 `systemctl --user` 是看不见自己的 |
+| `/sys/fs/cgroup/cgroup.controllers` = `cpuset cpu io pids`，**没有 `memory`** | `MemoryMax`/`MemoryHigh` 不生效，`systemd-oomd` 装了也没用；905MB 机器上无法给大白设内存天花板 |
+| `journalctl --user -u <unit>` 恒返回 `No journal files were found` | 用户服务日志**落在系统 journal**，必须用 `journalctl --user-unit=<unit>`；系统级 unit 用 `-u` |
+
+另：`journalctl --since=2h` 解析失败，须写 `--since=-2h`（`linux_service` 已自动规范化）。
+
+### 6.2 新技能 linux_native（5 个工具）
+
+| 工具 | 作用 |
+|---|---|
+| `linux_senses` | SoC 温度、欠压/降频、CPU 频率与调频策略、内存与 Swap、**zram 压缩比**、负载、磁盘、自身开销 → 判定（healthy/notice/strained/critical）+ 可执行建议 |
+| `linux_guard` | 派重活前的资源闸门：`need=heavy` 时检查温度 ≥72°C / 可用内存 <150MB / 负载饱和，任一不满足则拒绝并说明理由 |
+| `linux_service` | systemd **双 scope** 服务管理：list / status / logs / events（全系统近期错误）/ start / stop / restart |
+| `linux_notify` | 桌面通知（`notify-send` → portal D-Bus 回退） |
+| `linux_media` | MPRIS 当前播放 + play/pause/next/prev |
+
+设计要点：
+- **感知失败报 unknown，不报 healthy** —— 把读不到当正常是最危险的假阳性（与 §5 的过滤器兜底同类问题）；
+- **数据源全部只读、零特权、零依赖**（`/sys`、`/proc`、`vcgencmd`），任何一项读不到只标记该项，不整体失败；
+- **服务控制区分系统级/用户级**：系统级需 sudo，工具会明确提示并给出可执行命令；
+- **自停闸门**：对大白自己的 unit 执行 `stop` 会被拒绝（显式 stop 不触发 Restart，等于永久下线），需 `confirm=true`。
+
+### 6.3 系统级增强（drop-in，需 sudo 一次）
+
+`deploy/systemd/myservice.service.d/20-linux-native.conf` —— 对现有 unit 的最小增量：
+
+| 项 | 原值 | 新值 |
+|---|---|---|
+| `SyslogIdentifier` | 未设（日志 tag 是 `python`） | `dabai` |
+| `PATH` | 不含 `~/.local/bin` | 前置 `~/.local/bin`（sb-proxy 所在） |
+| `CPUWeight` / `IOWeight` | 100 | 200（对话优先于代理） |
+| `TasksMax` | 806 | 512 |
+| `OOMPolicy` | `stop` | `continue`（子进程被 OOM 不连坐） |
+| 12 项加固 + `UMask=0077` | 全关 | 开启 |
+
+**刻意不加** `ProtectSystem=strict` / `ProtectHome` / `PrivateTmp` / `SystemCallFilter`：
+大白要读写任意工作区、执行任意命令、spawn 子智能体，锁死文件系统等于废掉核心能力。
+`RestrictAddressFamilies` **必须含 `AF_NETLINK`**，否则 `system_check` 的 `ss -ltnp` 会静默失败。
+
+### 6.4 定期体检（用户级 timer，免 sudo）
+
+`deploy/systemd/dabai-health.{service,timer}` —— 开机 2 分钟后首跑，此后每 10 分钟：
+把一行式状态写进 journald，`strained`/`critical` 时弹桌面通知（同档位 1 小时冷却，升级档位立即提醒）。
+
+选 timer 不选后台线程：开机自动拉起、错过补跑（`Persistent=true`）、**零常驻内存**。
+写 journald 不写文件：本机 `Storage=volatile`（内存），**不碰 SD 卡**，且自带时间索引与轮转。
+
+```bash
+journalctl --user-unit=dabai-health.service -n 20          # 看历史趋势
+```
+
+### 6.5 验证记录（真实执行结果）
+
+| 验证项 | 命令 | 结果 |
+|---|---|---|
+| linux_native 工具全量 | 19 用例（含双 scope、非法参数、自停闸门、时间格式） | **19/19 通过，0 抛异常** |
+| 系统级 unit 可见性 | `linux_service(status, myservice)` | ✓ 识别为 system 级并提示「这是大白自己的服务」 |
+| 用户级 unit 日志 | `linux_service(logs, sing-box)` | ✓ 正确走 `--user-unit=` |
+| 未知 unit | `linux_service(status, no-such-unit)` | ✓ 明确报 not-found（不再伪装成「存在但没跑」） |
+| zram 压缩比 | 对照 `zramctl` | ✓ 3.38:1（278.5MB → 82.3MB），**逐位一致** |
+| 体检 timer | `list-timers` + 手动触发 | ✓ 已排程，日志进 journal（tag `dabai-health`） |
+| unit 语法 | `systemd-analyze verify`（3 个文件） | ✓ 全部无告警 |
+
+调试中发现并修掉的真问题（值得记住）：
+1. **`StartLimitIntervalSec` 放错 section** —— 必须在 `[Unit]`，放 `[Service]` 会被 systemd
+   **静默忽略**（`verify` 才报 `Unknown key`），等于崩溃循环保护根本没生效。dabai 与 sing-box 两处同错。
+2. **zram 读的 sysfs 节点不存在** —— `/sys/block/zram0/orig_data_size` 实测不存在，
+   真实数据源是 `mm_stat`（空格分隔），原实现压缩比**从来没读到过**（恒 None）。
+3. **感知失败报 healthy** —— 所有数据源失效时 verdict 仍返回 `healthy` + 「各项正常」，
+   假阳性比没感知更危险；已改为 `unknown`。
+4. **行号编辑打偏** —— 用 `line_start/line_end` 改代码时行号估算错误，误删了 `storage()` 的挂载解析；
+   教训：改已有文件用 `replace` 精确锚点，别用行号猜。
+
+
+## 7. 回滚（Linux 兼容层，§1–§5）
 
 改动在隔离工作树分支 `codex/linux-compat` 上开发，已合并回 `20260909`（merge commit `748d9d2`）。
 
