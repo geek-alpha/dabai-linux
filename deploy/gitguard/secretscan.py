@@ -297,20 +297,36 @@ def scan_staged() -> list[Finding]:
     return findings
 
 
-def scan_history(root: str = ".") -> list[Finding]:
-    """扫全部历史对象里的每一个 blob（不依赖提交数，用 batch 流式读）。"""
-    listing = subprocess.run(
-        ["git", "cat-file", "--batch-all-objects", "--batch-check=%(objectname) %(objecttype) %(objectsize)"],
-        capture_output=True, text=True, errors="replace", check=False,
-    ).stdout
-    targets = []
-    for line in listing.splitlines():
-        parts = line.split()
-        if len(parts) != 3 or parts[1] != "blob":
-            continue
-        size = int(parts[2])
-        if 0 < size <= 4 * 1024 * 1024:
-            targets.append(parts[0])
+def scan_history(root: str = ".", all_objects: bool = False) -> list[Finding]:
+    """扫历史里的 blob。
+
+    默认只扫**可达对象**（`rev-list --all --objects`）—— 这才是「历史」，
+    也才是 `git push` 会传的东西。
+
+    为什么不用 `--batch-all-objects`：那会把**悬空对象**（比如 `git add`
+    过又被 `git rm --cached` 的暂存残留）一并扫进来。那些永远不会被 push，
+    却会让扫描结果长期挂着几条噪音 —— 看久了人就麻木了。
+    要偏执时用 all_objects=True（对应 CLI 的 --history-all）。
+    """
+    if all_objects:
+        listing = subprocess.run(
+            ["git", "cat-file", "--batch-all-objects",
+             "--batch-check=%(objectname) %(objecttype) %(objectsize)"],
+            capture_output=True, text=True, errors="replace", check=False,
+        ).stdout
+        targets = []
+        for line in listing.splitlines():
+            parts = line.split()
+            if len(parts) != 3 or parts[1] != "blob":
+                continue
+            if 0 < int(parts[2]) <= 4 * 1024 * 1024:
+                targets.append(parts[0])
+    else:
+        out = _git("rev-list", "--all", "--objects")
+        # 同一 blob 可能被多个路径引用，去重以免重复报
+        targets = list(dict.fromkeys(
+            line.split()[0] for line in out.splitlines() if line.strip()
+        ))
     if not targets:
         return []
     # 必须走二进制解析：文本模式按行切会把「内容里本来就有的换行」
@@ -381,8 +397,11 @@ def main(argv: list[str]) -> int:
     if mode == "--staged":
         return report(scan_staged(), allow)
     if mode == "--history":
-        print("扫描全部 git 历史对象（可能较慢）…")
+        print("扫描历史（仅可达对象）…")
         return report(scan_history(root), allow)
+    if mode == "--history-all":
+        print("扫描全部 git 对象，含悬空对象（可能较慢）…")
+        return report(scan_history(root, all_objects=True), allow)
     if mode == "--tree":
         return report(scan_paths(rest or ["."]), allow)
     if mode == "--files":

@@ -54,11 +54,26 @@ bash deploy/gitguard/install.sh --check --deep   # 加上全历史扫描（慢�
 bash deploy/gitguard/install.sh --uninstall
 
 # 手动扫描
-python3 deploy/gitguard/secretscan.py --staged    # 暂存区
-python3 deploy/gitguard/secretscan.py --tree      # 工作区
-python3 deploy/gitguard/secretscan.py --history   # 全历史
+python3 deploy/gitguard/secretscan.py --staged        # 暂存区
+python3 deploy/gitguard/secretscan.py --tree          # 工作区
+python3 deploy/gitguard/secretscan.py --history       # 历史（仅可达对象 = 会被 push 的）
+python3 deploy/gitguard/secretscan.py --history-all   # 偏执模式：含悬空对象
 python3 deploy/gitguard/secretscan.py --files a.py b.json
 ```
+
+### `--history` 与 `--history-all` 的区别
+
+`--history` 只扫**可达对象**（`git rev-list --all --objects`）—— 这正是
+`git push` 会传的东西。
+
+`--history-all` 连**悬空对象**一起扫：比如你 `git add` 了一个含密钥的文件、
+发现不对又 `git rm --cached`，那个 blob 会留在对象库里，**不会被 push**，
+但 `--history-all` 能看见它。两者都查一遍最稳妥；查完用
+`git prune --expire=now && git gc --prune=now` 清掉悬空对象。
+
+（早先版本只扫 `--batch-all-objects`，结果长期挂着两条「悬空 blob 里的假密钥」
+噪音。**扫描结果里常驻噪音 = 人会开始忽略扫描结果 = 钩子名存实亡**，
+所以默认口径改成了可达对象。）
 
 ## 误报了怎么办
 
