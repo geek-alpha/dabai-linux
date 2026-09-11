@@ -333,6 +333,36 @@ sudo -n /usr/local/sbin/dabai-secrets sync     # 免密（只给 sync 免密，s
 ```
 
 
+### 6.8 仓库密钥防线（`deploy/gitguard/`）
+
+**背景**：仓库 11 个提交里一直带着明文 API key。`.gitignore` 只能拦
+「还没被跟踪的文件」，对**已在历史里的**毫无作用 —— 而 `git push`
+推的是全部历史，不是当前快照。
+
+**三层处置**
+
+| 层 | 动作 | 工具 |
+|---|---|---|
+| 止血 | 6 个含密钥配置停止跟踪（磁盘保留），`.gitignore` 补 7 条 | `git rm --cached` |
+| 清史 | 值替换 + 整文件移除，改写全部提交 | `git filter-repo` |
+| 防复发 | 提交前扫暂存区，命中即拒绝 | `pre-commit` 钩子 |
+
+**判据精度是刻意调过的** —— 误报多了钩子就会被 `--no-verify` 绕过，等于没有。
+19 项双向回归：真密钥 6 类全中；`max_tokens` / `state_key` /
+`TOKEN_STATS_KEY` / `sha` / `commit` / `api_base` URL / 中文长文本 /
+文件路径 全部不误报。
+
+**副产品发现**：`nodes.json`（代理节点配置，含 `auth`/`password`/
+`publicKey`/`encryption` 明文凭据）既没被跟踪、**也没被 `.gitignore` 覆盖** ——
+一次 `git add -A` 就会泄漏。已补规则。
+
+**回滚**：清史前全量备份在 `~/dabai-backup/*.bundle`（0600，含旧密钥，
+确认无误后应删除）。清史会改写所有提交 hash，回滚 = 从 bundle 重新 clone。
+
+**一个必须记住的边界**：钩子只在本地。别人 clone 后要自己跑一次
+`bash deploy/gitguard/install.sh`。
+
+
 ## 7. 回滚（Linux 兼容层，§1–§5）
 
 改动在隔离工作树分支 `codex/linux-compat` 上开发，已合并回 `20260909`（merge commit `748d9d2`）。
