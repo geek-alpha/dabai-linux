@@ -9,6 +9,10 @@
 #   3   = 内存调优 sysctl（zram 场景：swappiness / vfs_cache_pressure）立即生效
 #   all = 1 + 2（默认；即用户点名要的两项）
 #
+#   环境变量 NO_RESTART=1 = 跳过重启 myservice（因为它的 MainPID 就是
+#   大白本体 server.py，在本会话里重启会杀掉脚本自己的父进程）。
+#   配合 `sudo -n env NO_RESTART=1 bash $0 all` 使用。
+#
 #   特性：幂等（重复执行安全）、每次改动前自动备份带时间戳、
 #         重启服务前先校验 unit 可解析（避免把服务弄成 failed）、
 #         cmdline.txt 写入前校验仍是单行（vfat 单行约束）。
@@ -57,14 +61,22 @@ step1() {
   fi
   ok "unit 解析正常"
 
-  systemctl restart myservice
-  sleep 3
-  local st
-  st=$(systemctl is-active myservice.service 2>/dev/null || true)
-  if [ "$st" = "active" ]; then
-    ok "服务已重启并运行中"
+  # ⚠️ myservice.service 的 MainPID 就是 server.py 本身（大白的大脑）。
+  #    在本会话里重启它 = 杀掉正在执行本脚本的父进程，回复会断在半路。
+  #    所以默认**不重启**：daemon-reload 已把新配置读进 unit，
+  #    下次重启（或下面步骤 2 要求的重启）自然生效。
+  if [ "${NO_RESTART:-0}" = "1" ]; then
+    warn "NO_RESTART=1 —— 已跳过重启（配置已加载，下次重启生效）"
   else
-    warn "服务状态 = $st —— 请查：journalctl -u myservice -n 50"
+    systemctl restart myservice
+    sleep 3
+    local st
+    st=$(systemctl is-active myservice.service 2>/dev/null || true)
+    if [ "$st" = "active" ]; then
+      ok "服务已重启并运行中"
+    else
+      warn "服务状态 = $st —— 请查：journalctl -u myservice -n 50"
+    fi
   fi
 
   echo
