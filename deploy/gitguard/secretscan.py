@@ -19,6 +19,15 @@ import re
 import subprocess
 import sys
 
+# Windows 中文环境下 stdout 被重定向时默认编码是 GBK，报告里的 ✓ / ✗
+# 会直接抛 UnicodeEncodeError —— 扫描器自己崩了，比漏报更难查。
+# 固定成 UTF-8 + replace：任何平台、任何重定向下都能输出。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError, ValueError):
+        pass
+
 MIN_VALUE_LEN = 20
 
 # ---------- 判据 1：有固定前缀的密钥形态 ----------
@@ -51,18 +60,23 @@ NON_SECRET_SEGMENTS = {
     "version", "ver", "rev", "hash", "sha", "commit", "id", "uuid",
 }
 
-# 光有 key 段还不够 —— 必须是「密钥性质的 key」。
-# TIANAPI_QUIZ_KEY 这种没有限定词，靠下面 Rule C（高熵值）兜底。
-SECRET_QUALIFIERS = {
-    "api", "access", "secret", "private", "auth", "authenticate",
-    "authorization", "signing", "sign", "encryption", "encrypt",
-    "client", "consumer", "bearer", "session", "refresh", "master",
-    "root", "service", "license", "activation", "subscription",
-    "webhook", "app", "application", "developer", "personal",
+# 密钥词根 —— 字段名里必须出现其中之一，才可能被判为密钥字段。
+#
+# 为什么不再用「限定词」（api / service / app / client / session …）单独成立：
+# 它们在普通字段名里的出现频率远高于在真密钥里，实测贡献了大量误报：
+#   serviceCode = "FAST_DELIVERY"        有 service，没有密钥词根
+#   api         = "mtop.gaia.queryUser"  有 api，没有密钥词根
+# 这两类一个密钥词根都没有，不该判成密钥。
+KEY_ROOTS = {
+    "key", "keys", "token", "tokens", "secret", "secrets",
+    "password", "passwd", "pwd", "credential", "credentials",
 }
 
-# Rule C 用的宽松名匹配：名字里含这些子串才考虑高熵值
-SECRET_NAME_HINTS = ("key", "token", "secret", "pass", "cred", "auth", "api")
+# 连写形式（分词后只剩一个段，认不出词根）：apikey / accesstoken / privatekey
+KEY_ROOT_JOINED = (
+    "apikey", "accesskey", "secretkey", "secretkeys", "accesstoken",
+    "privatekey", "clientsecret", "appsecret", "authkey",
+)
 
 # 名字 + 值一起出现的赋值形态（JSON / Python / JS / shell）
 NAME_ASSIGN = re.compile(
@@ -92,34 +106,36 @@ def _segments(name: str) -> list[str]:
 
 
 def name_is_secretish(name: str) -> bool:
-    """严格判据：用于 Rule B。"""
+    """严格判据：用于 Rule B。
+
+    只认「密钥词根」：key / token / secret / password / cred。
+    serviceCode、api、appName 这类字段名不带密钥词根，直接排除 ——
+    它们过去靠 service / api / app 这些限定词命中，是误报的主要来源。
+    """
     segs = _segments(name)
     if not segs:
         return False
     if any(s in NON_SECRET_SEGMENTS for s in segs):
         return False
-    if any(s in SECRET_QUALIFIERS for s in segs):
+    if any(s in KEY_ROOTS for s in segs):
         return True
-    # token / secret / password 这类词根本身就是密钥性质
-    if any(s in ("token", "tokens", "secret", "secrets", "password",
-                 "passwd", "credential", "credentials") for s in segs):
-        return True
-    # apikey / accesstoken 这类连写形式
     joined = "".join(segs)
-    if any(w in joined for w in ("apikey", "accesskey", "secretkey", "accesstoken")):
-        return True
-    # 剩下的裸 key 段：必须带密钥限定词（api_key / access_key / …）
-    return False
+    return any(w in joined for w in KEY_ROOT_JOINED)
 
 
 def name_hints_secret(name: str) -> bool:
-    """宽松判据：用于 Rule C（高熵值）。只要求名字里含密钥词根，
-    且不带 NON_SECRET 词根 —— 这样 sha / commit / data 这类不会误报。"""
+    """宽松判据：用于 Rule C（高熵值）。
+
+    按「词根」匹配而不是子串匹配 —— 子串会把 monkey / keyboard /
+    tokenizer 里的 key、token 也认出来，那是白送误报。
+    """
     segs = _segments(name)
     if not segs or any(s in NON_SECRET_SEGMENTS for s in segs):
         return False
-    low = name.lower()
-    return any(h in low for h in SECRET_NAME_HINTS)
+    if any(s in KEY_ROOTS for s in segs):
+        return True
+    joined = "".join(segs)
+    return any(w in joined for w in KEY_ROOT_JOINED)
 
 
 def _entropy(s: str) -> float:
@@ -136,6 +152,8 @@ def _entropy(s: str) -> float:
 def is_high_entropy_secret(value: str) -> bool:
     v = value.strip()
     if len(v) < 32 or len(v) > 512:
+        return False
+    if looks_like_path(v):
         return False
     if any(c in _FORBIDDEN_CHARS for c in v):
         return False
@@ -162,10 +180,29 @@ def looks_placeholder(value: str) -> bool:
 _SECRET_VALUE_SHAPE = re.compile(r"[A-Za-z0-9_\-+/=.~:]+")
 _FORBIDDEN_CHARS = set(" \t|,;<>(){}[]\"'")
 
+# URL / 文件路径形态 —— 一律不是密钥。
+#   PASSWORD_LOGIN_PREFIX = '/api/v1/password-login'     名字带 password
+#   TOKEN_REMOTE_URL      = '/api/v1/sys/token/remote'   名字带 token
+# 两条都是路由常量：值够长、字母数字混合，但它们是路径不是凭据。
+_PATH_STARTS = ("/", "./", "../", "~", "\\", ".\\")
+
+
+def looks_like_path(value: str) -> bool:
+    v = value.strip()
+    if v.startswith(_PATH_STARTS):
+        return True
+    if "://" in v:                      # http:// https:// ws:// postgres:// …
+        return True
+    if v.startswith(("data:", "file:")):
+        return True
+    return False
+
 
 def looks_like_secret(value: str) -> bool:
     v = value.strip()
     if len(v) < MIN_VALUE_LEN:
+        return False
+    if looks_like_path(v):
         return False
     if any(c in _FORBIDDEN_CHARS for c in v):
         return False
@@ -209,6 +246,12 @@ def scan_text(text: str, where: str = "<text>") -> list[Finding]:
         # 判据 1：值形态
         for kind, pat in VALUE_PATTERNS:
             for m in pat.finditer(line):
+                # PEM 头必须「独占一行」才算真私钥。代码里把 PEM 头当字符串
+                # 处理很常见（例如先 strip 掉头尾再拼装），alipay_service.py
+                # 就有一行 for tag in ('-----BEGIN RSA PRIVATE KEY-----', …)，
+                # 那是文本处理，不是私钥。
+                if kind == "私钥文件头" and line.strip() != m.group(0).strip():
+                    continue
                 k = (line_no, m.group(0))
                 if k in seen:
                     continue
@@ -361,6 +404,13 @@ def _scan_history_binary(oids: list[str]) -> list[Finding]:
     return findings
 
 
+# 单次扫描预算。大仓库 git ls-files 能列出上万个文件，逐个读 + 正则
+# 实测 5 分钟还没跑完 —— 闸门挂死比漏报更糟（push 直接不能用）。
+# 到顶就停并在报告里说明：宁可少扫一部分，也不能把 push 卡住。
+_MAX_SCAN_FILES = 6000
+_MAX_SCAN_BYTES = 48 * 1024 * 1024
+
+
 def scan_tracked() -> list[Finding]:
     """扫「git 跟踪的文件」在工作区的当前内容。
 
@@ -369,8 +419,12 @@ def scan_tracked() -> list[Finding]:
     发布闸门里根本没法用（一个会挂住的检查等于没有检查）。
     改走 git ls-files：语义上就是「会被提交/推送的文件」，且恒定快。
     要扫任意路径仍可用 --files <路径…>。
+
+    仍然有预算上限：见 _MAX_SCAN_FILES / _MAX_SCAN_BYTES。
     """
     findings: list[Finding] = []
+    scanned = 0
+    total = 0
     for name in _git("ls-files", "-z").split("\0"):
         if not name:
             continue
@@ -378,6 +432,16 @@ def scan_tracked() -> list[Finding]:
             continue
         if not os.path.exists(name):
             continue  # 已删除但仍在索引里
+        try:
+            size = os.path.getsize(name)
+        except OSError:
+            continue
+        if scanned >= _MAX_SCAN_FILES or total + size > _MAX_SCAN_BYTES:
+            print(f"⚠ 已达扫描预算（{scanned} 个文件 / {total // 1048576}MB），"
+                  f"其余文件未扫描")
+            break
+        scanned += 1
+        total += size
         findings += scan_file(name)
     return findings
 

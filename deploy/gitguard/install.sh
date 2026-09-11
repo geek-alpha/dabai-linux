@@ -12,6 +12,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(git -C "$HERE" rev-parse --show-toplevel 2>/dev/null || echo "$HERE")"
 SCANNER="$ROOT/deploy/gitguard/secretscan.py"
+RULES="$ROOT/deploy/gitguard/rules_regress.py"
 SRC_HOOK="$HERE/pre-commit"
 
 SECRET_FILES=(settings.json codex_config.json stt_config.json tts_config.json cards.json character_cards.json)
@@ -117,6 +118,21 @@ run_check() {
       wn "钩子功能测试跳过（无法暂存临时文件）"
     fi
     rm -f "$tmpf"
+  fi
+
+  # 判据回归：真实项目里踩过的误报 + 必须仍能抓到的真密钥。
+  # 放宽判据很容易，顺手把真密钥一起放过就麻烦了 —— 所以固定跑这个。
+  if [ -f "$RULES" ]; then
+    local ro rc
+    set +e
+    ro="$(python3 "$RULES" 2>&1)"; rc=$?
+    set -e
+    if [ "$rc" -eq 0 ]; then
+      ok "判据回归通过（$(printf '%s' "$ro" | tail -1)）"
+    else
+      no "判据回归失败：$(printf '%s' "$ro" | grep -E '^  FAIL' | head -5 | tr '\n' ';')"
+      bad=1
+    fi
   fi
 
   if [ "$DEEP" -eq 1 ]; then

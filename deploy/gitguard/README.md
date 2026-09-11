@@ -29,16 +29,31 @@
 ### 刻意不报的（否则钩子会被绕过）
 
 ```
-max_tokens: 8192              # 分词成 [max, tokens] → 含 NON_SECRET 词根
-state_key = "2|2|20260909"    # 值含 | → 不是密钥形态
-TOKEN_STATS_KEY = "xxx_v1"    # 含 stats → 状态常量而非密钥
-sha = "14206abc..."           # 名字不含密钥词根
-"api_base": "https://..."     # URL 显式排除（字符集和熵都像密钥）
-api_key = "YOUR_KEY_HERE"     # 占位符
-prompt = "很长的中文提示词…"      # 字符集不匹配
+max_tokens: 8192                        # 分词成 [max, tokens] → 含 NON_SECRET 词根
+state_key = "2|2|20260909"              # 值含 | → 不是密钥形态
+TOKEN_STATS_KEY = "xxx_v1"              # 含 stats → 状态常量而非密钥
+sha = "14206abc..."                     # 名字不含密钥词根
+"api_base": "https://..."               # URL 显式排除（字符集和熵都像密钥）
+TOKEN_REMOTE_URL = "/api/v1/sys/token"  # 路由常量：以 / 开头 → 判为路径
+PASSWORD_LOGIN_PREFIX = "/api/v1/..."   # 同上，名字带 password 也不报
+serviceCode = "FAST_DELIVERY_CODE"      # 不含密钥词根（service 不算）
+"api": "mtop.gaia.queryUserInfoById"    # 不含密钥词根（api 不算）
+for tag in ('-----BEGIN RSA PRIVATE KEY-----', …)   # PEM 头没独占一行
+api_key = "YOUR_KEY_HERE"               # 占位符
+prompt = "很长的中文提示词…"              # 字符集不匹配
 ```
 
-回归用例在 `install.sh --check` 之外，也可以直接跑 `secretscan.py` 自测。
+后四条是 2026-09 在 `xianyu-auto-reply` 上实测踩出来的：那一个仓库原本
+15 条告警里有 10 条是这种误报，剩下 5 条才是真的硬编码密钥。
+
+回归用例：
+
+```bash
+python3 deploy/gitguard/rules_regress.py   # 18 条，退出码 0 = 全过
+```
+
+`install.sh --check` 会自动带上这一步 —— **改判据必须保证它仍然 18/18**，
+放宽误报时顺手把真密钥一起放过就麻烦了。
 
 ## 用法
 
