@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""密钥扫描器 —— 工作区 / 暂存区 / 全历史。
+"""密钥扫描器 —— 跟踪文件 / 暂存区 / 全历史。
 
 设计目标：既要在提交前拦住真密钥，又不能因为「max_tokens」这种
 名字里带 token 的普通配置而天天误报（误报多了钩子就会被 --no-verify 绕过，
@@ -361,6 +361,27 @@ def _scan_history_binary(oids: list[str]) -> list[Finding]:
     return findings
 
 
+def scan_tracked() -> list[Finding]:
+    """扫「git 跟踪的文件」在工作区的当前内容。
+
+    --tree 的旧实现是 os.walk 整个目录树，在本项目上会走进 models/、
+    audio_cache/、web/vendor/ 等巨型目录，实测 >100s 未完成 ——
+    发布闸门里根本没法用（一个会挂住的检查等于没有检查）。
+    改走 git ls-files：语义上就是「会被提交/推送的文件」，且恒定快。
+    要扫任意路径仍可用 --files <路径…>。
+    """
+    findings: list[Finding] = []
+    for name in _git("ls-files", "-z").split("\0"):
+        if not name:
+            continue
+        if os.path.splitext(name)[1].lower() in SKIP_EXTS:
+            continue
+        if not os.path.exists(name):
+            continue  # 已删除但仍在索引里
+        findings += scan_file(name)
+    return findings
+
+
 def scan_paths(paths: list[str]) -> list[Finding]:
     findings: list[Finding] = []
     for p in paths:
@@ -402,8 +423,8 @@ def main(argv: list[str]) -> int:
     if mode == "--history-all":
         print("扫描全部 git 对象，含悬空对象（可能较慢）…")
         return report(scan_history(root, all_objects=True), allow)
-    if mode == "--tree":
-        return report(scan_paths(rest or ["."]), allow)
+    if mode in ("--tree", "--tracked"):
+        return report(scan_tracked(), allow)
     if mode == "--files":
         return report(scan_paths(rest), allow)
     if mode == "--json":
@@ -411,7 +432,7 @@ def main(argv: list[str]) -> int:
         print(_json.dumps([str(f) for f in scan_paths(rest or ["."])], ensure_ascii=False, indent=2))
         return 0
     print(__doc__)
-    print("用法：secretscan.py [--staged|--tree|--history|--files <路径…>|--json]")
+    print("用法：secretscan.py [--staged|--tree(跟踪文件)|--history|--files <路径…>|--json]")
     return 2
 
 
