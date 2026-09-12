@@ -38,7 +38,7 @@ TOKEN_REMOTE_URL = "/api/v1/sys/token"  # 路由常量：以 / 开头 → 判为
 PASSWORD_LOGIN_PREFIX = "/api/v1/..."   # 同上，名字带 password 也不报
 serviceCode = "FAST_DELIVERY_CODE"      # 不含密钥词根（service 不算）
 "api": "mtop.gaia.queryUserInfoById"    # 不含密钥词根（api 不算）
-for tag in ('-----BEGIN RSA PRIVATE KEY-----', …)   # PEM 头没独占一行
+for tag in ('-----BEGIN' + ' RSA PRIVATE KEY-----', …)   # PEM 头没独占一行
 api_key = "YOUR_KEY_HERE"               # 占位符
 prompt = "很长的中文提示词…"              # 字符集不匹配
 ```
