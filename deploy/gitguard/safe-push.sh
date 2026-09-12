@@ -94,9 +94,13 @@ TOKEN="${GITHUB_TOKEN:-}"
 if [ -z "$TOKEN" ] && [ -r /etc/dabai/secrets.env ]; then
   TOKEN="$(grep -E '^GITHUB_TOKEN=' /etc/dabai/secrets.env | head -1 | cut -d= -f2- || true)"
 fi
+if [ -z "$TOKEN" ] && [ -r "$HOME/.config/dabai/secrets.env" ]; then
+  TOKEN="$(grep -E '^GITHUB_TOKEN=' "$HOME/.config/dabai/secrets.env" | head -1 | cut -d= -f2- || true)"
+fi
 if [ -z "$TOKEN" ]; then
-  echo "  ✗ 没找到 GITHUB_TOKEN"
-  echo "    持久化一次： dabai-secrets set GITHUB_TOKEN ghp_xxx"
+  echo "  ✗ 没找到 GITHUB_TOKEN（按序找：环境变量 → /etc/dabai/secrets.env → ~/.config/dabai/secrets.env）"
+  echo "    系统级持久化： sudo dabai-secrets set GITHUB_TOKEN ghp_xxx"
+  echo "    用户级持久化： umask 077 && printf 'GITHUB_TOKEN=%s\\n' ghp_xxx > ~/.config/dabai/secrets.env"
   echo "    或临时一次： export GITHUB_TOKEN=ghp_xxx"
   if [ "$DRY" != "1" ]; then die "缺少 token，无法建仓/推送"; fi
 else
