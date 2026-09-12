@@ -1,0 +1,29 @@
+[Unit]
+# 大白长跑引擎 —— 无人值守推进长期目标（几十~上百天）
+Description=大白长跑引擎（无人值守推进长期目标）
+Documentation=file:/home/wxf/dabai/tools/longrun/README.md
+After=network-online.target
+Wants=network-online.target
+# 0 = 永不因为「重启太频繁」被判死（长跑就是要无限重来）
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=/home/wxf/dabai
+Environment=LONGRUN_INTERVAL=300
+Environment=LONGRUN_TIMEOUT=1800
+Environment=LONGRUN_MAX_CALLS=200
+ExecStart=/home/wxf/dabai/venv/bin/python /home/wxf/dabai/tools/longrun/runner.py --loop
+# 崩了就起，30s 后再来；这是「一旦没完成就一直跑」的第一层保险
+Restart=always
+RestartSec=30
+# 温和模式：不跟主服务抢资源（长跑是马拉松，不是冲刺）
+CPUWeight=50
+IOSchedulingClass=idle
+Nice=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dabai-longrun
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,16 @@
+[Unit]
+# 长跑引擎心跳看门狗：卡死（进程活着但不再推进）时强制重启
+Description=大白长跑引擎心跳看门狗
+Documentation=file:/home/wxf/dabai/tools/longrun/README.md
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=10min
+# 兜底：OnUnitActiveSec 在 oneshot + Persistent 组合下有时算不出下一次，加一条绝对时刻
+OnCalendar=*:0/10
+Persistent=true
+AccuracySec=30s
+Unit=dabai-longrun-watchdog.service
+
+[Install]
+WantedBy=timers.target

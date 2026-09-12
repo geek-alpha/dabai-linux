@@ -1,16 +1,39 @@
 {
  "projects": [
   {
+   "id": "longrun-engine",
+   "title": "长跑引擎：无人值守推进长期目标",
+   "why": "任务做完即焚、目标不落盘就不深耕；真正成大事的都要时间磨砺，机器也一样——需要能连续跑几十上百天的执行器。",
+   "value": "让主人给一个目标就能撒手：引擎自己一轮轮推进、自己扛崩溃、自己防跑偏，而不是每次都要人盯着陪跑。",
+   "done_when": "服务连续跑满 30 天：journal 里每轮都有记录、崩溃/卡死都能自愈（重启后继续）、预算与急停可控、无人工干预下台账持续推进。",
+   "stage": "active",
+   "progress": 60,
+   "next": "观察头 24 小时真实运行：核对 journal 里每轮是否都有台账更新、预算计数是否准确、看门狗是否只在该动手时动手（零误杀）",
+   "created": "2026-09-13",
+   "log": [
+    {
+     "t": "2026-09-13",
+     "what": "长跑引擎落地并端到端验证：Ralph loop（每轮全新上下文）+ Anthropic 长跑 harness（一轮一动作+强制交接）+ 持久化执行（checkpoint/断点续跑）+ Letta sleep-time（空档整理台账）四范式合成 runner.py，配 systemd 自愈服务与心跳看门狗",
+     "ev": "首轮真实跑通 226s/exit=0/台账被更新（self-evolution 90→92%，含两处 agent.py 守卫 bug 修复）；kill -9 后 state.json 合法、journal 可解析、flock 自动释放；Restart=always 实测 PID 71818→71848（restart counter 1）；看门狗四分支实测：急停不干预/心跳过期重启 71886→71899/未运行拉起/心跳新鲜不动；单实例锁实测拒绝第二实例"
+    }
+   ]
+  },
+  {
    "id": "self-evolution",
    "title": "自我进化闭环",
    "why": "每轮对话都是新生：教训不落盘就重犯，目标不落盘就不深耕，进步不可见就没有方向。",
    "value": "让使用者拿到一个会自己变强的工具，而不是每次从零陪跑。",
    "done_when": "教训/目标/度量三件套自动运转，连续 10 轮对话无需人工提醒就有可见推进。",
    "stage": "active",
-   "progress": 90,
-   "next": "核对 usage 日志里带图请求的 prompt_tokens 增量是否≈384，并验证非视觉模型下走「图片未注入」提示而非 400",
+   "progress": 92,
+   "next": "跑一次真实带图对话轮（让工具结果带 [[IMG:]]，如 skills/android screenshot 或自造 stub），从 data/turn_metrics.jsonl 的 call_trace[].p 读相邻两次调用的增量，核对是否≈592、以及 1024 估算下轮内压缩是否照常触发",
    "created": "2026-09-12",
    "log": [
+    {
+     "t": "2026-09-13",
+     "what": "核对图片注入 token 增量：官方「每图封顶 384」在本渠道不成立（实测 201~995 随分辨率走），原估算 400 偏低 33%~60%，已提到 1024；顺手揪出并修掉两处「说了未注入却照样注入 image_url」的守卫缺失（非视觉模型必然 400）",
+     "ev": "tools/img_token_probe.py 实测 deepseek-flash@api.deepseek.com：纯文本基线 35；360x640→201、720x1280→592、1280x2276→592、1280x1280→995。agent.py:475-479 _IMG_TOKEN_EST 400→1024；agent.py:560-579 新增 _append_img_messages（img_ok=False 时只 append _IMG_NO_EYES 并 return 0）；agent.py:4793/4819 两处调用点收敛到它；tests/test_img_inject.py 4 passed；反证：旧逻辑在 img_ok=False 下注入 image_url=True，故该断言在改前必红。harness/vision_probe.py:88-109 + 实测 supports_vision('Qwen/Qwen3-30B-A3B-Instruct-2507')→(False,'名字无视觉线索且无实测记录')"
+    },
     {
      "t": "2026-09-13",
      "what": "端到端验收 [[IMG:]] 图片注入：B站控件树 0 文字，只靠 screenshot 图片注入读画面，实测准确读出卡片标题/时长/播放量/弹幕数（「2045年人类将永生？谷歌工程师的生命逃逸速度」15:19 / 1.4万 / 99）",
@@ -105,11 +128,6 @@
      "t": "2026-09-12",
      "what": "手机感知通道全量接通：dump_ui（原来只有 dump_raw 走 agent，snapshot/settle/守护仍在走 adb uiautomator 2.4s）改为 agent 优先；动作后等待从「固定 sleep 0.7s + 一次 dump」改成轮询+连续两帧指纹一致才写缓存；写缓存加 ts 单调守卫、ts 改取 dump 发起时刻；do_tap 只信 2.5s 内的坐标；do_launch 改成 cur_window 直查（不再等缓存过期）+ 窗口到了再 settle 1.5s 等内容画好。",
      "ev": "实测：agent dump 0.19/0.23/0.27s，snapshot 0.34/0.35/0.47s，tap 0.17s，settle 1.16~1.45s（跨页）；同 app 5 步 batch 4.4s、跨 app 2 个 app 5 步 9.9s；冷启 1.6~2.7s（旧版 7.5s）。功能验证：首页↔我 每步 see 都读到真屏（16 可点/29 文字 vs 29 可点/56 文字，缓存 0.9s）；跨 app 设置 6 可点/28 文字 → 小红书 29 可点/56 文字；scenario 采集 6 条含 0 赞项；ts 守卫两向单测通过。"
-    },
-    {
-     "t": "2026-09-12",
-     "what": "手机感知层架构升级完成：从 adb uiautomator dump（2500ms、60% 静默读到旧屏）换成手机端常驻 agent + 本机裸 HTTP JSON-RPC（190~346ms，快 9 倍，零静默失败）。手机上只放一个 3.7MB 的 u2.jar 到 /data/local/tmp，不装任何 apk；agent 用 nohup 脱离 adb shell 常驻 9008，本机 adb forward + http.client 直连，零第三方运行时依赖。",
-     "ev": "实测：热路径 190/314/346/373ms（101 控件 30 可点）；冷启动 2.2s（含 agent 重建）；adb 兜底 4309ms 且能返回有效 XML；对照 adb 方式 2500ms/60%失败"
     }
    ]
   }

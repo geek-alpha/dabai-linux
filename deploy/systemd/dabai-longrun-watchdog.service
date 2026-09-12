@@ -1,0 +1,12 @@
+[Unit]
+# 心跳看门狗 —— 由 dabai-longrun-watchdog.timer 触发（oneshot，零常驻内存）
+Description=大白长跑引擎心跳看门狗（卡死即重启）
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/wxf/dabai
+ExecStart=/bin/sh /home/wxf/dabai/tools/longrun/watchdog.sh
+SyslogIdentifier=dabai-longrun-watchdog
+CPUWeight=10
+IOSchedulingClass=idle
+Restart=no

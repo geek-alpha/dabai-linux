@@ -127,4 +127,7 @@ data/backup/
 journal_prereboot.baseline.txt
 # 视觉/定时任务运行时状态（进程重启自行覆写）
 data/vision_state.json
+data/img_probe_*.png
 data/scheduled_tasks.json
+# 长跑引擎运行态（journal/state/heartbeat/STOP/lock 都不该进仓）
+data/longrun/
