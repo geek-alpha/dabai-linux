@@ -48,6 +48,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .state import StateStore
+from ._reload import evict_dir_modules
 
 logger = logging.getLogger("harness.plugins")
 
@@ -68,44 +69,6 @@ def _load_code_module(mod_path: Path, name: str):
     except Exception as e:
         sys.modules.pop(spec.name, None)
         raise PluginError(f"插件 {name} 代码执行失败: {e}\n{traceback.format_exc()}") from e
-
-
-# 与技能层一致：热重载时清除插件自己导入的子模块缓存，
-# 改 impl/依赖文件后无需重启即可生效（跳过 server 共享模块）。
-_SHARED_PLUGIN_MODULES = frozenset({"video_lib"})
-
-
-def _evict_plugin_submodules(entry: dict, plugin_dir: Path) -> None:
-    try:
-        root = Path(plugin_dir).resolve()
-        for mod_name in list(entry.get("_mods_added") or []):
-            if mod_name in _SHARED_PLUGIN_MODULES:
-                continue
-            mod = sys.modules.get(mod_name)
-            if mod is None:
-                continue
-            try:
-                f = getattr(mod, "__file__", None)
-            except Exception:
-                f = None
-            if not f:
-                continue
-            try:
-                p = Path(f).resolve()
-            except Exception:
-                continue
-            if root == p or root in p.parents:
-                sys.modules.pop(mod_name, None)
-        # 字节码缓存可能残留旧 pyc（同秒/同长度编辑时 pyc 校验会误判为未变）
-        pycache = root / "__pycache__"
-        if pycache.is_dir():
-            for pyc in list(pycache.glob("*.pyc")):
-                try:
-                    pyc.unlink()
-                except Exception:
-                    pass
-    except Exception as e:
-        logger.warning("清除插件子模块缓存失败: %s", e)
 
 
 class Plugin:
@@ -297,11 +260,9 @@ class PluginManager:
             return entry
         try:
             if entry_path.exists():
-                _mods_before = set(sys.modules)
                 module = _load_code_module(entry_path, name)
                 instance = self._instantiate(module, name, info)
                 entry["instance"] = instance
-                entry["_mods_added"] = sorted(set(sys.modules) - _mods_before)
                 try:
                     instance.on_load()
                 except Exception as e:
@@ -376,7 +337,7 @@ class PluginManager:
                 logger.warning("插件 %s on_unload 钩子失败: %s", name, e)
         if entry:
             try:
-                _evict_plugin_submodules(entry, Path(entry["info"].get("path") or ""))
+                evict_dir_modules(entry["info"].get("path"), self.directory, label="插件")
             except Exception:
                 pass
 

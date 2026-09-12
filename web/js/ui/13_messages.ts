@@ -47,6 +47,23 @@ export default (function init(App: AppKernel) {
     return out;
   };
 
+  // 本地绝对路径 → /media 通用路由：浏览器把 /home/x/a.png 当同源相对路径请求，必然 404。
+  // Windows 盘符与 Unix 绝对路径都要转；已是前端挂载前缀的（/static、/generated…）原样放行。
+  const FRONT_ROUTE_RE = /^\/(?:static|media|generated|models|audio|backgrounds|anim|mpt|downloads|api|ws)(?:[/?#]|$)/;
+  App.toMediaUrl = function toMediaUrl(raw: string) {
+    const u = String(raw == null ? '' : raw).trim();
+    if (!u || u.startsWith('//')) return u;
+    const winAbs = /^[A-Za-z]:[\\/]/.test(u);
+    const unixAbs = u.startsWith('/') && !FRONT_ROUTE_RE.test(u);
+    if (!winAbs && !unixAbs) return u;
+    // 先解码归一化再编码：renderMsgMedia 走 new URL() 归一化时，浏览器已把中文/空格
+    // 转成 %XX，这里再 encodeURIComponent 会二次编码（%E8 → %25E8），服务端解出来是
+    // 字面量路径 → /media 404 → <video> onerror 隐藏，中文名媒体一律显示不出来。
+    let p = u.replace(/\\/g, '/');
+    try { p = decodeURIComponent(p); } catch (e) { /* 非法转义序列原样保留 */ }
+    return '/media?path=' + encodeURIComponent(p);
+  };
+
   // 普通网址链接化（媒体链接已单独处理）：raw 文本段 → 转义 + 可点击 <a>
   const PLAIN_URL_RE = /https?:\/\/[^\s<>"'`\u3000\uff08\uff09]+/gi;
   function linkifySegment(seg: string) {
@@ -233,23 +250,21 @@ export default (function init(App: AppKernel) {
         const u = new URL(rawUrl, location.href);
         if (u.origin === location.origin) url = u.pathname + u.search + u.hash;
       } catch (e) { /* 非 URL 原样保留 */ }
-      // 本地盘符绝对路径（C:\...、D:/...）→ 走 /media 通用路由，让任意位置视频都能播
-      if (/^[A-Za-z]:[\\/]/.test(url)) {
-        url = '/media?path=' + encodeURIComponent(url.replace(/\\/g, '/'));
-      }
+      // 本地绝对路径（C:\...、/home/...）→ 走 /media 通用路由，让任意位置媒体都能显示
+      url = App.toMediaUrl(url);
       const attrs = 'src="' + escHtml(url) + '"';
       const failFallback = 'this.style.display=\'none\';this.parentNode.classList.add(\'media-failed\')';
       const media = isVideoUrl(url)
         ? '<video class="msg-media msg-media-video" ' + attrs + ' controls playsinline preload="metadata" referrerpolicy="no-referrer" onerror="' + failFallback + '"></video>'
         : '<img class="msg-media msg-media-img" ' + attrs + ' alt="' + escHtml(url) + '" loading="lazy" referrerpolicy="no-referrer" onerror="' + failFallback + '">';
-      const wrapped = '<a class="msg-media-link" href="' + escHtml(rawUrl) + '" target="_blank" rel="noopener" title="' + escHtml(rawUrl) + '">' + media + '</a>';
-      // 优先替换 mdToHtml 生成的普通链接（href 与文案均为转义后的 URL）
-      const linkHtmlRaw = '<a class="md-link" href="' + escHtml(rawUrl) + '" target="_blank" rel="noopener">' + escHtml(rawUrl) + '</a>';
-      const linkHtmlNorm = '<a class="md-link" href="' + escHtml(url) + '" target="_blank" rel="noopener">' + escHtml(url) + '</a>';
-      if (html.includes(linkHtmlRaw)) {
-        html = html.split(linkHtmlRaw).join(wrapped);
-      } else if (html.includes(linkHtmlNorm)) {
-        html = html.split(linkHtmlNorm).join(wrapped);
+      const wrapped = '<a class="msg-media-link" href="' + escHtml(url) + '" target="_blank" rel="noopener" title="' + escHtml(url) + '">' + media + '</a>';
+      // [文字](媒体url) 形式：mdToHtml 已生成完整锚点，必须整块替换——只替换 href 里的
+      // URL 串会把 wrapped 塞进属性值，产出畸形 HTML（视频/图片被吞掉）。
+      const anchorOpen = '<a class="md-link" href="' + escHtml(rawUrl) + '"';
+      const a0 = html.indexOf(anchorOpen);
+      const a1 = a0 >= 0 ? html.indexOf('</a>', a0) : -1;
+      if (a1 >= 0) {
+        html = html.slice(0, a0) + wrapped + html.slice(a1 + 4);
       } else if (html.includes(escHtml(rawUrl))) {
         html = html.split(escHtml(rawUrl)).join(wrapped);
       } else if (html.includes(escHtml(url))) {
@@ -1069,38 +1084,90 @@ export default (function init(App: AppKernel) {
   });
   App.updateTokenMeter(); // 让持久化数据上屏
 
-  // 聊天框全屏：点击 ⤢ 展开为全屏（占满屏幕），再点还原
+  /* 聊天框全屏与全屏透明：两个按钮、两条路，共用同一套「铺满屏幕」的外壳。
+   *   ⤢ 不透明全屏：屏幕上只剩对话 —— 顺手把 3D 渲染整个停掉（省电，也真的安静）
+   *   ◍ 全屏透明：面板半透明、渲染不停 —— 角色在字后面干活，安静但不隔绝
+   * 两者互斥（都是「占满屏幕」，同时开只会打架）。 */
   App.chatFullscreen = false;
-  App.setChatFullscreen = function setChatFullscreen(on: boolean) {
+  App.chatGhost = false;
+
+  /** 铺满 / 退出铺满：两种全屏共用的外壳（差别只在透明与是否静默） */
+  const applyFsShell = (on: boolean) => {
     const panel = document.getElementById('chat-panel');
     const appEl = document.getElementById('app');
-    if (!panel) return;
-    App.chatFullscreen = !!on;
-    App.chatHeightLevel = App.chatFullscreen ? 1 : 0;
+    if (!panel) return null;
+    App.chatHeightLevel = on ? 1 : 0;
     // 清掉旧的高度档位类，统一走全屏
     panel.classList.remove('chat-h-md', 'chat-h-lg');
-    panel.classList.toggle('chat-fs', App.chatFullscreen);
-    if (appEl) appEl.classList.toggle('chat-fullscreen', App.chatFullscreen);
+    panel.classList.toggle('chat-fs', on);
+    // 进全屏必须先摘掉 collapsed：collapsed 自带 translateY(120%) + max-height:38dvh + opacity:0，
+    // 而且 CSS 里排在 .chat-fs 之后会盖掉全屏几何 —— 实测点 ◍ 后面板仍下移 364px、高只有 304px，
+    // 屏幕上就是「上半有字、下半空」。输入栏那份 collapsed 一起摘，否则它也不回位。
+    if (on) {
+      panel.classList.remove('collapsed');
+      const controls = document.getElementById('controls');
+      if (controls) controls.classList.remove('collapsed');
+    }
+    if (appEl) appEl.classList.toggle('chat-fullscreen', on);
+    const toggle = document.getElementById('chat-toggle');
+    if (toggle) toggle.classList.toggle('shifted', on);
+    return panel;
+  };
+
+  /** 两个全屏按钮的激活态 / 图标 / 提示，一处同步，避免各自漏改 */
+  const syncFsBtns = () => {
+    const fsBtn = document.getElementById('chat-height-btn');
+    if (fsBtn) {
+      const on = App.chatFullscreen && !App.chatGhost;
+      fsBtn.classList.toggle('active', on);
+      fsBtn.textContent = on ? '⤡' : '⤢';
+      fsBtn.title = on ? '退出全屏聊天（点击还原）' : '全屏聊天（点击展开）';
+    }
+    const ghBtn = document.getElementById('chat-ghost-btn');
+    if (ghBtn) {
+      ghBtn.classList.toggle('active', App.chatGhost);
+      ghBtn.textContent = App.chatGhost ? '◉' : '◍';
+      ghBtn.title = App.chatGhost
+        ? '退出全屏透明（点击还原）'
+        : '全屏透明：铺满屏幕，让角色透出来';
+    }
+  };
+
+  App.setChatFullscreen = function setChatFullscreen(on: boolean) {
+    const panel = applyFsShell(!!on);
+    if (!panel) return;
+    App.chatFullscreen = !!on;
+    App.chatGhost = false;
+    panel.classList.remove('chat-ghost');
     // 全屏 = 屏幕上只剩对话：非聊天框的一切渲染全部停掉（00_quiet 总闸）
     if (App.setQuiet) App.setQuiet(App.chatFullscreen);
-    const btn = document.getElementById('chat-height-btn');
-    if (btn) {
-      btn.classList.toggle('active', App.chatFullscreen);
-      btn.textContent = App.chatFullscreen ? '⤡' : '⤢';
-      btn.title = App.chatFullscreen ? '退出全屏聊天（点击还原）' : '全屏聊天（点击展开）';
-    }
-    const toggle = document.getElementById('chat-toggle');
-    if (toggle) toggle.classList.toggle('shifted', App.chatFullscreen);
+    syncFsBtns();
     setTimeout(() => App.scrollToBottom(true), 320);
   };
+
+  App.setChatGhost = function setChatGhost(on: boolean) {
+    const panel = applyFsShell(!!on);
+    if (!panel) return;
+    App.chatGhost = !!on;
+    App.chatFullscreen = !!on;
+    panel.classList.toggle('chat-ghost', App.chatGhost);
+    // 与不透明全屏的唯一分岔：渲染不停 —— 背景里得有东西，透明才有意义
+    if (App.setQuiet) App.setQuiet(false);
+    syncFsBtns();
+    setTimeout(() => App.scrollToBottom(true), 320);
+  };
+
   App.cycleChatHeight = function cycleChatHeight() {
-    App.setChatFullscreen(!App.chatFullscreen);
+    // 全屏透明下点 ⤢ = 切到不透明全屏（两个按钮像一组单选，不必先退出再进）
+    App.setChatFullscreen(!App.chatFullscreen || App.chatGhost);
   };
   // 收起聊天（与右下角切换按钮行为一致）
   App.closeChatPanel = function closeChatPanel() {
     const panel = document.getElementById('chat-panel');
     const controls = document.getElementById('controls');
     if (!panel || panel.classList.contains('collapsed')) return;
+    // 收起时把两种全屏态一起清掉：否则 chat-fs 的 fixed inset:0 会留在面板上
+    if (App.chatFullscreen || App.chatGhost) App.setChatFullscreen(false);
     panel.classList.add('collapsed');
     controls!.classList.add('collapsed');
     if (App.chatToggle) App.chatToggle.classList.remove('shifted', 'has-new');
@@ -1108,6 +1175,8 @@ export default (function init(App: AppKernel) {
   };
   const heightBtn = document.getElementById('chat-height-btn');
   if (heightBtn) heightBtn.addEventListener('click', App.cycleChatHeight);
+  const ghostBtn = document.getElementById('chat-ghost-btn');
+  if (ghostBtn) ghostBtn.addEventListener('click', () => App.setChatGhost(!App.chatGhost));
   const closeBtn = document.getElementById('chat-close-btn');
   if (closeBtn) closeBtn.addEventListener('click', App.closeChatPanel);
   const head = document.getElementById('chat-head');

@@ -143,6 +143,20 @@ export default function init(App: AppKernel) {
     if (!hudTimer) hudTimer = window.setTimeout(updateHud, 60);
   }
 
+  /* 聊天全屏（不透明）：速率 HUD 被完全遮挡 —— rAF 与 HUD 定时器一起停。
+   * 本模块只测量不绘制，但每帧的采样/写入仍是主线程开销，静默时一帧都不该跑。
+   * 注册即回调，所以这里不需要在别处补一次初始状态。 */
+  App.onQuiet((on: boolean) => {
+    if (on) {
+      if (raf) { cancelAnimationFrame(raf); raf = 0; }
+      if (hudTimer) { clearTimeout(hudTimer); hudTimer = 0; }
+    } else if (phase !== 'idle') {
+      // 退出全屏时若流式仍在进行，接着测（看门狗会在静默超时后自行归零）
+      schedule();
+      if (!hudTimer) hudTimer = window.setTimeout(updateHud, 60);
+    }
+  });
+
   /* ---------- 节拍：句界处给一次视觉脉冲 ---------- */
   function beat(now: number) {
     if (now - lastBeatAt < BEAT_MIN_GAP) return;

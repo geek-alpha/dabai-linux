@@ -1,17 +1,17 @@
 [Unit]
 # 定期触发大白系统体检
-Description=定期触发大白系统体检（开机 2 分钟后首跑，此后每 10 分钟）
+Description=定期触发大白系统体检（开机 2 分钟后首跑，此后每 30 分钟）
 Documentation=file:/home/wxf/dabai/deploy/systemd/README.md
 
 [Timer]
 # 开机 2 分钟后先跑一次（等系统稳定，避免把启动期的负载当成异常）
 OnBootSec=2min
-# 之后每 10 分钟一次
-OnUnitActiveSec=10min
+# 之后每 30 分钟一次（降频：减少唤醒次数 = 减少 CPU 唤醒发热与 SD 卡写）
+OnUnitActiveSec=30min
 # 关机期间错过的执行，开机后补跑一次（Persistent 需要 timer 有持久化时间戳）
 Persistent=true
 # 允许 30s 抖动，把多个 timer 的唤醒合并，省电
-AccuracySec=30s
+AccuracySec=60s
 Unit=dabai-health.service
 
 [Install]

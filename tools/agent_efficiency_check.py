@@ -461,8 +461,38 @@ check("截断后每个 tool 结果前面都有 tool_calls（function-calling 校
       all(any(m.get("tool_calls") for m in vt[:_i])
           for _i, m in enumerate(vt) if m.get("role") == "tool"))
 
-check("空打包结果：返回空且不残留旧视图",
-      A.AIAgent._stable_history_messages(ag, []) == [])
+# 空打包 ≠ 会话结束：这是真实运行里 93% 的前缀断裂来源。
+# 实测 data/hist_view_trace.jsonl（257 条真实运行样本）：15 次 anchor_lost 里
+# 14 次紧跟一次 empty —— 旧写法在 packed 空时把视图清掉，下一轮 packed 恢复
+# 就无锚点可对，只能全量重建，把整段历史按全价重发一遍。
+ag_e = _stub("s_empty")
+pe = [_u("问题1"), _a("回答1"), _u("问题2"), _a("回答2")]
+check("空包场景准备：视图已建立",
+      A.AIAgent._stable_history_messages(ag_e, pe) == pe)
+# ⚠ 这一条必须打在被断言的那个实例上：早先写成 ag，于是 ag_e 从未经历
+# 「空包」，后面那条「视图仍在」永远为真——退回旧写法做反向验证时全绿，
+# 是个假通过（验证器自己失效比 bug 更危险）。
+check("空打包结果：返回空（不往请求里塞历史）",
+      A.AIAgent._stable_history_messages(ag_e, []) == [])
+check("★★ 空打包后视图仍在（清掉它 = 下一轮必然全量重建）",
+      getattr(ag_e, "_hist_msgs_view", None) == pe,
+      "视图 %d 条 / 期望保留 %d 条"
+      % (len(getattr(ag_e, "_hist_msgs_view", []) or []), len(pe)))
+
+# 下一轮打包恢复，且比视图短（打包器缩水是常态，不是异常）
+pe_next = pe[-2:] + [_u("问题3"), _a("回答3")]
+ve1 = A.AIAgent._stable_history_messages(ag_e, pe_next)
+check("★★ 空包后的下一轮走追加而非重建（前缀逐字节保住）",
+      ve1[:len(pe)] == pe and len(ve1) == len(pe) + 2,
+      "视图 %d 条，期望前 %d 条与空包前一致" % (len(ve1), len(pe)))
+
+# 反向守卫：不能把「空包保留」写成「永远保留」——真换会话必须清。
+ag_sw = _stub("s_switch")
+A.AIAgent._stable_history_messages(ag_sw, pe)
+ag_sw.memory.session_id = "s_other"
+check("★ 换会话时空包仍清视图（保留策略不越界到跳会话）",
+      A.AIAgent._stable_history_messages(ag_sw, []) == []
+      and getattr(ag_sw, "_hist_msgs_view", None) == [])
 
 # 死代码守卫：上一次的滞回窗口只定义、只在回退路径调用，主路径照样每轮失效。
 # 这条检查盯着「接线」，因为「定义存在」不等于「生效」。
@@ -760,6 +790,74 @@ check("★ 技能状态落盘路径已接线（data/skills_state.json）",
 check("★ 技能状态读写都容错（无 memory 的裸实例也不报错）",
       'getattr(getattr(self, "memory", None), "session_id", None)' in _src_a)
 
+
+# ---- [10] 切角色卡片保留技能（_carry_skills_to）----
+# 技能是 Agent 的能力，人设是说话风格，两者正交：切卡片换的是记忆空间，
+# 不该让 Agent 忘掉自己会用哪些工具。实测 data/turn_metrics.jsonl：
+# tools 掉到 1 的轮次占 16.4%（34/207），吃掉全部 miss 的 20.7%。
+# 这一段要读写落盘状态：临时把路径指到临时目录 + 放开 tag=test 闸门，
+# 结束时必须还原——否则会覆盖真实的 data/skills_state.json。
+_tmpdir10 = tempfile.mkdtemp(prefix="carry_skills_")
+A.SKILLS_STATE_PATH = os.path.join(_tmpdir10, "skills_state.json")
+A._skills_state_persist_enabled = lambda: True
+
+_c10 = _mk_agent_sid("card_a")
+_c10._activate_skill("code_ops")
+_names_before10 = A._tool_names(_c10._all_tools)
+check("切卡片前技能已挂上（前提成立才谈得上保留）",
+      len(_names_before10) > 20, "%d 个" % len(_names_before10))
+
+_c10._carry_skills_to("card_b")          # 模拟切角色卡片：换记忆空间
+check("★★ 切卡片后工具集逐字节不变（能力不随人设重置）",
+      A._tool_names(_c10._all_tools) == _names_before10,
+      "%d / %d" % (len(A._tool_names(_c10._all_tools)), len(_names_before10)))
+check("★★ 激活集改挂到新 sid（不改挂 = 下一轮 restore 读不到，白保留）",
+      A._load_skills_state("card_b") == _c10._ordered_active_skills(),
+      "%s" % A._load_skills_state("card_b"))
+check("★ 新 sid 已认领，不让 restore 再覆盖一次",
+      _c10._skills_restored_sid == "card_b")
+check("★ 空 sid 不写档（不猜，宁可下次再说）",
+      (_c10._carry_skills_to(None) or True)
+      and A._load_skills_state("card_b") == ["code_ops"])
+
+# 真·新会话仍必须清盘（用户点「新会话」按钮）——该清的要清，别一起放行
+_c10.reset_session_skills()
+check("★ 用户点新会话仍清盘（保留 ≠ 永不清理）",
+      A._load_skills_state("card_b") == [] and not _c10._activated_skills)
+
+# 接线守卫：两个角色卡片入口都必须走 _carry_skills_to，不许退回 reset
+check("★★ 切卡片两个入口都走 _carry_skills_to（退回 reset 就前功尽弃）",
+      _src_a.count("self._carry_skills_to(self.memory.session_id)") >= 2,
+      "carry×%d" % _src_a.count("self._carry_skills_to(self.memory.session_id)"))
+
+A.SKILLS_STATE_PATH = _real_path9
+A._skills_state_persist_enabled = _real_enabled9
+
+# ---- [11] 「太重」按字符量判，不按工具个数 ----
+check("★★ 字符上限独立于个数上限（胖工具按字符拦）",
+      hasattr(A, "MAX_ACTIVE_TOOLS_CHARS") and A.MAX_ACTIVE_TOOLS_CHARS >= 40000,
+      "chars=%s" % getattr(A, "MAX_ACTIVE_TOOLS_CHARS", None))
+check("★ 字符上限有下限保护（配置写 0 不能把所有工具砍光）",
+      _mk_agent_sid("s1")._max_active_tools_chars() >= 8000,
+      "%d" % _mk_agent_sid("s1")._max_active_tools_chars())
+check("★ 字符上限可被 settings.json 覆盖（调参不必改代码）",
+      "max_active_tools_chars" in _src_a)
+
+# ---- [12] 自检不许污染真实诊断文件 ----
+# tools_trace.jsonl 是「真实环境里谁在改工具集」的唯一依据，而自检每跑一次
+# 就会触发一串 reset/activate。实测踩过：40 条 reset 里只有 4 条是真的。
+_real_base10 = A.BASE_DIR
+A.BASE_DIR = __import__("pathlib").Path(_tmpdir9)
+A._skills_state_persist_enabled = lambda: False
+A._trace_tools_change("reset", ["x"], 1)
+_f10 = os.path.join(_tmpdir9, "data", "tools_trace.jsonl")
+check("★ 自检(tag=test)不写 tools_trace（否则真实归因被回放污染）",
+      not os.path.exists(_f10))
+A._skills_state_persist_enabled = lambda: True
+A._trace_tools_change("reset", ["x"], 1)
+check("★ 守卫放开后正常落盘（守卫不能误杀真实记录）", os.path.exists(_f10))
+A.BASE_DIR = _real_base10
+A._skills_state_persist_enabled = _real_enabled9
 
 # 续跑轮（resume）也不能跳过工具集重建：断点里不存 tools，跳过重建就等于
 # 让模型用「重启后的空技能集」——技能工具调不出，tools 段还与断点不一致。

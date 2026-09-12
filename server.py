@@ -270,6 +270,8 @@ _mimetypes.add_type("text/javascript", ".ts")
 import subprocess as _ts_subprocess
 import threading as _ts_threading
 import json as _ts_json
+import time as _ts_time
+import atexit as _ts_atexit
 
 _TS_WORKER_JS = (
     "const readline=require('node:readline');"
@@ -283,8 +285,19 @@ _TS_WORKER_JS = (
 _ts_node_worker = None
 _ts_node_lock = _ts_threading.Lock()
 
+# 懒启动 + 空闲自杀：Node worker 常驻约 99MB，而它只在浏览器拉前端时才用得上。
+# 改为首次请求才启动，空闲超过 _TS_IDLE_KILL_SEC 自动回收（Popen 仍受锁保护）。
+_ts_node_last_use = 0.0
+_ts_node_broken = False          # node 缺失 / 启动失败：置位后不再反复重试
+_TS_IDLE_KILL_SEC = 120.0
+_TS_CACHE_MAX = 128              # 前端 .ts 约 69 个，留一倍余量
+_ts_cache: dict = {}             # 键=文件路径（只留最新版本），值=(etag, js_bytes)
+
 def _ts_start_worker():
-    global _ts_node_worker
+    """启动常驻 worker（幂等）；失败置 _ts_node_broken，后续走原样直服。"""
+    global _ts_node_worker, _ts_node_broken
+    if _ts_node_worker is not None:
+        return
     try:
         _ts_node_worker = _ts_subprocess.Popen(
             # CommonJS 模式（-e 默认 CJS），worker 脚本里用 require()
@@ -295,30 +308,65 @@ def _ts_start_worker():
         )
     except Exception:
         _ts_node_worker = None
+        _ts_node_broken = True
+
+def _ts_stop_worker():
+    """回收 worker（空闲自杀 / 进程退出时调用），释放约 99MB。"""
+    global _ts_node_worker
+    w = _ts_node_worker
+    _ts_node_worker = None
+    if w is None:
+        return
+    for step in (lambda: w.stdin.close(), lambda: w.terminate(), lambda: w.wait(timeout=3)):
+        try:
+            step()
+        except Exception:
+            pass
+
+def _ts_reaper():
+    """后台守护线程：空闲超过阈值就把 worker 收掉。"""
+    while True:
+        _ts_time.sleep(30)
+        try:
+            if _ts_node_worker is not None and (_ts_time.monotonic() - _ts_node_last_use) > _TS_IDLE_KILL_SEC:
+                with _ts_node_lock:
+                    _ts_stop_worker()
+        except Exception:
+            pass
+
+_ts_threading.Thread(target=_ts_reaper, daemon=True, name="ts-reaper").start()
+_ts_atexit.register(_ts_stop_worker)
 
 def _ts_transpile(code: str) -> str:
-    """同步向常驻 Node worker 发送源码，返回剥离类型后的 JS；失败抛异常。"""
-    w = _ts_node_worker
-    if w is None:
-        raise RuntimeError("ts worker unavailable")
+    """同步向 Node worker 发送源码，返回剥离类型后的 JS；失败抛异常。"""
+    global _ts_node_last_use
+    if _ts_node_broken:
+        raise RuntimeError("ts worker unavailable (node missing)")
     with _ts_node_lock:
-        w.stdin.write(_ts_json.dumps({"code": code}) + "\n")
-        w.stdin.flush()
-        line = w.stdout.readline()
+        _ts_start_worker()          # 懒启动：首个 .ts 请求才真正拉起 node
+        w = _ts_node_worker
+        if w is None:
+            raise RuntimeError("ts worker unavailable")
+        _ts_node_last_use = _ts_time.monotonic()
+        try:
+            w.stdin.write(_ts_json.dumps({"code": code}) + "\n")
+            w.stdin.flush()
+            line = w.stdout.readline()
+        except Exception:
+            _ts_stop_worker()       # worker 已死：收掉，下次请求重开
+            raise RuntimeError("ts worker broken")
         if not line:
+            _ts_stop_worker()
             raise RuntimeError("ts worker closed")
         out = _ts_json.loads(line)
         if not out.get("ok"):
             raise RuntimeError("strip failed: " + str(out.get("error")))
         return out["code"]
 
-_ts_start_worker()
-_ts_cache: dict = {}
-
 class TSTranspileMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
         path = request.url.path
-        if _ts_node_worker is None or not path.startswith("/static/"):
+        if _ts_node_broken or not path.startswith("/static/"):
             return await call_next(request)
         rel = path[len("/static/"):]
         if not (rel.endswith(".ts") or rel.endswith(".js")):
@@ -336,17 +384,22 @@ class TSTranspileMiddleware(BaseHTTPMiddleware):
                 return await call_next(request)
         try:
             st = fs_path.stat()
-            cache_key = (str(fs_path), st.st_mtime_ns, st.st_size)
+            cache_key = str(fs_path)
             # 协商缓存：内容未变直接 304，省掉整个模块的 body 传输
             etag = '"%x-%x"' % (st.st_mtime_ns, st.st_size)
             if request.headers.get("if-none-match") == etag:
                 return Response(status_code=304, headers={
                     "ETag": etag, "Cache-Control": "no-cache"})
-            js = _ts_cache.get(cache_key)
-            if js is None:
+            hit = _ts_cache.get(cache_key)
+            if hit is not None and hit[0] == etag:
+                js = hit[1]
+            else:
                 code = fs_path.read_text(encoding="utf-8")
                 js = _ts_transpile(code).encode("utf-8")
-                _ts_cache[cache_key] = js
+                # 键只按路径保留最新版本（旧实现键含 mtime/size，改一次前端就永久多存一份）
+                _ts_cache[cache_key] = (etag, js)
+                while len(_ts_cache) > _TS_CACHE_MAX:
+                    _ts_cache.pop(next(iter(_ts_cache)), None)
             resp = Response(content=js, media_type="text/javascript; charset=utf-8")
             resp.headers["ETag"] = etag
             resp.headers["Cache-Control"] = "no-cache"
@@ -2293,8 +2346,26 @@ def _cloud_proxy_for(base_url: str = "") -> str | None:
         return None
 
 
+def _norm_vision(v):
+    """视觉开关三态：True 强制支持 / False 强制排除 / None 自动判定。
+
+    字符串要一起收：前端 select 提交的是 "true"/"false"，手写配置里还可能是 1/off。
+    """
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("true", "1", "yes", "on"):
+            return True
+        if s in ("false", "0", "no", "off"):
+            return False
+    elif isinstance(v, (int, float)):
+        return bool(v)
+    return None
+
+
 def _llm_provider_meta(provider: dict) -> dict:
-    """供应商出参（纯凭证存储：名称/类型/地址/密钥/默认模型）。"""
+    """供应商出参（凭证 + 视觉开关）。"""
     return {
         "id": provider.get("id", ""),
         "name": provider.get("name", ""),
@@ -2302,6 +2373,7 @@ def _llm_provider_meta(provider: dict) -> dict:
         "base_url": provider.get("base_url", ""),
         "api_key": provider.get("api_key", ""),
         "default_model": provider.get("default_model", ""),
+        "vision": _norm_vision(provider.get("vision")),
     }
 def _ensure_llm_providers(cfg: dict) -> list:
     """规范化 settings.json 的供应商注册表（llm_providers 列表）。
@@ -2333,6 +2405,7 @@ def _ensure_llm_providers(cfg: dict) -> list:
             "base_url": str(p.get("base_url") or "").strip(),
             "api_key": str(p.get("api_key") or "").strip(),
             "default_model": str(p.get("default_model") or "").strip(),
+            "vision": _norm_vision(p.get("vision")),
         })
     if not norm:
         profiles = cfg.get("llm_profiles")
@@ -2578,6 +2651,7 @@ async def llm_providers_create(payload: dict):
         "base_url": str(payload.get("base_url") or "").strip(),
         "api_key": str(payload.get("api_key") or "").strip(),
         "default_model": str(payload.get("default_model") or "").strip(),
+        "vision": _norm_vision(payload.get("vision")),
     }
     if provider["kind"] == "ollama" and not provider["api_key"]:
         provider["api_key"] = "ollama"
@@ -2620,6 +2694,8 @@ async def llm_providers_update(pid: str, payload: dict):
                      ("default_model", "default_model")):
         if k in payload and payload[k] is not None:
             target[field] = str(payload[k]).strip()
+    if "vision" in payload:
+        target["vision"] = _norm_vision(payload.get("vision"))
     if target["kind"] == "ollama" and not target["api_key"]:
         target["api_key"] = "ollama"
     cfg["llm_providers"] = providers
@@ -3138,7 +3214,10 @@ def _normalize_card_llm(payload_llm: dict) -> dict:
     存一套地址——彻底避免"Ollama 本地串用自定义 API 配置"。
 
     兼容旧字段：provider / base_url / api_key 若传入则原样保留（旧卡迁移信息，
-    应用时按 base_url 匹配供应商）；前端新保存时只写 provider_id / model / temperature。
+    应用时按 base_url 匹配供应商）；前端新保存时只写 provider_id / model / temperature / vision。
+
+    vision 是卡片级读图三态：卡片绑的模型跟供应商的 default_model 常常不是同一个，
+    只有卡片自己知道「这张卡在跑的那个模型吃不吃图」。
     """
     payload_llm = payload_llm or {}
     temperature = payload_llm.get("temperature")
@@ -3153,6 +3232,7 @@ def _normalize_card_llm(payload_llm: dict) -> dict:
         "provider_id": (payload_llm.get("provider_id") or "").strip(),
         "model": (payload_llm.get("model") or "").strip(),
         "temperature": temperature,
+        "vision": _norm_vision(payload_llm.get("vision")),
     }
     # 卡片一旦声明了供应商（provider_id），就不再携带自己的 base_url/api_key，
     # 应用时统一从全局供应商注册表取地址/密钥；否则旧卡遗留的迁移字段会被一直带下去，
@@ -3244,6 +3324,29 @@ async def character_cards_delete(card_id: str):
     return {"ok": True}
 
 
+@app.get("/api/vision/check")
+async def api_vision_check(provider_id: str = "", model: str = "", override: str = ""):
+    """查一个模型能不能看见注入的截图。
+
+    角色卡编辑界面用它把「自动判定」摊开显示，省得用户猜判成了什么。
+    """
+    try:
+        cfg = _load_settings()
+        providers = _ensure_llm_providers(cfg)
+        pid = (provider_id or "").strip()
+        prov = next((p for p in providers if p["id"] == pid), None) if pid else None
+        if prov is None:
+            prov = _active_provider(cfg)
+        m = (model or "").strip() or str((prov or {}).get("default_model") or "").strip()
+        ov = _norm_vision(override) if (override or "").strip() else None
+        from harness.vision_probe import supports_vision
+        ok, why = supports_vision(m, prov, ov)
+        return {"code": 200, "ok": ok, "why": why, "model": m}
+    except Exception as e:
+        return {"code": 200, "ok": False, "why": f"判定失败：{e}", "model": model}
+
+
+
 @app.post("/api/character_cards/{card_id}/apply")
 async def character_cards_apply(card_id: str):
     """应用角色卡片：更新角色名/系统提示词（settings.json）+ TTS 配置（tts_config.json）。"""
@@ -3295,11 +3398,12 @@ async def character_cards_apply(card_id: str):
     llm_provider_id = (llm.get("provider_id") or "").strip()
     llm_model = (llm.get("model") or "").strip()
     llm_temperature = llm.get("temperature")
+    llm_vision = _norm_vision(llm.get("vision"))
     legacy_provider = (llm.get("provider") or "").strip()
     legacy_base_url = (llm.get("base_url") or "").strip()
     legacy_api_key = (llm.get("api_key") or "").strip()
     if (llm_provider_id or llm_model or legacy_provider or legacy_base_url
-            or legacy_api_key or llm_temperature is not None):
+            or legacy_api_key or llm_temperature is not None or llm_vision is not None):
         try:
             _cfg = _load_settings()
             providers = _ensure_llm_providers(_cfg)
@@ -3326,6 +3430,10 @@ async def character_cards_apply(card_id: str):
                     _cfg["llm_profiles"].setdefault(_kind, {})["model"] = llm_model
             if llm_temperature is not None:
                 _cfg["temperature"] = llm_temperature
+            # 卡片声明了读图能力就覆盖全局：读图技能按 cfg["llm_vision"] 判当前模型。
+            # 只在卡片显式带 vision 字段时写，免得把上一张卡的声明带过来。
+            if "vision" in llm:
+                _cfg["llm_vision"] = llm_vision
             _save_settings(_cfg)
             # 重载全部共享 Agent（按 user_id 分实例），确保保存/切换卡片后
             # 每个用户正在使用的 Agent 都立即换成新供应商模型，而不是只重载 default。
@@ -4888,32 +4996,33 @@ async def handle_user_message_stream(ws: WebSocket, user_text: str, history: lis
                     "success": event.success,
                     "resume": is_resume,
                 })
-                # 检测是否为屏幕控制工具，若是则转发给前端执行
-                if event.success:
+                # 同一次工具结果被 5 个子系统消费（屏幕指令/DSH 桥接/委派/媒体看护/子智能体）。
+                # 只解析一次：非 JSON 结果（占绝大多数，如 shell 输出）直接跳过，
+                # 避免 5 处各自 json.loads 失败各写一条 warning（实测约 1.9 行/秒的日志噪音）。
+                r = None
+                if event.success and isinstance(event.result, str) and event.result[:1] in ("{", "["):
                     try:
-                        r = json.loads(event.result)
-                        if isinstance(r, dict) and r.get("__screen_command__"):
-                            cmd = {"type": "screen_command", "tool": r["tool"], "args": r["args"]}
-                            await safe_send_json(ws, cmd)
+                        _parsed = json.loads(event.result)
+                        if isinstance(_parsed, dict):
+                            r = _parsed
+                    except (json.JSONDecodeError, TypeError, ValueError):
+                        logger.warning(f"[ToolResult] JSON 解析失败（结果可能被截断）: {str(event.result)[:120]!r}")
+                if r is not None:
+                    # 检测是否为屏幕控制工具，若是则转发给前端执行
+                    if r.get("__screen_command__"):
+                        _sc_tool = r.get("tool")
+                        _sc_args = r.get("args") or {}
+                        if _sc_tool:
+                            await safe_send_json(ws, {"type": "screen_command", "tool": _sc_tool, "args": _sc_args})
                             # 停止类指令 → 联动收尾同类型的看护子智能体
-                            await _cancel_media_on_stop(ws, str(r["tool"]), r.get("args") or {})
-                            logger.info(f"[ScreenCmd] 已发送: {r['tool']} {r['args']}")
-                    except (json.JSONDecodeError, TypeError):
-                        logger.warning(f"[ScreenCmd] 工具结果解析失败（可能被截断）: {str(event.result)[:120]!r}")
-                # DSH 桥接工具：注册待确认任务，前端弹确认卡片
-                if event.success:
-                    try:
-                        r = json.loads(event.result)
-                        if isinstance(r, dict) and r.get("__dsh_bridge__"):
-                            await request_harness_task(ws, r.get("task") or "", r.get("cwd"))
-                            logger.info(f"[Bridge] 已登记任务: {str(r.get('task'))[:60]}")
-                    except (json.JSONDecodeError, TypeError):
-                        logger.warning(f"[Bridge] DSH 桥接 JSON 解析失败（结果可能被截断）: {str(event.result)[:120]!r}")
-                # 委派本机代码助手：转任务中心可视化执行
-                if event.success:
-                    try:
-                        r = json.loads(event.result)
-                        if isinstance(r, dict) and r.get("__codex_delegate__"):
+                            await _cancel_media_on_stop(ws, str(_sc_tool), _sc_args)
+                            logger.info(f"[ScreenCmd] 已发送: {_sc_tool} {_sc_args}")
+                    # DSH 桥接工具：注册待确认任务，前端弹确认卡片
+                    if r.get("__dsh_bridge__"):
+                        await request_harness_task(ws, r.get("task") or "", r.get("cwd"))
+                        logger.info(f"[Bridge] 已登记任务: {str(r.get('task'))[:60]}")
+                    # 委派本机代码助手：转任务中心可视化执行
+                    if r.get("__codex_delegate__"):
                             # 统一智能体身份：新工具传 agent（codex/opencode），旧工具传 tool（cx/ai）
                             agent_id = (str(r.get("agent") or r.get("tool") or "")).lower().strip()
                             tool = {"codex": "cx", "opencode": "ai",
@@ -4930,26 +5039,14 @@ async def handle_user_message_stream(ws: WebSocket, user_text: str, history: lis
                                 await safe_send_json(ws, {"type": "codex_msg", "kind": "error",
                                                           "text": f"⛔ 代码助手 {tool} 未配置或任务为空，请检查 codex_config.json"})
                             logger.info(f"[Delegate] 已提请 {agent_name} 确认: len(task)={len(task_desc)} {task_desc[:60]}")
-                    except (json.JSONDecodeError, TypeError):
-                        logger.warning(f"[Delegate] 委派 JSON 解析失败（结果可能被截断）: {str(event.result)[:120]!r}")
-                # 媒体子智能体（media watch）：music_play/video_play 带 watch=true 时返回 __media_watch__
-                if event.success:
-                    try:
-                        r = json.loads(event.result)
-                        if isinstance(r, dict) and r.get("__media_watch__"):
-                            await _spawn_media_worker(ws, state, r)
-                        elif isinstance(r, dict) and r.get("__media_watch_cancel__"):
-                            await _cancel_media_worker(ws, r)
-                    except (json.JSONDecodeError, TypeError):
-                        logger.warning(f"[MediaWorker] watch 标记 JSON 解析失败（结果可能被截断）: {str(event.result)[:120]!r}")
-                # 通用子智能体（sub-agents）：sub_agent_spawn 返回 __sub_agent_spawn__
-                if event.success:
-                    try:
-                        r = json.loads(event.result)
-                        if isinstance(r, dict) and r.get("__sub_agent_spawn__"):
-                            await _spawn_sub_agent(ws, state, r)
-                    except (json.JSONDecodeError, TypeError):
-                        logger.warning(f"[SubAgent] spawn 标记 JSON 解析失败（结果可能被截断）: {str(event.result)[:120]!r}")
+                    # 媒体子智能体（media watch）：music_play/video_play 带 watch=true 时返回 __media_watch__
+                    if r.get("__media_watch__"):
+                        await _spawn_media_worker(ws, state, r)
+                    elif r.get("__media_watch_cancel__"):
+                        await _cancel_media_worker(ws, r)
+                    # 通用子智能体（sub-agents）：sub_agent_spawn 返回 __sub_agent_spawn__
+                    if r.get("__sub_agent_spawn__"):
+                        await _spawn_sub_agent(ws, state, r)
 
             elif isinstance(event, ToolCallProgress):
                 # 工具执行心跳：长任务（shell 长命令/文件搜索/媒体处理）持续告知用户仍在执行

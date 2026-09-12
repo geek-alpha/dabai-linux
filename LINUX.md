@@ -381,6 +381,68 @@ sudo -n /usr/local/sbin/dabai-secrets sync
 `bash deploy/gitguard/install.sh`。
 
 
+### 6.9 远程支配 Windows 主机（`~/.ssh/config`）
+
+**目标**：从树莓派直接操作 Windows（`desktop-apb0bda`），不依赖图形界面、不依赖任何常驻程序。
+
+**三层机制** —— 不是「持久化连接」，是三件独立的事叠加，**没有任何守护进程在保持连接**：
+
+| 层 | 靠什么 | 效果 |
+|---|---|---|
+| 免密 | `~/.ssh/id_ed25519_win` + `IdentitiesOnly yes` | 非交互执行 |
+| 连接复用 | `ControlMaster auto` + `ControlPath ~/.ssh/cm-%r@%h-%p` + `ControlPersist 5m` | 一条 TCP 扛住后续所有 ssh/scp |
+| Windows 自启 | sshd 服务 `Running` + `StartType Automatic` | 重启后照样能连 |
+
+实测：冷启动 488ms，复用 ~170ms（我一次任务发几十条命令，省的就是这个）。
+
+**两个入口**
+
+- `ssh win` / `ssh desktop-apb0bda` —— 走主机名（推荐，IP 变了不用改）
+- `ssh win-ip` —— 走固定 IP，mDNS 异常时的备用通道
+
+**Windows 特有的坑（必读）**
+
+管理员组成员的公钥**不放** `~/.ssh/authorized_keys`，而放：
+
+```
+C:\ProgramData\ssh\administrators_authorized_keys
+```
+
+`wangxingfeng` 在 administrators 组 → 往家目录放密钥会**静默失效**（连得上，但一直要密码）。
+
+**主机名解析靠两条独立路径**
+
+- mDNS：树莓派 `avahi-daemon`(enabled+active) ↔ Windows `Bonjour Service`(Running+Automatic)
+- 路由器 DNS：`192.168.31.1` 也解析这个名字
+
+两条都随 DHCP 走 → 换 IP 不用动配置。
+
+**边界**：`nsswitch.conf` 是 `mdns4_minimal [NOTFOUND=return]` —— avahi 一旦挂了，
+主机名会**直接失败、不退回 DNS**。这就是 `win-ip` 存在的理由。
+
+**排障表**
+
+| 症状 | 原因 | 处置 |
+|---|---|---|
+| 一直要密码 | 密钥放错位置 | 挪到 `administrators_authorized_keys` |
+| `Could not resolve hostname` | avahi 挂了 | `sudo systemctl restart avahi-daemon`，或改 `ssh win-ip` |
+| `Connection timed out` | IP 变了 | 先试 `ssh win-ip`；通说明是名字问题，不通才是网络问题 |
+| 突然全断 | Windows 重启 | 无需手动清理，下条命令自动重建 |
+
+**陈旧套接字自愈（已实测）**：硬杀主连接、留下 `cm-*` 套接字后，下一条命令自动重建，
+不需要手动 `rm`。
+
+**验证命令**
+
+```bash
+ssh -O check win     # 主连接是否活着
+ls ~/.ssh/cm-*       # 套接字文件名 = 实际连的 HostName
+```
+
+套接字名从 `cm-wangxingfeng@192.168.31.144-22` 变成 `cm-wangxingfeng@desktop-apb0bda-22`，
+是「真的在走主机名」的铁证。
+
+
 ## 7. 回滚（Linux 兼容层，§1–§5）
 
 改动在隔离工作树分支 `codex/linux-compat` 上开发，已合并回 `20260909`（merge commit `748d9d2`）。

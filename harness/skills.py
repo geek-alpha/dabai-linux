@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
 from .state import StateStore
+from ._reload import evict_dir_modules
 
 logger = logging.getLogger("harness.skills")
 
@@ -58,48 +59,6 @@ def _load_code_module(mod_path: Path, name: str):
     except Exception as e:
         sys.modules.pop(spec.name, None)
         raise SkillError(f"技能 {name} 代码执行失败: {e}\n{traceback.format_exc()}") from e
-
-
-# 热重载时不能从 sys.modules 清除的共享模块：server 与技能共用同一模块实例
-# （如 video_lib 的 STREAMS/队列状态互通），清除会让两者状态分裂。
-# 其余技能目录内的子模块（*_impl 等）必须清除——否则改 impl 文件后热重载
-# 仍读到 sys.modules 里缓存的旧代码，"修改工具清单不生效"。
-_SHARED_SKILL_MODULES = frozenset({"video_lib"})
-
-
-def _evict_skill_submodules(entry: dict, skill_dir: Path) -> None:
-    """卸载技能前清除它自己导入的子模块缓存（仅限技能目录内、非共享模块）。"""
-    try:
-        root = Path(skill_dir).resolve()
-        for mod_name in list(entry.get("_mods_added") or []):
-            if mod_name in _SHARED_SKILL_MODULES:
-                continue
-            mod = sys.modules.get(mod_name)
-            if mod is None:
-                continue
-            try:
-                f = getattr(mod, "__file__", None)
-            except Exception:
-                f = None
-            if not f:
-                continue
-            try:
-                p = Path(f).resolve()
-            except Exception:
-                continue
-            if root == p or root in p.parents:
-                sys.modules.pop(mod_name, None)
-        # 字节码缓存可能残留旧 pyc（同秒/同长度编辑时 pyc 校验会误判为未变），
-        # 连同技能目录的 __pycache__ 一起清掉，保证热重载一定读到新代码
-        pycache = root / "__pycache__"
-        if pycache.is_dir():
-            for pyc in list(pycache.glob("*.pyc")):
-                try:
-                    pyc.unlink()
-                except Exception:
-                    pass
-    except Exception as e:
-        logger.warning("清除技能子模块缓存失败: %s", e)
 
 
 class Skill:
@@ -243,11 +202,9 @@ class SkillRegistry:
 
         mod_path = skill_dir / "skill.py"
         if mod_path.exists():
-            _mods_before = set(sys.modules)
             try:
                 module = _load_code_module(mod_path, name)
                 entry["module"] = module
-                entry["_mods_added"] = sorted(set(sys.modules) - _mods_before)
                 # 代码里的 PROMPT 优先于清单 prompt
                 code_prompt = getattr(module, "PROMPT", "") or ""
                 if code_prompt:
@@ -345,7 +302,7 @@ class SkillRegistry:
                 logger.warning("技能 %s on_unload 钩子失败: %s", name, e)
             # 热重载生效的关键：清掉该技能自己导入的子模块缓存
             try:
-                _evict_skill_submodules(entry, Path(entry["info"].get("path") or ""))
+                evict_dir_modules(entry["info"].get("path"), self.directory, label="技能")
             except Exception:
                 pass
 
@@ -545,6 +502,11 @@ class SkillRegistry:
             return str(result), "skill"
         except Exception as e:
             return f"技能 {skill_name} 执行工具 {tool_name} 失败: {e}", "skill"
+
+    def module(self, name: str):
+        """取已加载技能的模块对象（服务端查技能内部状态用，如视觉判定）。"""
+        self.ensure_loaded()
+        return (self._loaded.get(name) or {}).get("module")
 
     def list_info(self) -> list[dict]:
         """返回技能清单 + 运行时状态（供管理界面/API）。"""

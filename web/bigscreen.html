@@ -341,6 +341,18 @@
     return urls;
   }
 
+  // 本地绝对路径 → /media 通用路由（后端按扩展名白名单校验后回文件）。
+  // 不转的话 /home/x/a.png 会被当同源相对路径，必然 404。
+  const FRONT_ROUTE_RE = /^\/(?:static|media|generated|models|audio|backgrounds|anim|mpt|downloads|api|ws)(?:[/?#]|$)/;
+  function toMediaUrl(raw) {
+    const u = String(raw == null ? '' : raw).trim();
+    if (!u || u.startsWith('//')) return u;
+    const winAbs = /^[A-Za-z]:[\\/]/.test(u);
+    const unixAbs = u.startsWith('/') && !FRONT_ROUTE_RE.test(u);
+    if (!winAbs && !unixAbs) return u;
+    return '/media?path=' + encodeURIComponent(u.replace(/\\/g, '/'));
+  }
+
   // ---------- 数据获取 ----------
 
   // 活跃任务优先补拉（正在跑的「过程」最需要实时）
@@ -452,7 +464,7 @@
     if (!Array.isArray(urls)) urls = [urls];
     let newest = null;
     for (const raw of urls) {
-      let url = String(raw || '').trim();
+      let url = toMediaUrl(String(raw || '').trim());
       if (!url) continue;
       // 相对路径（/generated/xxx.png）拼上当前页面 origin，避免 iframe/跨端口打开时加载失败
       if (url.startsWith('/')) url = location.origin + url;

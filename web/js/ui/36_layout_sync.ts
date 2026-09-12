@@ -30,10 +30,11 @@ export default function init(App: AppKernel) {
 
   if (typeof ResizeObserver !== 'undefined') {
     // 输入框自增高 / 窗口缩放 / 安全区变化，都会触发
-    new ResizeObserver(sync).observe(controls);
-  } else {
-    window.addEventListener('resize', sync);
+    const ro = new ResizeObserver(sync);
+    ro.observe(controls);
   }
+  // 视口高度变化会重算 dvh：面板底边让位（--controls-h）要重算
+  window.addEventListener('resize', sync);
 
   // 字体异步加载完成后行高会变，高度可能再跳一次，补一次同步
   const fonts = (document as any).fonts;

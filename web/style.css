@@ -161,15 +161,44 @@ html, body {
     background: linear-gradient(180deg, rgba(16,16,34,1), rgba(10,10,20,1));
     backdrop-filter: blur(2px) saturate(1.05);
     -webkit-backdrop-filter: blur(2px) saturate(1.05);
-    z-index: 30;
+    /* 80 = 高于全部氛围浮层（礼物 64 / 彩带 68 / 粒子闪光 69-70 / 评级大字 71 /
+     * 成就通知 72）。全屏不透明时用户要的是「屏幕上只剩对话」：面板必须在它们
+     * 之上，否则特效会飘在聊天框上面继续动。
+     * 仍低于用户主动打开的 UI：弹窗 150 / 任务中心 165 / VR 9999。 */
+    z-index: 80;
 }
 #app.chat-fullscreen #chat-panel.chat-fs .messages {
     /* 同样按输入栏实测高度让位，多行输入时最后一条消息才不会被盖住 */
     padding-bottom: calc(var(--controls-h, 62px) + 24px);
 }
 /* 全屏时输入栏与右下角切换按钮保持在面板之上 */
-#chat-panel.chat-fs ~ #controls { z-index: 31; }
-#app.chat-fullscreen ~ #chat-toggle { z-index: 32; }
+#chat-panel.chat-fs ~ #controls { z-index: 81; }
+#app.chat-fullscreen ~ #chat-toggle { z-index: 82; }
+/* 全屏透明（◍）：铺满屏幕，但面板本身**完全透明** —— 与默认「半屏」面板同一种观感
+ * （半屏面板就是 background: transparent，可读性全靠 .msg 的文字投影撑），
+ * 只是把范围从 38dvh 扩到整屏。这里绝不能加暗色蒙版或 backdrop-filter：
+ *   1) 0.4 的深色渐变 + 5px 模糊叠在暗场景上，观感就是「全不透明」，角色根本透不出来；
+ *   2) backdrop-filter 压在 WebGL 画布上时，部分浏览器采不到画布，直接把背板糊成黑块。
+ * 与不透明全屏（⤢）的差别：背景透明 + 渲染不停（00_quiet 不静默）。 */
+#chat-panel.chat-fs.chat-ghost {
+    background: transparent;
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+    box-shadow: none;
+}
+/* 正文浮在场景上：沿用半屏那一层轻投影，任何背景前都读得清 */
+#chat-panel.chat-fs.chat-ghost .messages { text-shadow: 0 1px 6px rgba(0, 0, 0, 0.65); }
+/* 透明全屏下正文贴底：与 38% 面板同一观感 —— 对话紧贴输入栏、向上生长。
+ * 用首个子元素 margin-top:auto，不用 justify-content:flex-end：
+ * 后者在内容溢出时会把顶部几条顶到滚不到的位置（Chrome 的老毛病）。 */
+#chat-panel.chat-fs.chat-ghost .messages > *:first-child { margin-top: auto; }
+/* 输入栏与输入框一起透出去，否则整屏只剩底部一条不透明的板 */
+#chat-panel.chat-fs.chat-ghost ~ #controls { background: rgba(10, 10, 20, 0.2); }
+#chat-panel.chat-fs.chat-ghost ~ #controls #text-input {
+    background: rgba(10, 12, 26, 0.5);
+    text-shadow: 0 1px 4px rgba(0, 0, 0, 0.7);
+}
+#chat-ghost-btn.active { background: rgba(0,229,255,0.32); color: #fff; }
 #chat-height-btn.active { background: rgba(124,92,255,0.45); color: #fff; }
 /* 点收起：整个滑出屏幕外（完全隐藏） */
 #chat-panel.collapsed {
@@ -177,6 +206,14 @@ html, body {
     opacity: 0;
     pointer-events: none;
     max-height: 38dvh;
+}
+/* 兜底：全屏态绝不允许带着 collapsed 的几何。这条排在 .collapsed 之后，
+ * 优先级也更高（多一个类），所以即使 JS 漏摘 collapsed，面板也仍是铺满的。 */
+#chat-panel.chat-fs.collapsed {
+    transform: none;
+    opacity: 1;
+    pointer-events: auto;
+    max-height: none;
 }
 
 .messages {
@@ -3993,7 +4030,8 @@ body.locked #task-btn { display: none; }
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 8px 12px 8px 16px;
+    gap: 6px;
+    padding: 6px 10px 6px 14px;
     border-bottom: 1px solid rgba(124,92,255,0.18);
     background: rgba(16,16,36,0.5);
     -webkit-user-select: none;
@@ -4002,8 +4040,8 @@ body.locked #task-btn { display: none; }
 .chat-head-title {
     display: flex;
     align-items: center;
-    gap: 8px;
-    font-size: 13px;
+    gap: 6px;
+    font-size: 12px;
     font-weight: 600;
     color: var(--text);
     letter-spacing: 0.3px;
@@ -4011,7 +4049,16 @@ body.locked #task-btn { display: none; }
     min-width: 0;
     overflow: hidden;
 }
+/* 标题文字是这一行里「最不重要的那一个」：宽度不够时先让它出省略号，
+ * 而不是去压缩按钮或状态徽章 —— 那些一压就变形，信息也读不出来。 */
+.chat-head-label {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
 .chat-head-dot {
+    flex: none;
     width: 8px;
     height: 8px;
     border-radius: 50%;
@@ -4024,14 +4071,15 @@ body.locked #task-btn { display: none; }
     50% { opacity: 0.5; transform: scale(0.8); }
 }
 .chat-head-count {
-    min-width: 20px;
-    height: 18px;
-    padding: 0 6px;
+    flex: none;
+    min-width: 18px;
+    height: 16px;
+    padding: 0 5px;
     border-radius: 999px;
     background: rgba(124,92,255,0.25);
     border: 1px solid rgba(124,92,255,0.4);
     color: #c9c2ff;
-    font-size: 11px;
+    font-size: 10.5px;
     font-weight: 700;
     display: inline-flex;
     align-items: center;
@@ -4039,14 +4087,16 @@ body.locked #task-btn { display: none; }
 }
 /* 上下文 / Token 用量徽章（青色系小胶囊，可点击看累计） */
 .chat-token-meter {
-    max-width: 260px;
-    height: 18px;
-    padding: 0 8px;
+    flex: 0 1 auto;
+    min-width: 0;
+    max-width: 220px;
+    height: 16px;
+    padding: 0 7px;
     border-radius: 999px;
     background: rgba(0,229,255,0.12);
     border: 1px solid rgba(0,229,255,0.35);
     color: var(--accent-2);
-    font-size: 11px;
+    font-size: 10.5px;
     font-weight: 600;
     display: inline-flex;
     align-items: center;
@@ -4069,15 +4119,17 @@ body.locked #task-btn { display: none; }
     vertical-align: baseline;
     user-select: text;
 }
-.chat-head-actions { display: flex; gap: 6px; }
+/* flex:none —— 按钮是「一压就变形」的元素：宽度不够时该让文字出省略号，
+   而不是把 26px 的方按钮挤成一条窄胶囊。 */
+.chat-head-actions { display: flex; gap: 5px; flex: none; }
 .chat-head-btn {
-    width: 28px;
-    height: 28px;
+    width: 26px;
+    height: 26px;
     border: none;
-    border-radius: 8px;
+    border-radius: 7px;
     background: rgba(124,92,255,0.12);
     color: var(--text-dim);
-    font-size: 15px;
+    font-size: 13px;
     line-height: 1;
     cursor: pointer;
     display: flex;
@@ -5585,13 +5637,14 @@ body.locked #task-btn { display: none; }
 .gfx-hud {
     display: inline-flex;
     align-items: center;
-    gap: 6px;
-    padding: 2px 8px;
+    flex: none;          /* 与按钮同级：宁可挤标题，不挤徽章 */
+    gap: 5px;
+    padding: 2px 7px;
     border: 1px solid rgba(124, 92, 255, 0.35);
     border-radius: 10px;
     background: rgba(124, 92, 255, 0.12);
-    font-size: 11px;
-    line-height: 16px;
+    font-size: 10.5px;
+    line-height: 15px;
     cursor: pointer;
     user-select: none;
     transition: border-color 0.2s, box-shadow 0.3s;
@@ -6292,11 +6345,14 @@ body.locked #task-btn { display: none; }
     /* 71 = 在成就弹窗（72）之下：重要通知永远优先，欢呼不抢它的位置 */
     z-index: 71;
 }
-/* 放在中央偏上：避开 34 的成就弹窗（top 74px）与 39 的中央施法字幕 */
+/* 放在上半屏顶部：避开 34 的成就弹窗（top 74px ~ 120px），
+ * 也让开 39 的施法字幕 —— 它整层贴着非全屏聊天框顶部（--cf-cy = 实测上沿 - 法阵半径，
+ * 字幕再下移 54px），已退到屏幕下半部，不再和这里的大字抢位置。
+ * 17% 是这两者之间唯一不打架的空档：上面是通知，下面是施法。 */
 .hc-tier {
     position: absolute;
     left: 50%;
-    top: 22%;
+    top: 17%;
     text-align: center;
     opacity: 0;
     transform: translate(-50%, 0) scale(0.6);
@@ -6785,14 +6841,15 @@ html #controls:focus-within::after {
 .lv-hot {
     display: inline-flex;
     align-items: center;
-    gap: 4px;
-    height: 22px;
-    padding: 0 7px;
+    flex: none;          /* 同上：热度 HUD 也不参与压缩 */
+    gap: 3px;
+    height: 20px;
+    padding: 0 6px;
     border-radius: 11px;
     background: rgba(255, 255, 255, 0.05);
     border: 1px solid rgba(255, 255, 255, 0.09);
     font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
-    font-size: 11px;
+    font-size: 10.5px;
     line-height: 1;
     color: #cfd3e8;
     pointer-events: none;
@@ -6800,7 +6857,7 @@ html #controls:focus-within::after {
     transition: border-color 0.3s ease, box-shadow 0.3s ease;
 }
 .lv-hot .lv-flame {
-    font-size: 11px;
+    font-size: 10.5px;
     filter: grayscale(0.55);
     transition: filter 0.3s ease, transform 0.3s ease;
 }
@@ -6839,7 +6896,7 @@ html #controls:focus-within::after {
     display: inline-flex;
     align-items: flex-end;
     gap: 1px;
-    height: 12px;
+    height: 11px;
 }
 .lv-hot .lv-spark i {
     display: block;
@@ -7155,6 +7212,21 @@ html #controls:focus-within::after {
     visibility: hidden;
     transition: opacity 0.3s ease, visibility 0.3s;
     --cf-c: 0, 229, 255;
+    /* 整层纵向锚点：法阵 / 光核 / 光柱 / 连发环 / 爆发 / HUD 全挂在它上面，
+     * 改这一处 = 整块特效上下移动。
+     * 落点 = 屏幕从上往下 68% 全屏高度（屏幕中偏下）。
+     * 固定按视口百分比算，不跟聊天框实测高度走：特效不随消息条数上下漂。
+     * 先 vh 再 dvh：不认识 dvh 的浏览器（老 Chromium / 老 WebView）会把 dvh 那条整条丢掉，
+     * 落到 vh；只写 dvh 的话 top 会退成 auto —— 法阵直接跑回屏幕顶部，就是「一直放中上」那档。 */
+    --cf-cy: 32vh;
+    --cf-cy: 32dvh;
+    /* ⚠ 两个锚点都是「顶部往下」，用户口述的是「底部往上」：
+     * 法阵 = 底部往上 68%（顶部往下 32%），字幕 = 顶部往下 56% 再上提一个字高（-44px）。
+     * 字幕要落在法阵下缘之外一点，别跟法阵同心。
+     * 2026-02 上提 44px：非全屏聊天框顶会随消息条数往上顶，56% 时字幕底边被压住。
+     * 只抬字幕、不动 --cf-cy —— 法阵 / 光核 / 光柱 / 能量场全部保持在原位。 */
+    --cf-hy: calc(56vh - 44px);
+    --cf-hy: calc(56dvh - 44px);
 }
 html.casting #cast-fx { opacity: 1; visibility: visible; }
 html.cast-t1 #cast-fx { --cf-c: 124, 92, 255; }
@@ -7165,8 +7237,8 @@ html.cast-t2 #cast-fx { --cf-c: 255, 179, 0; }
     position: absolute;
     inset: 0;
     background:
-        radial-gradient(circle at 50% 56%, rgba(var(--cf-c), 0.26), transparent 54%),
-        radial-gradient(circle at 50% 56%, transparent 40%, rgba(var(--cf-c), 0.1) 74%, transparent 88%);
+        radial-gradient(circle at 50% var(--cf-cy), rgba(var(--cf-c), 0.26), transparent 54%),
+        radial-gradient(circle at 50% var(--cf-cy), transparent 40%, rgba(var(--cf-c), 0.1) 74%, transparent 88%);
     opacity: 0;
     transition: opacity 0.4s ease, background 0.5s ease;
 }
@@ -7186,9 +7258,9 @@ html.cast-t2.casting .cf-aura { animation-duration: 1s; }
 .cf-ring {
     position: absolute;
     left: 50%;
-    top: 56%;
-    width: min(46vh, 430px);
-    height: min(46vh, 430px);
+    top: var(--cf-cy);
+    width: min(34vh, 320px);
+    height: min(34vh, 320px);
     border-radius: 50%;
     border: 1px solid rgba(var(--cf-c), 0.28);
     box-shadow: 0 0 44px rgba(var(--cf-c), 0.22), inset 0 0 70px rgba(var(--cf-c), 0.12);
@@ -7233,7 +7305,7 @@ html.cast-t2.casting .cf-ring::after { animation-duration: 1.3s; border-style: s
 .cf-core {
     position: absolute;
     left: 50%;
-    top: 56%;
+    top: var(--cf-cy);
     width: 12px;
     height: 12px;
     margin: -6px 0 0 -6px;
@@ -7253,9 +7325,9 @@ html.cast-t2.casting .cf-core { animation-duration: 0.42s; }
 .cf-beam {
     position: absolute;
     left: 50%;
-    top: 56%;
+    top: var(--cf-cy);
     width: 2px;
-    height: 46vh;
+    height: 30vh;
     margin-left: -1px;
     transform-origin: center top;
     background: linear-gradient(180deg,
@@ -7275,15 +7347,24 @@ html.casting .cf-beam {
     100% { transform: translateY(52%) scaleY(1.1); opacity: 0; }
 }
 
-/* ---------- 五、施法 HUD：屏幕中央的大字幕 ----------
+/* ---------- 五、施法 HUD：屏幕正中的大字幕 ----------
  *
- * 【为什么从小胶囊改成中央大字】
+ * 【为什么从小胶囊改成大字】
  * 旧版是 bottom:15%、12px 的一条小胶囊 —— 角色脚下的一根窄带，眼睛盯着中央时
  * 根本读不到。而真正在说「大白此刻在干什么」的说明，原本被塞在对话框的一行
- * 小字里：既看不清，又挡正文。现在它是屏幕中央的大字。
+ * 小字里：既看不清，又挡正文。现在它是大字。
  *
- * 位置：与法阵同心（top 56%）再下移 122px，落在法阵下缘，像「法阵的铭文」。
- * 刻意不正中：正中是礼物弹出的地方（#live-gifts），叠一起会打架。
+ * 【为什么字幕不再跟法阵同心】
+ * 第一版停在 29%（正压模型脸），第二版下移到视口正中 —— 居中一样挡脸，还压住礼物条。
+ * 法阵定到「底部往上 68%」之后，字幕若继续挂 --cf-cy + 54px 会整条落进法阵里。
+ * 所以字幕改用独立锚点 --cf-hy = 顶部往下 56% 再上提一个字高（-44px）：法阵中心在上、
+ * 半径约 17% 视口高，其下缘约 49% —— 字幕顶边（约 50%）贴着圈外沿，
+ * 底边（约 56%）离非全屏聊天框顶留出一段，不再被压。
+ *
+ * 【背景板为什么这么淡】
+ * 这一版就悬在模型身上，底色一实就是一块贴在屏幕正中的黑板。
+ * 所以只留 0.30 → 0.16 的极淡渐深 + 3px 背模糊：够把 24px 白字托起来，
+ * 又不盖住背后的人。
  *
  * ⚠ 定位用 margin-top 而**不是** transform 里的 translateY —— 因为升档动画
  *   (cf-up-pop) 要改 transform 做缩放，若定位也塞在 transform 里，升档那一刻
@@ -7292,19 +7373,23 @@ html.casting .cf-beam {
 .cf-hud {
     position: absolute;
     left: 50%;
-    top: 56%;
-    margin-top: 122px;
-    transform: translateX(-50%);
+    top: var(--cf-hy);
+    /* translate 的 Y 用 -50% 而不是 margin-top：字幕高度随 combo 徽章变，
+     * 要让「中心」落在 --cf-hy 上只能按自身高度算。
+     * ⚠ 因此升档动画 cf-up-pop 的关键帧必须跟着带 -50% Y，否则弹一下会跳位。 */
+    transform: translate(-50%, -50%);
     display: flex;
     flex-direction: column;
     align-items: center;
-    gap: 7px;
-    padding: 10px 28px 12px;
+    gap: 6px;
+    padding: 8px 22px 10px;
     border-radius: 18px;
-    background: linear-gradient(180deg, rgba(10, 14, 30, 0.78), rgba(6, 9, 20, 0.64));
-    border: 1px solid rgba(var(--cf-c), 0.45);
-    box-shadow: 0 0 30px rgba(var(--cf-c), 0.3), inset 0 0 20px rgba(var(--cf-c), 0.08);
-    backdrop-filter: blur(8px);
+    /* 背景板只留「托起文字」的最低限度：0.30 → 0.16 的极淡渐深 + 3px 背模糊。
+     * 原先 0.78 → 0.64 + 8px 模糊，在屏幕正中就是一块黑板，把背后的人整个糊掉。 */
+    background: linear-gradient(180deg, rgba(10, 14, 30, 0.30), rgba(6, 9, 20, 0.16));
+    border: 1px solid rgba(var(--cf-c), 0.32);
+    box-shadow: 0 0 30px rgba(var(--cf-c), 0.22), inset 0 0 20px rgba(var(--cf-c), 0.05);
+    backdrop-filter: blur(3px);
     font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
     line-height: 1;
     white-space: nowrap;
@@ -7314,28 +7399,30 @@ html.casting .cf-beam {
 .cf-hud-main {
     display: flex;
     align-items: center;
-    gap: 12px;
+    gap: 10px;
     min-width: 0;
     max-width: 100%;
 }
-/* 主角：人话说明。27px 大字 + 三层发光，余光里也读得到 */
+/* 主角：人话说明。24px 大字 + 三层发光，余光里也读得到。
+ * 27px → 24px：整层上移后与顶部徽章同处上半屏，收一档换回呼吸感。
+ * 24px 是「还能当主视觉」的下限（cast_fx_check 有断言锁着，不许再小）。 */
 .cf-hud .cf-act {
-    font-size: 27px;
+    font-size: 24px;
     font-weight: 800;
-    letter-spacing: 3px;
+    letter-spacing: 2px;
     color: #fff;
     overflow: hidden;
     text-overflow: ellipsis;
     text-shadow:
         0 0 20px rgba(var(--cf-c), 0.9),
         0 0 46px rgba(var(--cf-c), 0.5),
-        0 2px 8px rgba(0, 0, 0, 0.85);
+        0 2px 10px rgba(0, 0, 0, 0.9);
 }
 .cf-hud .cf-spin {
     display: inline-block;
     flex: none;
     color: rgba(var(--cf-c), 0.95);
-    font-size: 24px;
+    font-size: 20px;
 }
 html.casting .cf-hud .cf-spin { animation: cf-hud-spin 1.4s linear infinite; }
 html.cast-t1.casting .cf-hud .cf-spin { animation-duration: 0.8s; }
@@ -7348,14 +7435,16 @@ html.cast-t2.casting .cf-hud .cf-spin { animation-duration: 0.45s; }
 .cf-hud-sub {
     display: flex;
     align-items: center;
-    gap: 7px;
-    font-size: 12px;
+    gap: 6px;
+    font-size: 11.5px;
     letter-spacing: 0.5px;
+    /* 底透了之后，小字靠这层暗影站住 —— 不然压在模型身上读不出来 */
+    text-shadow: 0 1px 6px rgba(0, 0, 0, 0.9);
 }
 .cf-hud .cf-name {
     font-weight: 600;
     color: rgba(223, 231, 255, 0.9);
-    max-width: 220px;
+    max-width: 190px;
     overflow: hidden;
     text-overflow: ellipsis;
 }
@@ -7364,9 +7453,9 @@ html.cast-t2.casting .cf-hud .cf-spin { animation-duration: 0.45s; }
 .cf-hud .cf-time {
     font-variant-numeric: tabular-nums;
     font-weight: 700;
-    font-size: 15px;
+    font-size: 14px;
     color: rgba(var(--cf-c), 1);
-    min-width: 46px;
+    min-width: 42px;
     text-align: right;
 }
 /* 升档瞬间：整条 HUD 弹一下 —— 「等待被看见」的仪式 */
@@ -7374,9 +7463,9 @@ html.casting #cast-fx.cf-up .cf-hud {
     animation: cf-up-pop 0.5s cubic-bezier(0.16, 1, 0.3, 1);
 }
 @keyframes cf-up-pop {
-    0%   { transform: translateX(-50%) scale(1); }
-    38%  { transform: translateX(-50%) scale(1.14); }
-    100% { transform: translateX(-50%) scale(1); }
+    0%   { transform: translate(-50%, -50%) scale(1); }
+    38%  { transform: translate(-50%, -50%) scale(1.14); }
+    100% { transform: translate(-50%, -50%) scale(1); }
 }
 
 /* ---------- 五·补、连发（短期多次调用） ----------
@@ -7405,7 +7494,7 @@ html.casting #cast-fx.cf-up .cf-hud {
 .cf-combo-wave {
     position: absolute;
     left: 50%;
-    top: 56%;
+    top: var(--cf-cy);
     width: 0;
     height: 0;
 }
@@ -7434,7 +7523,7 @@ html.casting-combo #cast-fx::after {
     position: absolute;
     inset: 0;
     pointer-events: none;
-    background: radial-gradient(ellipse at 50% 56%,
+    background: radial-gradient(ellipse at 50% var(--cf-cy),
         transparent 46%, rgba(var(--cf-c), 0.17) 100%);
     animation: cf-combo-breathe 1.3s ease-in-out infinite;
 }
@@ -7462,7 +7551,7 @@ html.casting-combo .cf-core {
 .cf-burst {
     position: absolute;
     left: 50%;
-    top: 56%;
+    top: var(--cf-cy);
     width: 0;
     height: 0;
 }
@@ -7527,16 +7616,16 @@ html.cast-t2.casting .cf-ring { animation-duration: calc(2s * var(--cf-boost, 1)
     html.casting-combo #cast-fx::after { animation: none; opacity: 0.6; }
     #cast-fx { transition: none; }
 }
-/* 小屏：法阵缩小、光柱缩短、字幕收小并上移，避免压住输入栏 */
+/* 小屏：法阵缩小、光柱缩短、字幕收小 —— 整层同样锁在视口正中 */
 @media (max-width: 720px) {
-    .cf-ring { width: min(38vh, 260px); height: min(38vh, 260px); }
-    .cf-beam { height: 32vh; }
-    .cf-hud { margin-top: 92px; padding: 8px 18px 10px; gap: 5px; }
-    .cf-hud .cf-act { font-size: 20px; letter-spacing: 2px; }
-    .cf-hud .cf-spin { font-size: 18px; }
-    .cf-hud-sub { font-size: 11px; }
-    .cf-hud .cf-name { max-width: 120px; }
-    .cf-hud .cf-time { font-size: 13px; min-width: 38px; }
+    .cf-ring { width: min(30vh, 230px); height: min(30vh, 230px); }
+    .cf-beam { height: 22vh; }
+    .cf-hud { margin-top: 44px; padding: 7px 16px 8px; gap: 4px; }
+    .cf-hud .cf-act { font-size: 18px; letter-spacing: 1.5px; }
+    .cf-hud .cf-spin { font-size: 15px; }
+    .cf-hud-sub { font-size: 10.5px; }
+    .cf-hud .cf-name { max-width: 110px; }
+    .cf-hud .cf-time { font-size: 12px; min-width: 34px; }
 }
 
 /* ============================================================
@@ -7632,9 +7721,68 @@ html.cast-t2.casting .cf-ring { animation-duration: calc(2s * var(--cf-boost, 1)
  *  画布单独用 visibility：保留布局盒（100%×100%），只停绘制。display:none 会把
  *  画布尺寸打成 0，退出全屏时若没重新 resize 就是一帧黑屏。这里零风险。
  *
- *  刻意不动的东西：聊天框内的 HUD（热度 / 等级）与 z-index 高于聊天面板的
- *  成果反馈（评级大字 71 / 彩带 68 / 闪光 70 / 礼物层）—— 全屏时它们仍然
- *  看得见，停掉等于把反馈吞了。静默只打在被遮挡的层上。
+ *  另一类必须显式处理的层：挂在 #stage 之外（body / #app）的氛围浮层 —— 街机、
+ *  施法、速率 HUD、全息欢呼/彩带、直播弹幕/礼物/横幅、成就闪光与评级大字。
+ *  它们 z-index 高达 60~72，比聊天面板（80 之前是 30）还高：全屏时不但没被
+ *  遮住，反而飘在对话上面继续播动画 —— 用户反馈的「点了全屏，特效还在动」
+ *  就是这个。全屏不透明要的是「屏幕上只剩对话」，所以这里把它们一并移出
+ *  渲染树：只靠面板 z-index 盖住是不够的，盖住了仍在合成器上跑关键帧、白烧 GPU。
+ *  面板 z-index 同时抬到 80 兜底（见 153 行那段），两层保险。
+ *  刻意不动的：聊天框内的 HUD（热度 / 等级）—— 那是对话本身的一部分。
  * ============================================================ */
 html.chat-quiet #stage > *:not(#three-canvas) { display: none !important; }
 html.chat-quiet #stage > #three-canvas { visibility: hidden; }
+/* 挂在 #stage 之外、且 z-index 高于聊天面板的氛围层：全屏时整体移出渲染树。
+ * #live-hot 用 body > 限定：同一个热度 HUD 被聊天头部复用时不该被藏掉。 */
+html.chat-quiet #gfx-flash,
+html.chat-quiet #gfx-hud,
+html.chat-quiet #gfx-ach-panel,
+html.chat-quiet #arcade-fx,
+html.chat-quiet #cast-fx,
+html.chat-quiet #stream-hud,
+html.chat-quiet #holo-cheer,
+html.chat-quiet #holo-confetti,
+html.chat-quiet #live-danmaku,
+html.chat-quiet #live-gifts,
+html.chat-quiet .lv-banner,
+html.chat-quiet #live-gain,
+html.chat-quiet body > #live-hot,
+html.chat-quiet .gfx-particles,
+html.chat-quiet .gfx-float,
+html.chat-quiet .gfx-ach-toast {
+    display: none !important;
+    animation-play-state: paused !important;
+}
+
+/* ============================================================
+ *  聊天头部排版：窄屏优先让位（本轮新增；放在文件最末尾是刻意的）
+ *
+ *  头部一行现在挂着六组东西：标题 · 消息数 · token 徽章 · 等级 HUD · 热度 HUD ·
+ *  三个按钮（⤢ 全屏 / ◍ 全屏透明 / ▾ 收起）。1280px 宽下绰绰有余，
+ *  但窄屏（手机、分屏、竖屏）会开始互相挤。
+ *
+ *  处理原则是一条优先级阶梯，而不是「谁先被压谁变形」：
+ *    1. 按钮与两个 HUD 永不压缩（flex:none）—— 它们是交互元素，一压就变形
+ *    2. 先让标题出省略号（信息可复得：功能没丢，只是短了）
+ *    3. 再收 token 徽章的宽度（它本来就允许 ellipsis）
+ *    4. 最窄时才藏掉热度 HUD 的秒表与一半火花线 —— 视觉仍在，只是不再占宽
+ *
+ *  ⚠ 为什么这段必须在文件最末尾：.lv-hot / .gfx-hud / .chat-token-meter 的基础
+ *  规则定义在 4000~6900 行，同权重下**后出现者胜**。媒体查询若写在它们前面，
+ *  窄屏覆盖会被后面的基础规则反过来盖掉（写在这里就是踩过这个坑之后的结论）。
+ * ============================================================ */
+@media (max-width: 960px) {
+    .chat-token-meter { max-width: 132px; }
+}
+@media (max-width: 720px) {
+    .chat-head { gap: 5px; padding: 5px 8px 5px 10px; }
+    .chat-head-btn { width: 24px; height: 24px; font-size: 12px; }
+    .chat-token-meter { max-width: 92px; }
+    .gfx-hud { font-size: 10px; padding: 2px 6px; }
+    .lv-hot { height: 19px; padding: 0 5px; font-size: 10px; }
+    .lv-hot .lv-flame { font-size: 10px; }
+    /* 秒表与一半火花线：热度本身还在（数字 + 颜色 + 脉动），只是不再抢宽度 */
+    .lv-hot .lv-timer { display: none; }
+    .lv-hot .lv-spark { height: 10px; }
+    .lv-hot .lv-spark i:nth-child(even) { display: none; }
+}

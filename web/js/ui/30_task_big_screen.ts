@@ -376,7 +376,7 @@ export default (function init(App: AppKernel) {
     let added = false;
     let newest = null;
     for (const raw of urls) {
-      let url = String(raw || '').trim();
+      let url = App.toMediaUrl ? App.toMediaUrl(String(raw || '')) : String(raw || '').trim();
       if (!url || mediaItems.some(it => it.url === url)) continue;
       if (url.startsWith('/')) url = location.origin + url;
       const kind = /\.(mp4|webm|ogv|mov|m4v)(?:[?#]|$)/i.test(url) ? 'video' : 'img';

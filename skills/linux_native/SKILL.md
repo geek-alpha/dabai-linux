@@ -86,6 +86,37 @@
 - **只读优先**：senses / net / storage / audit 全只读；只有 signal / tune / gpio write 是写操作。
 - **清理只报告不执行**：`storage clean` 只统计候选，删不删由用户决定。
 
+## 排查方法（硬规则）
+
+- **动手前先搜一轮**：Linux/systemd 这类问题的收尾动作是**有标准答案的**
+  （如 journald 的 `journalctl --flush`），网上一查就有；自己硬试 N 遍未必撞得上。
+- **先问「这些尝试彼此独立吗」**：同一个 boot 里反复重启同一个服务，只是**同一个证据重复 N 次**，
+  不构成排除法。不独立的失败堆再高，也只是一次失败——别拿它下「原因不明」的结论。
+- **按目标验证，不按字段验证**：`RuntimeMaxUse` 生效**不能**证明 `Storage` 生效。
+  验的是目标（`/var/log/journal` 有 `.journal` 文件、`/run/log/journal` 已空），
+  不是「某个我改过的字段变了」。
+- **说「原因不明」之前，先确认自己搜过**。
+- **「多尝试」= 换维度，不是重复同一动作**：改 A 字段不生效 → 换 B 字段、换配置层（conf.d / drop-in / 命令行）、
+  换观测点（不是换措辞再试一次）。同一个动作做 N 遍，N 再大也只是 1 次尝试。
+- **别把「我改了」当「它生效了」**：改配置 ≠ 生效。必须有独立的**生效标志**——
+  `systemctl show <unit> -p <Property>`、`journalctl --disk-usage` 这类由系统自己吐出来的值，
+  而不是「我写的文件在磁盘上」。
+
+### 结论的证据分级（下结论前必须自评）
+
+| 级别 | 含义 | 允许的说法 |
+|---|---|---|
+| **实测** | 本机命令输出直接证明 | 「已验证」+ 贴原始输出 |
+| **推断** | 有机制依据但没跑过 | 「推断」+ 说明依据和未验证点 |
+| **猜测** | 只是像 | 「不确定」+ 说明还差哪一步 |
+
+- **不许把推断说成实测**：「逻辑上成立」「理论上应该」**不能**替代跑一次。
+  本轮踩过：`Storage=persistent` 没实测就说「已生效」，实际差一条 `journalctl --flush`。
+- **主动找反证**：下结论前先问「什么现象能推翻它」，并**去查那个现象**。
+  只收集支持自己的证据 = 自我确认，不是验证。
+- **未验证项必须显式写出来**，宁可标注「没测过」也不许糊过去——用户有权知道哪部分是真的。
+- **高风险动作（重启/覆盖/删除）先留回滚路径和基线**，再动手；基线要存成能复查的文件，别只在脑子里。
+
 ## 踩坑记录（别重踩）
 
 1. `journalctl --user -u <unit>` 在本机**恒返回 `No journal files were found`** ——
@@ -111,6 +142,12 @@
 12. **`ss` 的双栈监听会重复报**（`0.0.0.0:80` 与 `[::]:80` 是同一服务），
     必须按端口合并，否则同一个服务刷两遍。
 13. **改已有文件别用行号编辑** —— 打偏一次就误删了整段函数。用 `replace` 精确锚点。
+14. **journald 从 volatile 切 persistent，改配置 + 重启服务都不够，必须 `journalctl --flush`** ——
+    journald 一旦在 `/run/log/journal` 建了活跃 journal 就**不会主动搬家**：`Storage=persistent`
+    写进 `/etc/systemd/journald.conf.d/` 后只重启服务，`--disk-usage` 仍指向 `/run`。
+    `journalctl --flush` 之后 `/var/log/journal/<machine-id>/` 才出现 `.journal`，`/run/log/journal` 变空。
+    （本机 raspberrypi-sys-mods 自带 `40-rpi-volatile-storage.conf` = `Storage=volatile`，
+    必须在 `/etc/systemd/journald.conf.d/` 里覆盖，不用动 `/usr/lib` 下的官方文件。）
 
 ## 相关文件
 

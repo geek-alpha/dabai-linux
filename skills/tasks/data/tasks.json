@@ -156,6 +156,146 @@
       "overdue_fired": false,
       "tags": [],
       "notes": ""
+    },
+    "t_bb6e83d0fca3": {
+      "id": "t_bb6e83d0fca3",
+      "title": "写 mcp 技能：按需拉起 MCP server，不用即杀",
+      "description": "用户要求「按需可以」：实现 skills/mcp 技能。设计：MCP 协议层（stdio JSON-RPC）+ 4 个元工具（mcp_servers/connect/call/disconnect），工具清单只在连接后进上下文，进程不用即杀。验收：本地夹具 server 端到端跑通 + harness skill_help 能加载。",
+      "priority": "high",
+      "status": "done",
+      "due_date": "",
+      "due_ts": null,
+      "created_at": 1789166284.248295,
+      "updated_at": 1789166434.8782878,
+      "depends_on": [],
+      "subtasks": [
+        {
+          "id": "s_339ab14a380b",
+          "title": "mcp_client.py：stdio JSON-RPC 协议层（读线程+队列、超时、进程池、atexit 清理）",
+          "description": "",
+          "priority": "high",
+          "status": "done",
+          "due_date": "",
+          "due_ts": null,
+          "depends_on": []
+        },
+        {
+          "id": "s_5ab03b15cf9c",
+          "title": "skill.py：4 个元工具 handler（servers/connect/call/disconnect）",
+          "description": "",
+          "priority": "high",
+          "status": "done",
+          "due_date": "",
+          "due_ts": null,
+          "depends_on": [
+            "s_339ab14a380b"
+          ]
+        },
+        {
+          "id": "s_7fa509eab46e",
+          "title": "skill.json + SKILL.md：清单与说明书（disclosure=on_demand）",
+          "description": "",
+          "priority": "high",
+          "status": "done",
+          "due_date": "",
+          "due_ts": null,
+          "depends_on": [
+            "s_5ab03b15cf9c"
+          ]
+        },
+        {
+          "id": "s_040bd074a954",
+          "title": "本地最小 MCP server 夹具，端到端验证 initialize/tools/list/tools/call",
+          "description": "",
+          "priority": "high",
+          "status": "done",
+          "due_date": "",
+          "due_ts": null,
+          "depends_on": [
+            "s_7fa509eab46e"
+          ]
+        },
+        {
+          "id": "s_40dc4b5db391",
+          "title": "装进 harness 验证 skill_help('mcp') 可加载、工具可调用",
+          "description": "",
+          "priority": "high",
+          "status": "done",
+          "due_date": "",
+          "due_ts": null,
+          "depends_on": [
+            "s_040bd074a954"
+          ]
+        }
+      ],
+      "reminder": null,
+      "overdue_fired": false,
+      "tags": [],
+      "notes": ""
+    },
+    "t_cb7d1bb0ef17": {
+      "id": "t_cb7d1bb0ef17",
+      "title": "豆包生成科幻视频并验证去水印",
+      "description": "",
+      "priority": "medium",
+      "status": "todo",
+      "due_date": "",
+      "due_ts": null,
+      "created_at": 1789249921.690502,
+      "updated_at": 1789249921.7213123,
+      "depends_on": [],
+      "subtasks": [
+        {
+          "id": "s_e5f1a0b16fb1",
+          "title": "豆包生成一条新科幻视频",
+          "description": "",
+          "priority": "medium",
+          "status": "todo",
+          "due_date": "",
+          "due_ts": null,
+          "depends_on": []
+        },
+        {
+          "id": "s_c9f5b868a799",
+          "title": "把视频从手机拉回电脑",
+          "description": "",
+          "priority": "medium",
+          "status": "todo",
+          "due_date": "",
+          "due_ts": null,
+          "depends_on": [
+            "s_e5f1a0b16fb1"
+          ]
+        },
+        {
+          "id": "s_3afbff77a15d",
+          "title": "用 video_dewatermark.py 去水印",
+          "description": "",
+          "priority": "medium",
+          "status": "todo",
+          "due_date": "",
+          "due_ts": null,
+          "depends_on": [
+            "s_c9f5b868a799"
+          ]
+        },
+        {
+          "id": "s_3a44effbf32c",
+          "title": "抽帧对比验证水印确实被擦掉",
+          "description": "",
+          "priority": "medium",
+          "status": "todo",
+          "due_date": "",
+          "due_ts": null,
+          "depends_on": [
+            "s_3afbff77a15d"
+          ]
+        }
+      ],
+      "reminder": null,
+      "overdue_fired": false,
+      "tags": [],
+      "notes": ""
     }
   },
   "reminder_events": []

@@ -41,17 +41,23 @@ export default (function init(App: AppKernel) {
 
   App.setQuiet = function setQuiet(on: boolean) {
     on = !!on;
-    if (on === App.chatQuiet) return;
+    const changed = on !== App.chatQuiet;
     App.chatQuiet = on;
     document.documentElement.classList.toggle('chat-quiet', on);
 
     // 1) 3D 帧循环 —— 最大的一块开销。WebXR 会话中帧由头显驱动，不能停。
+    //    这里是**幂等对齐**：不看 changed、也不看 loopStopped 的旧值，每次调用都按
+    //    目标状态写一遍。原来的「状态没变就早退」有个致命漂移 —— 若某次调用时
+    //    renderer 还没建好（早期调用、模块顺序变化），标志位已经翻成 true 而帧循环
+    //    根本没停；之后再调就早退，永远修不回来。用户看到的就是「点了全屏，模型
+    //    还在动」。改成每次都能自愈。
     try {
       const renderer = App.renderer;
       if (renderer) {
         if (on) {
           if (!App.xrPresenting) { renderer.setAnimationLoop(null); loopStopped = true; }
         } else if (loopStopped) {
+          // 只在确实停过时才恢复：XR 会话期间没停过，就别去抢 three 的帧调度
           renderer.setAnimationLoop(App.animate);
           loopStopped = false;
         }
@@ -62,6 +68,9 @@ export default (function init(App: AppKernel) {
     notifyBigscreen(on);
 
     // 3) 各模块自己的定时器 / 采样（热度、数据流、施法、看门狗、任务轮询…）
+    //    广播仍只在状态真变化时发：回调虽是幂等的，但重复广播会打断模块自己的
+    //    「暂停 → 恢复」成对逻辑（例如施法计时器只在 active>0 时才重启）。
+    if (!changed) return;
     for (let i = 0; i < hooks.length; i += 1) {
       try { hooks[i](on); } catch { /* 同上 */ }
     }

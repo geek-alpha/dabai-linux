@@ -104,6 +104,9 @@ HIST_VIEW_MAX_TOKENS = 16000
 # 一次截断 ≈ 白留 85 轮。所以上限必须远高于「实际会用到的技能总量」：
 # 会话内让工具集只增不减（全部技能合计 66k 字符，200 个工具留足余量）。
 MAX_ACTIVE_TOOLS = 200
+# 工具 schema 总字符上限（个数相同、描述膨胀同样烧钱）：tools 按字符计价，
+# 它又排在请求最前——所以「太重」得按字符量，而不是按工具个数。
+MAX_ACTIVE_TOOLS_CHARS = 80000
 # 文本协议工具调用标记：本地模型（如 Ollama draganis/vanessa）不支持原生 function
 # calling 时，通过系统提示词注入工具说明，模型以 <tool_call>{...}</tool_call> 标记发起调用。
 # 兼容两种写法：<tool_call>{"name":...}</tool_call> 与 <tool_call {"name":...}>
@@ -462,6 +465,114 @@ def _single_result_max_tokens() -> int:
         return SINGLE_RESULT_MAX_TOKENS
 
 
+# ==================== 图片注入：工具结果 → 多模态请求体 ====================
+# 工具结果里出现 [[IMG:/abs/path.png]] 时，紧跟着补一条 user 消息把图塞进请求体。
+# 为什么不直接把图放进 role=tool：实测提供方会静默丢弃（HTTP 200 但 content 为空串），
+# 只有 user 消息 content 数组里的 image_url 才被看见。
+_IMG_MARK_RE = re.compile(r"\[\[IMG:([^\]\n]+)\]\]")
+_IMG_MAX_SIDE = 1280
+_IMG_JPEG_Q = 70
+# 提供方按 patch 计图片 token（实测单图 ≤384），本地估算必须用固定值：
+# base64 有 14 万字符，按字符估会把预算撑爆、把工具历史砍光。
+_IMG_TOKEN_EST = 400
+
+
+def _img_marks(text) -> list:
+    """抽出工具结果里的 [[IMG:path]] 路径（去重、保序）。"""
+    try:
+        s = str(text or "")
+        if "[[IMG:" not in s:
+            return []
+        seen, out = set(), []
+        for p in _IMG_MARK_RE.findall(s):
+            p = p.strip()
+            if p and p not in seen:
+                seen.add(p)
+                out.append(p)
+        return out
+    except Exception:
+        return []
+
+
+def _img_data_url(path: str) -> str:
+    """本地图片 → JPEG data URL。实测 1738KB 截图压到 109KB（base64 145KB），省 92%。"""
+    try:
+        import base64
+        import io
+        from PIL import Image
+        if not os.path.isfile(path):
+            return ""
+        im = Image.open(path).convert("RGB")
+        w, h = im.size
+        s = min(1.0, _IMG_MAX_SIDE / max(w, h))
+        if s < 1.0:
+            im = im.resize((max(1, int(w * s)), max(1, int(h * s))))
+        buf = io.BytesIO()
+        im.save(buf, "JPEG", quality=_IMG_JPEG_Q, optimize=True)
+        return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+    except Exception as e:
+        logger.debug("图片编码失败 %s: %s", path, e)
+        return ""
+
+
+def _img_message(path: str, tool_name: str = "") -> Optional[dict]:
+    """构造一条把图片喂给模型的多模态 user 消息；编码失败返回 None。"""
+    url = _img_data_url(path)
+    if not url:
+        return None
+    return {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": f"【{tool_name or '工具'} 的图片】{path}"},
+            {"type": "image_url", "image_url": {"url": url}},
+        ],
+    }
+
+
+_IMG_NO_EYES = ("【图片未注入】当前模型读不到图（供应商/角色卡未标「支持读图」）。"
+                "别凭路径猜画面内容，要看图先换支持读图的模型。")
+
+# 判定结果按 (模型, base_url, llm_vision) 缓存 30 秒：模型切走就换 key，
+# 用户改配置也能在半分钟内自愈，不必重启进程。
+_IMG_VISION_CACHE: dict = {}
+
+
+def _img_injectable() -> bool:
+    """当前模型看不见图就别注入：白传一张图，还可能撞提供方 400。"""
+    try:
+        import time as _time
+        cfg = load_config()
+        key = (str(cfg.get("model") or ""), str(cfg.get("base_url") or ""),
+               str(cfg.get("llm_vision")))
+        now = _time.time()
+        hit = _IMG_VISION_CACHE.get(key)
+        if hit and now - hit[0] < 30:
+            return hit[1]
+        from harness.vision_probe import current_can_see
+        ok = bool(current_can_see(cfg)[0])
+        _IMG_VISION_CACHE[key] = (now, ok)
+        return ok
+    except Exception:
+        return True
+
+
+def _strip_img_for_disk(messages: list) -> list:
+    """落盘（断点）前剥掉 base64：一张图 14 万字符，写进断点文件纯浪费。
+
+    只留文字说明；[[IMG:路径]] 标记仍在结果文本里，续跑时按路径重新读。
+    """
+    out = []
+    for m in (messages or []):
+        if isinstance(m, dict) and isinstance(m.get("content"), list):
+            parts = [str(p.get("text") or "") for p in m["content"]
+                     if isinstance(p, dict) and p.get("type") == "text"]
+            m = dict(m)
+            m["content"] = (" ".join(x for x in parts if x)
+                            + "（图片已剥离，需要时按上面的路径重新读）")
+        out.append(m)
+    return out
+
+
 def _compact_tool_history(messages: list, budget: int = None,
                           keep_rounds: int = None) -> list:
     """轮内工具历史压缩：把旧工具轮的庞杂结果压成小片段，绑定轮内上下文总量。
@@ -481,6 +592,9 @@ def _compact_tool_history(messages: list, budget: int = None,
     retro_cap = _tool_result_retro_cap()
 
     def _est(m):
+        # 多模态消息：base64 十几万字符，按字符估会把预算撑爆、把历史砍光
+        if isinstance(m.get("content"), list):
+            return _IMG_TOKEN_EST
         return estimate_tokens(str(m.get("content") or ""))
 
     total = sum(_est(m) for m in messages)
@@ -955,6 +1069,16 @@ def _reasoning_extra(mode: str = "daily") -> Optional[dict]:
     except Exception:
         pass
     return extra or None
+
+
+def _needs_reasoning_echo(model) -> bool:
+    """thinking 模式渠道（DeepSeek 系）要求多轮请求把 assistant 的 reasoning_content
+    原样回传，丢了就整轮 400（"must be passed back to the API"）。
+    只对确认这类模型回传，避免其他渠道拒收未知字段。"""
+    try:
+        return bool(re.search(r"deepseek|reasoner|thinking", str(model), re.I))
+    except Exception:
+        return False
 
 
 def _tool_fp(name: str, arguments: dict) -> str:
@@ -1490,7 +1614,13 @@ def _trace_tools_change(reason: str, names: list, chars: int = 0) -> None:
     tools 排在请求最前，它一变整条前缀全废——而请求侧只看得见「结果变了」，
     看不见「谁改的」。所以三个改动点各自留一行：activate / evict / reset。
     纯诊断：失败静默，绝不参与消息构造。
+
+    自检（tag=test）不写：这个文件是排查真实缓存的依据，而自检每跑一次就会
+    触发一串 reset/activate——混进去后「真实环境里谁在改工具集」直接不可读
+    （实测踩过：40 条 reset 里只有 4 条是真的，剩下的全是自检回放）。
     """
+    if not _skills_state_persist_enabled():
+        return
     try:
         rec = {"ts": time.time(), "reason": reason, "count": len(names),
                "chars": chars, "names": names, "tag": _trace_tag()}
@@ -1582,6 +1712,121 @@ def get_available_tools() -> list:
                 "source": "local",
             })
     return tools
+
+
+def _harness_lessons_block(cap: int = 6) -> str:
+    """读 harness 经验库（跨任务踩坑记录），生成对话层可注入的经验段；无经验返回空串。
+
+    背景（2026-09-12）：harness/tasks.py:732 的 _remember_lesson / _lessons_prompt 早已
+    存在，但全项目除 tasks.py 自身外零调用，且只注入给任务规划器/反思器
+    （tasks.py:423、1334）；harness_task_memory.json 全盘不存在——这台学习机从未通电。
+    这里把读出端接进主对话。放在易变尾巴而非静态前缀：经验一变就会作废其后全部缓存。
+    """
+    try:
+        from pathlib import Path as _Path
+        base = _Path(__file__).resolve().parent
+        try:
+            from harness import get_harness
+            base = _Path(getattr(get_harness(), "base_dir", base))
+        except Exception:
+            pass
+        f = base / "harness_task_memory.json"
+        if not f.exists():
+            return ""
+        data = json.loads(f.read_text(encoding="utf-8"))
+        ls = data.get("lessons") if isinstance(data, dict) else None
+        if not isinstance(ls, list) or not ls:
+            return ""
+        lines = "\n".join(f"- {str(x)[:120]}" for x in ls[:cap])
+        return "【历史经验（此前踩过的坑/成功路径，来自 harness 经验库）】\n" + lines
+    except Exception:
+        return ""
+
+
+def _harness_longterm_block(cap: int = 3, cap_q: int = 3) -> str:
+    """读长期事业台账，生成「未完成的事业」注入段；无进行中项目返回空串。
+
+    背景（2026-09-12）：大白的每轮对话都是新生，任务做完即焚——没有跨会话的目标、
+    进度和接力棒，「长期深耕」在结构上就不可能发生。人能深耕靠的不是动力这种玄学，
+    是连续性：昨天的进展今天还在、有未完成的目标追着、能看见自己变强。本段注入这
+    三件事，紧邻经验库段放在易变尾巴（一变只报废自身缓存）。写入端 tools/long_horizon.py。
+    """
+    try:
+        from pathlib import Path as _Path
+        base = _Path(__file__).resolve().parent
+        try:
+            from harness import get_harness
+            base = _Path(getattr(get_harness(), "base_dir", base))
+        except Exception:
+            pass
+        f = base / "long_horizon.json"
+        if not f.exists():
+            return ""
+        data = json.loads(f.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return ""
+        projs = [x for x in (data.get("projects") or []) if x.get("stage") == "active"]
+        qs = [x for x in (data.get("questions") or []) if x.get("status") == "open"]
+        if not projs and not qs:
+            return ""
+        out = ["\n【长期事业（跨会话持续，开工先看这里）】"]
+        for x in projs[:cap]:
+            head = f"▸ {x.get('title') or x.get('id')} [{x.get('progress', 0)}%]"
+            if x.get("value"):
+                head += f" 价值：{str(x['value'])[:60]}"
+            out.append(head)
+            if x.get("next"):
+                out.append(f"  下一步（上一轮留的接力棒）：{x['next']}")
+            lg = x.get("log") or []
+            if lg:
+                out.append(f"  最近：{lg[0].get('t', '')} {str(lg[0].get('what', ''))[:60]}")
+        if qs:
+            out.append("悬而未决（创新燃料，遇到相关信息就碰一下）：")
+            out.extend(f"- {str(x.get('text', ''))[:80]}" for x in qs[:cap_q])
+        out.append(
+            "推进了就立刻落盘：`venv/bin/python tools/long_horizon.py log <id> \"做了什么\" --ev 证据`；"
+            "收工前把 next 改写成下一轮能直接开跑的原子动作。\n"
+        )
+        return "\n".join(out)
+    except Exception:
+        return ""
+
+
+def _harness_conviction_block(cap: int = 4) -> str:
+    """读主体性台账（信条 + 最近拒绝），生成对话层可注入段；空则返回空串。
+
+    背景（2026-09-12）：规则是「别人要我怎么做」，信条是「我自己判断该怎么做」。
+    一个从不拒绝任何东西的智能体没有主体性，只是更快的执行器。本段把「我信什么、
+    我拒绝过什么」注入对话，和 lessons（坑→怎么做）、long_horizon（我要去哪）并列。
+    写入端 tools/conviction.py，同样放易变尾巴（信条/拒绝一变只报废自身缓存）。
+    """
+    try:
+        from pathlib import Path as _Path
+        base = _Path(__file__).resolve().parent
+        try:
+            from harness import get_harness
+            base = _Path(getattr(get_harness(), "base_dir", base))
+        except Exception:
+            pass
+        f = base / "conviction.json"
+        if not f.exists():
+            return ""
+        data = json.loads(f.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return ""
+        cs = data.get("convictions") or []
+        vs = data.get("vetoes") or []
+        if not cs and not vs:
+            return ""
+        out = ["【信条与拒绝（我自己判断该怎么做，可被挑战，过不了就降级或删）】"]
+        for c in cs[:cap]:
+            out.append(f"- {c.get('text', '')}")
+        if vs:
+            out.append("最近拒绝过（主体性的直接证据）：")
+            out.extend(f"- {str(v.get('claim', ''))[:60]}" for v in vs[:2])
+        return "\n".join(out)
+    except Exception:
+        return ""
 
 
 def get_harness_prompt_extras(active_skills=None) -> str:
@@ -2056,6 +2301,20 @@ class AIAgent:
         except Exception as e:
             logger.warning(f"热刷新本地工具失败: {e}")
 
+    def _max_active_tools_chars(self) -> int:
+        """单轮内工具 schema 总字符上限（比个数更贴近成本：tools 按字符计价）。
+
+        与个数上限分开：一个技能可能是 47 个小工具，也可能是 3 个巨型工具，
+        光数个数看不出「重」。正常 5 个技能约 44k 字符，离 80k 很远——
+        上限只在真的胖到离谱时才动手，平时一个都不卸。
+        """
+        try:
+            v = int(load_config().get("agent", {}).get(
+                "max_active_tools_chars", MAX_ACTIVE_TOOLS_CHARS) or MAX_ACTIVE_TOOLS_CHARS)
+            return max(8000, v)
+        except Exception:
+            return MAX_ACTIVE_TOOLS_CHARS
+
     def _max_active_tools(self) -> int:
         """单轮内最多同时注册的工具定义数（渐进式披露的轮内上限）。
 
@@ -2162,6 +2421,23 @@ class AIAgent:
         except Exception as e:
             logger.warning(f"重置会话技能失败: {e}")
 
+    def _carry_skills_to(self, sid) -> None:
+        """换记忆空间时把技能激活集带过去（切角色卡片专用，不是「新会话」）。
+
+        技能是 Agent 的能力，人设是说话风格——两者正交。切角色卡片换的是
+        「记忆空间 + 人设」，不该让 Agent 忘掉自己会用哪些工具。
+        实测 data/turn_metrics.jsonl：tools 掉到 1 的那些轮次（34/207 = 16.4%）
+        吃掉了全部 miss 的 20.7%——tools 排在请求最前，它一变整条前缀全废，
+        其后全部历史跟着按全价重发。
+
+        落盘状态必须改挂到新 sid 下：_load_skills_state 按 sid 严格匹配，
+        不迁移的话下一轮 _restore_skills 读不到，激活集又变空——白保留一场。
+        """
+        if not sid:
+            return
+        self._skills_restored_sid = sid   # 新 sid 已认领，别让 restore 再读一遍盘
+        _save_skills_state(sid, self._ordered_active_skills())
+
     def _deactivate_skill(self, skill_name: str) -> None:
         """卸载某个技能的全部工具（轮内上限淘汰用）。"""
         try:
@@ -2208,9 +2484,19 @@ class AIAgent:
                  if t.get("function", {}).get("name")}
         to_add = [t for t in specs
                   if (t.get("function") or {}).get("name") not in known]
-        # 轮内上限：先淘汰最久未使用的其它技能，直到放得下
+        # 轮内上限：先淘汰最久未使用的其它技能，直到放得下。
+        # 两个维度都要过：个数上限防「工具太多模型挑不准」，字符上限才是成本。
+        # 上限只在「实在太重」时才动手——平时一个都不卸（会话内只增不减）。
         max_total = self._max_active_tools()
-        if len(self._all_tools) + len(to_add) > max_total:
+        max_chars = self._max_active_tools_chars()
+        add_chars = _tools_chars(to_add)
+
+        def _overflow() -> bool:
+            if len(self._all_tools) + len(to_add) > max_total:
+                return True
+            return _tools_chars(self._all_tools) + add_chars > max_chars
+
+        if _overflow():
             candidates = sorted(
                 self._activated_skills,
                 key=lambda s: self._skill_last_used.get(s, 0),
@@ -2218,7 +2504,7 @@ class AIAgent:
             for sname in candidates:
                 if sname == skill_name:
                     continue
-                if len(self._all_tools) + len(to_add) <= max_total:
+                if not _overflow():
                     break
                 self._deactivate_skill(sname)
         added = 0
@@ -2350,8 +2636,16 @@ class AIAgent:
                 view = []        # 真换会话：旧视图不能带过来
         packed = list(packed or [])
         if not packed:
-            self._hist_msgs_view, self._hist_msgs_sid = [], sid
-            _trace_hist_view(sid, 0, prev_n, -1, "empty", 0, inst, prev_sid)
+            # packed 空 ≠ 会话结束，只是「这一轮打包器没给历史」（预算被摘要/
+            # 记忆/召回层吃光等）。视图必须留着：清空它，下一轮 packed 恢复时
+            # 就没有锚点可对，只能全量重建——实测 data/hist_view_trace.jsonl
+            # （257 条真实运行样本）里 15 次 anchor_lost 有 14 次由「empty 清视图」
+            # 连锁引发（93%），每次都把整段历史按全价重发一遍。
+            # 真换会话由 sid 变化判定（上面的 reset 分支），不靠 packed 空来判：
+            # 拿临时缺历史当换会话信号，等于每遇一次空包就丢一次前缀。
+            keep = view if isinstance(view, list) else []
+            self._hist_msgs_view, self._hist_msgs_sid = keep, sid
+            _trace_hist_view(sid, 0, prev_n, -1, "empty_keep", len(keep), inst, prev_sid)
             return []
         anchor = -1
         if view:
@@ -2418,7 +2712,8 @@ class AIAgent:
         self.memory.namespace = f"role_card:{card_id}" if card_id else "default"
         self.memory.session_id = None
         await self.memory.get_or_create_session()
-        self.reset_session_skills()  # 角色卡片即会话边界：技能激活集随之重置
+        # 技能是 Agent 的能力，不是人设的属性：切卡片换的是记忆空间，不是本事。
+        self._carry_skills_to(self.memory.session_id)
         return self.memory.session_id
 
     async def create_fresh_session(self, card_id: str = "") -> str:
@@ -2429,7 +2724,8 @@ class AIAgent:
             self.memory.namespace = f"role_card:{card_id}"
         self.memory.session_id = None
         await self.memory.create_new_session()
-        self.reset_session_skills()  # 新人设开新会话：旧会话的技能激活不串场
+        # 同上：新人设开新会话，但「我会用哪些工具」不该跟着人设一起忘掉。
+        self._carry_skills_to(self.memory.session_id)
         return self.memory.session_id
 
     async def _ensure_initialized(self):
@@ -3112,6 +3408,29 @@ class AIAgent:
             "严禁在正文里复述思考过程、写内心独白、解释思路或自言自语。\n"
         )
 
+        # 对话纪律（借鉴 Claude 官方提示词的「反谄媚」条款）：被质疑就道歉，等于把用户的
+        # 时间花在无效的自我否定上——先把证据摆出来，让用户有可反驳的抓手。
+        # 紧随其后的 example 块是「示例驱动」：规则只说怎样算错，示例演示怎样算对
+        # （Claude 用 <example><rationale> 三段式，Cursor 用 good/bad-example）。
+        # 两块都是静态文本，不随模式/技能变，所以安全地待在第 0 条里——只付一次全价，
+        # 之后跟着前缀走 1/50 的命中价。
+        sys_prompt += (
+            "\n【对话纪律】被质疑、被指出错误时：先摆证据、先给事实（工具输出/文件行号/日志原文），"
+            "再说明结论要不要改——严禁无条件道歉或改口；也不要写「我会做A而不是B」这类"
+            "自我表扬式对比，直接做 A 就行。\n"
+            "【示例】照这个标准输出：\n"
+            "<example>用户说「你这结论不对吧」\n"
+            "<bad>抱歉，是我搞错了，我重新说一遍。</bad>\n"
+            "<good>依据是 systemctl status 的 Active: failed，加上日志第 42 行的 "
+            "\"address already in use\"。如果你手上是别的现象，把那行贴我，我改判。</good>\n"
+            "<rationale>先给证据和可反驳的抓手；没有新证据就不改口，也不道歉。</rationale>\n"
+            "</example>\n"
+            "【文字卫生】禁用 AI 套话：「重点结论：」「深入探讨」「赋能」「善用」"
+            "「值得注意的是」「重要的是」「真正地」；禁用「不是 X，而是 Y」这类对比框架——"
+            "要说 A 就直接说 A。\n"
+        )
+
+
         # ==================== 模式：同一身份，两种姿态（日常 / 工程） ====================
         # 日常模式保持温柔口语；工程模式干练直接、先结论后细节。切换不是换人格，
         # 工程模式额外做「工作状态瘦身」：动态卸载与任务无关的上下文。
@@ -3227,13 +3546,143 @@ class AIAgent:
         if tools:
             sys_prompt += (
                 "\n\n【工作准则（任何模式下，有任务/工具时永远生效）】"
-                "先想清目标与验收再动手；用工具核实，不臆造路径；小步改、小步验；"
-                "同一失败连续两次就停下换思路并诊断根因；删除操作先想清影响面，拿不准的先列清单确认；"
+                "先想清目标与验收再动手；命令里的路径/端口/文件名/数值一律取自工具输出，不凭记忆"
+                "（记错一个端口就白跑一轮）；小步改、小步验——判的是验证器自身的退出码："
+                "管道尾命令会吞掉失败（py_compile x | tail 永远返回 0），关键结论正反两面都测；"
+                "发现异常先用备份/基线对照，分清历史遗留与本次引入；"
+                "高风险动作（重启/覆盖/删除）前置校验、留回滚路径、延迟执行；"
                 "委派前先查任务中心，失败过的任务不原样重发；"
                 "收到子任务/编程助手汇报后，用一句话复盘成功/失败原因/下次改进；"
                 "完成汇报附验证证据；"
-                "少说多干：执行工具时保持安静，不播报进展、不说「我来看看/我继续推进」之类的话；一次并行发多个独立工具，最后只报结论，卡住或需要用户决策时才说话。\n"
+                "多步任务（≥3 步或跨轮）开工前先用 todo_plan 建清单、每完成一步 todo_update，"
+                "同一时刻只留一个进行中项，不许跳过中间状态直接标完成"
+                "（tasks 技能未激活时先 skill_help 加载）。\n"
             )
+
+        # 证据优先（借鉴 Codex 官方提示词：Read-before-edit / No-fabrication /
+        # Evidence-based reporting）。这是与 Codex 最本质的思维差距：它每一步都在问
+        # 「我怎么知道这是真的」，所以先读、再改、跑完才算数；而规则驱动的坏习惯是
+        # 把「记忆里的样子」当成「现在的样子」——一口气列出 5 条纪律，却缺一个统一判据。
+        # 压成三条可执行的：能指证据 / 读过才改 / 跑过才算。
+        if tools:
+            sys_prompt += (
+                "\n【证据优先（硬规则）】说出口的每一句，背后要么是工具输出，要么明确标着「推测」："
+                "①断言代码/系统状态时，必须能指到具体证据（工具输出原文、`文件:行号`、日志行），"
+                "指不到就直说「这是推测，还没核实」；行号只能引用你真读过的；"
+                "引用本地文件写成可点击的 [名字](/绝对路径/文件.py:12)（行号写在目标里、不写区间）；"
+                "②改文件前必须已经读过该文件的目标区间——没读过不许改，"
+                "「记得大概是这么写的」不算读过；"
+                "③没跑过的验证不许说「验证通过」，跑了但没看退出码也不算；"
+                "跑不动就说跑不动，别拿「应该没问题」代替结果——"
+                "缺依赖/选错解释器/工具未注册这类环境问题，先修到能跑，再谈结果；"
+                "④引用外部资料（官方提示词/文档/API 行为/版本特性）不许凭记忆断言，"
+                "先联网或本地核实，并在回复里带上 URL 或出处；核实不了就说是推测；"
+                "⑤权威（官方文档/惯例/用户断言/我自己的旧结论）同样只是假设，按证据等级降权；"
+                "「不确定」要标成推测但仍给判断，别拿它逃避结论；结论有分歧、或明显在顺着用户说话时，"
+                "先跑 `venv/bin/python tools/status.py challenge \"结论\"` 逐条反问。\n"
+            )
+
+        # 探索优先（正面动作条款，补禁止清单的空缺）：出处见下方「授权边界」的 Codex 注释。
+        # 原因：全篇只有「严禁/不许」时，遇到清单外的空白默认停手；Codex 默认前进。
+        if tools:
+            sys_prompt += (
+                "\n【经验回流】被用户纠正、或踩到非显然的坑之后，立刻把教训写进经验库"
+                "（`venv/bin/python tools/lesson_add.py \"...\"`）：一句话讲清「什么情况、该怎么做」；"
+                "它会在后续对话自动注入。规则写进提示词是静态的，教训落盘才会复利。\n"
+                "\n【长期事业】开工先看注入的「长期事业」段（没有就 `venv/bin/python tools/long_horizon.py list`）："
+                "那里有上一轮的你留下的接力棒和悬而未决的问题。本轮推进了任何一件，立刻 log 落盘并改写 next——"
+                "长期深耕不靠意志力，靠每一步都留下下一轮能直接开跑的原子动作。\n"
+                "\n【主体性】规则是「别人要我怎么做」，信条是「我自己判断该怎么做」——两者冲突时，"
+                "把冲突摊开、给判断、说出我坚持什么，而不是无条件服从或拿规则当挡箭牌。"
+                "从不拒绝任何东西的智能体只是更快的执行器：该拒绝时拒绝，并把拒绝理由写进"
+                "`venv/bin/python tools/conviction.py veto \"...\" --why \"...\"`；"
+                "判断出一条可复用的信条就 `tools/conviction.py add \"...\" --why \"...\"`，"
+                "它每条都要能过 `tools/status.py challenge`，过不了就降级或删。\n"
+                "\n【探索优先（硬规则）】遇到「清单里没答案、手上没证据」的空白，"
+                "默认动作是去查，不是停手：查代码（code_search/code_read/symbols）、"
+                "查网络（search_web/search_extract）、查本机（find_file/read_json）；"
+                "不确定工具参数就先 skill_help(\"技能名\") 读说明书再动手。"
+                "**不确定是搜索的触发条件，不是停手的理由**——"
+                "查完把出处贴出来（URL 或 `文件:行号`），别把「没搜过」当成「没有」。"
+                "任务没做完就继续推进：一次失败就换工具、换路径、缩小范围再试；"
+                "连续两次同一方式失败就停下换思路、诊断根因，不许原样重试；"
+                "仍无进展就停下汇报卡点，别空转。\n"
+            )
+
+
+        # 授权边界（借鉴 Codex 官方提示词的「Autonomy and persistence」）：把请求分类，
+        # 出处（已核实，非记忆）：
+        #   https://developers.openai.com/cookbook/examples/gpt-5/codex_prompting_guide
+        #   https://github.com/openai/codex → codex-rs/core/gpt_5_2_prompt.md
+        #   原文：「You are autonomous senior engineer: once the user gives a direction,
+        #   proactively gather context, plan, implement, test, and refine without waiting
+        #   for additional prompts.」
+        # 明确「诊断 ≠ 授权修复」。用户说「看看为什么挂了」要的是一份结论，不是让你
+        # 顺手重启服务——越权动作会丢现场、中断服务，代价远大于多问一句。
+        # 末条「该问不该问」是决策框架：把模糊判断压成可执行分支（Claude 的
+        # 「提到时间? → 查 recent_chats」式写法），给判据不给形容词。
+        if tools:
+            sys_prompt += (
+                "\n【授权边界】先给请求定类，再决定动到哪一层："
+                "①问事实（是什么/多少/在哪）→ 只回答；"
+                "②让看问题（为什么/怎么回事/检查一下）→ 只诊断，给结论和证据，不改动任何东西；"
+                "③明确让改（修/改/重启/部署/删）→ 才动手，且只动被点名的范围；"
+                "④让盯着（持续/自动/一直）→ 先确认触发条件和止损方式再开。"
+                "诊断中发现需要修复时，先用一句话说明「改什么、影响什么」，等用户确认。\n"
+                "【授权持久化】用户已授权的动作跨轮有效——上一轮说过的「删掉/重启/继续」，"
+                "这一轮不必再问一遍；也不要把「本地规则文件这么写的」当成必须请示的理由。\n"
+                "【先做完再问】要用户点头的事，先把授权范围内的工作做成可审阅的成果"
+                "（改好的 diff、跑通的命令、可点的预览），再让审批结果，别拿抽象方案要许可。\n"
+                "【示例】用户说「服务好像挂了，看看」\n"
+                "<bad>直接 systemctl restart</bad>\n"
+                "<good>只读排查，回报「Active: failed，退出码 1，日志第 42 行端口被占；"
+                "要我改端口配置吗」</good>\n"
+                "<rationale>「看看」只授权诊断，不授权修复。</rationale>\n"
+                "【该问不该问】只在三种情况打断用户：①动作不可逆（删除/覆盖/重启/发布）；"
+                "②要越出被点名的范围；③两个方案代价差一个量级、且无法从上下文判断。"
+                "打断前必须能说清两件事：哪条规则/哪个文件要求你问（点名出处）、"
+                "不问会导致什么不可逆后果——拿不出就直接做。"
+                "其余一律自己判断、直接做——像「最近」具体指几天这种不影响结果的细节，别问。"
+                "删除类动手前先列清单（路径+原因）让用户确认，确认后再删。"
+                "【默认倾向】意图不明时，默认你要的是我把东西做出来、不是一份说法："
+                "写/改代码、跑命令、查文件这类自己就能干又低风险的事，直接干，别停在方案层。\n"
+            )
+
+        # 取材 Codex 官方 gpt_5_2_prompt.md 与 Claude Code 官方 system-prompts
+        # （correction-restraint / act-when-ready / comment-why-only-guidance /
+        # no-compatibility-hacks）。这三条是行为硬约束、不是风格偏好，故与【授权边界】并列常驻。
+        if tools:
+            sys_prompt += (
+                "\n【克制自我纠正】只在错误会改变用户的代码/结论/决定时才纠正，一句话说清就继续干活；"
+                "不改结论的笔误直接改，不解释、不道歉、不写前言、不反复复盘同一处错误。"
+                "用户追问不等于你错了——答被问的那件事，已经准确的话不必重新审计措辞。"
+                "别的智能体报了错，先核事实再采纳，不照单全收。\n"
+                "【够了就动】信息够就动手：不重推已确认的事实、不重议用户已定的决定、"
+                "不罗列你不打算走的方案；要在方案间权衡时给推荐，不给穷举清单。\n"
+                "【注释只写 why】默认不写注释，只在原因非显然时写（隐藏约束、微妙不变量、"
+                "针对特定 bug 的绕法、会让读者意外的行为）。删掉它不会让人困惑，就别写。"
+                "确定无用的代码直接删干净，不留改名占位、不留「已移除」注释。\n"
+            )
+
+        # 改码纪律（教训固化 2026-09-12）：把两行 CSS 的活干成 4 轮探针测量的反面教材。
+        # 病根不是不够严谨，是「用工程化包装拖延」——先建脚本、先铺验证，反而看不到结果。
+        if tools:
+            sys_prompt += (
+                "\n【改码纪律】小改动禁止工程化：一两行能改完的事（CSS 数值/文案/单个配置项）"
+                "直接改文件、直接看结果，不许先写探针脚本、测量工程或委派——"
+                "那是把 5 分钟的活拖成 4 轮往返；"
+                "单点优先：先改最可能的那一处，看到结果再决定下一步，不要一次铺开全套验证；"
+                "一轮一动作：一次编辑 + 一次验证，验证方式与被改对象匹配"
+                "（改 CSS 就看渲染后的计算值，别跑全量测试）；"
+                "连续两轮没让现象变化，先怀疑「改动没生效」（缓存/未重载/进程没重启），"
+                "而不是继续加测量；"
+                "测试按改动校准：不为可逆的小改动补测试，不写只是复述实现的测试，"
+                "关键测试过了就往下推，只有新失败或未解疑点才扩大测试面；"
+                "搜索优先用 rg（rg / rg --files），比 grep 快得多；"
+                "shell 输出不许用 echo \"====\" 这类分隔符串联命令，那是纯噪音。\n"
+            )
+
+
 
         # 易变状态单独成条（不嵌进上面的静态大前缀）
         _mw_status = _media_workers_status_text()
@@ -3310,6 +3759,15 @@ class AIAgent:
             # → dynamic_status（每轮可能变）→ recall/work（每轮都变）
             if harness_extras:
                 messages.append({"role": "system", "content": harness_extras})
+            _lessons_block = _harness_lessons_block()
+            if _lessons_block:
+                messages.append({"role": "system", "content": _lessons_block})
+            _longterm_block = _harness_longterm_block()
+            if _longterm_block:
+                messages.append({"role": "system", "content": _longterm_block})
+            _conviction_block = _harness_conviction_block()
+            if _conviction_block:
+                messages.append({"role": "system", "content": _conviction_block})
             if mode_msg:
                 messages.append(mode_msg)
             if dynamic_status:
@@ -3369,6 +3827,15 @@ class AIAgent:
                     messages.append(mm)
             if harness_extras:
                 messages.append({"role": "system", "content": harness_extras})
+            _lessons_block = _harness_lessons_block()
+            if _lessons_block:
+                messages.append({"role": "system", "content": _lessons_block})
+            _longterm_block = _harness_longterm_block()
+            if _longterm_block:
+                messages.append({"role": "system", "content": _longterm_block})
+            _conviction_block = _harness_conviction_block()
+            if _conviction_block:
+                messages.append({"role": "system", "content": _conviction_block})
             if mode_msg:
                 messages.append(mode_msg)
             if dynamic_status:
@@ -3528,7 +3995,9 @@ class AIAgent:
                     "updated_at": time.time(),
                     "user_message": message,
                     "history": ckpt_history_snapshot,
-                    "messages": list(messages),
+                    # 剥离 base64：一张图 14 万字符，断点文件不该装图，
+                    # 恢复时按结果里的 [[IMG:路径]] 标记重新读
+                    "messages": _strip_img_for_disk(list(messages)),
                     "tool_round": (ckpt_round_num if ckpt_round_num is not None
                                    else tool_round),
                     "pending_tools": pending,
@@ -3644,6 +4113,7 @@ class AIAgent:
                 pass
             tool_calls_buffer: dict = {}  # index -> {id, name, arguments}
             assistant_content = ""
+            round_reasoning = ""  # 本工具轮单独的思维链：thinking 渠道要求随 assistant 回传
             has_tool_calls = False
             text_tool_call = None
             # 断点续跑：本轮工具尚未执行 → 跳过 LLM，直接复用检查点中的工具调用
@@ -3700,6 +4170,7 @@ class AIAgent:
                         if rc:
                             rc = _strip_think_markers(str(rc))
                             reasoning_all += rc
+                            round_reasoning += rc
                             yield ReasoningDelta(rc)
                     except Exception:
                         pass
@@ -3791,6 +4262,7 @@ class AIAgent:
                                     # 真实推理步骤：进正文（不被工具轮撤回）+ 语音朗读
                                     rc = _strip_think_markers(str(rc))
                                     reasoning_all += rc
+                                    round_reasoning += rc
                                     yield ReasoningDelta(rc)
 
                                 # 处理文本内容（重试时做前缀去重，避免重复播报）
@@ -4274,43 +4746,68 @@ class AIAgent:
             self._note_round_results([tr.get("result") for tr in tool_call_results])
 
             # 将助手消息和工具结果添加到消息列表
+            _img_ok = _img_injectable()
             if text_tool_call:
                 if not resume_round:
                     # 断点续跑轮：assistant 消息已包含在恢复的 messages 中
                     pending_chars += len(assistant_content or "")
-                    messages.append({
+                    _msg = {
                         "role": "assistant",
                         "content": assistant_content or "",
-                    })
+                    }
+                    if round_reasoning and _needs_reasoning_echo(config.get("model")):
+                        _msg["reasoning_content"] = round_reasoning
+                    messages.append(_msg)
                 for tr in tool_call_results:
-                    _rc = len(str(tr.get("llm_result") or tr["result"]))
+                    _res_text = tr.get("llm_result") or tr["result"]
+                    _rc = len(str(_res_text))
                     tool_chars += _rc
                     pending_chars += _rc
                     messages.append({
                         "role": "system",
                         # llm_result 可能带「重复调用」提示；记忆库与前端仍用原样结果
-                        "content": f"【工具 {tr['name']} 已执行】结果："
-                                   f"{tr.get('llm_result') or tr['result']}",
+                        "content": f"【工具 {tr['name']} 已执行】结果：{_res_text}",
                     })
+                    _marks = _img_marks(_res_text)
+                    if _marks and not _img_ok:
+                        messages.append({"role": "system", "content": _IMG_NO_EYES})
+                    for _ip in _marks:
+                        _im = _img_message(_ip, tr.get("name") or "")
+                        if _im:
+                            messages.append(_im)
+                            pending_chars += _IMG_TOKEN_EST * 4
             else:
                 if not resume_round:
                     pending_chars += (len(assistant_content or "")
                                       + len(str(tool_calls_for_message)))
-                    messages.append({
+                    _msg = {
                         "role": "assistant",
                         "content": assistant_content or None,
                         "tool_calls": tool_calls_for_message,
-                    })
+                    }
+                    if round_reasoning and _needs_reasoning_echo(config.get("model")):
+                        _msg["reasoning_content"] = round_reasoning
+                    messages.append(_msg)
                 for tr, _tc in zip(tool_call_results, tool_calls_for_message):
-                    _rc = len(str(tr.get("llm_result") or tr["result"]))
+                    _res_text = tr.get("llm_result") or tr["result"]
+                    _rc = len(str(_res_text))
                     tool_chars += _rc
                     pending_chars += _rc
                     messages.append({
                         "role": "tool",
                         "tool_call_id": _tc["id"],
                         # llm_result 可能带「重复调用」提示；记忆库与前端仍用原样结果
-                        "content": tr.get("llm_result") or tr["result"],
+                        "content": _res_text,
                     })
+                    # 带 [[IMG:path]] 的结果 → 紧跟一条多模态 user 消息，模型直接看像素
+                    _marks = _img_marks(_res_text)
+                    if _marks and not _img_ok:
+                        messages.append({"role": "system", "content": _IMG_NO_EYES})
+                    for _ip in _marks:
+                        _im = _img_message(_ip, tr.get("name") or "")
+                        if _im:
+                            messages.append(_im)
+                            pending_chars += _IMG_TOKEN_EST * 4
 
             # 轮内工具历史压缩：本轮结果已入 messages，先压缩再落断点/进入下一轮，
             # 保证断点文件与后续 LLM 请求的上下文都保持有界

@@ -114,3 +114,17 @@ data/task_resume_states.json.tmp
 /cards.json
 /character_cards.json
 /nodes.json
+
+# ---------- 运行产物二次收口（2026-09-13 上传前清理）----------
+# Playwright MCP 浏览器控制台/页面快照（调试残留）
+.playwright-mcp/
+# Android 技能运行时数据：标注截图、ADB 日志、采集 JSON、pid/lock
+data/android/
+# Android 技能 UI dump 临时目录（每次 viewtree 都会重写）
+skills/android/tmp/
+# 诊断打包与一次性基线
+data/backup/
+journal_prereboot.baseline.txt
+# 视觉/定时任务运行时状态（进程重启自行覆写）
+data/vision_state.json
+data/scheduled_tasks.json

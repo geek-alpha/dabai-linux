@@ -1870,6 +1870,21 @@ def code_patch(args: dict) -> str:
 
 # ---------- 5. 测试与自审 ----------
 
+def _project_python(root: Path) -> str:
+    """选项目解释器：root/venv → root/.venv → 当前解释器。
+
+    直接用 sys.executable 会绕过项目 venv，让「依赖明明装了却报 ModuleNotFoundError」的
+    假阴性混进验证结果——验证一旦不可信，整个闭环就废了，所以必须跟随项目环境。
+    不读 DABAI_PYTHON：那是大白自己的启动解释器，跑别人的项目会拿错依赖。
+    """
+    for venv in ("venv", ".venv"):
+        for sub in ("bin/python", "Scripts/python.exe"):
+            p = root / venv / sub
+            if p.is_file():
+                return str(p)
+    return sys.executable
+
+
 def code_test(args: dict) -> str:
     root = _norm_root(args.get("root"))
     try:
@@ -1879,7 +1894,7 @@ def code_test(args: dict) -> str:
     files = _split_list(args.get("files")) or _split_list(args.get("paths"))
     pattern = str(args.get("pattern") or "").strip()
     verbose = bool(args.get("verbose"))
-    cmd = [sys.executable, "-m", "pytest", "-q", "--no-header",
+    cmd = [_project_python(root), "-m", "pytest", "-q", "--no-header",
            "-p", "no:cacheprovider"]
     if verbose:
         cmd.append("-v")
@@ -1895,8 +1910,9 @@ def code_test(args: dict) -> str:
         return f"⚠ 测试运行超时（>{timeout}s）已终止"
     out, err = r.stdout or "", r.stderr or ""
     if "No module named 'pytest'" in err or "No module named pytest" in err:
-        return ("⚠ 当前 python 环境没有安装 pytest。可改用 code_verify(mode=test) "
-                "逐文件运行，或先安装：python -m pip install pytest")
+        py = _project_python(root)
+        return (f"⚠ 项目解释器（{py}）没有安装 pytest。可改用 code_verify(mode=test) "
+                f"逐文件运行，或先安装：{py} -m pip install pytest")
     failed = [l.strip() for l in out.splitlines() if l.strip().startswith("FAILED")]
     summary = ""
     for l in reversed(out.splitlines()):
@@ -2094,7 +2110,7 @@ def _run_test(fp: Path, root: Path, timeout: int) -> str:
         return f"⚠ {rel}：目前只支持运行 .py 测试文件"
     try:
         r = subprocess.run(
-            [sys.executable, str(fp)], capture_output=True, text=True,
+            [_project_python(root), str(fp)], capture_output=True, text=True,
             timeout=timeout, cwd=str(root), errors="replace",
             creationflags=_CREATE_NO_WINDOW)
     except subprocess.TimeoutExpired:
@@ -2129,7 +2145,7 @@ def _import_smoke(fp: Path, root: Path, timeout: int) -> str:
     )
     try:
         r = subprocess.run(
-            [sys.executable, "-c", code], capture_output=True, text=True,
+            [_project_python(root), "-c", code], capture_output=True, text=True,
             timeout=timeout, cwd=str(root), errors="replace",
             creationflags=_CREATE_NO_WINDOW)
     except subprocess.TimeoutExpired:

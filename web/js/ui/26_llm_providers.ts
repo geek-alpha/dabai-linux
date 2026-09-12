@@ -49,11 +49,13 @@ export default (function init(App: AppKernel) {
       item.className = 'provider-item' + (p._active ? ' active' : '');
       const kindLabel = p.kind === 'ollama' ? 'Ollama 本地' : '自定义 API';
       const modelLabel = p.default_model ? p.default_model : '（未设默认模型）';
+      const visionLabel = p.vision === true ? '读图：强制开启' : (p.vision === false ? '读图：强制关闭' : '读图：自动判定');
       item.innerHTML = `
         <div class="provider-item-main">
           <div class="provider-item-name">${App.escapeHtml(p.name)} ${p._active ? '<span class="provider-item-badge">当前使用</span>' : ''}</div>
           <div class="provider-item-meta">${kindLabel} · ${App.escapeHtml(p.base_url || '未配置 Base URL')}</div>
           <div class="provider-item-meta">默认模型：${App.escapeHtml(modelLabel)}</div>
+          <div class="provider-item-meta">${visionLabel}</div>
         </div>
         <div class="provider-item-actions">
           ${p._active ? '' : '<button class="role-card-edit" data-act="1" title="设为当前使用">启用</button>'}
@@ -78,6 +80,11 @@ export default (function init(App: AppKernel) {
     if (App.providerBaseUrl) App.providerBaseUrl.value = (provider && provider.base_url) || '';
     if (App.providerApiKey) App.providerApiKey.value = (provider && provider.api_key) || '';
     if (App.providerDefaultModel) App.providerDefaultModel.value = (provider && provider.default_model) || '';
+    if (App.providerVision) {
+      App.providerVision.value = provider && provider.vision === true
+        ? 'true'
+        : (provider && provider.vision === false ? 'false' : '');
+    }
     if (App.providerDeleteBtn) App.providerDeleteBtn.style.display = provider ? '' : 'none';
     if (App.providerModels) {
       App.providerModels.style.display = 'none';
@@ -104,7 +111,10 @@ export default (function init(App: AppKernel) {
       kind: App.providerKind?.value || 'custom',
       base_url,
       api_key: App.providerApiKey?.value.trim() || '',
-      default_model: App.providerDefaultModel?.value.trim() || ''
+      default_model: App.providerDefaultModel?.value.trim() || '',
+      // 三态：''=自动（交给模型名+实测判定），true/false=用户强制
+      vision: App.providerVision?.value === 'true' ? true
+        : (App.providerVision?.value === 'false' ? false : null)
     };
     const editingId = App._editingProviderId;
     try {

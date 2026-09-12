@@ -60,6 +60,9 @@ export default (function init(App: AppKernel) {
         App.rcLlmTempVal.textContent = Number(App.rcLlmTemperature.value).toFixed(2);
       }
     });
+    // 读图能力：卡片绑的模型跟供应商默认模型常常不是同一个，改动即重判
+    App.rcLlmVision?.addEventListener('change', () => App.refreshRcLlmVisionTip?.());
+    App.rcLlmModel?.addEventListener('change', () => App.refreshRcLlmVisionTip?.());
     // 缓存全局默认温度（卡片未单独设定时沿用）
     App.rcLlmDefaultTemp = 0.2;
     fetch('/api/llm/config').then(r => r.json()).then(cfg => {
@@ -323,8 +326,12 @@ export default (function init(App: AppKernel) {
       : (App.rcLlmDefaultTemp ?? 0.2);
     App.rcLlmTemperature.value = temp;
     App.rcLlmTempVal.textContent = Number(temp).toFixed(2);
+    if (App.rcLlmVision) {
+      App.rcLlmVision.value = llm.vision === true ? 'true' : (llm.vision === false ? 'false' : '');
+    }
     // 严格从所选供应商加载模型列表（未选供应商则只提示，绝不串用其它提供方）
     await App.loadRcLlmModels();
+    App.refreshRcLlmVisionTip?.();
     // TTS
     App.switchRcTTSEngine(tts.engine || 'edge_tts');
     const rate = parseInt(tts.edge_rate) || 0;
@@ -441,6 +448,29 @@ export default (function init(App: AppKernel) {
     if (App.rcLlmModel) App.rcLlmModel.value = '';
     await App.loadRcLlmModels();
   };
+
+  /** 把「这张卡用的模型能不能看见注入的截图」摊开显示 */
+  App.refreshRcLlmVisionTip = async function refreshRcLlmVisionTip() {
+    const tip = App.rcLlmVisionTip;
+    if (!tip) return;
+    const qs = new URLSearchParams({
+      provider_id: App.rcLlmProviderId || '',
+      model: App.rcLlmModel?.value.trim() || '',
+      override: App.rcLlmVision?.value || ''
+    });
+    try {
+      const d = await (await fetch('/api/vision/check?' + qs.toString())).json();
+      if (d.ok) {
+        tip.textContent = `✓ ${d.model} 能读图（${d.why}）`;
+        return;
+      }
+      tip.textContent = `✗ ${d.model} 看不见图（${d.why}）→ `
+        + '截图注入后它读不到，换一个支持读图的模型';
+    } catch (e) {
+      tip.textContent = '判定不可用（接口未生效？）';
+    }
+  };
+
 
   /** 从所选供应商自动加载可用大模型列表 —— 只从该供应商拉取，绝不串用其它提供方。
    *  保留当前已选模型；拉取失败时仍保留当前模型选项，避免空白无法选择 */
@@ -774,7 +804,9 @@ export default (function init(App: AppKernel) {
       llm: {
         provider_id: App.rcLlmProviderId || '',
         model: App.rcLlmModel?.value.trim() || '',
-        temperature: App.rcLlmTemperature ? Number(App.rcLlmTemperature.value) : null
+        temperature: App.rcLlmTemperature ? Number(App.rcLlmTemperature.value) : null,
+        vision: App.rcLlmVision?.value === 'true' ? true
+          : (App.rcLlmVision?.value === 'false' ? false : null)
       }
     };
   };

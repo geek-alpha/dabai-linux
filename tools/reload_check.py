@@ -32,7 +32,69 @@ def _scan_core() -> list:
 
 
 def _proc_start() -> tuple:
-    """当前 python server.py 进程的 PID 与启动时间（秒）。"""
+    """当前 server 进程的 PID 与启动时间（秒）。
+
+    Linux 优先（systemctl / /proc），Windows 兜底（powershell）。
+    探测失败返回 (None, None) —— 调用方必须报 UNKNOWN，绝不能当成 [OK]。
+    """
+    if sys.platform.startswith("linux"):
+        pid, started = _proc_start_linux()
+        if pid:
+            return pid, started
+    return _proc_start_windows()
+
+
+def _proc_start_linux() -> tuple:
+    pid = None
+    try:
+        out = subprocess.run(
+            ["systemctl", "show", "myservice.service", "-p", "MainPID", "--value"],
+            capture_output=True, text=True, timeout=10)
+        v = (out.stdout or "").strip()
+        if v.isdigit() and int(v) > 0:
+            pid = int(v)
+    except Exception:
+        pid = None
+    if not pid:  # 兜底：扫 /proc 找 server.py
+        try:
+            for d in os.listdir("/proc"):
+                if not d.isdigit():
+                    continue
+                try:
+                    with open("/proc/%s/cmdline" % d, "rb") as f:
+                        cmd = f.read().decode("utf-8", "ignore")
+                except Exception:
+                    continue
+                if "server.py" in cmd:
+                    pid = int(d)
+                    break
+        except Exception:
+            pid = None
+    if not pid:
+        return None, None
+    try:
+        with open("/proc/%d/stat" % pid, "r") as f:
+            stat = f.read()
+        fields = stat[stat.rfind(")") + 2:].split()
+        starttime = int(fields[19])  # 第 22 字段（starttime，clock ticks）
+        hz = os.sysconf("SC_CLK_TCK") or 100
+        btime = 0
+        with open("/proc/stat", "r") as f:
+            for line in f:
+                if line.startswith("btime"):
+                    btime = int(line.split()[1])
+                    break
+        if btime:
+            return pid, btime + starttime / float(hz)
+        with open("/proc/uptime", "r") as f:
+            uptime = float(f.read().split()[0])
+        return pid, time.time() - uptime + starttime / float(hz)
+    except Exception:
+        return None, None
+
+
+def _proc_start_windows() -> tuple:
+    """Windows 兜底（原实现保留）。"""
     try:
         out = subprocess.run(
             ["powershell", "-NoProfile", "-Command",
@@ -45,7 +107,6 @@ def _proc_start() -> tuple:
                 continue
             pid, ts = line.split("|", 1)
             try:
-                # ISO 8601 带本地时区 → 转 epoch
                 from datetime import datetime
                 dt = datetime.fromisoformat(ts.strip())
                 return int(pid), dt.timestamp()
@@ -98,6 +159,16 @@ def main(as_json=False):
     print("运行中进程 PID %s，启动于 %s" % (res["pid"], res["started_at"]))
     print("自动重启（harness.core_autorestart）：%s"
           % ("开启" if auto else "关闭 ← 核心改动不会自动生效"))
+    if not started:
+        # 关键：探测失败 ≠ 已生效。旧版在这里静默放过，永远打印 [OK]，
+        # 把“探测不到”伪装成“没问题”（实测踩过：agent.py 改完未生效却报 OK）。
+        print("[?] 探测不到运行中进程 —— 无法判定改动是否生效（这不是 [OK]）。")
+        print("    按修改时间列出的核心文件，请人工核对：")
+        for p in sorted(files, key=lambda x: -x.stat().st_mtime)[:10]:
+            print("   %-24s %s" % (p.name,
+                                    time.strftime("%Y-%m-%d %H:%M:%S",
+                                                  time.localtime(p.stat().st_mtime))))
+        return 2
     if not res["stale"]:
         print("[OK] 所有核心改动都已生效（没有比进程启动时间更新的核心文件）")
         return 0

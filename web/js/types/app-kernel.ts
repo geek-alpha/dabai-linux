@@ -436,6 +436,7 @@ export interface AppKernel {
   providerBaseUrl: HTMLInputElement | null;
   providerApiKey: HTMLInputElement | null;
   providerDefaultModel: HTMLInputElement | null;
+  providerVision: HTMLSelectElement | null;
   providerTestBtn: HTMLButtonElement | null;
   providerTestResult: HTMLSpanElement | null;
   providerModels: HTMLSelectElement | null;
@@ -460,6 +461,8 @@ export interface AppKernel {
   rcLlmTip: HTMLDivElement | null;
   rcLlmTemperature: HTMLInputElement | null;
   rcLlmTempVal: HTMLSpanElement | null;
+  rcLlmVision: HTMLSelectElement | null;
+  rcLlmVisionTip: HTMLDivElement | null;
   rcTtsTabs: HTMLDivElement | null;
   rcTtsEdgePanel: HTMLDivElement | null;
   rcTtsGsoPanel: HTMLDivElement | null;
@@ -1038,6 +1041,10 @@ export interface AppKernel {
   chatFullscreen: boolean;
   chatHeightLevel: number;
   setChatFullscreen: (on: boolean) => void;
+  /* 全屏透明（◍）：同样铺满屏幕，但面板半透明且**不静默** —— 3D 场景继续渲染，
+   * 角色透过面板看得见。与 chatFullscreen 互斥。 */
+  chatGhost: boolean;
+  setChatGhost: (on: boolean) => void;
   cycleChatHeight: () => void;
   closeChatPanel: () => void;
   /* 聊天全屏静默总闸（00_quiet 挂载）：全屏时停掉非聊天框的一切渲染 */
@@ -1731,6 +1738,7 @@ export interface AppKernel {
   llmProvidersCache?: any;
   loadRcLlmGlobalConfig?: any;
   loadRcLlmModels?: any;
+  refreshRcLlmVisionTip?: any;
   loadProvidersCache?: any;
   loadRcModels?: any;
   loadRcSttConfig?: any;

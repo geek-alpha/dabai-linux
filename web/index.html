@@ -6,7 +6,7 @@
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="theme-color" content="#0f0f1e">
     <title>白头凤【BattlePhoenix】</title>
-    <link rel="stylesheet" href="/static/style.css?v=33">
+    <link rel="stylesheet" href="/static/style.css?v=36">
     <!-- Three.js importmap：用 ES module 加载 three 与扩展 -->
     <script type="importmap">
     {
@@ -136,12 +136,13 @@
             <div id="chat-head" class="chat-head">
                 <div class="chat-head-title">
                     <span class="chat-head-dot"></span>
-                    <span>大白 · 对话</span>
+                    <span class="chat-head-label">大白 · 对话</span>
                     <span id="chat-head-count" class="chat-head-count" title="消息数">0</span>
                     <span id="chat-token-meter" class="chat-token-meter" title="上下文 / Token 用量">—</span>
                 </div>
                 <div class="chat-head-actions">
                     <button id="chat-height-btn" class="chat-head-btn" title="全屏聊天（点击展开）">⤢</button>
+                    <button id="chat-ghost-btn" class="chat-head-btn" title="全屏透明：铺满屏幕，让角色透出来">◍</button>
                     <button id="chat-close-btn" class="chat-head-btn" title="收起聊天">▾</button>
                 </div>
             </div>
@@ -268,6 +269,15 @@
                     <div class="tts-tip">填写后，应用未指定模型的角色卡片时会自动使用它</div>
                 </div>
                 <div class="tts-field">
+                    <label for="provider-vision">读图能力</label>
+                    <select id="provider-vision">
+                        <option value="">自动判定（推荐）</option>
+                        <option value="true">支持读图（强制）</option>
+                        <option value="false">不支持读图（强制排除）</option>
+                    </select>
+                    <div class="tts-tip">read_image 会挑一个支持视觉的模型读图：自动判定 = 模型名线索（vision/vl/4o/claude/gemini…）＋实测记录；名字看不出来的模型在这里强制打开</div>
+                </div>
+                <div class="tts-field">
                     <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
                         <button id="provider-test-btn" type="button" style="background:rgba(124,92,255,0.15);border:1px solid rgba(124,92,255,0.5);border-radius:8px;color:var(--accent);font-size:12px;padding:6px 12px;cursor:pointer">测试并加载模型</button>
                         <span class="tts-tip" id="provider-test-result">按上方地址测试连通性，成功后可选默认模型</span>
@@ -337,6 +347,15 @@
                     </label>
                     <input id="rc-llm-temperature" type="range" min="0" max="2" step="0.05" value="0.2" style="margin-top:6px">
                     <div class="tts-tip">越低越稳定听话，越高越自由放飞（0 ~ 2）；保存后该卡片应用时生效</div>
+                </div>
+                <div class="tts-field">
+                    <label for="rc-llm-vision">读图能力</label>
+                    <select id="rc-llm-vision">
+                        <option value="">自动判定（模型名线索 + 实测记录）</option>
+                        <option value="true">支持读图（强制打开）</option>
+                        <option value="false">不支持读图（不拿它试，由别的视觉模型代看）</option>
+                    </select>
+                    <div class="tts-tip" id="rc-llm-vision-tip">这张卡绑的模型能不能吃图。选「不支持」只是不再拿它试，读图仍会找其它视觉模型代看。</div>
                 </div>
                 <div class="tts-field">
                     <label>声音</label>
@@ -822,6 +841,6 @@
         <div id="vr-hint" class="vr-hint"></div>
     </div>
 
-    <script type="module" src="/static/app.ts?v=170"></script>
+    <script type="module" src="/static/app.ts?v=171"></script>
 </body>
 </html>
