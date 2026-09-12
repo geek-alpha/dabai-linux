@@ -1,0 +1,31 @@
+<!doctype html>
+<html><body><div id="host"></div><pre id="out">pending</pre>
+<script type="module">
+const dump = (o) => { document.getElementById('out').textContent = JSON.stringify(o, null, 2); };
+const mod = await import('/static/js/ui/13_messages.ts');
+const App = {};
+mod.default(App);
+const el = document.createElement('div');
+document.getElementById('host').appendChild(el);
+
+const TEXT = '成品在这儿：[nomark-1](/home/wxf/Videos/doubao-scifi/nomark-1.mp4)';
+App.renderMsgMedia(el, TEXT);
+const v = el.querySelector('video');
+
+const probe = async () => {
+  const out = {
+    extracted: App.extractMediaUrls(TEXT),
+    html: el.innerHTML,
+    src: v ? v.getAttribute('src') : null,
+  };
+  if (v) {
+    try {
+      const r = await fetch(v.getAttribute('src'), { method: 'GET', headers: { Range: 'bytes=0-1023' } });
+      out.fetch = { status: r.status, type: r.headers.get('content-type'), len: r.headers.get('content-length'), cr: r.headers.get('content-range') };
+    } catch (e) { out.fetchErr = String(e); }
+    out.video = { error: v.error ? { code: v.error.code, message: v.error.message } : null, networkState: v.networkState, readyState: v.readyState, videoWidth: v.videoWidth, duration: v.duration, currentSrc: v.currentSrc };
+  }
+  dump(out);
+};
+setTimeout(probe, 5000);
+</script></body></html>

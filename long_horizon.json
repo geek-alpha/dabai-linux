@@ -1,0 +1,134 @@
+{
+ "projects": [
+  {
+   "id": "self-evolution",
+   "title": "自我进化闭环",
+   "why": "每轮对话都是新生：教训不落盘就重犯，目标不落盘就不深耕，进步不可见就没有方向。",
+   "value": "让使用者拿到一个会自己变强的工具，而不是每次从零陪跑。",
+   "done_when": "教训/目标/度量三件套自动运转，连续 10 轮对话无需人工提醒就有可见推进。",
+   "stage": "active",
+   "progress": 90,
+   "next": "核对 usage 日志里带图请求的 prompt_tokens 增量是否≈384，并验证非视觉模型下走「图片未注入」提示而非 400",
+   "created": "2026-09-12",
+   "log": [
+    {
+     "t": "2026-09-13",
+     "what": "端到端验收 [[IMG:]] 图片注入：B站控件树 0 文字，只靠 screenshot 图片注入读画面，实测准确读出卡片标题/时长/播放量/弹幕数（「2045年人类将永生？谷歌工程师的生命逃逸速度」15:19 / 1.4万 / 99）",
+     "ev": "shot-20260913-044143.png 等 6 张，8 条推荐卡内容全部读出"
+    },
+    {
+     "t": "2026-09-13",
+     "what": "删掉 read_image 工具：图片只走 [[IMG:]] 上下文注入，读图能力判定搬到 harness/vision_probe.py（settings 页仍能用），并给注入加了拦截——模型看不见图就不注入、只留提示，避免撞提供方 400 或让模型凭路径瞎猜。",
+     "ev": "skills/vision 整目录删除；server.py:3327 /api/vision/check 改为直接 import；agent.py:530 _img_injectable（30s 缓存）+ 4755/4784 两处注入点拦截；全新进程验证：178 工具、read_image 不在、vision 技能不在；current_can_see()=(True, '角色卡里显式标了「支持读图」')"
+    },
+    {
+     "t": "2026-09-13",
+     "what": "实现了「工具结果 → 多模态请求体」直通：工具返回带 [[IMG:绝对路径]] 标记时，agent.py 在同位置追加一条 user 消息（text+image_url），图片直接进请求体、不经二次转手。三处防护：JPEG 压缩（1738KB 截图→109KB，base64 145KB）、token 估算对多模态消息固定 400、断点落盘剥离 base64 只留路径。android 的 screenshot/annotate 已带标记并热重载生效（实测第二次调用返回带 [[IMG:]]）。",
+     "ev": "agent.py:468 新增 _img_marks/_img_data_url/_img_message/_strip_img_for_disk；注入点 agent.py:4715/4739；实测 data_url=148815 字符、_compact_tool_history 不动图片消息、语法检查三个文件通过；进程 793 未重启（hot_reload 检测到对话轮执行中延迟重启）"
+    },
+    {
+     "t": "2026-09-13",
+     "what": "实测澄清了「图片能不能进工具上下文」：deepseek-flash 本身多模态（直接发 image_url 能准确读出 B站截图文字），但图片放进 role=tool 会被静默丢弃（200 + 空内容），只有 user 消息里的 image_url 有效。harness 的工具返回通道是纯字符串（agent.py:4654），所以原生注入需要改造。已修 read_image 的空内容 bug：max_tokens 1500→4000（reasoning 吃光预算），实测恢复输出 1000+ 字符。",
+     "ev": "实测三组：A tool-role+image → reply=''；B tool-text+user-image → 准确读出「中美同意开展人工…」；max_tokens=1500 → reasoning=1374/finish=length；4000 → reasoning=322/正文1091字符；skills/vision/skill.py:313 已改"
+    },
+    {
+     "t": "2026-09-13",
+     "what": "调研了开源 GUI agent 的定位机制（UI-TARS / browser-use / Set-of-Mark / Lacuna / MindStudio），结论：普通 LMM 做空间回归必然 hallucinate，坐标必须由结构化通道给。据此给 annotate 加「方位」字段（_zone：顶部/上部/中部/下部/底部 × 左/中/右）+ 编号字号放大到 46*sc 加黑边。实测 B站首页：annotate 一次 → 表里「13 @(366,473) 上部中 每周必看」→ tap → 窗口跳到 WebGeneralComposeActivity，一次命中，零视觉依赖。",
+     "ev": "adb_ui.py:691 _zone 新增；adb_ui.py:1194 do_annotate 输出带方位；实测截图见 data/android/annot-20260913-035731.png；read_image 同时段报 deepseek-flash 空内容 + vision-exp 429"
+    },
+    {
+     "t": "2026-09-13",
+     "what": "给安卓技能加了 annotate：把可点区域编号画进截图，同时输出「编号→坐标」表，实测一次点击命中（点 (413,293) 命中「热门」标签，read_image 复验选中态为热门）。结论：定位走控件树坐标通道，眼睛只做语义兜底。",
+     "ev": "adb_ui.py:1176 do_annotate + skill.py:280 _UI_ACTIONS 加 annotate；实测 tap 一次命中"
+    },
+    {
+     "t": "2026-09-13",
+     "what": "读图能力下沉到角色卡：卡片 llm 新增 vision 三态（自动/强制支持/强制排除），优先级 角色卡 > 供应商 > 实测 > 名字线索；同时修掉一个静默错位 bug——candidates() 原用 provider.default_model 判读图，而实际在跑的是 cfg['model']，两者不同时会拿 A 模型的结论决定 B 模型。新增 GET /api/vision/check 把判定摊开显示在卡片编辑弹窗（✓能读 / ✗不能读→谁来代看）。",
+     "ev": "vcheck.py: override 优先级 3 例、active_model=card-model-B、ov=False 时激活模型被排除只剩 qwen-vl-max；scheck.py: _norm_vision 9 例、卡片 vision 往返+幂等、旧卡无字段→None；node --check 3 个 TS 通过；py_compile server.py/harness/skills.py/skills/vision/skill.py OK"
+    },
+    {
+     "t": "2026-09-13",
+     "what": "把读图能力接进模型配置界面：供应商新增 vision 三态（null 自动/true 强制支持/false 强制排除），UI 加「读图能力」下拉 + 列表显示判定状态；supports_vision 优先级改为 显式排除 > 显式支持 > 实测被拒 > 实测成功 > 名字启发式。",
+     "ev": "ast 抽真实源码跑通：_norm_vision 三态 11 例正确、_ensure_llm_providers 往返保留 vision=True/False/None 且幂等、_llm_provider_meta 出参含 vision；node --experimental-strip-types --check 三个 TS 文件通过"
+    },
+    {
+     "t": "2026-09-13",
+     "what": "把上轮的验证方法封成技能能力：android action=verify（kw 按资源名/文字定位区域 + color 目标色计数 + 噪声带判状态），batch 里是 verify 子命令，也能直接跑 skills/android/verify.py。实测一条 batch 命令拿到 0 → 4968。顺带把 viewtree 控件解析抽成 adb_ui.viewtree_nodes()，see 和 verify 共用一份实现。",
+     "ev": "skills/android/verify.py；data/android/verify_state.json；batch 'verify like_layout #FB7299;xy 995,1104;sleep 2.5;verify like_layout #FB7299' → 基线 0 → 4968"
+    },
+    {
+     "t": "2026-09-13",
+     "what": "竖版页点赞验证破局：不再用整屏像素 diff（视频噪声 42.6% 淹没信号），改成「资源 id 定位 + 颜色语义特征验证」——like_icon 区域的 B站粉像素数 0/5094/0 三态可复现。同轮生成 B站 resid 表（80325 条），see 全站带资源名，微信/B站这类 app 的粗定位锚点齐了。",
+     "ev": "/tmp/story_before.png、/tmp/story_after.png、/tmp/story_after2.png 三态像素统计；skills/android/resid/tv.danmaku.bili.json"
+    },
+    {
+     "t": "2026-09-13",
+     "what": "插件层同一处热重载 bug 修掉，并把技能/插件两处重复逻辑抽成 harness/_reload.py（evict_dir_modules + is_shared_module）。途中发现并修掉自己上一轮引入的回归：改成按 __file__ 归属清除后，path 缺失时 Path('').resolve()==cwd 会把整个项目的模块摘掉（实测误清 5 个 harness 模块），现在清除前强制校验目标目录是 base_dir 的真子目录。回归自检 tools/skills_reload_selftest.py 扩到 15 项（含非法目录防护 5 项）。",
+     "ev": "selftest ALL PASS exit=0；reload_check 列出 3 个待生效文件；journalctl 显示守护在等对话轮结束重启"
+    },
+    {
+     "t": "2026-09-13",
+     "what": "修掉 harness 热重载的核心 bug：_evict_skill_submodules 从「只清加载期快照 _mods_added」改成「按 __file__ 全量扫 sys.modules，清掉技能目录内所有模块」，并给共享模块加子模块前缀保护。之前改 viewtree.py 后 adb_ui 里那句延迟 import 永远拿旧对象，see 报 no attribute res_name。新增 tools/skills_reload_selftest.py 做回归（含旧实现 A/B 对照，证明旧版确实残留）。",
+     "ev": "tools/skills_reload_selftest.py ALL PASS；curl POST /api/harness/skills/android/reload 返回 200 后 see 正常输出"
+    },
+    {
+     "t": "2026-09-13",
+     "what": "资源 id 语义化落地：tools/resid_map.py（自写 arsc 解析器，绕开 androguard 在本机 arsc 上解析出 0 条）+ from-device 一键生成 id→名表；see/viewtree 现在带 ← 名称。微信 73233 条命中（7f090158→id/actionbar_up_indicator、7f095238→id/plus_icon）；拼多多商家版被资源名混淆（23871 条/346 个名/7628 条叫 id/pdd），证明这条路对混淆 app 无效，需退回类名+坐标。",
+     "ev": "tools/resid_map.py + skills/android/resid/*.json + see 实跑输出"
+    },
+    {
+     "t": "2026-09-13",
+     "what": "探明手机控制的真实边界：能（跳过UI直达Activity/读隐藏节点/系统层直读/content query/input motionevent任意手势/无疲劳并行）；不能（屏幕外节点 RecyclerView 不 materialize、/dev/input 写被 SELinux 拒、设备无 OCR、微信屏蔽 uiautomator）。",
+     "ev": "实测：微信聊天页 736 节点/161 不可见/533 hex id；dd of=/dev/input/event5 Permission denied；motionevent 注入后 LauncherUI→WebWXLogoutUI"
+    },
+    {
+     "t": "2026-09-13",
+     "what": "settle 提速：原地动作快判（快照 win 字段当免费窗口探针，quiet 1.2s 内指纹不变即返回），轮询间隔 0.15→0.05。实测 3 步 batch 7.2s→4.6s，原地动作 2.5s→1.2~1.8s，滑动 0.77~1.5s。",
+     "ev": "adb_ui.py:832 settle 改动 + 实跑对照（code_smoke 全绿）"
+    },
+    {
+     "t": "2026-09-13",
+     "what": "5 类页面覆盖验证跑完，并定位到真正的服务杀手（ColorOS boot_clear）",
+     "ev": "Doze 白名单 + standby bucket active 后服务连活 330s（上次死亡点 137s），served=11 errs=0。覆盖实测：拼多多 306节点/94文字/155.6ms、Chrome+输入法 62/18/159.2ms、系统分享弹窗 127/40/221.3ms、系统视频播放器 17/2/105ms、微信 1/0（应用自屏蔽，agent 同样只 1 空壳节点）。缺口两条：输入法键盘按键不在树里（不影响 settext 操作）、click 在「强行停止」按钮上 hops=6 打满返回 ok:false（Java 端循环退出未校验 isClickable）。新增 skills/android/cov.py（可复用的覆盖采集器）。判据：服务端 rootMs 12~14 + walkMs 13~59，端到端 105~221ms，瓶颈在 adb forward 传输不在采集。"
+    },
+    {
+     "t": "2026-09-12",
+     "what": "修掉 tap 的子串误命中（kw_rank：完全相等 > 前缀 > 子串，同级短标签优先）；用数据证伪「让守护采样跟 FRESH 分级对齐」这条接力棒——它建立在错误归因上",
+     "ev": "kw_rank 6/6 单测通过、4 次 tap 全部命中正确坐标；12 次连续 tap 命中率 3/12→7/12 但总耗时 6.65s→6.9s 反而变差；真根因是 input tap 不产生 getevent 事件（touch_worker 实测零记录）+ dump 550ms 是瓶颈（parse 仅 30ms）"
+    },
+    {
+     "t": "2026-09-12",
+     "what": "缓存新鲜度分级落地（FRESH 常量表：tap 2.5 / base 5 / look 8 / fp 600 / any 600 + STALE_MARK 20），三处散落的数字全部收口，grep 确认 fresh_snap 调用里再无字面量。验证中撞出并修掉两个真缺陷：① 守护进程单例竞态泄漏（实测两个 daemon 并跑）→ 改 fcntl.flock 单例；② 冷启后 see 会报出上一个 app 的旧屏（3 次命中 1 次）→ fresh_snap 加 check_win，用 dumpsys window 核对包名。",
+     "ev": "分级行为测试：4s 前缓存 tap 档拒收/look 档命中，30s 前缓存 look 档拒收/fp 档命中；单例测试：并发起第二个 daemon 0.46s 静默退出、进程数保持 1；跨 app 复现测试：修复前 3 次冷启 1 次报错屏，修复后 3/3 一致（其中 2 次如实回落到现场 dump）；耗时：see 0.43~0.45s（+132ms 窗口核对），tap 0.23~0.60s"
+    },
+    {
+     "t": "2026-09-12",
+     "what": "手机感知通道全量接通：dump_ui（原来只有 dump_raw 走 agent，snapshot/settle/守护仍在走 adb uiautomator 2.4s）改为 agent 优先；动作后等待从「固定 sleep 0.7s + 一次 dump」改成轮询+连续两帧指纹一致才写缓存；写缓存加 ts 单调守卫、ts 改取 dump 发起时刻；do_tap 只信 2.5s 内的坐标；do_launch 改成 cur_window 直查（不再等缓存过期）+ 窗口到了再 settle 1.5s 等内容画好。",
+     "ev": "实测：agent dump 0.19/0.23/0.27s，snapshot 0.34/0.35/0.47s，tap 0.17s，settle 1.16~1.45s（跨页）；同 app 5 步 batch 4.4s、跨 app 2 个 app 5 步 9.9s；冷启 1.6~2.7s（旧版 7.5s）。功能验证：首页↔我 每步 see 都读到真屏（16 可点/29 文字 vs 29 可点/56 文字，缓存 0.9s）；跨 app 设置 6 可点/28 文字 → 小红书 29 可点/56 文字；scenario 采集 6 条含 0 赞项；ts 守卫两向单测通过。"
+    },
+    {
+     "t": "2026-09-12",
+     "what": "手机感知层架构升级完成：从 adb uiautomator dump（2500ms、60% 静默读到旧屏）换成手机端常驻 agent + 本机裸 HTTP JSON-RPC（190~346ms，快 9 倍，零静默失败）。手机上只放一个 3.7MB 的 u2.jar 到 /data/local/tmp，不装任何 apk；agent 用 nohup 脱离 adb shell 常驻 9008，本机 adb forward + http.client 直连，零第三方运行时依赖。",
+     "ev": "实测：热路径 190/314/346/373ms（101 控件 30 可点）；冷启动 2.2s（含 agent 重建）；adb 兜底 4309ms 且能返回有效 XML；对照 adb 方式 2500ms/60%失败"
+    }
+   ]
+  }
+ ],
+ "questions": [
+  {
+   "text": "challenge 现在靠自觉调用，怎么变成流程里的强制检查点而不是又一条规则？",
+   "status": "open",
+   "created": "2026-09-12"
+  },
+  {
+   "text": "怎么量化「我变强了」？缓存命中率、教训复用次数、项目推进速度，哪个才是真指标？",
+   "status": "open",
+   "created": "2026-09-12"
+  },
+  {
+   "text": "规则区 2519 字符 / 14 条，凭什么决定删哪条？要用实际命中率裁，不是靠感觉。",
+   "status": "open",
+   "created": "2026-09-12"
+  }
+ ]
+}

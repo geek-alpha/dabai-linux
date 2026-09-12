@@ -1,0 +1,142 @@
+{
+  "name": "android",
+  "title": "安卓手机控制（ADB）",
+  "version": "1.3.0",
+  "description": "通过 ADB 支配 USB 或同网 WiFi 连接的安卓手机：自动发现重连、看屏（带缓存的控件+文字一次拿全）、按文字点、中文输入、多步批处理、读短信/验证码、点击滑动长按按键截图、启动安装应用、执行原始 shell。",
+  "author": "dabai",
+  "enabled": true,
+  "disclosure": "on_demand",
+  "prompt": "【技能 安卓手机控制】大白能通过 ADB 支配一台安卓手机（USB 或同网 WiFi）。看屏幕用 action=see（一条命令给全：前台页面+可点元素带坐标+全部文字，走实时层缓存约 0.3 秒，比 dump 快一个量级）；要连做多步就用 action=batch（spec 里分号分隔，如 \"see;tap_text 推荐;swipe 540 1800 540 900 400;see\"，一次调用跑完，不要连发多次工具调用）；点控件用 tap_text 传文字而不是手算坐标（按坐标点 tap/xy 会回报命中元素，落空会回最近的可点候选——照候选改用 tap_text，别重猜）；点赞/收藏这类图标按钮点没点上用 action=verify 量像素（kw=资源名如 like_layout，color=#FB7299；第一次记基线、第二次报变化；视频在播时截图 diff 全是噪声，只有颜色计数准）；打中文必须用 ctext（input text 只吃 ASCII）。定位一律走坐标通道：see/annotate 给的坐标来自控件树，精确（实测 annotate 一次调用→按表点→界面确实跳转，一次命中）。要「图 + 可点清单」一起拿就用 action=annotate：一张带编号的标注图 + 一张编号表，每行是「编号 @(x,y) 方位 标签 [预计效果]」，方位（如「顶部右」）就是把眼睛看到的东西对到坐标行的桥梁——别读图上的小数字，实测会错位。眼睛只回答「这块是什么」，不报坐标。视觉模型不可用（read_image 报空内容或 429）时别卡住，控件树通道照跑。设备没反应时先调 action=auto。前提：手机开启「开发者选项→USB 调试」；无线还需先用 USB 执行一次 adb tcpip 5555（手机重启后需重做）。",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "android",
+        "description": "通过 ADB 控制连接的安卓手机。action 决定操作：auto=自动发现并连回手机(设备失联/换 WiFi/重启后先试它)；devices=列设备；connect=无线连接；see=一次拿全当前屏幕(前台页面+可点元素带坐标+全部文字，走缓存最快，看屏幕首选)；annotate=把可点区域编号画到截图上并输出「编号→坐标」表(配合 n 限制个数)；page=只抽当前页全部文字；find=按关键词列匹配控件(配合 kw)；tap_text=按文字点控件(配合 kw，不用手算坐标)；batch=一次跑多步(spec 分号分隔，如 \"see;tap_text 推荐;see\")；scenario=跑完整场景流程(配合 name，name=notes 滚屏采集信息流卡片，配 n)；verify=量某个区域的像素(配合 kw 定位元素、color 目标色；两次调用报变化，视频页唯一可靠判据)；ctext=输入中文/emoji(配合 text)；text=输入 ASCII；tap/swipe/longpress=按坐标操作；key=按系统键；screenshot=截图；dump=现场读 UI 结构(慢，仅在 see 缓存过期时用)；code=提取最新短信验证码；sms=读最新短信(n 条数)；start=启动应用；install=装 apk；unlock=唤醒解锁；shell=透传原始 adb shell 命令。坐标均为真实像素。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "enum": [
+                "auto",
+                "devices",
+                "connect",
+                "see",
+                "annotate",
+                "page",
+                "find",
+                "tap_text",
+                "batch",
+                "scenario",
+                "verify",
+                "tap",
+                "swipe",
+                "longpress",
+                "ctext",
+                "text",
+                "key",
+                "screenshot",
+                "dump",
+                "code",
+                "sms",
+                "start",
+                "install",
+                "unlock",
+                "shell"
+              ],
+              "description": "要执行的操作"
+            },
+            "serial": {
+              "type": "string",
+              "description": "设备序列号（多设备时用；USB 与 WiFi 双通道并存时默认优先 USB）"
+            },
+            "host": {
+              "type": "string",
+              "description": "connect 时的地址，如 192.168.1.5:5555"
+            },
+            "kw": {
+              "type": "string",
+              "description": "find/tap_text 要匹配的文字（控件文字或 content-desc 的子串）"
+            },
+            "spec": {
+              "type": "string",
+              "description": "batch 的动作串，分号分隔，每步一个子命令，如 \"see;tap_text 推荐;swipe 540 1800 540 900 400;see\"；子命令：see/page/cur/find X/tap X/tap_text X/tap-all X/wait X/xy X,Y/swipe x1 y1 x2 y2 [ms]/key X/text X/ctext X/shot/sms/code/start 包名 [c]/stop [包名]/shell 原生命令/sleep N/annotate N；tap 后直接写两个数字会自动当坐标点（如 tap 540 1800）；微信这类控件树不给文字的 app，先 annotate 拿编号→坐标表再 xy；跨 app 批量用 start+stop 串起来，如 「start com.tencent.mm;see;tap 通讯录;start com.xingin.xhs -c;see」"
+            },
+            "n": {
+              "type": "number",
+              "description": "scenario 采集条数（默认 12）/ sms 读几条（默认 5）"
+            },
+            "x": {
+              "type": "number",
+              "description": "tap/swipe/longpress 的起点 x 像素"
+            },
+            "y": {
+              "type": "number",
+              "description": "tap/swipe/longpress 的起点 y 像素"
+            },
+            "x2": {
+              "type": "number",
+              "description": "swipe 的终点 x 像素"
+            },
+            "y2": {
+              "type": "number",
+              "description": "swipe 的终点 y 像素"
+            },
+            "duration": {
+              "type": "number",
+              "description": "swipe/longpress 时长(毫秒)，默认 300"
+            },
+            "text": {
+              "type": "string",
+              "description": "ctext/text 要输入的内容（中文/emoji 必须走 ctext）"
+            },
+            "key": {
+              "type": "string",
+              "description": "key 时的按键名或数字 keycode"
+            },
+            "pkg": {
+              "type": "string",
+              "description": "start 时的应用包名，如 com.tencent.mm"
+            },
+            "apk": {
+              "type": "string",
+              "description": "install 时的 apk 文件路径"
+            },
+            "cmd": {
+              "type": "string",
+              "description": "shell 时透传 adb shell 命令；batch 时也可当 spec 用"
+            },
+            "name": {
+              "type": "string",
+              "description": "scenario 的场景名，现有：notes（滚屏采集信息流卡片，配 n 指定条数）"
+            },
+            "color": {
+              "type": "string",
+              "description": "verify 的目标颜色，如 #FB7299。给了就报该色在区域内的像素数，并与上次调用对比"
+            },
+            "tol": {
+              "type": "number",
+              "description": "verify 的颜色容差（曼哈顿距离，默认 50）"
+            },
+            "label": {
+              "type": "string",
+              "description": "verify 的基线名。默认用「窗口+kw+颜色」当键；同一页面验证多个元素时用 label 区分"
+            },
+            "box": {
+              "type": "string",
+              "description": "verify 直接指定区域 x1,y1,x2,y2（不用 kw 定位）"
+            },
+            "reset": {
+              "type": "boolean",
+              "description": "verify 清掉基线重新记录"
+            }
+          },
+          "required": [
+            "action"
+          ]
+        }
+      }
+    }
+  ]
+}
