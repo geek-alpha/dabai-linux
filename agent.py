@@ -3284,6 +3284,9 @@ class AIAgent:
     def _validate_tool_call(self, tool_name: str, arguments: dict) -> tuple:
         """严格校验工具参数：类型 / 必填 / 枚举 / 嵌套结构。
 
+        工具未注册但确实存在时，先自动加载它所属技能再校验一次（见下方注释）——
+        省掉模型「先 skill_help 再重试」的那次往返。
+
         Returns:
             (cleaned_args, error)：通过时返回清洗后的参数与 None；
             失败时返回 (None, 中文错误描述)——调用方应把错误回填给模型自行修正，
@@ -3291,16 +3294,33 @@ class AIAgent:
         """
         spec = find_tool_spec(self._all_tools, tool_name)
         if spec is None:
-            # 工具未注册：同样不执行，但明确指出它属于哪个技能、
-            # 该 skill_help 谁，避免模型反复瞎试同一个工具
+            # 工具未注册：先自动加载它所属的技能，能加载就直接放行。
+            # 实测 data/longrun/traces：A 类（技能未加载）43/57 = 75.4%，首见 cycle 8
+            # 之后 24 个 cycle 仍在复发，每 cycle 稳定浪费约 1 次调用。报错原文自己
+            # 就写着「请先调用 skill_help」，模型照犯不误——这条指令靠它自觉执行不可靠。
+            # 只加载工具、不注入说明书全文：说明书该由模型按需自己读，为省一次往返
+            # 付几 KB 的 prompt 成本不划算。
             owner = ""
+            owner_kind = ""
             try:
                 from harness import get_harness
                 o = get_harness().tool_owner(tool_name)
                 if o:
-                    owner = str(o[1])
+                    owner_kind, owner = str(o[0]), str(o[1])
             except Exception:
                 pass
+            # 只对技能自动加载：插件是整体注册的，没有「按需加载单个插件」这条路径。
+            # tool_owner 只索引启用且未损坏的属主（harness/core.py:316），所以自动加载
+            # 不会绕过用户在管理界面里的启停选择。
+            if owner and owner_kind == "skill":
+                try:
+                    if self._activate_skill(owner):
+                        spec = find_tool_spec(self._all_tools, tool_name)
+                        if spec is not None:
+                            logger.info(f"工具 {tool_name} 未注册，已自动加载技能 {owner} 后继续")
+                            return validate_arguments(spec, arguments)
+                except Exception as e:
+                    logger.warning(f"自动加载技能 {owner} 失败: {e}")
             if owner:
                 return None, (f"工具 '{tool_name}' 属于技能 {owner}，但尚未注册。"
                               f"请先调用 skill_help(\"{owner}\") 加载该技能后重试。")
