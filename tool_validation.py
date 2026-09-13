@@ -18,6 +18,7 @@
 """
 from __future__ import annotations
 
+import re
 from typing import Optional
 
 
@@ -64,6 +65,28 @@ def _coerce_scalar(v, t: str):
                 return True, False
         return False, v
     return True, v  # 未知类型放行
+
+
+_STR_ARRAY_SEPS = re.compile(r"[\n,，;；]")
+
+
+def _coerce_string_array(v, schema):
+    """字符串 → 字符串数组（仅当 items.type == "string"）。返回 (是否成功, 值)。
+
+    分隔符沿用各工具实现自己的约定（如 code_ops_impl.py:421 的 [\\n,，;；]）：校验层只做
+    类型翻译，不发明新约定，也不去重/截断（那是实现的职责）。
+
+    实测 4 次该错里 2 次是多关键词（28.jsonl 换行 6 个、9.jsonl 逗号 4 个），所以必须
+    切分：整串包成单元素会让检索静默搜不到，比报错更糟。
+    """
+    if isinstance(v, list):
+        return True, v
+    if not isinstance(v, str):
+        return False, v
+    items = schema.get("items")
+    if not isinstance(items, dict) or items.get("type") != "string":
+        return False, v
+    return True, [p for p in (x.strip() for x in _STR_ARRAY_SEPS.split(v)) if p]
 
 
 def _validate_value(value, schema, path: str, errors: list):
@@ -154,9 +177,15 @@ def validate_arguments(tool_spec: dict, arguments: dict):
             sub = props.get(key)
             if sub is None:
                 continue  # 未知字段放行
+            stype = sub.get("type") if isinstance(sub, dict) else None
+            # 数组归一化必须在校验之前：否则 _validate_value 已记下类型错误，
+            # 回填被 _errors_for_key 拦掉，包装结果传不到工具手里。
+            if stype == "array":
+                ok, converted = _coerce_string_array(value, sub)
+                if ok and converted is not value:
+                    cleaned[key] = value = converted
             _validate_value(value, sub, key, errors)
             # 标量类型转换结果回填（避免字符串数字传给期望 int 的工具）
-            stype = sub.get("type") if isinstance(sub, dict) else None
             if stype in ("integer", "number", "boolean", "string") and not _errors_for_key(errors, key):
                 ok, converted = _coerce_scalar(value, stype)
                 if ok and converted != value:
