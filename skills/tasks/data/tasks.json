@@ -296,6 +296,134 @@
       "overdue_fired": false,
       "tags": [],
       "notes": ""
+    },
+    "t_ffcc71e68669": {
+      "id": "t_ffcc71e68669",
+      "title": "长跑引擎：让大白无人值守推进目标几十~上百天",
+      "description": "调研开源社区长任务范式 → 落地 dabai-longrun 常驻执行器（断点续跑/防打转/预算闸门/急停/systemd 自愈）",
+      "priority": "high",
+      "status": "in_progress",
+      "due_date": "",
+      "due_ts": null,
+      "created_at": 1789252965.170055,
+      "updated_at": 1789253446.7846828,
+      "depends_on": [],
+      "subtasks": [
+        {
+          "id": "s_955760c0e3b0",
+          "title": "调研：Ralph loop / Anthropic harness / durable execution / sleep-time compute 范式与出处",
+          "description": "",
+          "priority": "high",
+          "status": "done",
+          "due_date": "",
+          "due_ts": null,
+          "depends_on": []
+        },
+        {
+          "id": "s_90031f0564fb",
+          "title": "实现 tools/longrun/runner.py（一轮一动作、journal 落盘、checkpoint、防打转、预算闸门、STOP 急停）",
+          "description": "",
+          "priority": "high",
+          "status": "done",
+          "due_date": "",
+          "due_ts": null,
+          "depends_on": [
+            "s_955760c0e3b0"
+          ]
+        },
+        {
+          "id": "s_8de85c85243e",
+          "title": "systemd user 单元 + 心跳看门狗 timer（Restart=always，卡死自愈）",
+          "description": "",
+          "priority": "high",
+          "status": "done",
+          "due_date": "",
+          "due_ts": null,
+          "depends_on": [
+            "s_90031f0564fb"
+          ]
+        },
+        {
+          "id": "s_80020476b691",
+          "title": "验证：dry-run / 真跑一轮 / kill -9 断点续跑 / systemd-analyze verify + 启停实测",
+          "description": "",
+          "priority": "high",
+          "status": "done",
+          "due_date": "",
+          "due_ts": null,
+          "depends_on": [
+            "s_8de85c85243e"
+          ]
+        },
+        {
+          "id": "s_bc8f6285b583",
+          "title": "登记 long_horizon 项目与证据，写 README 说明运维命令",
+          "description": "",
+          "priority": "high",
+          "status": "done",
+          "due_date": "",
+          "due_ts": null,
+          "depends_on": [
+            "s_80020476b691"
+          ]
+        }
+      ],
+      "reminder": null,
+      "overdue_fired": false,
+      "tags": [],
+      "notes": ""
+    },
+    "t_a7b52cfabcd4": {
+      "id": "t_a7b52cfabcd4",
+      "title": "长跑引擎三处待修（progressed 判定 / 手机互斥锁 / 单轮成本）",
+      "description": "依据 cycle 3-8 journal 与 trace7 实测：①progressed 只看台账 stamp，分不清「空转」与「干了活没落盘」；②runner worker 与主对话共用一台手机，ADB 无全局互斥；③cycle7 单轮 1,663,145 prompt tokens / 29 轮 LLM 调用。",
+      "priority": "high",
+      "status": "done",
+      "due_date": "",
+      "due_ts": null,
+      "created_at": 1789259304.5596807,
+      "updated_at": 1789259449.5599833,
+      "depends_on": [],
+      "subtasks": [
+        {
+          "id": "s_3b88721eb61d",
+          "title": "progressed 改三态判定（progressed/worked_no_ledger/idle），空转才累加 failures",
+          "description": "",
+          "priority": "high",
+          "status": "done",
+          "due_date": "",
+          "due_ts": null,
+          "depends_on": []
+        },
+        {
+          "id": "s_3170d5e6bc82",
+          "title": "新增手机资源互斥锁 tools/phone_lock.py，runner prompt 与 android 工具入口都遵守",
+          "description": "",
+          "priority": "high",
+          "status": "done",
+          "due_date": "",
+          "due_ts": null,
+          "depends_on": [
+            "s_3b88721eb61d"
+          ]
+        },
+        {
+          "id": "s_914de5ce009a",
+          "title": "单轮成本降本：build_prompt 加批量检索指引 + journal 记 token 趋势便于观察",
+          "description": "",
+          "priority": "high",
+          "status": "done",
+          "due_date": "",
+          "due_ts": null,
+          "depends_on": [
+            "s_3170d5e6bc82"
+          ]
+        }
+      ],
+      "reminder": null,
+      "overdue_fired": false,
+      "tags": [],
+      "notes": ""
     }
   },
   "reminder_events": []

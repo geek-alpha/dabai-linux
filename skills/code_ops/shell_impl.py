@@ -36,7 +36,7 @@ async def shell_run(args: dict) -> str:
     cmd = str(args.get("command") or "").strip()
     if not cmd:
         return "错误：command 不能为空"
-    timeout = max(1, min(int(args.get("timeout") or 60), 300))
+    timeout = max(1, min(int(args.get("timeout") or 60), 1200))
     try:
         exe = _executor()
         out = await asyncio.wait_for(

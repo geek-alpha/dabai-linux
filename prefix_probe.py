@@ -165,8 +165,18 @@ def compare(prev, cur, labels=None, marks=None):
         "wasted_chars": sum(pc[keep:]),
         "hist_marks": dict(marks or {}),
     }
+    # 跨会话识别：状态文件是全局单文件、不按会话存——新会话首轮会拿上一会话
+    # 末尾状态做比对，于是每开一次新对话就报一次「N 个工具被移除」的假警。
+    # 判据只看 keep：同会话续轮时历史整段保留（keep 通常 10+），keep∈(0,2] 只可能
+    # 是新会话。曾用「且 len(cm)<len(pm)」做保守条件，漏判 4 轮（新会话首轮就跑完
+    # 多轮工具、消息数反而更多）。实测 184 轮：keep<=2 共 90 轮，其中 tools_diff.any
+    # 53 轮是假警，真·同会话工具变化只剩 2 轮（1 次真重置、1 次描述变化）。
+    # 跨会话本来就没有可复用的前缀，工具差异不算「轮内变化」：只标事实，不改数字。
+    rep["cross_session"] = bool(0 < keep <= 2)
     # 归因一句话：先看 tools（在最前面，最致命），再看断点位置
-    if rep["tools_diff"]["any"]:
+    if rep["cross_session"]:
+        rep["cause"] = "跨会话（新对话：上轮状态属另一个会话，工具差异不计为轮内变化）"
+    elif rep["tools_diff"]["any"]:
         rep["cause"] = "tools（工具集变化 → 整条前缀失效）"
     elif not broke:
         rep["cause"] = "无（前缀完全一致）"
@@ -225,7 +235,7 @@ def describe(rep) -> str:
                 % (rep.get("tools_count"), rep.get("tools_chars")))
     parts = []
     td = rep.get("tools_diff") or {}
-    if td.get("any"):
+    if td.get("any") and not rep.get("cross_session"):
         seg = []
         if td.get("added"):
             seg.append("新增 %d 个（+%s 字符）：%s"

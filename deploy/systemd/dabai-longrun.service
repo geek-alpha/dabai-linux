@@ -11,8 +11,10 @@ StartLimitIntervalSec=0
 Type=simple
 WorkingDirectory=/home/wxf/dabai
 Environment=LONGRUN_INTERVAL=300
-Environment=LONGRUN_TIMEOUT=1800
-Environment=LONGRUN_MAX_CALLS=200
+Environment=LONGRUN_TIMEOUT=3600
+# 0 = 不限量 / 不冷却：长跑要的是「一直在跑」，不是「跑几次就被关小黑屋」
+Environment=LONGRUN_MAX_CALLS=0
+Environment=LONGRUN_BLOCK_AFTER=0
 ExecStart=/home/wxf/dabai/venv/bin/python /home/wxf/dabai/tools/longrun/runner.py --loop
 # 崩了就起，30s 后再来；这是「一旦没完成就一直跑」的第一层保险
 Restart=always

@@ -50,11 +50,11 @@ SAME_RESULT_GUARD_LIMIT = 4
 TOOL_CALL_TIMEOUT = 30.0
 # 工具执行心跳间隔（秒）：超过该间隔仍未结束时，向客户端推送 ToolCallProgress 进度事件
 TOOL_HEARTBEAT_INTERVAL = 5.0
-# 工具超时上限（秒）：任何工具都不允许无限等待（防止僵尸工具拖死对话）。
-# 2026-08-30 收回 300s：此前为容纳长工具抬到 900s，实测体验是"工具能卡十几
-# 分钟"——对话轮内超过 2~3 分钟的工具本就不该主线程硬等，应改用后台任务系统；
-# 长耗时工具（Blender/Mixamo/工作树命令）单列 300s 覆盖，内部自带子进程超时。
-TOOL_CALL_TIMEOUT_MAX = 300.0
+# 工具超时上限（秒）：这是天花板而不是实际值——只有 _TOOL_TIMEOUT_OVERRIDES /
+# settings.json -> agent.tool_timeouts 点名的工具才放大到接近它，其余仍按
+# TOOL_CALL_TIMEOUT(30s) 执行。2026-09-13 抬到 1200：shell_run 要能跑满 20 分钟
+# 的长任务（全店诊断、批量发布），此前 300 一刀切把它砍在半路。默认短、点名长。
+TOOL_CALL_TIMEOUT_MAX = 1200.0
 # 长耗时工具的超时覆盖（秒）：默认 tool_call_timeout 对这些工具太短。
 # 可在 settings.json -> agent.tool_timeouts 里按工具名继续覆盖。
 # 支持「一次调用做多件事」的工具：{工具名: (批量参数名, 用法说明)}
@@ -69,6 +69,7 @@ _BATCHABLE_TOOLS = {
 
 _TOOL_TIMEOUT_OVERRIDES = {
     "pmx_to_vrm": 300.0,          # Blender 转换（内部 600s 子进程超时，主轮最多等 5 分钟）
+    "shell_run": 1200.0,          # 长命令（全店诊断/批量发布）：给满 20 分钟，与 MAX 齐平
     "wt_run": 300.0,              # 工作树内跑命令
     "wt_create": 180.0,           # git worktree add 冷启动
     "anim_batch": 300.0,          # Mixamo 批量下载
@@ -472,9 +473,11 @@ def _single_result_max_tokens() -> int:
 _IMG_MARK_RE = re.compile(r"\[\[IMG:([^\]\n]+)\]\]")
 _IMG_MAX_SIDE = 1280
 _IMG_JPEG_Q = 70
-# 提供方按 patch 计图片 token（实测单图 ≤384），本地估算必须用固定值：
-# base64 有 14 万字符，按字符估会把预算撑爆、把工具历史砍光。
-_IMG_TOKEN_EST = 400
+# 本地估算必须用固定值：base64 有 14 万字符，按字符估会把预算撑爆、把工具历史砍光。
+# 实测（tools/img_token_probe.py，deepseek-flash @ api.deepseek.com）单图增量随分辨率走：
+# 360x640→201、720x1280→592、1280x1280→995，官方「每图封顶 384」在本渠道不成立。
+# 原值 400 偏低 33%~60%，上下文预算会被悄悄超支；1024 覆盖 _IMG_MAX_SIDE=1280 的实测上限。
+_IMG_TOKEN_EST = 1024
 
 
 def _img_marks(text) -> list:
@@ -554,6 +557,26 @@ def _img_injectable() -> bool:
         return ok
     except Exception:
         return True
+
+
+def _append_img_messages(messages: list, marks: list, tool_name: str, img_ok: bool) -> int:
+    """[[IMG:]] 标记 → 多模态消息；返回追加的字符当量（供预算累计）。
+
+    看不见图时只留 _IMG_NO_EYES 提示、绝不注入 image_url：提示说「未注入」
+    就必须真的没注入，否则非视觉模型会撞提供方 400。
+    """
+    if not marks:
+        return 0
+    if not img_ok:
+        messages.append({"role": "system", "content": _IMG_NO_EYES})
+        return 0
+    added = 0
+    for _ip in marks:
+        _im = _img_message(_ip, tool_name)
+        if _im:
+            messages.append(_im)
+            added += _IMG_TOKEN_EST * 4
+    return added
 
 
 def _strip_img_for_disk(messages: list) -> list:
@@ -813,6 +836,27 @@ def _normalize_tool_rounds(messages: list) -> list:
             n += 1
         i += 1
     return messages
+
+
+def _ensure_reasoning_echo(messages: list) -> list:
+    """给缺 reasoning_content 的 assistant 消息补空串（thinking 渠道的硬要求）。
+
+    为什么必须补在唯一出口：全仓只有 4785/4811 两处在 round_reasoning 非空时挂这个
+    字段，而历史注入(3837/3843)、孤立 tool 修复(825 合成 assistant)、断点续跑与记忆
+    恢复产出的 assistant 天生没有它——任一混进请求就被渠道整轮 400
+    （"The reasoning_content in the thinking mode must be passed back to the API"）。
+
+    补空串而非删字段：空串不进 prompt token（前缀不变，命中价不受影响），
+    字段存在即可过校验；实测该渠道接受空串与占位文本。
+    """
+    out = []
+    for m in messages:
+        if (isinstance(m, dict) and m.get("role") == "assistant"
+                and "reasoning_content" not in m):
+            m = dict(m)
+            m["reasoning_content"] = ""
+        out.append(m)
+    return out
 
 
 def _tool_max_tokens() -> int:
@@ -1081,6 +1125,40 @@ def _needs_reasoning_echo(model) -> bool:
         return False
 
 
+# ---- 规则区三条硬规则（删除/画图/音乐）的埋点分类 ----
+# 这三条此前无任何埋点，删留只能靠感觉。这里只回答「该行为发生过没有」，
+# 不判断行为对错——对错由 tools/prompt_rules_audit.py 结合上下文裁。
+# 删除判定保守但不能假阴：假阴会得出「这条规则从没被触发过」的反向结论。
+_DELETE_CMD_RE = re.compile(
+    r"(?:^|[;&|]\s*|\bsudo\s+|\bxargs\s+)(?:rm|rmdir|unlink|shred)\b"
+    r"|\bgit\s+rm\b|\s-delete\b|\btruncate\b\s+-s\s*0"
+)
+_SHELL_TOOLS = {"shell_run", "run_shell", "shell", "bash", "sh"}
+
+
+def _rule_op_kinds(tool_name: str, arguments) -> tuple:
+    """把一次工具调用归类到规则区埋点：返回 (画图, 音乐, 删除) 三个 0/1。
+
+    删除这一类故意放宽到「名字里带 delete/remove」+ shell 删除命令：
+    workspaces_remove 这类非文件删除也算进来，它同样是「删除请求」。
+    计数只用于「规则有没有作用面」，不用于精确统计删了几个文件。
+    """
+    n = str(tool_name or "").lower()
+    img = 1 if n.startswith("image_gen") else 0
+    music = 1 if n.startswith("music_") else 0
+    delete = 1 if ("delete" in n or "remove" in n) else 0
+    if not delete and n in _SHELL_TOOLS:
+        cmd = ""
+        if isinstance(arguments, dict):
+            cmd = str(arguments.get("command") or arguments.get("cmd") or "")
+        if cmd:
+            # 先摘掉丢弃式重定向：`ls 2>/dev/null` 是纯读，不是删除也不是写
+            bare = re.sub(r"\d?>\s*&\d|\d?>\s*/dev/null", " ", cmd)
+            if _DELETE_CMD_RE.search(bare):
+                delete = 1
+    return img, music, delete
+
+
 def _tool_fp(name: str, arguments: dict) -> str:
     """工具调用指纹：工具名 + 参数 JSON（键排序），用于死循环检测。"""
     try:
@@ -1129,6 +1207,36 @@ REPEAT_CALL_HINT = (
 # 跨轮工具调用指纹的上限。长会话里指纹会持续累积，但它只服务统计，
 # 淘汰最旧的只会让数字略偏保守，不会出错。
 _CROSS_FP_LIMIT = 4000
+
+
+# 「连续单发只读」检测：只统计同一轮 pending 里的同名工具（见 _tool_name_counts）
+# 看不见真正烧时间的那类浪费 —— 模型每轮只发 1 个只读调用、连发好几轮，每轮付一次
+# 秒级 LLM 往返。判据必须严格（本轮恰好 1 个工具且它只读），否则提示会打在正常行为上。
+SINGLE_RO_STREAK_N = 3
+SINGLE_RO_NAMES_MAX = 6
+
+
+def _is_readonly_tool(name: str) -> bool:
+    """只读判定，唯一权威名单是 harness.tool_sched.READONLY_TOOLS。
+    拿不到调度器就返回 False —— 宁可漏报，也不能在写工具上暗示「可以并行」。"""
+    try:
+        from harness.tool_sched import is_readonly
+        return is_readonly(name)
+    except Exception:
+        return False
+
+
+def _single_ro_note(streak: int, names: list, pending_names: list) -> tuple:
+    """更新「连续单发只读」计数，返回 (streak, names, 本轮是否该给反馈)。
+
+    只有「本轮恰好 1 个工具且它只读」才累加；多工具、写工具、纯文本轮一律清零。
+    每满 SINGLE_RO_STREAK_N 轮给一次反馈而非每轮都给：长串行会被覆盖，又不会刷屏。
+    """
+    if len(pending_names) == 1 and _is_readonly_tool(pending_names[0]):
+        streak += 1
+        names = (list(names) + [pending_names[0]])[-SINGLE_RO_NAMES_MAX:]
+        return streak, names, streak % SINGLE_RO_STREAK_N == 0
+    return 0, [], False
 
 
 def _get_tool_cache():
@@ -1570,6 +1678,18 @@ def _is_tools_unsupported_error(e: Exception) -> bool:
     )
 
 
+def _is_reasoning_echo_error(e: Exception) -> bool:
+    """判断是否为「thinking 模式必须回传 reasoning_content」类 400。
+
+    要求报错文本同时点到 reasoning_content 与 passed back/thinking，避免把无关的
+    400（参数非法、上下文超长、余额不足）误判成可自愈错误而反复重试。
+    """
+    msg = (str(e) or "").lower()
+    if "reasoning_content" not in msg:
+        return False
+    return "passed back" in msg or "thinking" in msg
+
+
 def _is_valid_tool_spec(t) -> bool:
     """校验 OpenAI function-calling 工具 schema 是否合法。
 
@@ -1714,6 +1834,180 @@ def get_available_tools() -> list:
     return tools
 
 
+def _harness_base():
+    """harness 数据目录：默认项目根，harness 注册了自定义 base_dir 时以它为准。"""
+    from pathlib import Path as _Path
+    base = _Path(__file__).resolve().parent
+    try:
+        from harness import get_harness
+        base = _Path(getattr(get_harness(), "base_dir", base))
+    except Exception:
+        pass
+    return base
+
+
+def _gene_mod():
+    """加载 tools/gene_fitness.py：键算法与曝光统计的唯一真源。失败返回 None。"""
+    try:
+        import importlib.util as _ilu
+        f = _harness_base() / "tools" / "gene_fitness.py"
+        spec = _ilu.spec_from_file_location("gene_fitness", f)
+        mod = _ilu.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception:
+        return None
+
+
+# 本轮已进 prompt 的基因键（"kind:sha1"）与首次注入时刻：轮末由 _gene_flush_exposure
+# 写一行曝光流水。键集合是「基因 ↔ 结局」对照的唯一凭据，累计次数反推不出它。
+_GENE_ROUND_KEYS: list = []
+_GENE_ROUND_TS: str = ""
+# 留空轮换序号：每轮 +1，决定 longterm/conviction 段本轮留空哪一条。模块加载时取
+# 时间低位做起点，进程重启后不会从同一序列重放（否则重启越勤、留空越集中）。
+_GENE_HOLDOUT_SEQ: int = int(time.time()) & 0xFFFF
+# 上一次曝光流水落盘的时刻：结局窗口的左端。终态事件只归到「它到达终态的那一轮」，
+# 窗口必须首尾相接——用固定轮长会把跨轮完成的长期任务漏掉。
+_GENE_LAST_TS: float = 0.0
+
+
+def _gene_round_reset() -> int:
+    """丢弃本轮未落盘的缓冲，返回被丢弃的键数。测试隔离与异常兜底用。"""
+    global _GENE_ROUND_TS, _GENE_HOLDOUT_SEQ
+    n = len(_GENE_ROUND_KEYS)
+    _GENE_ROUND_KEYS.clear()
+    _GENE_ROUND_TS = ""
+    _GENE_HOLDOUT_SEQ += 1
+    return n
+
+
+def _gene_touch(pairs) -> None:
+    """把本轮真正进了 prompt 的基因各记一次曝光，供 tools/gene_fitness.py 算选择压力。
+
+    直接 exec tools/gene_fitness.py 而不是在本地重算 sha1 键：键算法两份实现一旦
+    漂移，埋点会静默归零——那正是这次要修的故障本身。全程静默，埋点失败不影响对话。
+    累计次数即时写盘（够做轮换排序），键集合留在缓冲等轮末一次性落盘。
+    """
+    mod = _gene_mod()
+    if mod is None:
+        return
+    try:
+        mod.touch_batch(pairs)
+    except Exception:
+        pass
+    try:
+        global _GENE_ROUND_TS
+        if not _GENE_ROUND_TS:
+            _GENE_ROUND_TS = time.strftime("%Y-%m-%d %H:%M:%S")
+        for p in (pairs if isinstance(pairs, list) else []):
+            if isinstance(p, dict):
+                kind, text = p.get("kind", ""), p.get("text", "")
+            else:
+                kind, text = p[0], p[1]
+            k = f"{kind}:{mod.key_of(text)}"
+            if k not in _GENE_ROUND_KEYS and len(_GENE_ROUND_KEYS) < 200:
+                _GENE_ROUND_KEYS.append(k)
+    except Exception:
+        pass
+
+
+def _gene_flush_exposure(metrics: dict | None = None) -> int:
+    """把本轮注入过的基因键写成一行曝光流水（一轮一行），返回写入行数。
+
+    挂在 _record_turn_metrics 最前面——那是「本轮结束」的必经点，且在 tool_round
+    判断之前，没调工具的轮次也照样记账。缓冲先取走再写：写盘失败不重复投递。
+
+    metrics 是本轮结局标签（工具轮数/报错数/耗时 + 本轮到达终态的任务结局）：keys 只
+    回答「谁在场」，配上结局才能问「它在场的那一轮，是变好了还是没变」。
+    """
+    if not _GENE_ROUND_KEYS:
+        return 0
+    keys, turn = list(_GENE_ROUND_KEYS), _GENE_ROUND_TS
+    _gene_round_reset()
+    mod = _gene_mod()
+    if mod is None:
+        return 0
+    global _GENE_LAST_TS
+    now = time.time()
+    try:
+        # 窗口 = 上轮落盘时刻 → 现在。首轮没有上轮，退化成「本轮时长」而不是从 0 起算
+        # ——从 0 起算会把历史上所有终态任务一次性算进本轮，那列结局就永久失真。
+        start = _GENE_LAST_TS or (now - float((metrics or {}).get("duration_ms") or 0) / 1000.0)
+        oc = mod.task_outcomes(start, now)
+        if oc and isinstance(metrics, dict):
+            metrics = dict(metrics)
+            metrics["task_outcomes"] = oc
+    except Exception:
+        pass
+    try:
+        n = mod.log_exposure(keys, turn, metrics=metrics)
+    except Exception:
+        return 0
+    if n:
+        # 只有真写进去了才推进窗口：写盘失败时下次窗口自动扩大，宁可重收也不能漏。
+        _GENE_LAST_TS = now
+    return n
+
+
+def _gene_pick(items: list, cap: int, fresh: int = 2) -> list:
+    """注入窗口选取：前 fresh 条保新近性（刚踩的坑立刻能用），其余按曝光升序补足。
+
+    为什么不按命中降序：inject 记的是曝光次数（自变量），不是价值（因变量）。按曝光
+    降序排会让已在窗口的 6 条永久霸占窗口，窗口外 54 条永远拿不到验证机会。最少曝光
+    优先是自动轮换——每轮注入都 +1，下一轮自然轮到别的未验证基因。
+    """
+    ls = [str(x) for x in (items if isinstance(items, list) else [])]
+    head, rest = ls[:fresh], ls[fresh:]
+    mod = _gene_mod()
+    if mod is not None:
+        try:
+            rest = mod.order_by_exposure(rest)
+        except Exception:
+            pass
+    return (head + rest)[:cap]
+
+
+def _gene_holdout(items: list, cap: int) -> list:
+    """给「恒在场」的基因造缺席轮次：每轮轮换留空 1 条，返回本轮实际注入的列表。
+
+    为什么必须留空：实测 5 条基因（3 条 longterm + 2 条 conviction）4/4 轮 100% 在场
+    ——cap 大于候选数，它们结构上不可能缺席。没有缺席就没有对照组，效应在数学上
+    不可识别：这不是样本量不够，是实验设计缺一块，攒到 1000 轮也估不出。
+
+    留空对象按轮次严格轮换（seq % n），长期看每条被留空次数均衡；seq 轮内固定、
+    轮末递增，同一轮多次构建 prompt 结果一致。不留开关：半开半关的轮次混在一起，
+    效应估计更乱，要停就整段回退。
+    """
+    ls = list(items) if isinstance(items, list) else []
+    if len(ls) <= 1:
+        return ls[:cap]
+    k = _GENE_HOLDOUT_SEQ % len(ls)
+    return [x for i, x in enumerate(ls) if i != k][:cap]
+
+
+# 注入段的收尾标点：截断必须停在句子边界
+_CLIP_PUNC = "。；！？，、）】」"
+
+
+def _clip(text, n: int, tol: float = 0.5) -> str:
+    """把注入文本截到 n 字符量级，尽量停在标点上；实际长度落在 n~1.5n。
+
+    为什么不直接 t[:n]：硬切会把 91% 的教训砍在句中（实测 68 条里 62 条），注入的是
+    一句读不懂的残句——那条教训等于白注入，选择压力和 fitness 都建立在噪声上。
+    句子完整优先于字符数，多出的几十字符比一整条读不懂的基因便宜。
+    """
+    s = str(text)
+    if len(s) <= n:
+        return s
+    cut = s[:n]
+    i = max((cut.rfind(p) for p in _CLIP_PUNC), default=-1)
+    if i >= n * tol:
+        return cut[:i + 1]
+    over = s[n:max(n + 1, int(n * 1.5))]
+    j = min((k for k in (over.find(p) for p in _CLIP_PUNC) if k >= 0), default=-1)
+    return s[:n + j + 1] if j >= 0 else cut + "…"
+
+
 def _harness_lessons_block(cap: int = 6) -> str:
     """读 harness 经验库（跨任务踩坑记录），生成对话层可注入的经验段；无经验返回空串。
 
@@ -1737,7 +2031,9 @@ def _harness_lessons_block(cap: int = 6) -> str:
         ls = data.get("lessons") if isinstance(data, dict) else None
         if not isinstance(ls, list) or not ls:
             return ""
-        lines = "\n".join(f"- {str(x)[:120]}" for x in ls[:cap])
+        pick = _gene_pick(ls, cap)
+        lines = "\n".join(f"- {_clip(x, 120)}" for x in pick)
+        _gene_touch([("lesson", str(x)) for x in pick])
         return "【历史经验（此前踩过的坑/成功路径，来自 harness 经验库）】\n" + lines
     except Exception:
         return ""
@@ -1769,24 +2065,26 @@ def _harness_longterm_block(cap: int = 3, cap_q: int = 3) -> str:
         qs = [x for x in (data.get("questions") or []) if x.get("status") == "open"]
         if not projs and not qs:
             return ""
+        picked = _gene_holdout(projs, cap)
         out = ["\n【长期事业（跨会话持续，开工先看这里）】"]
-        for x in projs[:cap]:
+        for x in picked:
             head = f"▸ {x.get('title') or x.get('id')} [{x.get('progress', 0)}%]"
             if x.get("value"):
-                head += f" 价值：{str(x['value'])[:60]}"
+                head += f" 价值：{_clip(x['value'], 60)}"
             out.append(head)
             if x.get("next"):
                 out.append(f"  下一步（上一轮留的接力棒）：{x['next']}")
             lg = x.get("log") or []
             if lg:
-                out.append(f"  最近：{lg[0].get('t', '')} {str(lg[0].get('what', ''))[:60]}")
+                out.append(f"  最近：{lg[0].get('t', '')} {_clip(lg[0].get('what', ''), 60)}")
         if qs:
             out.append("悬而未决（创新燃料，遇到相关信息就碰一下）：")
-            out.extend(f"- {str(x.get('text', ''))[:80]}" for x in qs[:cap_q])
+            out.extend(f"- {_clip(x.get('text', ''), 80)}" for x in qs[:cap_q])
         out.append(
             "推进了就立刻落盘：`venv/bin/python tools/long_horizon.py log <id> \"做了什么\" --ev 证据`；"
             "收工前把 next 改写成下一轮能直接开跑的原子动作。\n"
         )
+        _gene_touch([("longterm", str(x.get("title") or x.get("id"))) for x in picked])
         return "\n".join(out)
     except Exception:
         return ""
@@ -1818,12 +2116,14 @@ def _harness_conviction_block(cap: int = 4) -> str:
         vs = data.get("vetoes") or []
         if not cs and not vs:
             return ""
+        picked = _gene_holdout(cs, cap)
         out = ["【信条与拒绝（我自己判断该怎么做，可被挑战，过不了就降级或删）】"]
-        for c in cs[:cap]:
+        for c in picked:
             out.append(f"- {c.get('text', '')}")
         if vs:
             out.append("最近拒绝过（主体性的直接证据）：")
-            out.extend(f"- {str(v.get('claim', ''))[:60]}" for v in vs[:2])
+            out.extend(f"- {_clip(v.get('claim', ''), 60)}" for v in vs[:2])
+        _gene_touch([("conviction", str(c.get("text", ""))) for c in picked])
         return "\n".join(out)
     except Exception:
         return ""
@@ -2154,8 +2454,11 @@ class AIAgent:
                 print(f"📋 结果: {event.result[:200]}")
     """
 
-    def __init__(self, user_id: str = "default"):
+    def __init__(self, user_id: str = "default", namespace: str = ""):
         self.user_id = user_id
+        # 命名空间覆盖：无头调用方（长跑引擎）用它落到独立会话。
+        # 否则会 adopt 角色卡的活跃会话——读走整段历史，还把自己的输出写回去。
+        self._ns_override = namespace.strip()
         self.memory: Optional[ChatMemory] = None
         self._client: Optional[AsyncOpenAI] = None
         self._config: dict = {}
@@ -2168,6 +2471,7 @@ class AIAgent:
         self._skills_restored_sid = None     # 已评估过技能恢复的 sid（重启重挂用）
         self._initialized = False
         self._text_tool_mode = False  # 当前模型不支持原生工具调用时置 True，改用文本协议
+        self._reasoning_echo_required = False  # thinking 渠道要求回传 reasoning_content：踩过一次后每轮前置补齐
         self._usage_enabled = True  # LLM 用量统计开关（运行时提供方不支持时可降级为 False）
         self._last_round_fps: list = []  # 死循环防护：最近几轮工具调用指纹
         self._last_round_sigs: list = []  # 死循环防护（强判据）：对应轮次的结果指纹
@@ -2177,6 +2481,12 @@ class AIAgent:
         # 只用于统计，不做任何拦截（用户明确要求重读时不该被拦）。
         # 用 dict 而非 set：需要按插入顺序淘汰旧项，set 无序做不到。
         self._cross_round_fps: dict = {}
+        # 「连续单发只读」：连续几轮各只发 1 个只读工具（每轮都付一次 LLM 往返）。
+        # 与 _cross_round_fps 的分工：那个看「同一个调用被重复」，这个看「本可并行的
+        # 调用被拆到多轮」——实测每 LLM 轮只发 1.36 个工具，跨轮串行才是主要浪费。
+        self._single_ro_streak = 0
+        self._single_ro_names: list = []
+        self._single_ro_armed = False   # 本轮已判定该给反馈，由结果构造处消费
         # 实例标识：写进诊断日志，用来区分「视图被清」和「换了实例」
         # （真实样本里同一 sid 反复 reset_sid，只有这个能证伪）。
         self._inst_tag = f"{os.getpid()}-{id(self) & 0xFFFF:04x}"
@@ -2688,6 +2998,8 @@ class AIAgent:
 
         角色卡片各自拥有独立的会话/摘要/长期记忆空间，避免不同人设之间记忆串扰。
         """
+        if self._ns_override:
+            return self._ns_override
         try:
             card_id = (load_config().get("active_role_card") or "").strip()
             return f"role_card:{card_id}" if card_id else "default"
@@ -2735,16 +3047,21 @@ class AIAgent:
     # ==================== 韧性调用（harness 监督：重试 + 超时 + 熔断 + 计量） ====================
 
     async def _create_with_reason_fallback(self, **kwargs):
-        """chat.completions.create，带「推理参数被拒自动降级」自愈。
+        """chat.completions.create，带两类自愈：推理参数被拒、reasoning 回传缺失。
 
-        硅基流动等渠道对部分模型的 reasoning_effort / thinking_budget /
-        enable_thinking 参数偶发拒绝（HTTP 400 code 20015 parameter invalid），
-        表现为聊天里整轮「开小差」。命中时去掉这些推理调优参数重试一次，
-        避免一次瞬时参数拒绝就打挂整轮对话。
+        - 参数被拒：硅基流动等渠道对部分模型的 reasoning_effort / thinking_budget /
+          enable_thinking 偶发拒绝（HTTP 400 code 20015 parameter invalid），表现为
+          聊天里整轮「开小差」。命中时去掉这些推理调优参数重试一次。
+        - 回传缺失：thinking 渠道要求 assistant 消息回传 reasoning_content，缺字段
+          整轮 400「must be passed back」。先给缺字段的补空串重试；仍被拒就去掉
+          thinking 参数（退出 thinking 模式后该规则不再适用）。自愈成功后置
+          _reasoning_echo_required，后续轮在出口前置补齐，不必每轮多付一次重试。
         """
         try:
             return await self._client.chat.completions.create(**kwargs)
         except Exception as e:
+            if _is_reasoning_echo_error(e):
+                return await self._retry_with_reasoning_echo(e, **kwargs)
             extra = kwargs.get("extra_body")
             if not (isinstance(extra, dict)
                     and any(k in extra for k in ("reasoning_effort",
@@ -2761,6 +3078,28 @@ class AIAgent:
                                                  "thinking_budget",
                                                  "enable_thinking")}
             return await self._client.chat.completions.create(**kwargs)
+
+    async def _retry_with_reasoning_echo(self, err, **kwargs):
+        """reasoning_content 回传缺失的自愈：补空串 → 仍被拒则退出 thinking 模式。"""
+        kwargs = dict(kwargs)
+        kwargs["messages"] = _ensure_reasoning_echo(kwargs.get("messages") or [])
+        try:
+            resp = await self._client.chat.completions.create(**kwargs)
+        except Exception as e2:
+            if not _is_reasoning_echo_error(e2):
+                raise
+            extra = kwargs.get("extra_body")
+            if not isinstance(extra, dict):
+                raise
+            logger.warning("补齐 reasoning_content 仍被拒，去掉 thinking 参数重试: %s", e2)
+            kwargs["extra_body"] = {k: v for k, v in extra.items()
+                                    if k not in ("reasoning_effort",
+                                                 "thinking_budget",
+                                                 "enable_thinking")}
+            resp = await self._client.chat.completions.create(**kwargs)
+        self._reasoning_echo_required = True
+        logger.warning("thinking 渠道要求回传 reasoning_content，已补齐并记住: %s", err)
+        return resp
 
     async def _retry_create(self, kind: str = "chat", **kwargs):
         """带 harness 监督的 chat.completions.create —— Agent 全部 LLM 调用的唯一入口。
@@ -2782,6 +3121,10 @@ class AIAgent:
             if _msgs:
                 kwargs = dict(kwargs)
                 kwargs["messages"] = _normalize_tool_rounds(_msgs)
+                # 踩过「必须回传 reasoning_content」的 400 之后，后续轮前置补齐：
+                # 否则每轮都要先失败一次、再补一次重试，多付一整轮全价 prompt。
+                if getattr(self, "_reasoning_echo_required", False):
+                    kwargs["messages"] = _ensure_reasoning_echo(kwargs["messages"])
         except Exception:
             pass
         runtime = _get_runtime()
@@ -2849,6 +3192,14 @@ class AIAgent:
         h = getattr(u, "prompt_cache_hit_tokens", 0) or 0
         m = getattr(u, "prompt_cache_miss_tokens", 0) or 0
         return (int(h), int(m))
+
+    @staticmethod
+    def _cache_field_present(u) -> bool:
+        """provider 是否回传了前缀缓存字段（缺字段时 _read_cache 静默返回 0）。"""
+        if u is None:
+            return False
+        return (getattr(u, "prompt_cache_hit_tokens", None) is not None
+                or getattr(u, "prompt_cache_miss_tokens", None) is not None)
 
     # ==================== 工具执行路由 ====================
 
@@ -3006,6 +3357,22 @@ class AIAgent:
             self._last_round_sigs[-1] = [_result_fp(r) for r in results]
         except Exception:
             pass
+
+    def _single_ro_hint(self) -> str:
+        """「连续单发只读」的事实反馈，只加给 LLM 那份结果（UI 与记忆库保持原样）。
+
+        为什么不只靠规则区的「并行优先」：那条规则实测两天并行度纹丝不动
+        （每批 1.08 个工具）。改成在模型刚做完时告诉它「你已经连着 3 轮各发 1 个
+        只读」——事实反馈比抽象要求有效，而且这次有埋点能验证。
+        """
+        if not self._single_ro_armed:
+            return ""
+        self._single_ro_armed = False
+        names = "、".join(self._single_ro_names)
+        return (
+            f"\n\n【并行提示】你已连续 {self._single_ro_streak} 轮各只发 1 个只读工具"
+            f"（{names}）。只读调用之间无冲突、同一轮可以并行发出——"
+            "下次需要多个只读信息时请一次发完，每省一轮就省一次秒级往返。")
 
     def _remember_cross_fp(self, fp: str) -> None:
         """登记工具调用指纹，供跨轮重复统计（只统计，不拦截）。
@@ -3488,7 +3855,7 @@ class AIAgent:
                 "⚠ 删除类任务（硬规则）：删除是不可逆操作——用户明确点名要删的文件/目录直接删；用户只是笼统说「清理/删除」时，动手前先列出将要删除的清单（路径+原因）让用户确认，确认后再删；不限制文件类型与目录，git 已跟踪文件、递归删除、整目录删除均可，只要用户同意；\n"
                 "⚠ 画图/图片/壁纸/立绘/头像/插画/海报/视频等视觉生成需求必须用 image_gen_create 直接生成，绝不委派给任何智能体/编程助手；\n"
                 "⚠ 音乐/听歌/放歌/搜歌/点歌/歌单/歌词/榜单全是大白自己的直接能力，必须直接调用 music_search / music_play / music_playlist / music_lyric 等 music_* 工具完成，绝不委派给任何智能体、也绝不用命令行/文件/脚本类工具去做；\n"
-                # 并行与不重复读从「少说多干」的子句里拆出来独立成条。
+                # 并行与不重复读从原来那条「执行期间保持安静」的子句里拆出来独立成条。
                 # 原来它们埋在最后一条 ⚠ 的后半句里，前面压着委派/删除/画图/音乐
                 # 五条硬规则——而这两条恰恰是决定整轮耗时的大头（一次 LLM 往返
                 # 是秒级，一次白等就是几秒）。规则想生效，先得让模型一眼看见，
@@ -3512,10 +3879,15 @@ class AIAgent:
                 # 摸项目的成本主要在「读错文件」：猜错一个 1200 行的文件，定点读要烧 8 次调用。
                 "⚠ 摸清大项目：先 code_map 一次拿全貌（入口/枢纽文件/复杂函数/改动热点），"
                 "再对枢纽文件用 symbols，最后只定点读要改的区间——别凭感觉挑文件整读；\n"
-                "⚠ 少说多干（硬规则）：执行工具期间保持安静，不播报进展、不口头同步，"
-                "禁止「我来看看」「我继续推进」这类废话；只有三种情况才开口："
-                "①最终结论（先结论后细节）；②卡住/失败需要用户决策；③用户明确问进展。"
-                "其余时间闭嘴干活，把步骤一口气做完；\n"
+                # 原来这条只写「保持安静」，实测退化成全程沉默：用户看不到进展，
+                # 不知道是在干活还是卡死了。改成「禁止无信息量的播报」+「阶段成果必须简报」，
+                # 保留原意（不刷废话），补上用户能感知的反馈节奏。
+                # 前提句是关键：用户看不到工具调用，所以「沉默」等于「黑箱」，不是「专注」。
+                "⚠ 说重点（硬规则）：用户看不到你的工具调用和内部思考，只能看到你输出的文字——"
+                "所以不播报无信息量的进展（「我来看看」「我继续推进」），"
+                "但每完成一个阶段或有启发性发现（定位到根因、方案被证伪、意外数据、方向要变），"
+                "用一句话说清「刚拿到什么、意味着什么」；"
+                "最终结论先结论后细节；卡住或需要用户决策立刻开口；\n"
                 "工具详细用法与更多能力见下方技能说明。\n\n"
             )
             # ⚠ 不能按 work_mode 分叉：sys_prompt 是请求的第 0 条，它一变整条前缀全废。
@@ -3916,6 +4288,10 @@ class AIAgent:
         eff_batches = 0         # 工具执行批次数（与工具数相比即并行度）
         eff_tool_errors = 0     # 本轮工具报错**次数**（注意：不是「整轮失败」）
         eff_mergeable = 0       # 本轮「本该合并成一次调用」的多余调用数（并行度优化的尺子）
+        eff_single_ro = 0       # 本轮注入的「连续单发只读」反馈次数（跨轮串行埋点）
+        eff_img_ops = 0         # 本轮画图工具调用数（规则区「画图」埋点）
+        eff_music_ops = 0       # 本轮 music_* 调用数（规则区「音乐」埋点）
+        eff_delete_ops = 0      # 本轮删除类操作数（规则区「删除」埋点）
         eff_seen: set = set()
         full_text = ""
         reasoning_all = ""  # 本轮累积的真实思维链（循环被强制停止时兜底生成正文）
@@ -4021,6 +4397,9 @@ class AIAgent:
         # 用量累加器（一轮对话内跨多次 LLM 调用累计；usage_emitted 保证最多发出一次）
         sum_prompt = sum_completion = sum_total = rounds = last_prompt = 0
         sum_cache_hit = sum_cache_miss = 0
+        # provider 是否回传了前缀缓存字段：区分「命中数真的是 0」与「这家没这个口径」。
+        # 后者会让成本模型把无归属的 token 误当成全 miss，或干脆漏算。
+        cache_reported = False
         # 本轮注入 messages 的工具结果字符数 —— Δ（每次调用新增）的主要来源。
         # 单条上限 16000 字符，一次并行 4 条就是 64000 字符 ≈ 21K token 的 Δ；
         # 不把它单独记下来，「新增到底花在哪」就只能猜。
@@ -4055,6 +4434,19 @@ class AIAgent:
             同步写一行 JSON（约 0.1ms，每轮仅一次）：不值得为它付 to_thread 的
             调度开销。异常一律吞掉——观测绝不能成为故障源。
             """
+            # 排在 tool_round 判断之前：本轮注入过基因就记账，哪怕一次工具都没调。
+            # 结局字段只收不依赖 provider 口径的量：cache_* 缺报会记成 0，那个假 0
+            # 当不了因变量。字段名与 turn_metrics 对齐，便于两处逐轮对照。
+            # 耗时只算一次：两处各算一次会差出 flush 写盘那几毫秒，对账就永远报不一致，
+            # 把「真漂移」和「测量时刻不同」混成一类，判据就废了。
+            duration_ms = int((time.monotonic() - eff_start) * 1000)
+            _gene_flush_exposure({
+                "tool_rounds": tool_round,
+                "tool_calls": eff_tool_calls,
+                "tool_errors": eff_tool_errors,
+                "re_reads": eff_re_reads,
+                "duration_ms": duration_ms,
+            })
             if tool_round <= 0:
                 return
             try:
@@ -4066,12 +4458,22 @@ class AIAgent:
                     "re_reads": eff_re_reads,
                     "cross_reads": eff_cross_reads,
                     "truncations": eff_truncations,
-                    "duration_ms": int((time.monotonic() - eff_start) * 1000),
+                    "duration_ms": duration_ms,
                     "tool_errors": eff_tool_errors,
                     "mergeable_calls": eff_mergeable,
+                    "single_ro_hints": eff_single_ro,
+                    # 规则区「删除/画图/音乐」三条的行为暴露量：0 次 ≠ 规则没用，
+                    # 只说明这段时间没被触发过——审计工具据此区分「无据可删」与「有作用面」。
+                    "img_gen_calls": eff_img_ops,
+                    "music_calls": eff_music_ops,
+                    "delete_ops": eff_delete_ops,
                     # ---- 前缀缓存（纯观测）----
                     "cache_hit": sum_cache_hit,
                     "cache_miss": sum_cache_miss,
+                    # 缺字段的 provider 会把 hit/miss 双双记 0；带上口径标记与来源，
+                    # 免得下一轮又拿这个 0 当「真的没命中」去算钱。
+                    "cache_reported": cache_reported,
+                    "base_url": config.get("base_url", ""),
                     "prompt_tokens": sum_prompt,
                     "llm_calls": rounds,
                     "cold_miss": max(0, first_miss),
@@ -4188,7 +4590,9 @@ class AIAgent:
                         sum_prompt += u[0]
                         sum_completion += u[1]
                         sum_total += u[2]
-                        ch, cm = self._read_cache(getattr(resp, "usage", None))
+                        _usage_obj = getattr(resp, "usage", None)
+                        ch, cm = self._read_cache(_usage_obj)
+                        cache_reported = cache_reported or self._cache_field_present(_usage_obj)
                         if first_miss < 0:
                             first_miss = cm
                         sum_cache_hit += ch
@@ -4332,6 +4736,7 @@ class AIAgent:
                         sum_completion += u[1]
                         sum_total += u[2]
                         ch, cm = self._read_cache(last_usage)
+                        cache_reported = cache_reported or self._cache_field_present(last_usage)
                         if first_miss < 0:
                             first_miss = cm
                         sum_cache_hit += ch
@@ -4446,6 +4851,11 @@ class AIAgent:
                         loop_break = True
                         break
 
+                # 跨轮串行观测：文本协议每轮只有一个工具，正是「单发」判据的现场
+                (self._single_ro_streak, self._single_ro_names,
+                 self._single_ro_armed) = _single_ro_note(
+                    self._single_ro_streak, self._single_ro_names, [tool_name])
+
                 # 断点落盘（b：文本协议轮，工具即将执行）
                 await _save_round_ckpt(
                     [{"id": f"text_{tool_round}", "name": tool_name,
@@ -4489,6 +4899,11 @@ class AIAgent:
                 eff_tool_calls += 1
                 if not success:
                     eff_tool_errors += 1
+                _kinds = _rule_op_kinds(
+                    tool_name, cleaned_args if cleaned_args is not None else arguments)
+                eff_img_ops += _kinds[0]
+                eff_music_ops += _kinds[1]
+                eff_delete_ops += _kinds[2]
                 _fp = _tool_fp(tool_name, cleaned_args if cleaned_args is not None else arguments)
                 if _fp in eff_seen:
                     eff_re_reads += 1
@@ -4500,6 +4915,10 @@ class AIAgent:
                     if _fp in self._cross_round_fps:
                         eff_cross_reads += 1
                     _llm_result = result
+                _ro_hint = self._single_ro_hint()
+                if _ro_hint:
+                    _llm_result = str(_llm_result) + _ro_hint
+                    eff_single_ro += 1
                 self._remember_cross_fp(_fp)
 
                 tool_call_results.append({
@@ -4590,6 +5009,11 @@ class AIAgent:
                     (i, tn, args) for i, (_tc, tn, _s, args, err) in enumerate(prepared)
                     if not err
                 ]
+                # 跨轮串行观测：本轮只发 1 个只读工具就累加，连续 N 轮在结果里附事实反馈
+                (self._single_ro_streak, self._single_ro_names,
+                 self._single_ro_armed) = _single_ro_note(
+                    self._single_ro_streak, self._single_ro_names,
+                    [tn for _i, tn, _a in pending])
                 for i, (_tc, tn, _s, _args, err) in enumerate(prepared):
                     if err:
                         outcomes[i] = (err, False)
@@ -4700,6 +5124,10 @@ class AIAgent:
                     eff_tool_calls += 1
                     if not success:
                         eff_tool_errors += 1
+                    _kinds = _rule_op_kinds(tool_name, arguments)
+                    eff_img_ops += _kinds[0]
+                    eff_music_ops += _kinds[1]
+                    eff_delete_ops += _kinds[2]
                     _fp = _tool_fp(tool_name, arguments)
                     if _fp in eff_seen:
                         eff_re_reads += 1
@@ -4723,6 +5151,10 @@ class AIAgent:
                             _llm_result = str(result) + (
                                 f"\n\n【合并提示】你本轮把 {tool_name} 调了 {_cnt} 次。"
                                 f"{_binfo[1]} —— 一次调用就能做完，省 {_cnt - 1} 次往返。")
+                    _ro_hint = self._single_ro_hint()
+                    if _ro_hint:
+                        _llm_result = str(_llm_result) + _ro_hint
+                        eff_single_ro += 1
                     self._remember_cross_fp(_fp)
 
                     tool_call_results.append({
@@ -4757,6 +5189,8 @@ class AIAgent:
                     }
                     if round_reasoning and _needs_reasoning_echo(config.get("model")):
                         _msg["reasoning_content"] = round_reasoning
+                        # reasoning 回传同样进 prompt，漏计会让上下文预算少算一大截
+                        pending_chars += len(round_reasoning)
                     messages.append(_msg)
                 for tr in tool_call_results:
                     _res_text = tr.get("llm_result") or tr["result"]
@@ -4768,14 +5202,8 @@ class AIAgent:
                         # llm_result 可能带「重复调用」提示；记忆库与前端仍用原样结果
                         "content": f"【工具 {tr['name']} 已执行】结果：{_res_text}",
                     })
-                    _marks = _img_marks(_res_text)
-                    if _marks and not _img_ok:
-                        messages.append({"role": "system", "content": _IMG_NO_EYES})
-                    for _ip in _marks:
-                        _im = _img_message(_ip, tr.get("name") or "")
-                        if _im:
-                            messages.append(_im)
-                            pending_chars += _IMG_TOKEN_EST * 4
+                    pending_chars += _append_img_messages(
+                        messages, _img_marks(_res_text), tr.get("name") or "", _img_ok)
             else:
                 if not resume_round:
                     pending_chars += (len(assistant_content or "")
@@ -4787,6 +5215,8 @@ class AIAgent:
                     }
                     if round_reasoning and _needs_reasoning_echo(config.get("model")):
                         _msg["reasoning_content"] = round_reasoning
+                        # reasoning 回传同样进 prompt，漏计会让上下文预算少算一大截
+                        pending_chars += len(round_reasoning)
                     messages.append(_msg)
                 for tr, _tc in zip(tool_call_results, tool_calls_for_message):
                     _res_text = tr.get("llm_result") or tr["result"]
@@ -4800,14 +5230,8 @@ class AIAgent:
                         "content": _res_text,
                     })
                     # 带 [[IMG:path]] 的结果 → 紧跟一条多模态 user 消息，模型直接看像素
-                    _marks = _img_marks(_res_text)
-                    if _marks and not _img_ok:
-                        messages.append({"role": "system", "content": _IMG_NO_EYES})
-                    for _ip in _marks:
-                        _im = _img_message(_ip, tr.get("name") or "")
-                        if _im:
-                            messages.append(_im)
-                            pending_chars += _IMG_TOKEN_EST * 4
+                    pending_chars += _append_img_messages(
+                        messages, _img_marks(_res_text), tr.get("name") or "", _img_ok)
 
             # 轮内工具历史压缩：本轮结果已入 messages，先压缩再落断点/进入下一轮，
             # 保证断点文件与后续 LLM 请求的上下文都保持有界

@@ -211,9 +211,10 @@ def reload_relay_config() -> bool:
     LLM_CFG.clear()
     LLM_CFG.update(_merge_llm_cfg(new.get('llm', {})))
     _cfg_mtime = mt
-    # 同步工作目录到执行器
+    # 同步工作目录到执行器（进程级覆盖优先：worker 的独立工作区不被全局配置顶掉）
     try:
-        EXECUTOR.cwd = AGENT_CFG.get('work_dir', EXECUTOR.cwd)
+        if not _env_workspace():
+            EXECUTOR.cwd = AGENT_CFG.get('work_dir', EXECUTOR.cwd)
     except Exception:
         pass
     llm_state = '开' if llm_available() else '关'
@@ -929,9 +930,18 @@ def _llm_summarize(text: str, max_chars: int = 900) -> str:
 
 # ---------- 执行器 ----------
 
+def _env_workspace() -> str:
+    """进程级工作区覆盖：长跑 worker 用独立工作区跑，产出不落到主项目。
+
+    全局 work_dir 是 server 与所有子进程共享的配置，改它会污染主会话；
+    环境变量天然只作用于本进程及其子进程，所以隔离走这里。
+    """
+    return (os.environ.get('DABAI_WORKSPACE') or '').strip()
+
+
 class Executor:
     def __init__(self):
-        self.cwd = AGENT_CFG.get('work_dir') or str(BASE_DIR)
+        self.cwd = _env_workspace() or AGENT_CFG.get('work_dir') or str(BASE_DIR)
         # 保证目录存在
         try:
             os.makedirs(self.cwd, exist_ok=True)

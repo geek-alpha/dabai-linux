@@ -357,6 +357,87 @@ export default (function init(App: AppKernel) {
     }
   }
 
+  // ---------- 长跑引擎：轮次下钻（点一轮看它到底干了什么） ----------
+
+  const longrunTraceCache = new Map<number, any>();
+
+  async function loadLongrunTrace(cycle: number): Promise<any> {
+    if (longrunTraceCache.has(cycle)) return longrunTraceCache.get(cycle);
+    try {
+      const r = await fetch('/api/longrun/trace/' + encodeURIComponent(String(cycle)));
+      const data = await r.json();
+      longrunTraceCache.set(cycle, data);
+      return data;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function traceEventLines(events: any[]): string[] {
+    const lines: string[] = [];
+    for (const e of events || []) {
+      if (!e || !e.type) continue;
+      if (e.type === 'prompt') {
+        lines.push('【本轮动作】' + (e.action || '') + '（prompt ' + (e.chars || 0) + ' 字）');
+      } else if (e.type === 'ToolCallStart') {
+        lines.push('▸ ' + (e.tool_name || '工具') + ' ' + String(e.hint || e.arguments || '').slice(0, 120));
+      } else if (e.type === 'ToolCallResult') {
+        lines.push('  ' + (e.success === false ? '✗' : '✓') + ' ' +
+          String(e.result || '').replace(/\n/g, ' ').slice(0, 160));
+      } else if (e.type === 'exit') {
+        lines.push('退出码 ' + e.exit + ' · ' + (e.dur != null ? e.dur + 's' : '') + ' · ' +
+          (e.progressed ? '✓ 有进展' : '✗ 无进展（' + (e.reason || '台账没变') + '）'));
+        const u = e.usage || {};
+        if (u.in != null) lines.push('token ' + u.in + '→' + u.out + (u.rounds ? ' · ' + u.rounds + ' 轮' : ''));
+      } else if (e.type === 'StreamDelta' && e.text) {
+        lines.push(String(e.text));
+      }
+    }
+    return lines;
+  }
+
+  function renderLongrunRounds(wrap: HTMLElement, t: any) {
+    const rounds = (t.extra && t.extra.rounds) || [];
+    if (!rounds.length) return;
+    const box = el('div', 'task-steps');
+    box.appendChild(el('div', 'task-section-label', '轮次台账 · 点一轮看它到底干了什么'));
+    const pane = el('pre', 'task-log-pre');
+    pane.style.display = 'none';
+    for (const rd of rounds.slice().reverse()) {
+      const row = el('div', 'task-step');
+      row.innerHTML = '<span class="task-step-dot"></span><span></span>';
+      const txt = row.lastElementChild as HTMLElement;
+      const time = rd.t ? new Date(rd.t * 1000).toLocaleTimeString('zh-CN', { hour12: false }) : '';
+      txt.textContent = '第 ' + rd.cycle + ' 轮 [' + (rd.goal || '') + '] ' + (rd.ok ? '✓' : '✗') + ' ' +
+        (rd.dur != null ? rd.dur + 's ' : '') + (rd.tool_count ? rd.tool_count + ' 个工具 ' : '') + time +
+        (rd.trace ? ' · 可下钻' : ' · 无 trace');
+      if (rd.trace) {
+        row.style.cursor = 'pointer';
+        row.title = '点开看这一轮的 prompt / 工具调用 / 退出码';
+        row.addEventListener('click', () => {
+          if (pane.style.display !== 'none' && pane.dataset.cycle === String(rd.cycle)) {
+            pane.style.display = 'none';
+            return;
+          }
+          pane.dataset.cycle = String(rd.cycle);
+          pane.style.display = '';
+          pane.textContent = '加载第 ' + rd.cycle + ' 轮 trace…';
+          loadLongrunTrace(rd.cycle).then((d: any) => {
+            if (!d) { pane.textContent = 'trace 读取失败'; return; }
+            if (!d.ok) { pane.textContent = d.error || '该轮没有 trace'; return; }
+            const lines = traceEventLines(d.events || []);
+            pane.textContent = '第 ' + rd.cycle + ' 轮 · ' + d.lines + ' 条事件\n' + (lines.join('\n') || '（空）');
+          });
+        });
+      } else {
+        row.style.opacity = '0.55';
+      }
+      box.appendChild(row);
+    }
+    box.appendChild(pane);
+    wrap.appendChild(box);
+  }
+
   function renderDetail(taskId: string) {
     const wrap = document.getElementById('task-center-detail');
     if (!wrap) return;
@@ -413,6 +494,9 @@ export default (function init(App: AppKernel) {
       }
       wrap.appendChild(stepsBox);
     }
+
+    // 长跑引擎：轮次可下钻（每轮一个 trace 文件）
+    if (t.kind === 'longrun') renderLongrunRounds(wrap, t);
 
     if (t.logs && t.logs.length) {
       // 过程性日志默认折叠：摘要行露出最新一条，点开看全文

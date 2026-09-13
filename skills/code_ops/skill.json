@@ -683,7 +683,7 @@
             },
             "timeout": {
               "type": "integer",
-              "description": "超时秒数（默认 60，最大 300）"
+              "description": "超时秒数（默认 60，最大 1200；长任务如全店诊断/批量发布给 600~1200）"
             }
           },
           "required": [

@@ -566,6 +566,10 @@
             "enabled": {
               "type": "boolean",
               "description": "是否立即启用（默认 true）"
+            },
+            "profile": {
+              "type": "string",
+              "description": "用哪个智能体档案执行（如 shopkeeper=经营分身）；留空=通用执行者"
             }
           },
           "required": [

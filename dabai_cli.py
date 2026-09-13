@@ -216,7 +216,7 @@ async def repl(agent, printer: _TurnPrinter) -> None:
 async def _run(args, text: str) -> int:
     from agent import AIAgent
 
-    agent = AIAgent(user_id=args.user)
+    agent = AIAgent(user_id=args.user, namespace=args.namespace)
     try:
         await agent.initialize()
     except Exception as e:
@@ -249,6 +249,8 @@ def main() -> int:
     ap.add_argument("-u", "--user", default="cli",
                     help="会话 user_id（默认 cli，与浏览器会话隔离）")
     ap.add_argument("-v", "--verbose", action="store_true", help="显示思维链与过程话")
+    ap.add_argument("--namespace", default="",
+                    help="记忆命名空间覆盖（如 longrun）：落独立会话，不与角色卡主会话串扰")
     ap.add_argument("-q", "--quiet", action="store_true", help="只输出正文，不显示工具调用")
     ap.add_argument("--json", action="store_true", help="输出原始事件流（JSON Lines）")
     args = ap.parse_args()

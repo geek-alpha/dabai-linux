@@ -294,6 +294,7 @@ _UI_ACTIONS = {"see", "page", "find", "tap_text", "ctext", "batch", "code", "sms
 
 
 _UI_CACHE: dict = {}
+_LOCK_CACHE: dict = {}
 _SCENE_CACHE: dict = {}
 _VERIFY_CACHE: dict = {}
 
@@ -420,23 +421,38 @@ def _ui_action(a: str, args: dict) -> str:
     return f"✗ 不支持的 action：{a}"
 
 
-async def execute(tool_name: str, arguments: dict) -> str:
-    """harness 约定：dispatch(tool_name, arguments)，action 在 arguments 里。"""
-    args = arguments or {}
-    a = (args.get("action") or "devices").strip().lower()
-    if a == "devices":
-        return _devices()
-    if a == "connect":
-        return _connect(args.get("host") or "")
-    if a == "auto":
-        return _auto_connect()
+def _phone_lock():
+    """按 mtime 加载 tools/phone_lock.py —— 与 _ui() 同款。
+
+    锁只能有一份实现：长跑 worker 和主对话用的是同一台手机，各写各的锁等于没锁。
+    """
+    import importlib
+    import sys
+    tools = Path(__file__).resolve().parents[2] / "tools"
+    src = tools / "phone_lock.py"
+    if str(tools) not in sys.path:
+        sys.path.insert(0, str(tools))
+    mod = sys.modules.get("phone_lock")
+    if mod is not None:
+        cur = getattr(mod, "__file__", "") or ""
+        if not cur or Path(cur).resolve() != src:
+            sys.modules.pop("phone_lock", None)
+    import phone_lock
+    mtime = src.stat().st_mtime_ns if src.exists() else 0
+    if _LOCK_CACHE.get("mtime") != mtime:
+        phone_lock = importlib.reload(phone_lock)
+        _LOCK_CACHE["mtime"] = mtime
+    return phone_lock
+
+
+def _dispatch(a: str, args: dict) -> str:
     if a in _UI_ACTIONS:
         return _ui_action(a, args)
     ser = _serial(args.get("serial"))
-    if ser is None and a not in ("devices", "connect", "auto"):
+    if ser is None:
         _auto_connect()  # 掉线兜底：后台保活有 65 秒盲区，操作路径上必须自愈一次
         ser = _serial(args.get("serial"))
-    if ser is None and a not in ("devices", "connect", "auto"):
+    if ser is None:
         return "✗ 没有唯一在线设备，请先 adb devices 确认连接（或指定 serial）"
     if a == "tap":
         return _tap(ser, args.get("x"), args.get("y"))
@@ -462,3 +478,31 @@ async def execute(tool_name: str, arguments: dict) -> str:
     if a == "shell":
         return _shell(ser, args.get("cmd"))
     return f"✗ 不支持的 action：{a}"
+
+
+async def execute(tool_name: str, arguments: dict) -> str:
+    """harness 约定：dispatch(tool_name, arguments)，action 在 arguments 里。
+
+    除 devices/connect/auto 三个探测动作外全走手机锁：worker 与主对话共用一台
+    手机，交叉执行 adb 不是「可能点错」，是必然点错。
+    """
+    args = arguments or {}
+    a = (args.get("action") or "devices").strip().lower()
+    if a == "devices":
+        return _devices()
+    if a == "connect":
+        return _connect(args.get("host") or "")
+    if a == "auto":
+        return _auto_connect()
+    owner = os.environ.get("DABAI_AGENT") or "dabai"
+    wait = float(os.environ.get("DABAI_PHONE_WAIT", "15"))
+    try:
+        pl = _phone_lock()
+    except Exception as e:
+        return _dispatch(a, args) + f"\n⚠ 手机锁加载失败（{e}），本次未互斥"
+    with pl.hold(owner, wait=wait) as (ok, info):
+        if not ok:
+            held = int(time.time() - float(info.get("since") or 0)) if info.get("since") else 0
+            return (f"✗ 手机正被「{info.get('owner')}」占用（pid {info.get('pid')}，已 {held}s），"
+                    f"本次 {a} 未执行。等它结束再试；要排队更久可设 DABAI_PHONE_WAIT=60。")
+        return _dispatch(a, args)

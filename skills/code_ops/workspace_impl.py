@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import json
+import os
 import ssl
 import urllib.parse
 
@@ -72,8 +73,20 @@ async def workspace_get(args: dict) -> str:
     return "；".join(parts)
 
 
+def _workspace_locked() -> str:
+    """独立工作区模式下禁止改全局工作区（长跑 worker 专用）。
+
+    全局工作区是所有会话共享的配置，worker 一改，主人的主对话也跟着被带偏。
+    """
+    if (os.environ.get("DABAI_WORKSPACE") or "").strip():
+        return "当前进程运行在独立工作区（DABAI_WORKSPACE），禁止切换全局工作区。"
+    return ""
+
+
 async def workspace_set(args: dict) -> str:
     """设置/切换全局工作区。"""
+    if locked := _workspace_locked():
+        return locked
     path = str(args.get("path") or "").strip()
     if not path:
         return "请提供目标工作区路径（path 必填）。"
@@ -159,6 +172,8 @@ async def workspaces_remove(args: dict) -> str:
 
 async def workspaces_activate(args: dict) -> str:
     """激活一个已保存的工作区。"""
+    if locked := _workspace_locked():
+        return locked
     path = str(args.get("path") or "").strip()
     if not path:
         return "请提供要激活的工作区路径（path 必填）。"

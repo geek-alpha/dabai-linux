@@ -198,6 +198,7 @@ async def lifespan(app: FastAPI):
                 str(job.get("task") or job.get("name") or ""),
                 title=("定时·" + str(job.get("name") or "任务"))[:60],
                 extra={"job_id": job.get("id")},
+                profile=str(job.get("profile") or ""),
             )
             logger.info("[Scheduler] 已派发定时任务《%s》[%s] → [%s]",
                         job.get("name"), job.get("id"), worker.id)
@@ -2058,6 +2059,15 @@ async def task_center_list():
     if harness_ids:
         tasks = [t for t in tasks
                  if str((t.get("extra") or {}).get("harness_tid") or "") not in harness_ids]
+    # 合并长跑引擎：它是 systemd 拉起的独立进程，既不在 orchestrator 注册表、
+    # 也不在 Harness TaskSystem 里 —— 只读合成一条（数据源是它的 state/journal/
+    # heartbeat 文件），让它在任务中心可见、可点开、可停。
+    try:
+        from tools.longrun.status_view import snapshot as _longrun_snap, TASK_ID as _LONGRUN_ID
+        tasks = [t for t in tasks if str(t.get("id") or "") != _LONGRUN_ID]
+        tasks.append(_longrun_snap(full=False))
+    except Exception as e:
+        logger.warning(f"[TaskCenter] 合并长跑引擎失败: {e}")
     tasks.sort(key=lambda x: -(x.get("created_at") or 0))
     return {"ok": True, "tasks": tasks[:50]}
 
@@ -2068,6 +2078,13 @@ async def task_center_get(task_id: str):
     task = orch.get(task_id)
     if task is not None:
         return {"ok": True, "task": task.snapshot(full=True)}
+    # 长跑引擎（合成条目，不在任何注册表里）
+    try:
+        from tools.longrun.status_view import snapshot as _longrun_snap, TASK_ID as _LONGRUN_TID
+        if task_id == _LONGRUN_TID:
+            return {"ok": True, "task": _longrun_snap(full=True)}
+    except Exception as e:
+        logger.warning(f"[TaskCenter] 长跑任务详情失败: {e}")
     # 回退：Harness TaskSystem 的 flow/batch 任务（详情含步骤/条目状态）
     try:
         ht = _harness().tasks.status(task_id)
@@ -2142,6 +2159,19 @@ async def task_center_kill(task_id: str):
     orch = get_orchestrator()
     task = orch.get(task_id)
     if task is None:
+        # 长跑引擎（合成条目）：中断 = 停 systemd 服务，watchdog 一并停 ——
+        # 只停服务不停 watchdog，它按心跳判活会立刻把它拉起来。
+        try:
+            from tools.longrun.status_view import TASK_ID as _LONGRUN_TID, service_action
+            if task_id == _LONGRUN_TID:
+                ok, msg = service_action("stop")
+                if not ok:
+                    raise HTTPException(status_code=500, detail=msg)
+                return {"ok": True, "task_id": task_id, "status": "cancelled", "message": msg}
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.warning(f"[TaskCenter] 长跑中断失败: {e}")
         # 回退：Harness TaskSystem 的 flow/batch 任务（cancel 中断整个流程/批量）
         try:
             if _harness().tasks.cancel(task_id):
@@ -2190,6 +2220,30 @@ async def task_center_clear():
     except Exception as e:
         logger.warning(f"[TaskCenter] 清除 Harness 任务失败: {e}")
     return {"ok": True, "cleared": n}
+
+
+@app.post("/api/longrun/{action}")
+async def api_longrun_ctl(action: str):
+    """长跑引擎启停：start/resume、stop/pause、restart、status。
+
+    引擎是 systemd 单元，跟 server 没有父子关系，只能经 systemctl 控；
+    子进程会阻塞事件循环，丢线程里跑。
+    """
+    from tools.longrun.status_view import service_action
+    ok, msg = await asyncio.to_thread(service_action, action)
+    if not ok:
+        return JSONResponse({"ok": False, "message": msg}, status_code=400)
+    return {"ok": True, "action": action, "message": msg}
+
+
+@app.get("/api/longrun/trace/{cycle}")
+async def api_longrun_trace(cycle: int):
+    """某一轮的原始 trace（prompt 摘要 / 工具调用序列 / 退出码），任务中心下钻用。
+
+    轮次 trace 是 append-only 文件，读它不碰引擎状态 —— 引擎正在跑也能看上一轮。
+    """
+    from tools.longrun.status_view import read_trace
+    return await asyncio.to_thread(read_trace, cycle)
 
 
 # ---------- DSH 桥接（兼容旧前端确认卡片，引擎已迁移到任务中心） ----------

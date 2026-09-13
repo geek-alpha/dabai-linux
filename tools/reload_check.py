@@ -126,10 +126,54 @@ def _autorestart_enabled() -> bool:
         return False
 
 
+LOADED_STATE = BASE / "data" / "hot_reload_state.json"
+
+
+def _loaded_state() -> dict:
+    """读 hot_reload 落盘的「已加载快照」（hot_reload._dump_loaded_state 写）。
+
+    为什么不能只看进程启动时间：core_autorestart=true 时重启走 os.execv 自替换，
+    PID 与 /proc/<pid>/stat 的 starttime 都冻结在进程创建时刻（实测 execv 前后
+    19284→19284、ticks 1214348→1214348），于是「文件比进程新」在每次自动重启后
+    依然成立，永远误报未生效。
+    """
+    try:
+        with open(LOADED_STATE, "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def _restart_check_report() -> str:
+    """跑一次重启体检（tools/restart_server.sh --check），返回输出末尾。
+
+    为什么由本工具来跑：reload_check 只知道「有改动没生效」，不知道「为什么
+    没生效」——单元状态、端口、守护日志都在重启脚本的体检里。发现问题的工具
+    顺手把证据留下，比让人再手敲一条命令可靠。
+
+    防递归：重启脚本内部会回调本工具，所以给它 DABAI_NO_RECHECK=1，并把报告
+    写到另一个文件，不覆盖上次真重启的报告。
+    """
+    script = BASE / "tools" / "restart_server.sh"
+    if not script.is_file():
+        return ""
+    env = dict(os.environ)
+    env["DABAI_NO_RECHECK"] = "1"
+    env["DABAI_REPORT"] = str(BASE / "data" / "restart_check_report.txt")
+    try:
+        out = subprocess.run(["bash", str(script), "--check"],
+                             capture_output=True, text=True, timeout=60, env=env)
+    except Exception as e:
+        return "体检脚本执行失败: %s" % e
+    text = ((out.stdout or "") + (out.stderr or "")).strip()
+    return text[-2000:] if len(text) > 2000 else text
+
+
 def main(as_json=False):
     pid, started = _proc_start()
     auto = _autorestart_enabled()
     files = _scan_core()
+    state = _loaded_state()
     newest = max(files, key=lambda p: p.stat().st_mtime) if files else None
     res = {
         "pid": pid,
@@ -141,8 +185,35 @@ def main(as_json=False):
                                        time.localtime(newest.stat().st_mtime))
                          if newest else None),
         "stale": [],
+        "state_at": (time.strftime("%Y-%m-%d %H:%M:%S",
+                                   time.localtime(state.get("at")))
+                     if state and state.get("at") else None),
     }
-    if started:
+    core_state = (state.get("core") or {}) if state else {}
+    if core_state and pid and state.get("pid") and int(state["pid"]) != int(pid):
+        # 快照不是本进程写的：被测试夹具或别的进程覆盖过。此时指纹比对会产出一整片假
+        # 警报（实测 2026-09-14 06:40：全套测试把 {"core": {"/fake/core_x.py": [1,10]}}
+        # 写进生产快照，本工具立刻报「44 个核心文件未生效」）。宁可降级判据并告警，
+        # 也不拿别人的快照当权威。
+        print("[!] 已加载快照的 pid=%s ≠ 运行中进程 pid=%s —— 快照不是本进程写的，"
+              "降级用进程启动时间判定（自动重启后可能误报；下次重启会重建快照）。"
+              % (state.get("pid"), pid))
+        core_state = {}
+    res["judge"] = "loaded_state" if core_state else "proc_start"
+    if core_state:
+        # 首选判据：守护落盘的已加载快照——直接比 mtime_ns+size，与重启方式无关
+        for p in files:
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            if core_state.get(str(p)) != [st.st_mtime_ns, st.st_size]:
+                res["stale"].append({
+                    "file": p.name,
+                    "mtime": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.st_mtime)),
+                    "ahead_sec": int(st.st_mtime - (state.get("at") or 0)),
+                })
+    elif started:
         for p in files:
             m = p.stat().st_mtime
             if m > started + 1:  # 1 秒容差
@@ -153,13 +224,21 @@ def main(as_json=False):
                 })
     res["stale"].sort(key=lambda x: -x["ahead_sec"])
     res["stale_count"] = len(res["stale"])
+    # 改动没生效时顺手体检：谁发现没生效，谁留下证据（报告落盘）
+    res["restart_check"] = _restart_check_report() if res["stale"] else ""
     if as_json:
         print(json.dumps(res, ensure_ascii=False, indent=2))
         return 0
     print("运行中进程 PID %s，启动于 %s" % (res["pid"], res["started_at"]))
     print("自动重启（harness.core_autorestart）：%s"
           % ("开启" if auto else "关闭 ← 核心改动不会自动生效"))
-    if not started:
+    if res["judge"] == "loaded_state":
+        print("判据：已加载快照（%s，落盘于 %s）"
+              % (LOADED_STATE.name, res.get("state_at") or "未知"))
+    else:
+        print("判据：进程启动时间 —— 已加载快照缺失（守护未重启或未开启热重载）；"
+              "该判据在自动重启后会误报")
+    if not started and res["judge"] != "loaded_state":
         # 关键：探测失败 ≠ 已生效。旧版在这里静默放过，永远打印 [OK]，
         # 把“探测不到”伪装成“没问题”（实测踩过：agent.py 改完未生效却报 OK）。
         print("[?] 探测不到运行中进程 —— 无法判定改动是否生效（这不是 [OK]）。")
@@ -170,14 +249,19 @@ def main(as_json=False):
                                                   time.localtime(p.stat().st_mtime))))
         return 2
     if not res["stale"]:
-        print("[OK] 所有核心改动都已生效（没有比进程启动时间更新的核心文件）")
+        print("[OK] 运行中进程加载的就是当前磁盘版本")
         return 0
     print("[!] 有 %d 个核心文件的改动还没进运行中的进程：" % res["stale_count"])
+    _ref = "已加载快照" if res["judge"] == "loaded_state" else "进程启动"
     for it in res["stale"][:15]:
-        print("   %-24s 改于 %s（比进程启动晚 %ds）"
-              % (it["file"], it["mtime"], it["ahead_sec"]))
+        print("   %-24s 改于 %s（比%s晚 %ds）"
+              % (it["file"], it["mtime"], _ref, it["ahead_sec"]))
     if not auto:
         print("\n原因：core_autorestart=false —— 需要手动重启 server.py 才会生效。")
+    diag = res.get("restart_check")
+    if diag:
+        print("\n--- 重启体检（%s）---" % (BASE / "data" / "restart_check_report.txt"))
+        print(diag)
     return 1
 
 

@@ -15,6 +15,8 @@
   next <id> "原子级下一步"        只改接力棒
   q    "悬而未决的问题" / q --done N / q --list
   list / show <id> / stage <id> active|paused|done
+  block <id> --why "卡在主人哪件事"   标记为等主人：长跑引擎跳过它，不再为它空烧轮次
+  unblock <id>                        主人做完后解除，目标重新进入轮转
 """
 import argparse
 import json
@@ -76,6 +78,7 @@ def cmd_new(a):
         "stage": "active",
         "progress": 0,
         "next": a.nxt or "",
+        "allow": [x.strip() for x in (getattr(a, "allow", "") or "").split(",") if x.strip()],
         "created": today(),
         "log": [],
     }
@@ -142,6 +145,39 @@ def cmd_stage(a):
     return 0
 
 
+def cmd_block(a):
+    """把目标标成「等主人」。
+
+    长跑引擎唯一无法自己跨过的卡点就是「只有主人能做的那件事」（解锁手机、扫码
+    登录、点头批补丁）。没有这个标记时，worker 每轮只能重写一遍文档、改一次
+    接力棒，而引擎按「台账变了」判为有进展——于是一个卡死的目标可以无限烧钱
+    （实测 biz-negotiate 13 轮 586 万 prompt token，一条消息没发出去）。
+    """
+    d = load()
+    p = find(d, a.id)
+    if not p:
+        print(f"没有这个项目：{a.id}")
+        return 1
+    p["owner_block"] = {"why": a.why or "（未说明）", "since": today()}
+    save(d)
+    print(f"⏳ {p['title']} 标记为等主人：{p['owner_block']['why']}")
+    print("   引擎会跳过它；你做完那件事再 unblock 就恢复轮转。")
+    return 0
+
+
+def cmd_unblock(a):
+    d = load()
+    p = find(d, a.id)
+    if not p:
+        print(f"没有这个项目：{a.id}")
+        return 1
+    old = p.pop("owner_block", None)
+    save(d)
+    tail = f"（原卡点：{old.get('why')}）" if old else "（本来就没标记）"
+    print(f"▶ {p['title']} 解除等主人{tail}")
+    return 0
+
+
 def cmd_q(a):
     d = load()
     qs = d["questions"]
@@ -177,7 +213,7 @@ def cmd_list(a):
     if not ps:
         print("暂无进行中的事业。用 new 立项。")
     for p in ps:
-        mark = "▶" if p.get("stage") == "active" else "⏸"
+        mark = "⏳" if p.get("owner_block") else ("▶" if p.get("stage") == "active" else "⏸")
         print(f"{mark} [{p.get('progress', 0):3d}%] {p.get('title')} ({p.get('id')})")
         if p.get("next"):
             print(f"       下一步：{p['next']}")
@@ -220,6 +256,7 @@ def main():
     p.add_argument("--value", default="")
     p.add_argument("--done", default="")
     p.add_argument("--next", dest="nxt", default="")
+    p.add_argument("--allow", default="", help="主人预授权的能力，逗号分隔，如 send_msg")
     p.set_defaults(fn=cmd_new)
 
     p = sub.add_parser("log")
@@ -239,6 +276,15 @@ def main():
     p.add_argument("id")
     p.add_argument("value")
     p.set_defaults(fn=cmd_stage)
+
+    p = sub.add_parser("block")
+    p.add_argument("id")
+    p.add_argument("--why", default="", help="卡在主人哪件事上")
+    p.set_defaults(fn=cmd_block)
+
+    p = sub.add_parser("unblock")
+    p.add_argument("id")
+    p.set_defaults(fn=cmd_unblock)
 
     p = sub.add_parser("q")
     p.add_argument("text", nargs="?", default="")

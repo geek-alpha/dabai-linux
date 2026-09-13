@@ -1246,6 +1246,37 @@ def code_map(args: dict) -> str:
 # ---------- 批量编辑的支撑函数 ----------
 
 
+BACKUP_KEEP = 3
+
+
+def _prune_backups(fp: Path, keep: int = BACKUP_KEEP) -> int:
+    """同一文件的 .bak-<时间戳> 只留最近 keep 份，返回删掉的份数。
+
+    备份的价值是「改坏了好回滚」，只需要最近几份；无限累积会让工作区被几十份
+    全量副本淹没（实测 data/longrun/ws 里 46 份备份占了正式产物的 59%）。
+    只匹配 .bak-<纯数字>，引擎自定义的 .bak-r33 / .pre-apply-* 一律不碰。
+    """
+    pat = re.compile(re.escape(fp.name) + r"\.bak-(\d+)$")
+    cands = []
+    try:
+        for p in fp.parent.iterdir():
+            m = pat.match(p.name)
+            if m:
+                cands.append((int(m.group(1)), p))
+    except OSError:
+        return 0
+    cands.sort(reverse=True)
+    removed = 0
+    for _, p in cands[keep:]:
+        try:
+            p.unlink()
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+
 def _norm_edit(d: dict) -> dict:
     """把一处编辑的参数收口成统一结构（含常见别名识别）。
 
@@ -1496,6 +1527,7 @@ def code_edit(args: dict) -> str:
         bak = fp.with_name(fp.name + f".bak-{int(time.time())}")
         try:
             bak.write_bytes(fp.read_bytes())
+            _prune_backups(fp)
         except OSError as e:
             results.append(f"备份失败（未修改文件）：{e}")
             continue
@@ -1848,6 +1880,7 @@ def code_patch(args: dict) -> str:
             if not is_new:
                 bak = fp.with_name(fp.name + f".bak-{int(time.time())}")
                 bak.write_bytes(fp.read_bytes())
+                _prune_backups(fp)
                 try:
                     fp.write_bytes(new_text.encode(
                         enc if enc != "utf-8-sig" else "utf-8-sig"))

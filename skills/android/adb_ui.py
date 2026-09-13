@@ -31,6 +31,7 @@ seq 语法（分号分隔，一次调用跑完）：
 """
 from __future__ import annotations
 
+import atexit
 import hashlib
 import http.client
 import json
@@ -81,6 +82,8 @@ REMOTE_XML = "/sdcard/_adb_ui.xml"
 IME_ADB = "com.android.adbkeyboard/.AdbIME"
 IME_USER = "com.baidu.input_oppo/.ImeService"  # 存盘丢了时的兼底：本机原输入法
 IME_STATE = Path("/home/wxf/dabai/data/android/ime_before.txt")
+# 非空 = 我们临时借用了 ADBKeyboard，里面存着该还回去的那个；atexit 据此兜底
+_IME_HELD = ""
 
 # 缓存新鲜度上限（秒）：按「用途」分级，一处定义，别再在各函数里散着写数字。
 # 定这些数的依据：agent dump 一次 0.2~0.35s，重采很便宜；越不能出错的用途给得越紧。
@@ -598,6 +601,25 @@ def _do_verify(rest: list) -> str:
 
 
 def do_batch(spec: str) -> str:
+    """整批只借一次 ADBKeyboard：逐条切会每条多付 ~1.5s，
+    且中途异常会把用户键盘留在 ADBKeyboard 上。用完必还。"""
+    global _IME_HELD
+    steps = [s for s in (x.strip() for x in spec.split(";")) if s]
+    borrow = any(s.split()[0].lower() == "ctext" for s in steps)
+    if borrow and "adbkeyboard" not in (_c0 := _ime_get()):
+        _IME_HELD = _c0 or IME_USER
+        IME_STATE.parent.mkdir(parents=True, exist_ok=True)
+        IME_STATE.write_text(_IME_HELD, encoding="utf-8")
+        _ime_set(IME_ADB, wait=0.6)
+    try:
+        return _do_batch_impl(spec)
+    finally:
+        if _IME_HELD:
+            _o, _IME_HELD = _IME_HELD, ""
+            _ime_set(_o, wait=0)
+
+
+def _do_batch_impl(spec: str) -> str:
     """一条命令跑完整串动作：分号分隔，每步一个子命令。
     存在的理由：每发起一次调用都要过一次 LLM 往返，把 N 步压进一次进程启动才是真的省。
     示例：batch "see;tap 推荐;see;xy 540,1800"
@@ -662,42 +684,91 @@ def do_batch(spec: str) -> str:
 
 
 
-def do_ime(want: str = "adb") -> str:
-    """切输入法。ctext 靠 ADBKeyboard 接广播，不在前台就白广播。
-    切之前先把原输入法存盘，restore 才还得回去。"""
+def _ime_get() -> str:
     _, cur = sh("shell", "settings", "get", "secure", "default_input_method")
-    cur = cur.strip()
+    return cur.strip()
+
+
+def _ime_set(target: str, wait: float = 1.0) -> str:
+    sh("shell", "ime", "enable", target)
+    sh("shell", "ime", "set", target)
+    if wait:
+        time.sleep(wait)
+    return _ime_get()
+
+
+def _ime_peek_orig() -> str:
+    """我们切走之前用户用的是哪个：优先存盘，其次兜底常量。"""
+    try:
+        return IME_STATE.read_text(encoding="utf-8").strip() or IME_USER
+    except OSError:
+        return IME_USER
+
+
+def _ime_restore_quietly() -> None:
+    """atexit 兜底：进程崩在广播中途也不能把用户的输入法留在 ADBKeyboard 上。"""
+    global _IME_HELD
+    if not _IME_HELD:
+        return
+    orig, _IME_HELD = _IME_HELD, ""
+    try:
+        if _ime_get().startswith("com.android.adbkeyboard"):
+            _ime_set(orig, wait=0)
+    except Exception:
+        pass
+
+
+atexit.register(_ime_restore_quietly)
+
+
+def do_ime(want: str = "adb") -> str:
+    """显式切输入法（长期停留，直到 restore）。ctext 不走这里——它用完即还。
+    切之前先把原输入法存盘，restore 才还得回去。"""
+    cur = _ime_get()
     if want in ("adb", "on"):
         if cur and "adbkeyboard" not in cur:
             IME_STATE.parent.mkdir(parents=True, exist_ok=True)
             IME_STATE.write_text(cur, encoding="utf-8")
         target = IME_ADB
     elif want in ("restore", "off"):
-        try:
-            target = IME_STATE.read_text(encoding="utf-8").strip() or IME_USER
-        except OSError:
-            target = IME_USER
+        target = _ime_peek_orig()
     else:
         target = want
-    sh("shell", "ime", "enable", target)
-    sh("shell", "ime", "set", target)
-    time.sleep(1.0)
-    _, now = sh("shell", "settings", "get", "secure", "default_input_method")
-    return f"输入法 {cur or '?'} → {now.strip()}"
+    now = _ime_set(target)
+    return f"输入法 {cur or '?'} → {now or '?'}"
 
 
 def do_ctext(text: str) -> str:
     """中文/emoji 输入。input text 只吃 ASCII，Unicode 走 ADBKeyboard 的广播通道。
-    远端 shell 会把参数再解析一次，所以带空格的文本得自己套上单引号。"""
-    _, cur = sh("shell", "settings", "get", "secure", "default_input_method")
-    note = ""
-    if "adbkeyboard" not in cur:
-        do_ime("adb")
-        note = "（已自动切到 ADBKeyboard）"
-    quoted = "'" + text.replace("'", "'\\''") + "'"
-    _, out = sh("shell", "am", "broadcast", "-a", "ADB_INPUT_TEXT", "--es", "msg", quoted)
-    ok = "result=0" in out
-    return f"{'✓' if ok else '✗'} 输入「{text}」{note}" + ("" if ok else f"（{out[:80]}）")
+    远端 shell 会把参数再解析一次，所以带空格的文本得自己套上单引号。
+    ADBKeyboard 只在广播那一瞬需要，用完立刻还回用户原来的输入法——
+    常驻会让手机上一敲键盘就是空的 ADB 输入框，等于把人家键盘搞坏了。"""
+    global _IME_HELD
+    cur = _ime_get()
+    orig = ""
+    mine = False                      # 只有本次自己借的才负责还；batch 己借的交给 batch 统一还
+    if _IME_HELD:
+        orig = _IME_HELD              # batch 已整批借走，本条不再反复切
+    elif "adbkeyboard" not in cur:
+        orig = cur or IME_USER
+        IME_STATE.parent.mkdir(parents=True, exist_ok=True)
+        IME_STATE.write_text(orig, encoding="utf-8")
+        if "adbkeyboard" not in _ime_set(IME_ADB, wait=0.6):
+            _ime_set(orig, wait=0)
+            return f"✗ 切不到 ADBKeyboard（当前 {cur or '?'}），已还原，中文输入失败"
+        _IME_HELD = orig
+        mine = True
+    try:
+        quoted = "'" + text.replace("'", "'\\''") + "'"
+        _, out = sh("shell", "am", "broadcast", "-a", "ADB_INPUT_TEXT",
+                    "--es", "msg", quoted)
+        ok = "result=0" in out
+    finally:
+        if mine:
+            _IME_HELD = ""
+            _ime_set(orig, wait=0)
+    back = "（输入法已还原）" if mine else ""
+    return f"{'✓' if ok else '✗'} 输入「{text}」{back}" + ("" if ok else f"（{out[:80]}）")
 
 
 SNAP = Path("/home/wxf/dabai/data/android/live.json")

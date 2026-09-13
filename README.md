@@ -40,6 +40,21 @@ npm install
 npm start
 ```
 
+### 服务托管与重启（本机实际部署方式）
+
+本机 server.py 由**系统级 systemd 单元** `myservice.service` 托管（`/etc/systemd/system/myservice.service`，`Restart=always` / 3s，enabled，另有 `10-recovery.conf`、`20-linux-native.conf`、`30-secrets.conf` 三个 drop-in 注入环境变量）。
+
+```bash
+tools/restart_server.sh              # 重启（委托 systemctl，再自检 + 落报告）
+tools/restart_server.sh --delay 20   # 延迟 20 秒动手（给发起方留收尾时间）
+tools/restart_server.sh --check      # 只体检不重启（rc=0 表示健康）
+journalctl -u myservice.service -f   # 日志在这里，不在文件里
+```
+
+重启结果落在 `data/restart_report.txt`：新 PID / 状态 / 监听端口 / `tools/reload_check.py` 的核心文件生效检查 / journal 末尾。
+
+两条经验（2026-09-13 实测）：① 不要自己 kill + spawn —— systemd 会在 3 秒后自己拉起，脚本再起的第二个实例只会 bind 失败；② 进程的 stdout 接的是 journald socket，所以「日志文件为空」不代表没日志，先看 `journalctl -u <unit>`。判断谁在托管只需一条命令：`cat /proc/<pid>/cgroup`。
+
 ## 📁 项目结构
 
 ```text

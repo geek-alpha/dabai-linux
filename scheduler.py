@@ -71,7 +71,7 @@ def list_jobs() -> list:
 
 
 def add_job(name: str, task: str, interval_sec: int,
-            enabled: bool = True) -> tuple:
+            enabled: bool = True, profile: str = "") -> tuple:
     """新增定时任务。返回 (job, error)。name 重复或参数非法时 error 非空。"""
     name = str(name or "").strip()
     task = str(task or "").strip()
@@ -95,6 +95,7 @@ def add_job(name: str, task: str, interval_sec: int,
         "task": task,
         "interval_sec": interval,
         "enabled": bool(enabled),
+        "profile": str(profile or "").strip(),   # 用哪个智能体档案跑（""=通用执行者）
         "next_run_at": now,           # 创建即触发第一次
         "running": False,
         "runs": 0,

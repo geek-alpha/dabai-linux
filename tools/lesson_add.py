@@ -15,7 +15,27 @@ from pathlib import Path
 
 BASE = Path(__file__).resolve().parent.parent
 FILE = BASE / "harness_task_memory.json"
-MAX_LESSONS = 60
+ARCHIVE = BASE / "harness_task_memory.archive.json"
+# 上限只防无限膨胀，不是价值判据：注入窗口由 agent.py:_gene_pick 的选择压力控制
+# （新近位 + 最少曝光优先），库容量不影响 prompt 质量，所以不拿新近度当淘汰标准。
+MAX_LESSONS = 500
+
+
+def _archive(texts):
+    """溢出条目归档而非蒸发：淘汰必须可见、可捞回。"""
+    if not texts:
+        return
+    try:
+        old = json.loads(ARCHIVE.read_text(encoding="utf-8"))
+    except Exception:
+        old = {}
+    keep = old.get("lessons") if isinstance(old, dict) else None
+    keep = [str(x) for x in keep] if isinstance(keep, list) else []
+    keep.extend(texts)
+    tmp = str(ARCHIVE) + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"lessons": keep}, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, ARCHIVE)
 
 
 def main() -> int:
@@ -33,12 +53,15 @@ def main() -> int:
         print(f"已存在（第 {ls.index(text) + 1} 条），未重复写入")
         return 0
     ls.insert(0, text)
+    dropped = ls[MAX_LESSONS:]
     ls = ls[:MAX_LESSONS]
+    _archive(dropped)
     tmp = str(FILE) + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump({"lessons": ls}, f, ensure_ascii=False, indent=1)
     os.replace(tmp, FILE)
-    print(f"已记录（共 {len(ls)} 条）：{text[:80]}")
+    tail = f"；已满 {MAX_LESSONS} 条，最老的 {len(dropped)} 条归档到 {ARCHIVE.name}" if dropped else ""
+    print(f"已记录（共 {len(ls)} 条）：{text[:80]}{tail}")
     return 0
 
 

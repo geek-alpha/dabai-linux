@@ -23,6 +23,7 @@ import logging
 import re
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
 logger = logging.getLogger("sub_agents")
@@ -47,6 +48,52 @@ MAX_ROUNDS = 0             # 单 worker 最大「思考+工具」轮次（0=不�
 MAX_RUNTIME = 2 * 60 * 60       # 单 worker 最长运行时间（秒），防悬挂（默认 2 小时）
 SUB_MAX_EST_TOKENS = 600000  # 单 worker 预估 token 预算（防烧钱），可经 settings.json -> agent.sub_max_est_tokens 覆盖
 _MAX_WORKERS = 120          # 注册表上限
+
+# 审计落盘：注册表在内存里，进程一重启就查不到 worker 干过什么（只剩产物文件 mtime 可反推）。
+_HIST_FILE = Path(__file__).resolve().parent / "data" / "sub_agents.jsonl"
+_HIST_MAX_BYTES = 2 * 1024 * 1024   # 超过就截断
+_HIST_KEEP = 200                    # 截断/回灌保留的条数
+
+
+def _hist_trim() -> None:
+    """文件超限时只保留最近 _HIST_KEEP 行，防无限增长。"""
+    try:
+        if _HIST_FILE.stat().st_size <= _HIST_MAX_BYTES:
+            return
+        keep = _HIST_FILE.read_text(encoding="utf-8").splitlines()[-_HIST_KEEP:]
+        _HIST_FILE.write_text("\n".join(keep) + "\n", encoding="utf-8")
+    except Exception as e:
+        logger.warning("[SubAgent] 审计截断失败: %s", e)
+
+
+def _hist_record(worker, event: str, note: str = "") -> None:
+    """把 worker 的一次状态变更追加进审计日志（data/sub_agents.jsonl）。
+
+    失败只告警、不抛——审计绝不能成为执行链路的故障源。
+    """
+    try:
+        rec = {
+            "id": worker.id,
+            "kind": worker.kind,
+            "title": worker.title,
+            "task": worker.task[:600],
+            "profile": worker.profile,
+            "status": worker.status,
+            "status_label": worker.status_label,
+            "event": event,
+            "note": note[:300],
+            "created_at": int(worker.created_at * 1000),
+            "updated_at": int(worker.updated_at * 1000),
+            "ts": time.time(),
+            "result": worker.result[-1500:],
+            "error": worker.error[:600],
+        }
+        _HIST_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with _HIST_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        _hist_trim()
+    except Exception as e:
+        logger.warning("[SubAgent] 审计落盘失败: %s", e)
 
 
 def _max_rounds() -> int:
@@ -342,6 +389,31 @@ class SubAgentManager:
         self._client_model = ""
         self._tools: Optional[list] = None
         self._tools_cache: dict[str, list] = {}   # 按档案 id 分组的过滤后工具集
+        self._history: list[dict] = []            # 重启前跑过的 worker（每个 id 只留最后一次状态）
+        self._load_history()
+
+    def _load_history(self) -> None:
+        """启动时回灌审计日志，让重启后仍能查到上一批 worker 干了什么。"""
+        try:
+            if not _HIST_FILE.exists():
+                return
+            latest: dict[str, dict] = {}
+            lines = _HIST_FILE.read_text(encoding="utf-8").splitlines()[-_HIST_KEEP * 3:]
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                wid = rec.get("id")
+                if wid:
+                    latest[wid] = rec
+            self._history = sorted(latest.values(), key=lambda r: r.get("ts", 0))
+            logger.info("[SubAgent] 回灌审计历史 %d 条", len(self._history))
+        except Exception as e:
+            logger.warning("[SubAgent] 审计历史读取失败: %s", e)
 
     def set_report_handler(self, handler) -> None:
         """设置「worker 完成/出错 → 反馈主智能体」的汇报回调（server 注入）。"""
@@ -377,6 +449,7 @@ class SubAgentManager:
         worker.watchdog = asyncio.ensure_future(self._watchdog(worker.id))
         worker.loop_task = asyncio.ensure_future(self._run(worker))
         logger.info("[SubAgent] 派出《%s》→ [%s]", worker.title, worker.id)
+        _hist_record(worker, "spawn")
         return worker
 
     def get(self, worker_id: str) -> Optional[SubAgent]:
@@ -389,7 +462,16 @@ class SubAgentManager:
     def list(self, limit: int = 80) -> list[dict]:
         ordered = sorted(self._workers.values(),
                          key=lambda w: w.created_at, reverse=True)
-        return [w.snapshot(full=False) for w in ordered[:limit]]
+        out = [w.snapshot(full=False) for w in ordered[:limit]]
+        if len(out) < limit:
+            seen = {w.id for w in self._workers.values()}
+            for rec in reversed(self._history):      # 历史按时间正序存，取最近的排前面
+                if len(out) >= limit:
+                    break
+                if rec.get("id") in seen:
+                    continue
+                out.append(dict(rec, restored=True))
+        return out
 
     def active_text(self, limit: int = 8) -> str:
         """给主智能体看的「正在干活的子进程」摘要（注入每轮对话动态状态）。"""
@@ -742,6 +824,7 @@ class SubAgentManager:
             if worker.watchdog is not None:
                 worker.watchdog.cancel()
             worker.cancelled = True
+            _hist_record(worker, "cancel", reason)
             return worker
 
     async def _finish(self, worker: SubAgent, status: str, *,
@@ -756,6 +839,7 @@ class SubAgentManager:
         if worker.watchdog is not None:
             worker.watchdog.cancel()
             worker.watchdog = None
+        _hist_record(worker, status)
         await self._mirror_finish(worker, status, result or error)
         await self._emit(status, worker)
         logger.info("[SubAgent] 「%s」→ %s", worker.title, worker.status_label)
@@ -782,6 +866,7 @@ class SubAgentManager:
     async def _set_status(self, worker: SubAgent, status: str) -> None:
         worker.status = status
         worker.updated_at = time.time()
+        _hist_record(worker, "status")
         await self._mirror_set_status(worker, status)
         await self._emit(status, worker)
 

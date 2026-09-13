@@ -24,8 +24,19 @@ norecursedirs = [
     "*.egg",
     "__pycache__",
     "audio_cache",
+    # data/ 是运行时产物 + 长跑引擎工作区，里面存着探针与干跑副本
+    # （如 self-evolution/dryrun/test_msg_chars.py 是脚本式断言，import 时直接
+    # sys.exit）。它们不是测试套的一部分，混进来会让「裸跑 pytest」以 SystemExit
+    # 中断收集、一个真测试都跑不到——与上面 mmd_tools_new 是同一类假警报。
+    "data",
 ]
 
 # 收集阶段不因单个模块导入失败而中断——一个坏模块不该挡住其余测试。
 # 兜底用：将来若又混进需要特殊运行时的目录，也不会再出现「全中断」。
 addopts = "--continue-on-collection-errors"
+
+# 测试套就是 tests/：裸跑 pytest 只该收集它。
+# tools/ 与 skills/ 下也散着 *_test.py，但那些是脚本式自测（顶层 sys.exit(0)），
+# 被收集会在导入阶段直接 SystemExit —— 那是 INTERNALERROR，不是收集错误，
+# 上面的 --continue-on-collection-errors 兜不住，整轮收集直接中断、一个真测试都跑不到。
+testpaths = ["tests"]

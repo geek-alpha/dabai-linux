@@ -17,6 +17,7 @@
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
@@ -28,6 +29,10 @@ from typing import Callable, Optional
 logger = logging.getLogger("hot_reload")
 
 BASE_DIR = Path(__file__).resolve().parent
+
+# 已加载快照落盘：供 tools/reload_check.py 判断「改动是否真进了运行中的进程」。
+# 不能拿进程启动时间当判据——自动重启走 os.execv 自替换，PID 与 starttime 都不变。
+LOADED_STATE_FILE = BASE_DIR / "data" / "hot_reload_state.json"
 
 POLL_INTERVAL = 1.0        # 目录扫描间隔（秒）
 SETTLE_TIME = 0.5          # 检测到变化后等待的稳定时间（防编辑器半写状态）
@@ -142,9 +147,10 @@ def _active_turns_running() -> bool:
         return False
 
 
-def _restart_process(changed_paths: list[Path], reason: str) -> None:
+def _restart_process(changed_paths: list[Path], reason: str) -> bool:
+    """Returns: True=已 execv 自替换（不返回）；False=语法检查未过，本次跳过。"""
     if not _safe_to_compile(changed_paths):
-        return
+        return False
     logger.warning("核心代码变化（%s）→ 自动重启服务进程…", reason)
     try:
         sys.stdout.flush()
@@ -162,6 +168,29 @@ def _restart_process(changed_paths: list[Path], reason: str) -> None:
                          cwd=str(BASE_DIR))
         os._exit(0)
     os.execv(sys.executable, [sys.executable, str(BASE_DIR / "server.py")])
+    return True  # 不可达：execv 成功即替换当前进程
+
+
+def _dump_loaded_state(core_snap: dict, ext_snap: dict) -> None:
+    """把「本进程启动时加载的代码版本」落盘，作为 reload_check 的生效判据。
+
+    只在守护启动时写一次：此刻快照 = 磁盘现状 = 进程刚 import 的版本。检测到 core
+    变化后虽然会更新内存快照，但那份改动还没进内存里的模块（重启才生效），跟着写
+    会把「未生效」记成「已生效」。
+    """
+    try:
+        LOADED_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "pid": os.getpid(),
+            "at": time.time(),
+            "core": {k: list(v) for k, v in core_snap.items()},
+            "ext": {k: list(v) for k, v in ext_snap.items()},
+        }
+        tmp = LOADED_STATE_FILE.with_name(LOADED_STATE_FILE.name + ".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, LOADED_STATE_FILE)
+    except Exception as e:
+        logger.warning("已加载快照落盘失败（不影响热更新）: %s", e)
 
 
 # ---------- 主循环 ----------
@@ -169,6 +198,7 @@ def _restart_process(changed_paths: list[Path], reason: str) -> None:
 def _watch_loop(on_ext_reload: Optional[Callable[[], None]]) -> None:
     core_snap = _snapshot(_scan_core())
     ext_snap = _snapshot(_scan_ext())
+    _dump_loaded_state(core_snap, ext_snap)
     while True:
         time.sleep(POLL_INTERVAL)
         try:
@@ -223,8 +253,11 @@ def _watch_loop(on_ext_reload: Optional[Callable[[], None]]) -> None:
                         break
                 names = ", ".join(sorted(p.name for p in changed_paths))
                 time.sleep(SETTLE_TIME)  # 等文件写入完成后再重启
-                _restart_process(sorted(changed_paths), names)
-                return  # 不会到达：execv 已替换当前进程
+                if _restart_process(sorted(changed_paths), names):
+                    return  # 不会到达：execv 已替换当前进程
+                # 语法没过：跳过本次，守护必须继续监听（文件改好后 mtime 变化会重新触发）。
+                # 这里直接 return 会让守护线程永久退出，之后所有核心改动静默不生效。
+                continue
 
             # 技能/插件变化 → 热重载（不重启）
             ext_new = _snapshot(_scan_ext())

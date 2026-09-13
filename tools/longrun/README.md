@@ -38,6 +38,8 @@
 ```sh
 # 手动看状态（轮次/预算/心跳/冷却/最近 5 轮）
 venv/bin/python tools/longrun/runner.py --status
+# 人话汇报（干了什么 / 产出在哪 / 要主人做什么）——给主人看的，不是给工程师看的
+venv/bin/python tools/longrun/runner.py --report
 # 只跑一轮 / 只看本轮会派什么
 venv/bin/python tools/longrun/runner.py --once
 venv/bin/python tools/longrun/runner.py --dry-run
@@ -56,6 +58,14 @@ journalctl --user-unit=dabai-longrun -f
 # 停 / 急停
 systemctl --user stop dabai-longrun.service
 touch data/longrun/STOP
+
+# 彻底关停（连看门狗一起，重启也不自启）
+systemctl --user disable --now dabai-longrun.service dabai-longrun-watchdog.timer
+# 恢复：disable 会把 symlink 删掉，所以先补回来再 enable
+ln -sf /home/wxf/dabai/deploy/systemd/dabai-longrun.service ~/.config/systemd/user/
+ln -sf /home/wxf/dabai/deploy/systemd/dabai-longrun-watchdog.timer ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now dabai-longrun.service dabai-longrun-watchdog.timer
 ```
 
 ## 五、文件
@@ -65,6 +75,7 @@ touch data/longrun/STOP
 | `tools/longrun/runner.py` | 主循环（stdlib only） |
 | `tools/longrun/watchdog.sh` | 心跳看门狗（心跳过期 → 重启服务） |
 | `data/longrun/journal.jsonl` | append-only 事件流（每轮一条，崩溃不丢） |
+| `data/longrun/report.md` | 给主人看的人话汇报（每轮重写，不是 append） |
 | `data/longrun/state.json` | checkpoint：轮次/连续失败/冷却/预算（原子写） |
 | `data/longrun/heartbeat` | 心跳时间戳（每 60s 刷） |
 | `data/longrun/STOP` | 急停闸（存在即停） |
@@ -80,3 +91,35 @@ venv/bin/python tools/long_horizon.py new <id> \
 
 `stage=active` 且 `next` 非空的目标才会被推；`next` 空了等于没想清下一步，引擎会跳过它——
 这是刻意的：宁可空转，不许瞎转。
+
+## 七、和发布闸门的关系（运维必读）
+
+引擎在干活时会**直接改工作区**（agent.py、tests/ 等），所以 `deploy/gitguard/safe-push.sh` 的
+「① 工作区必须干净」会拦住推送——这是对的，不该为了推而放宽闸门。
+要发布时的正确顺序：
+
+```sh
+systemctl --user stop dabai-longrun.service   # 先让引擎停下来（不杀正在跑的一轮）
+touch data/longrun/STOP                       # 再拉急停闸，防止被看门狗/重启拉起
+# 此时再审阅引擎产出的改动 → git add/commit → safe-push.sh
+rm data/longrun/STOP && systemctl --user start dabai-longrun.service   # 恢复长跑
+```
+
+## 八、汇报通道（主人 ↔ 引擎）
+
+引擎的产出以前只落在 `journal.jsonl` 和隔离工作区里：主人不看终端就永远不知道它干了什么、
+卡在哪。实测过最坏的一种——三个目标全卡在主人身上时，引擎安静空转了 27 轮，
+屏幕上一点提示都没有。这条通道把「引擎想说的话」搬到主人本来就会看的地方：
+
+| 方向 | 通道 | 看什么 |
+|---|---|---|
+| 引擎 → 主人 | `data/longrun/report.md` | 每轮结束自动重写：⚠ 等你决定 / 最近几轮干了什么 / 产出在哪 |
+| 引擎 → 主人 | 任务中心的「长跑引擎」条目 | 标题带 `⏳ 等你决定 N 件`，steps 首行列出卡点 |
+| 主人 → 引擎 | `long_horizon.py next/log/block/unblock` | 改接力棒、给证据、挂起或恢复目标 |
+
+汇报里唯一需要主人动手的是 **⚠ 等你决定** 一段，其余都是「知道一下」；
+空转 ≥3 轮会在汇报顶部直接标出来，不用主人自己去数。
+
+```sh
+venv/bin/python tools/longrun/runner.py --report   # 打印并顺手刷新 report.md
+```

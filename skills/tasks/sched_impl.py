@@ -68,15 +68,18 @@ async def sched_add(args: dict) -> str:
     interval_s, err = _parse_interval(args.get("interval"))
     if err:
         return "✘ " + err
+    profile = str(args.get("profile") or "").strip()
     job, err = add_job(name, task, interval_s,
-                       enabled=bool(args.get("enabled", True)))
+                       enabled=bool(args.get("enabled", True)), profile=profile)
     if err:
         return "✘ " + err
     return ("✔ 已创建定时任务《%s》[%s]\n"
             "  任务：%s\n"
+            "  执行者：%s\n"
             "  间隔：每 %d 秒执行一次（创建即触发第一次）\n"
             "  说明：由子智能体后台执行，完成后自动汇报；sched_list 可随时查看。"
-            % (job["name"], job["id"], job["task"][:200], job["interval_sec"]))
+            % (job["name"], job["id"], job["task"][:200],
+               profile or "通用执行者", job["interval_sec"]))
 
 
 async def sched_list(args: dict) -> str:
