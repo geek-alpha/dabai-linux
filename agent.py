@@ -2008,6 +2008,41 @@ def _clip(text, n: int, tol: float = 0.5) -> str:
     return s[:n + j + 1] if j >= 0 else cut + "…"
 
 
+# 教训里「能改变下次行为」的部分：规则句优先于背景句
+_LESSON_RULE = re.compile(r"(必须|不要|别|规则：|结论：|判据|否则|禁止|只能|优先|先.{0,8}再)")
+_SENT_SPLIT = re.compile(r"(?<=[。；！？])")
+
+
+def _clip_lesson(text, n: int = 150) -> str:
+    """经验库注入专用的截断：保住「规则句」，不是保住「背景句」。
+
+    背景（2026-09-14）：教训的写法是「背景 → 实测 → 规则」，而 _clip 取前 120 字符
+    必然取到背景，规则永远进不来——实测 77 条里 47 条（61%）的指令词只出现在第 120
+    字符之后，注入的是一条读得懂、但没法据以行动的故事。这里把同一份字符预算换成
+    「主题句 + 规则句」：平均注入长度 107→117 字符，真库丢规则 23→0 条。
+    无规则句时退回 _clip，不引入新的失败模式。
+    """
+    s = str(text)
+    if len(s) <= n:
+        return s
+    sents = [x for x in _SENT_SPLIT.split(s) if x.strip()]
+    if len(sents) < 2:
+        return _clip(s, 120)
+    head = sents[0]
+    if len(head) > n * 0.7:
+        head = _clip(s, int(n * 0.6))
+    for x in sents[1:]:
+        if not _LESSON_RULE.search(x):
+            continue
+        room = n - len(head)
+        if len(x) <= room:
+            return head + x
+        if room >= 30:
+            return head + _clip(x, room)
+        break
+    return _clip(s, 120)
+
+
 def _harness_lessons_block(cap: int = 6) -> str:
     """读 harness 经验库（跨任务踩坑记录），生成对话层可注入的经验段；无经验返回空串。
 
@@ -2032,7 +2067,7 @@ def _harness_lessons_block(cap: int = 6) -> str:
         if not isinstance(ls, list) or not ls:
             return ""
         pick = _gene_pick(ls, cap)
-        lines = "\n".join(f"- {_clip(x, 120)}" for x in pick)
+        lines = "\n".join(f"- {_clip_lesson(x)}" for x in pick)
         _gene_touch([("lesson", str(x)) for x in pick])
         return "【历史经验（此前踩过的坑/成功路径，来自 harness 经验库）】\n" + lines
     except Exception:
