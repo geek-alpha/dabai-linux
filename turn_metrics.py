@@ -58,6 +58,32 @@ def record(goal: str, metrics: dict) -> None:
     except Exception as e:
         logger.debug("轮次指标记录跳过: %s", e)
 
+ERR_TRACE_PATH = os.path.join(BASE_DIR, "data", "tool_err_trace.jsonl")
+
+
+def record_err(err_names, call_names=None, goal: str = "") -> None:
+    """工具报错轮次的长期流水——**不滚动**，与 turn_metrics 的 300 行窗口分开存。
+
+    为什么不能只靠 turn_metrics：那边 KEEP_LINES=300（实测 228 轮≈25 小时，即约
+    1.4 天）会把历史吃掉，而「某条教训写入之后同类错误还犯不犯」要的是跨周窗口，
+    滚动截断后无从对比。只在真有报错时写一行（实测 229 轮里 65 轮，约 28%）。
+    异常照旧吞掉——观测绝不能成为故障源。
+    """
+    try:
+        if not err_names:
+            return
+        row = {
+            "ts": time.time(),
+            "goal": (goal or "")[:60],
+            "err_names": list(err_names),
+            "call_names": list(call_names or []),
+        }
+        os.makedirs(os.path.dirname(ERR_TRACE_PATH), exist_ok=True)
+        with open(ERR_TRACE_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception as e:
+        logger.debug("工具报错流水记录跳过: %s", e)
+
 
 def load(limit: int = 0) -> list:
     """读回指标（默认全部）。损坏的行直接跳过，不抛异常。"""

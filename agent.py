@@ -4327,6 +4327,10 @@ class AIAgent:
         eff_img_ops = 0         # 本轮画图工具调用数（规则区「画图」埋点）
         eff_music_ops = 0       # 本轮 music_* 调用数（规则区「音乐」埋点）
         eff_delete_ops = 0      # 本轮删除类操作数（规则区「删除」埋点）
+        # 工具名级明细：只有次数时，106 次报错分不清是哪个工具、哪类错，
+        # 「教训写入之后同类错误还犯不犯」就无从对比。纯观测，不干预行为。
+        eff_call_names: list = []   # 本轮调用过的工具名（去重保序）
+        eff_err_names: list = []    # 本轮报错的工具名（同名错两次记两次）
         eff_seen: set = set()
         full_text = ""
         reasoning_all = ""  # 本轮累积的真实思维链（循环被强制停止时兜底生成正文）
@@ -4485,7 +4489,7 @@ class AIAgent:
             if tool_round <= 0:
                 return
             try:
-                from turn_metrics import record as _rec
+                from turn_metrics import record as _rec, record_err as _rec_err
                 _rec(message, {
                     "tool_rounds": tool_round,
                     "tool_calls": eff_tool_calls,
@@ -4513,6 +4517,8 @@ class AIAgent:
                     "llm_calls": rounds,
                     "cold_miss": max(0, first_miss),
                     "tool_chars": tool_chars,
+                    "call_names": eff_call_names,
+                    "err_names": eff_err_names,
                     "call_trace": call_trace,
                     "prefix": _prefix_rep,
                     # tools 排在请求最前面，它的大小与变化是命中率的第一个决定变量；
@@ -4523,6 +4529,9 @@ class AIAgent:
                     "tools_chars": _prefix_rep.get("tools_chars") or 0,
                     "seg": _seg,
                 })
+                # 报错轮额外落一条长期流水：turn_metrics 只留 300 行（≈1.4 天），
+                # 滚掉之后「教训写入后同类错误复发」就没法算了。
+                _rec_err(eff_err_names, eff_call_names, message)
                 # 本轮最后一次调用的消息指纹存盘，供下一轮比对断点（纯观测）
                 try:
                     import prefix_probe as _pp
@@ -4932,8 +4941,11 @@ class AIAgent:
                 yield ToolCallResult(tool_name=tool_name, result=result, success=success)
 
                 eff_tool_calls += 1
+                if tool_name not in eff_call_names:
+                    eff_call_names.append(tool_name)
                 if not success:
                     eff_tool_errors += 1
+                    eff_err_names.append(tool_name)
                 _kinds = _rule_op_kinds(
                     tool_name, cleaned_args if cleaned_args is not None else arguments)
                 eff_img_ops += _kinds[0]
@@ -5157,8 +5169,11 @@ class AIAgent:
                     yield ToolCallResult(tool_name=tool_name, result=result, success=success)
 
                     eff_tool_calls += 1
+                    if tool_name not in eff_call_names:
+                        eff_call_names.append(tool_name)
                     if not success:
                         eff_tool_errors += 1
+                        eff_err_names.append(tool_name)
                     _kinds = _rule_op_kinds(tool_name, arguments)
                     eff_img_ops += _kinds[0]
                     eff_music_ops += _kinds[1]
