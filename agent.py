@@ -107,6 +107,10 @@ HIST_VIEW_MAX_TOKENS = 16000
 MAX_ACTIVE_TOOLS = 200
 # 工具 schema 总字符上限（个数相同、描述膨胀同样烧钱）：tools 按字符计价，
 # 它又排在请求最前——所以「太重」得按字符量，而不是按工具个数。
+# token 当量：tools schema 密度 0.393 token/字符（三个 i=0 锚点两两联立，一致
+# 到 ±0.004），故 80k 字符 ≈ 31.4k token。实测模型 deepseek-flash 窗口 1M，
+# 占比 3.1%——上限无需动。别拿轮内 i>0 的点解密度：messages 会被短期窗口截断，
+# dc 虚高，解出的密度低到 0.18（真值 0.46）。
 MAX_ACTIVE_TOOLS_CHARS = 80000
 # 文本协议工具调用标记：本地模型（如 Ollama draganis/vanessa）不支持原生 function
 # calling 时，通过系统提示词注入工具说明，模型以 <tool_call>{...}</tool_call> 标记发起调用。
