@@ -1246,14 +1246,15 @@ def code_map(args: dict) -> str:
 # ---------- 批量编辑的支撑函数 ----------
 
 
-BACKUP_KEEP = 3
+BACKUP_KEEP = 1
 
 
 def _prune_backups(fp: Path, keep: int = BACKUP_KEEP) -> int:
     """同一文件的 .bak-<时间戳> 只留最近 keep 份，返回删掉的份数。
 
-    备份的价值是「改坏了好回滚」，只需要最近几份；无限累积会让工作区被几十份
-    全量副本淹没（实测 data/longrun/ws 里 46 份备份占了正式产物的 59%）。
+    备份只解决「刚改坏、还没提交，要撤回上一次」这一种情况，一份就够；
+    真正的回滚网是 git。留 3 份的代价实测是 143 个散落在 24 个源码目录里的
+    全量副本（都 gitignore、git 看不见，扫目录时极易当成源码）。
     只匹配 .bak-<纯数字>，引擎自定义的 .bak-r33 / .pre-apply-* 一律不碰。
     """
     pat = re.compile(re.escape(fp.name) + r"\.bak-(\d+)$")
