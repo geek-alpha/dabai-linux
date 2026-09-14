@@ -5288,11 +5288,13 @@ class AIAgent:
                     _res_text = tr.get("llm_result") or tr["result"]
                     _rc = len(str(_res_text))
                     tool_chars += _rc
-                    pending_chars += _rc
+                    # 前缀也是 prompt 的一部分：先拼 content 再取长度，改前缀不会再漏
+                    _content = f"【工具 {tr['name']} 已执行】结果：{_res_text}"
+                    pending_chars += len(_content)
                     messages.append({
                         "role": "system",
                         # llm_result 可能带「重复调用」提示；记忆库与前端仍用原样结果
-                        "content": f"【工具 {tr['name']} 已执行】结果：{_res_text}",
+                        "content": _content,
                     })
                     pending_chars += _append_img_messages(
                         messages, _img_marks(_res_text), tr.get("name") or "", _img_ok)
