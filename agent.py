@@ -4482,6 +4482,9 @@ class AIAgent:
         pending_chars = 0
         # 上次 LLM 调用时的 messages 长度：给 chars_raw 对账用
         _msg_mark = 0
+        # messages 全量字符数（增量维护）：chars_raw 是本次追加量，只有第 0 次
+        # 调用才是全量。拿 chars_raw 当换算比分母会得出 2~16 的假分布。
+        _msg_all = 0
         # 首次调用的 miss 单独记：它是「冷启动」（前缀全废，如刚重启/刚换模型），
         # 与「每轮新增内容」的稳态 miss 是两回事。不分开就只能看到一个被轮次
         # 长短污染的总体命中率——短轮次永远显得比长轮次差，无法横向对比。
@@ -4657,15 +4660,18 @@ class AIAgent:
                     # 非流式：resp.usage 天然可用，直接累计（含前缀缓存命中口径）
                     u = self._read_usage(resp)
                     if u:
+                        _raw = sum(_msg_prompt_chars(_m) for _m in messages[_msg_mark:])
                         call_trace.append({
                             "p": u[0],
                             "d": (u[0] - last_prompt) if last_prompt else 0,
                             # 实长对账：直接从 messages 切片求和，字段默认计入。
                             # 与 chars 不等 = 有字段没登记（图片走 token 当量，已知例外）
-                            "chars_raw": sum(_msg_prompt_chars(_m) for _m in messages[_msg_mark:]),
+                            "chars_raw": _raw,
+                            "chars_all": _msg_all + _raw,
                             "chars": pending_chars,
                         })
                         pending_chars = 0
+                        _msg_all += _raw
                         _msg_mark = len(messages)
                         rounds += 1
                         last_prompt = u[0]
@@ -4806,15 +4812,18 @@ class AIAgent:
                     # 部分 openai 版本的 AsyncStream 不暴露 .usage）
                     u = self._read_usage(last_usage)
                     if u:
+                        _raw = sum(_msg_prompt_chars(_m) for _m in messages[_msg_mark:])
                         call_trace.append({
                             "p": u[0],
                             "d": (u[0] - last_prompt) if last_prompt else 0,
                             # 实长对账：直接从 messages 切片求和，字段默认计入。
                             # 与 chars 不等 = 有字段没登记（图片走 token 当量，已知例外）
-                            "chars_raw": sum(_msg_prompt_chars(_m) for _m in messages[_msg_mark:]),
+                            "chars_raw": _raw,
+                            "chars_all": _msg_all + _raw,
                             "chars": pending_chars,
                         })
                         pending_chars = 0
+                        _msg_all += _raw
                         _msg_mark = len(messages)
                         rounds += 1
                         last_prompt = u[0]
