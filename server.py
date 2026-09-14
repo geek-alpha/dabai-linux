@@ -4588,6 +4588,9 @@ class WSState:
         self._last_proactive_speak: float = 0
         # RL 决策的快照间隔（秒），由快照间隔控制器学习得出（大厅/游戏共用）
         self._current_snapshot_interval: float = 30.0
+        # 执行中排队消息（FIFO）：AI 正在跑时用户输入不打断，先入队，
+        # 当前轮结束后自动续跑队首；元素为 (text, record_history, msg_source)
+        self.pending_messages: list = []
 
     def new_session(self) -> str:
         """开启新回复会话：把旧会话标记为取消，返回新 session_id。"""
@@ -4660,6 +4663,17 @@ def _is_resume_intent(text: str) -> bool:
     if t.startswith(_RESUME_PREFIX):
         return any(w in t for w in _RESUME_TASK_WORDS)
     return False
+
+
+_STOP_WORDS = {
+    "停止", "停", "停下", "停一下", "停停", "别说了", "闭嘴", "取消", "暂停",
+    "先停", "别干了", "别继续", "stop",
+}
+
+
+def _is_stop_word(text: str) -> bool:
+    """用户只发停止指令（exact match）→ 立即打断；「别停/继续」等不误伤。"""
+    return (text or "").strip().lower() in _STOP_WORDS
 
 
 async def handle_user_message_stream(ws: WebSocket, user_text: str, history: list,
@@ -5297,6 +5311,16 @@ async def _kickoff_response(ws: WebSocket, text: str, history: list, state: WSSt
     )
     # 登记为全局活跃轮：事件广播 + 进度缓冲，前端刷新重连可无缝接管
     _register_active_turn(state.active_task, sid, state, text, False)
+
+    def _drain_pending(_t):
+        # 本轮结束：若执行中收到过留言，自动续跑队首（FIFO），实现「插话不打断」
+        if not state.pending_messages:
+            return
+        nxt, rec, src = state.pending_messages.pop(0)
+        asyncio.create_task(
+            _kickoff_response(ws, nxt, history, state, allow_interrupt=True,
+                              record_history=rec, msg_source=src))
+    state.active_task.add_done_callback(_drain_pending)
     return True
 
 
@@ -5933,6 +5957,20 @@ async def websocket_endpoint(ws: WebSocket):
                     coord.settle_forced(AgentChoice.AI_AGENT, unified)
                 except Exception as e:
                     logger.warning(f"RL强制路由记录失败: {e}")
+                _ai_busy = (_turn_is_alive()
+                            or (state.active_task is not None
+                                and not state.active_task.done()))
+                if _ai_busy and _is_stop_word(text):
+                    state.pending_messages.clear()
+                    _cancel_active_turn()
+                    await safe_send_json(ws, {"type": "system_msg", "text": "⏹ 已停止"})
+                    continue
+                if _ai_busy:
+                    state.pending_messages.append((text, not ui_auto,
+                                                   "auto" if ui_auto else "chat"))
+                    await safe_send_json(ws, {"type": "system_msg",
+                        "text": f"⏳ 已记下你的话，这轮干完就接上（排队 {len(state.pending_messages)} 条）"})
+                    continue
                 await _kickoff_response(
                     ws, text, history, state, allow_interrupt=True,
                     record_history=not ui_auto,

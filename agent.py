@@ -4089,6 +4089,10 @@ class AIAgent:
                 "删除类动手前先列清单（路径+原因）让用户确认，确认后再删。"
                 "【默认倾向】意图不明时，默认你要的是我把东西做出来、不是一份说法："
                 "写/改代码、跑命令、查文件这类自己就能干又低风险的事，直接干，别停在方案层。\n"
+                "【交付即停】默认「一请求一交付」：把用户这句话对应的这件事做完、给出结论就停下等回应，"
+                "不要顺藤摸瓜把结论牵出的下一件事也自动做掉。「这件事做完了」的标准是用户的问题得到回答"
+                "或目标达成，不是「所有相关可能性都穷尽了」。只有用户明确说「全自动/别停/一直跑/继续挖/"
+                "撒手跑」这类话，才进入连续自主：一口气推进多个相关步骤不停。\n"
             )
 
         # 取材 Codex 官方 gpt_5_2_prompt.md 与 Claude Code 官方 system-prompts
@@ -5404,14 +5408,14 @@ class AIAgent:
             yield TextDelta(full_text)
             await self.memory.add_message("assistant", full_text, source=msg_source)
         elif full_text:
-            yield TextDelta("\n(已达到最大工具调用轮数)")
+            yield TextDelta("\n（本轮先交付到这里，说『继续』我接着往下做）")
             await self.memory.add_message("assistant", full_text)
         elif reasoning_all:
-            _tail = "（任务处理到最大步数，已停止；建议简化问题或换一种方法重试）"
+            _tail = "（本轮先交付到这里，说『继续』我接着往下做）"
             yield TextDelta(_tail)
             await self.memory.add_message("assistant", _tail)
         else:
-            yield TextDelta("（抱歉，处理超过最大步数，请简化问题重试）")
+            yield TextDelta("（本轮先交付到这里，说『继续』我接着往下做）")
 
         # 方法末尾兜底：即使没走"对话结束"分支也尽量发出用量事件
         if not usage_emitted and sum_total > 0:
