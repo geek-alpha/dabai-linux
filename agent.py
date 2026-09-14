@@ -579,6 +579,18 @@ def _append_img_messages(messages: list, marks: list, tool_name: str, img_ok: bo
     return added
 
 
+# 消息里「不算进 prompt 字符数」的框架字段白名单。
+# 反向白名单是刻意的：漏计过两次（reasoning_content、多模态图注），
+# 漏计的代价是上下文预算少算一大截且无任何报错。默认计入才让漏项不可能发生。
+_MSG_FRAMEWORK_KEYS = frozenset({"role", "tool_call_id", "name", "type"})
+
+
+def _msg_prompt_chars(msg: dict) -> int:
+    """单条消息进 prompt 的字符实长（不含 role/tool_call_id 等框架字段）。"""
+    return sum(len(str(v)) for k, v in msg.items()
+               if k not in _MSG_FRAMEWORK_KEYS and v is not None)
+
+
 def _strip_img_for_disk(messages: list) -> list:
     """落盘（断点）前剥掉 base64：一张图 14 万字符，写进断点文件纯浪费。
 
@@ -4468,6 +4480,8 @@ class AIAgent:
         # 若 Δ 明显大于追加内容所能解释的量，说明还有别的来源在每轮改写前缀。
         call_trace = []
         pending_chars = 0
+        # 上次 LLM 调用时的 messages 长度：给 chars_raw 对账用
+        _msg_mark = 0
         # 首次调用的 miss 单独记：它是「冷启动」（前缀全废，如刚重启/刚换模型），
         # 与「每轮新增内容」的稳态 miss 是两回事。不分开就只能看到一个被轮次
         # 长短污染的总体命中率——短轮次永远显得比长轮次差，无法横向对比。
@@ -4646,9 +4660,13 @@ class AIAgent:
                         call_trace.append({
                             "p": u[0],
                             "d": (u[0] - last_prompt) if last_prompt else 0,
+                            # 实长对账：直接从 messages 切片求和，字段默认计入。
+                            # 与 chars 不等 = 有字段没登记（图片走 token 当量，已知例外）
+                            "chars_raw": sum(_msg_prompt_chars(_m) for _m in messages[_msg_mark:]),
                             "chars": pending_chars,
                         })
                         pending_chars = 0
+                        _msg_mark = len(messages)
                         rounds += 1
                         last_prompt = u[0]
                         sum_prompt += u[0]
@@ -4791,9 +4809,13 @@ class AIAgent:
                         call_trace.append({
                             "p": u[0],
                             "d": (u[0] - last_prompt) if last_prompt else 0,
+                            # 实长对账：直接从 messages 切片求和，字段默认计入。
+                            # 与 chars 不等 = 有字段没登记（图片走 token 当量，已知例外）
+                            "chars_raw": sum(_msg_prompt_chars(_m) for _m in messages[_msg_mark:]),
                             "chars": pending_chars,
                         })
                         pending_chars = 0
+                        _msg_mark = len(messages)
                         rounds += 1
                         last_prompt = u[0]
                         sum_prompt += u[0]
