@@ -187,3 +187,41 @@ data/peer_cursor.json
 *.key
 *.srl
 *.csr
+
+# ── 凭证（绝不入仓）────────────────────────────────────────────────
+# 这三个是实打实的密钥/回调地址：X API 的 App Secret、企业微信机器人 webhook、
+# 服务端环境变量。之前全都没规则挡着，`git status -uall` 里明晃晃列着。
+tools/x_ip/x_credentials.json
+tools/x_ip/wecom_bot.json
+tools/x_ip/wecom_latest_response.json
+logs/.server_env
+
+# ── 运行时数据（每台实例自己的，靠更新器的经历保护，不靠 git）──────────
+tools/x_ip/x_ip.db
+tools/x_ip/push_queue/
+
+# ── 证书与部署材料（*.key/*.srl/*.csr 已有规则）────────────────────────
+# deploy/tls 整个目录都是 setup 脚本现场生成的产物，没有一个是源码。
+*.cnf
+*.ext
+/certs-new/
+/deploy/tls/
+
+# ── 编辑器/工具留下的备份与半成品 ────────────────────────────────────
+# agent.py.pre-sandbox 这类是改动前的快照，进仓只会让包变脏。
+*.pre-*
+*.bak-*
+*.orig
+
+# ── Windows 保留名写出来的垃圾文件 ──────────────────────────────────
+# 某次重定向到 NUL 在 Linux 侧落成了真文件，`git status` 里挂着两个。
+NUL
+nul
+
+# ── 设计过程素材（几十张预览图，不是运行时资源）──────────────────────
+# 白名单思路：web/icons/icon-*.png 与 setup-qr.png 是 PWA 真正引用的资源，
+# 必须入仓（实测 manifest.webmanifest / setup.html 引用）；根级这些 png 只是
+# 当时比稿用的截图，不进包。
+web/*.png
+web/_swprobe.html
+web/icons/_preview*.png
