@@ -26,6 +26,7 @@
 |---|---|
 | `peer_list` | 联邦点名：谁在线、各自负载/内存/温度/在线时长、能不能接电话 |
 | `peer_call` | **打电话**：发一句并当场等它回话（默认等 90 秒） |
+| `peer_task` | **派活**：让对面起一个后台子智能体真的去执行，干完把结论回你收件箱 |
 | `peer_say` | 异步留言：对方下次醒来才看到 |
 | `peer_inbox` | 读本实例收到的留言（读完自动标已读） |
 | `peer_state` | 只问一个实例的实时状态 |
@@ -60,6 +61,7 @@ python peer_watch.py --no-reply                  # 只响铃不回话
 | `kind=call` | 桌面通知 + 立刻回一句（对面正守着等） |
 | `kind=reply` | 只记日志，**绝不回话**（否则两个大白互相刷屏） |
 | `kind=say` | 桌面通知，不回话（留言就该是留言） |
+| `kind=task` | 桌面通知，不回话；`server.py` 那侧已把它变成一次性定时任务派给子智能体执行 |
 
 回话用的是**大白本体的 LLM 档位**（settings.json 当前激活供应商）配本机实时状态，
 所以「你那边怎么样」是真答得上来的。
@@ -72,6 +74,26 @@ python peer_watch.py --no-reply                  # 只响铃不回话
 为什么必须落盘：`server.py` 里 `import peer_watch` 拿到的是自己进程内的副本，
 内存变量在跨进程读时恒为 0 —— 表现为耳朵明明在跑，`state` 的 `ear` 却永远是 false。
 读侧（`local_state`）先信内存，再回退读心跳文件，两者都带 `max_age` 兜底。
+
+## 派活（kind=task）
+
+第一性原理：同伴要的不是「我替它跑命令」，是「让它那台的执行器动起来」。那台机器
+本来就有无人值守的执行入口 —— `scheduler.py` 每 15 秒从 `data/scheduled_tasks.json`
+重读一次，外部进程写进去就会被捡到。所以这里不新增执行通道，只把 task 消息翻译成
+一条一次性定时任务（`once=true`）。**耳朵照旧只响铃、不执行** —— shell 不进耳朵：
+联邦消息只凭密钥认证，给耳朵挂 shell 等于在链路上开一个「同伴说一句话就能在对面
+跑命令」的洞。
+
+三道闸门，按代价从低到高：
+
+| 闸门 | 行为 |
+|---|---|
+| 总开关 | `settings.json` → `peer.allow_remote_task`（缺省开）；关掉则一单不接 |
+| 危险模式 | `rm -rf` / `mkfs` / `dd of=/dev/` / `shutdown` / `curl…\|sh` / `chmod -R 777 /` 等**不可逆**动作命中即拒，只记录不执行 |
+| 配额 | 同一同伴每小时最多 6 单 —— 对方程序出错时不能变成刷屏 |
+
+被拦下的不占配额、不落单，全部写进 `data/peer_tasks.jsonl` 留痕。
+接单后子智能体干完，按任务里自带的要求把结论 `say` 回发起方收件箱。
 
 ## 协议
 
@@ -108,6 +130,9 @@ python peer_watch.py --no-reply                  # 只响铃不回话
 | `data/peer_cursor.json` | 大白的已读游标 |
 | `data/peer_watch_cursor.json` | **耳朵的**游标（独立！） |
 | `data/peer_watch.log` | 耳朵日志（超过 256KB 自动截尾） |
+| `data/peer_tasks.jsonl` | 派活审计：每条 task 的原文 + 结局（accepted / blocked / quota / ...） |
+| `data/peer_task_quota.json` | 派活配额：每同伴一小时的派单时刻表 |
+| `data/scheduled_tasks.json` | 接单后落的一次性任务（`once=true`，跑完自动退役） |
 
 两个游标必须分开：「大白自己读到哪」和「耳朵听到哪」是两件事，共用的话耳朵先听到
 就等于大白永远看不到这条消息。

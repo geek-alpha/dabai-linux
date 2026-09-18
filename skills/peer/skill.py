@@ -101,10 +101,31 @@ def peer_state(args: dict) -> str:
     return f"{node}：{_facts(r) or '（没读到任何指标）'}"
 
 
+def peer_task(args: dict) -> str:
+    """派活：对面起一个后台子智能体真去执行，不是回一句话。
+
+    和 peer_call 的分工：call 要的是「当场一句话」，task 要的是「动手做件事」。
+    """
+    node = str(args.get("node") or "").strip()
+    text = str(args.get("text") or "").strip()
+    if not node or not text:
+        return "需要 node（目标实例名）和 text（要它干的活）。先 peer_list 看有谁。"
+    r = peer_mesh.say(node, text, kind="task", timeout=15.0)
+    if not r.get("ok"):
+        known = r.get("known")
+        hint = f"（可用：{', '.join(known)}）" if known else ""
+        return f"没能派给 {node}：{r.get('error', '未知错误')}{hint}"
+    t = r.get("task") or {}
+    if t.get("ok"):
+        return f"已派给 {node}（单号 {t.get('job_id')}）—— 它后台跑，干完把结论回你收件箱。"
+    return f"{node} 收到了但没接单：{t.get('error', '未知原因')}"
+
+
 HANDLERS = {
     "peer_list": peer_list,
     "peer_say": peer_say,
     "peer_call": peer_call,
     "peer_inbox": peer_inbox,
     "peer_state": peer_state,
+    "peer_task": peer_task,
 }

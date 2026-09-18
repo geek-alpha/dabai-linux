@@ -71,8 +71,12 @@ def list_jobs() -> list:
 
 
 def add_job(name: str, task: str, interval_sec: int,
-            enabled: bool = True, profile: str = "") -> tuple:
-    """新增定时任务。返回 (job, error)。name 重复或参数非法时 error 非空。"""
+            enabled: bool = True, profile: str = "", once: bool = False) -> tuple:
+    """新增定时任务。返回 (job, error)。name 重复或参数非法时 error 非空。
+
+    once=True 是一次性任务（跑完自动 enabled=False）—— 联邦派活的载体：
+    同伴派来的活只需要跑一次，不能按 interval 反复触发。
+    """
     name = str(name or "").strip()
     task = str(task or "").strip()
     try:
@@ -96,6 +100,7 @@ def add_job(name: str, task: str, interval_sec: int,
         "interval_sec": interval,
         "enabled": bool(enabled),
         "profile": str(profile or "").strip(),   # 用哪个智能体档案跑（""=通用执行者）
+        "once": bool(once),
         "next_run_at": now,           # 创建即触发第一次
         "running": False,
         "runs": 0,
@@ -174,6 +179,8 @@ def record_result(job_id: str, ok: bool, result: str = "") -> bool:
         return False
     now = time.time()
     hit["running"] = False
+    if hit.get("once"):
+        hit["enabled"] = False      # 一次性任务跑完即退役，不留在列表里被下个周期再触发
     hit["runs"] = int(hit.get("runs") or 0) + 1
     hit["last_result"] = str(result or "")[:600]
     hit["last_error"] = "" if ok else str(result or "")[:300]

@@ -27,6 +27,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import socket
 import time
@@ -44,6 +45,8 @@ PEERS_FILE = DATA_DIR / "peers.json"
 INBOX_FILE = DATA_DIR / "peer_inbox.jsonl"
 CURSOR_FILE = DATA_DIR / "peer_cursor.json"
 WATCH_CURSOR_FILE = DATA_DIR / "peer_watch_cursor.json"
+TASK_LOG_FILE = DATA_DIR / "peer_tasks.jsonl"
+TASK_QUOTA_FILE = DATA_DIR / "peer_task_quota.json"
 
 TS_WINDOW = 300          # 签名时间窗（秒）：足够容忍时钟漂移，又不足以让抓包重放
 PROBE_TIMEOUT = 6.0      # 单实例探测超时
@@ -251,6 +254,131 @@ def _tail(n: int = 50) -> List[Dict[str, Any]]:
     return out
 
 
+# ---------- 联邦派活（kind=task） ----------
+# 第一性原理：同伴要的不是「我替它跑命令」，是「让它那台的执行器动起来」。
+# 那台机器本来就有无人值守的执行入口 —— scheduler 每 15 秒从 scheduled_tasks.json
+# 重读一次，外部进程写进去就会被捡到。所以这里不新增执行通道，只把 task 消息
+# 翻译成一条一次性定时任务。耳朵照旧只响铃、不执行，shell 不进耳朵。
+
+TASK_QUOTA_PER_HOUR = 6        # 每同伴每小时最多接几单：对方程序出错时不能变成刷屏
+TASK_CHAR_CAP = 2000
+TASK_INTERVAL_SEC = 86400      # 一次性任务的占位间隔，跑完即 enabled=False
+
+# 命中即不自动执行，转人工确认。只拦「不可逆」这一类，普通读写/查询不拦 ——
+# 拦得太宽等于这个能力没用；拦得住手滑和不可逆，才是它存在的理由。
+_DANGEROUS = (
+    r"rm\s+-[a-z]*[rf]",
+    r"\bmkfs",
+    r"\bdd\b[^\n]*of=/dev/",
+    r"\b(shutdown|reboot|poweroff|halt)\b",
+    r">\s*/dev/(sd|nvme|mmcblk)",
+    r":\(\)\s*\{",
+    r"(curl|wget)[^\n|]*\|\s*(ba|z)?sh",
+    r"chmod\s+-R\s+777\s+/",
+    r"\b(userdel|groupdel|passwd)\b",
+    r">\s*/etc/",
+)
+_DANGEROUS_RE = re.compile("|".join(_DANGEROUS), re.I)
+
+
+def task_gate_enabled() -> bool:
+    """settings.json → peer.allow_remote_task。读不到按开处理（联邦本身就是「有密钥就能进」）。"""
+    try:
+        d = json.loads((BASE_DIR / "settings.json").read_text(encoding="utf-8"))
+        v = (d.get("peer") or {}).get("allow_remote_task")
+        return True if v is None else bool(v)
+    except (OSError, ValueError, AttributeError):
+        return True
+
+
+def dangerous_in(text: str) -> str:
+    """返回命中的危险模式（空串=安全）。"""
+    m = _DANGEROUS_RE.search(text or "")
+    return m.group(0) if m else ""
+
+
+def _quota_take(frm: str) -> bool:
+    """记账并判断配额。整文件读改写：全集群就三台机器，不值得上锁。"""
+    now = time.time()
+    try:
+        d = json.loads(TASK_QUOTA_FILE.read_text(encoding="utf-8"))
+        d = d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        d = {}
+    recent = [float(t) for t in (d.get(frm) or []) if now - float(t) < 3600]
+    ok = len(recent) < TASK_QUOTA_PER_HOUR
+    d[frm] = recent + ([now] if ok else [])
+    _atomic_write(TASK_QUOTA_FILE, json.dumps(d, ensure_ascii=False, indent=2))
+    return ok
+
+
+def _audit_task(row: Dict[str, Any]) -> None:
+    try:
+        TASK_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(TASK_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def _task_brief(frm: str, text: str) -> str:
+    return (
+        f"【跨机联邦委派 · 来自同伴 {frm}】\n{text}\n\n"
+        f"要求：\n"
+        f"- 这是另一台机器上的你自己派来的活，不是用户的请求；能自己查就自己查，别反问\n"
+        f"- 干完用一句话回报发起方：python peer_mesh.py say {frm} \"<结论>\"\n"
+        f"- 不可逆动作照旧先问用户，别因为「是同伴派的」就跳过确认"
+    )
+
+
+def accept_task(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """把一条 kind=task 消息翻译成一次性定时任务。任何失败都返回 dict，绝不抛异常。
+
+    三道闸门按「代价从低到高」排：开关 → 危险模式 → 配额，全过才派单。
+    """
+    frm = str(entry.get("from") or "?")
+    text = str(entry.get("text") or "").strip()[:TASK_CHAR_CAP]
+    row: Dict[str, Any] = {"ts": int(time.time()), "from": frm, "text": text[:400]}
+
+    if not text:
+        row["result"] = "empty"
+        _audit_task(row)
+        return {"ok": False, "error": "空任务"}
+    if not task_gate_enabled():
+        row["result"] = "disabled"
+        _audit_task(row)
+        return {"ok": False, "error": "本机已关掉联邦派活（settings.json → peer.allow_remote_task=false）"}
+    bad = dangerous_in(text)
+    if bad:
+        row["result"] = "blocked"
+        row["reason"] = bad
+        _audit_task(row)
+        return {"ok": False, "blocked": True, "error": f"含不可逆动作「{bad}」，已拦下、没有自动执行"}
+    if not _quota_take(frm):
+        row["result"] = "quota"
+        _audit_task(row)
+        return {"ok": False, "error": f"{frm} 一小时内已派满 {TASK_QUOTA_PER_HOUR} 单，这条只记录不执行"}
+
+    try:
+        from scheduler import add_job
+        job, err = add_job(name=f"联邦·{frm}·{int(time.time())}·{secrets.token_hex(3)}",
+                           task=_task_brief(frm, text),
+                           interval_sec=TASK_INTERVAL_SEC, once=True)
+    except Exception as e:
+        job, err = None, f"{type(e).__name__}: {e}"
+    if not job:
+        row["result"] = "dispatch_failed"
+        row["reason"] = str(err)
+        _audit_task(row)
+        return {"ok": False, "error": f"派发失败：{err}"}
+
+    row["result"] = "accepted"
+    row["job_id"] = str(job.get("id"))
+    _audit_task(row)
+    return {"ok": True, "job_id": str(job.get("id")),
+            "note": "已接单：子智能体后台执行，干完回你收件箱"}
+
+
 # ---------- 本机状态 ----------
 
 def _read_first(paths: List[str]) -> Optional[str]:
@@ -367,7 +495,10 @@ async def peer_say(request: Request):
         except (TypeError, ValueError):
             pass
     append_inbox(entry)
-    return {"ok": True, "delivered": True, "at": entry["ts"]}
+    out: Dict[str, Any] = {"ok": True, "delivered": True, "at": entry["ts"]}
+    if entry["kind"] == "task":
+        out["task"] = accept_task(entry)
+    return out
 
 
 @router.post("/inbox")
