@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><title>Silero 判停探针</title></head>
+<body>
+<pre id="log">loading…</pre>
+<script type="module">
+const log = (s) => { document.getElementById('log').textContent += '\n' + s; };
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+async function loadAt48k(url) {
+  const buf = await (await fetch(url)).arrayBuffer();
+  const ctx = new OfflineAudioContext(1, 48000, 48000);
+  const ab = await ctx.decodeAudioData(buf);
+  return ab.getChannelData(0);
+}
+
+async function main() {
+  const mod = await import('/static/js/core/12b_silero_vad.ts');
+  const App = {};
+  mod.default(App);
+  App.sileroVadInit();
+  const t0 = performance.now();
+  while (!App.sileroVadReady() && performance.now() - t0 < 90000) await sleep(100);
+  if (!App.sileroVadReady()) { window.__result = { error: 'model not ready' }; log('未就绪'); return; }
+
+  const sig = await loadAt48k('/static/_silero_speech.mp3');
+  const frame = (k) => sig.subarray(k * 2048, (k + 1) * 2048);
+
+  // 第一遍：全量喂，定位最后一个「人声」帧（mp3 尾部有静音尾巴，不能拿它当过渡点）
+  const probs = [];
+  for (let i = 0; i + 2048 <= sig.length; i += 2048) {
+    App.sileroVadPush(sig.subarray(i, i + 2048), 48000);
+    await sleep(43);
+    probs.push(App.sileroVadProb());
+  }
+  let lastVoiced = -1;
+  for (let k = 0; k < probs.length; k++) if (probs[k] >= 0.5) lastVoiced = k;
+
+  // 第二遍：重置状态，喂到人声末尾立刻切静音，测「说完 → 判停」延迟
+  App.sileroVadReset();
+  await sleep(200);
+  let voiceAtSpeechEnd = null, probAtSpeechEnd = -1;
+  for (let k = 0; k <= lastVoiced; k++) {
+    App.sileroVadPush(frame(k), 48000);
+    await sleep(43);
+    if (k === lastVoiced) { voiceAtSpeechEnd = App.sileroVadIsVoice(); probAtSpeechEnd = App.sileroVadProb(); }
+  }
+
+  const silence = new Float32Array(2048);
+  let firstFalseMs = -1, falseProb = -1;
+  const tSil = performance.now();
+  for (let k = 0; k < 70; k++) {
+    App.sileroVadPush(silence, 48000);
+    await sleep(43);
+    if (firstFalseMs < 0 && App.sileroVadIsVoice() === false) {
+      firstFalseMs = performance.now() - tSil;
+      falseProb = App.sileroVadProb();
+    }
+  }
+
+  // B) 判停时长档位：神经可用 vs 不可用
+  let neuralMs = -1, legacyMs = -1;
+  try {
+    const vadMod = await import('/static/js/core/12_vad_auto.ts');
+    const A2 = { sileroVadReady: () => true, VAD_SILENCE_MS: 1200 };
+    vadMod.default(A2);
+    neuralMs = A2.vadGetSilenceMs();
+    const A3 = { sileroVadReady: () => false, VAD_SILENCE_MS: 1200 };
+    vadMod.default(A3);
+    legacyMs = A3.vadGetSilenceMs();
+  } catch (e) {
+    log('vad_auto 加载失败: ' + e);
+  }
+
+  window.__result = {
+    frames: probs.length,
+    lastVoicedFrame: lastVoiced,
+    voicedRatio: +(probs.filter((p) => p >= 0.5).length / probs.length).toFixed(2),
+    probAtSpeechEnd: +probAtSpeechEnd.toFixed(3),
+    voiceAtSpeechEnd,
+    silenceToFalseMs: +firstFalseMs.toFixed(0),
+    falseProb: +falseProb.toFixed(3),
+    silenceMsNeural: neuralMs,
+    silenceMsLegacy: legacyMs,
+    cutLatencyNeuralMs: firstFalseMs < 0 ? -1 : Math.round(firstFalseMs + neuralMs),
+  };
+  log('DONE ' + JSON.stringify(window.__result));
+}
+main().catch((e) => { window.__result = { error: String(e) }; log('ERROR ' + e); });
+</script>
+</body>
+</html>

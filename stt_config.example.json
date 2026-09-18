@@ -2,6 +2,7 @@
   "provider": "auto",
   "api_url": "",
   "api_key": "",
-  "model": "FunAudioLLM/SenseVoiceSmall",
-  "api_timeout": 6
+  "model": "XingChenAGI/XingChenASR-V3.2",
+  "fallback_models": ["Qwen/Qwen3-ASR-1.7B"],
+  "api_timeout": 10
 }

@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><title>Silero VAD 探针</title></head>
+<body>
+<pre id="log">loading…</pre>
+<script type="module">
+const log = (s) => { document.getElementById('log').textContent += '\n' + s; };
+const SR = 16000, CHUNK = 512, CTX = 64;
+
+function noise(sec) {
+  const n = SR * sec, a = new Float32Array(n);
+  for (let i = 0; i < n; i++) a[i] = (Math.random() * 2 - 1) * 0.12;
+  return a;
+}
+function tone(sec, f) {
+  const n = SR * sec, a = new Float32Array(n);
+  for (let i = 0; i < n; i++) a[i] = Math.sin(2 * Math.PI * f * i / SR) * 0.3;
+  return a;
+}
+function silence(sec) { return new Float32Array(SR * sec); }
+// 类语音：F0=120Hz 谐波 + 共振峰包络 + 4Hz 音节调幅
+function speechLike(sec) {
+  const n = SR * sec, a = new Float32Array(n);
+  const F = [[700, 1.0, 110], [1220, 0.6, 160], [2600, 0.35, 220]];
+  for (let i = 0; i < n; i++) {
+    const t = i / SR;
+    let s = 0;
+    for (let h = 1; h * 120 < 4000; h++) {
+      const f = h * 120;
+      let amp = 0;
+      for (const [fc, g, bw] of F) amp += g / (1 + Math.pow((f - fc) / bw, 2));
+      s += amp * Math.sin(2 * Math.PI * f * t + h);
+    }
+    const env = 0.55 + 0.45 * Math.sin(2 * Math.PI * 4 * t);
+    a[i] = (s * 0.08 + (Math.random() * 2 - 1) * 0.005) * env;
+  }
+  return a;
+}
+
+// 浏览器解码真人声 mp3 → 16k 单声道
+async function loadMp3(url) {
+  const buf = await (await fetch(url)).arrayBuffer();
+  const ctx = new AudioContext();
+  const ab = await ctx.decodeAudioData(buf);
+  const ch = ab.getChannelData(0);
+  const ratio = ab.sampleRate / SR;
+  const n = Math.round(ch.length / ratio);
+  const out = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const pos = i * ratio, i0 = pos | 0, f = pos - i0;
+    const a = ch[i0] || 0;
+    const b = i0 + 1 < ch.length ? ch[i0 + 1] : a;
+    out[i] = a + (b - a) * f;
+  }
+  return out;
+}
+
+async function main() {
+  const ort = await import('/static/vendor/onnxruntime-web/ort.min.mjs');
+  ort.env.wasm.wasmPaths = '/static/vendor/onnxruntime-web/';
+  ort.env.wasm.numThreads = 1;
+  ort.env.logLevel = 'error';
+  const t0 = performance.now();
+  const sess = await ort.InferenceSession.create('/static/vendor/silero/silero_vad.onnx', { executionProviders: ['wasm'] });
+  const loadMs = Math.round(performance.now() - t0);
+  log('模型加载 ' + loadMs + 'ms; inputs=' + sess.inputNames + ' outputs=' + sess.outputNames);
+
+  async function run(sig) {
+    let state = new Float32Array(2 * 128);
+    let ctx = new Float32Array(CTX);
+    const probs = [];
+    let inferMs = 0;
+    for (let i = 0; i + CHUNK <= sig.length; i += CHUNK) {
+      const input = new Float32Array(CTX + CHUNK);
+      input.set(ctx, 0);
+      input.set(sig.subarray(i, i + CHUNK), CTX);
+      const t = performance.now();
+      const out = await sess.run({
+        input: new ort.Tensor('float32', input, [1, CTX + CHUNK]),
+        state: new ort.Tensor('float32', state, [2, 1, 128]),
+        sr: new ort.Tensor('int64', BigInt64Array.from([16000n]), []),
+      });
+      inferMs += performance.now() - t;
+      probs.push(out[sess.outputNames[0]].data[0]);
+      state = out[sess.outputNames[1]].data;
+      ctx = input.subarray(CHUNK);
+    }
+    const avg = probs.reduce((a, b) => a + b, 0) / probs.length;
+    const max = Math.max.apply(null, probs);
+    const voiced = probs.filter(v => v >= 0.5).length / probs.length;
+    return { frames: probs.length, avg: +avg.toFixed(3), max: +max.toFixed(3), voicedRatio: +voiced.toFixed(2), msPerFrame: +(inferMs / probs.length).toFixed(2), first8: probs.slice(0, 8).map(v => +v.toFixed(2)) };
+  }
+
+  const realSpeech = await loadMp3('/static/_silero_speech.mp3');
+  log('真人声样本 ' + (realSpeech.length / SR).toFixed(2) + 's');
+  const res = {};
+  for (const [name, sig] of [['silence', silence(1)], ['whiteNoise', noise(1)], ['tone440', tone(1, 440)], ['speechLike', speechLike(1.5)], ['realSpeech', realSpeech]]) {
+    res[name] = await run(sig);
+    log(name + ' → ' + JSON.stringify(res[name]));
+  }
+  window.__result = { loadMs, res };
+  log('DONE');
+}
+main().catch(e => { window.__result = { error: String(e) }; log('ERROR ' + e); });
+</script>
+</body>
+</html>

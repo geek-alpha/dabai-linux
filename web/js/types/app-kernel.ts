@@ -1091,6 +1091,13 @@ export interface AppKernel {
   vadIsHumanVoice: () => boolean;
   vadResetVoiceEma: () => void;
   vadGetConfirmMs: (vol: number) => number;
+  /* ---------- 神经 VAD（12b_silero_vad 挂载） ---------- */
+  sileroVadInit: () => void;
+  sileroVadReady: () => boolean;
+  sileroVadProb: () => number;
+  sileroVadIsVoice: () => boolean | null;
+  sileroVadPush: (samples: Float32Array, rate: number) => void;
+  sileroVadReset: () => void;
   vadGetSilenceMs: () => number;
   vadGetVolume: () => number;
   startVADRecording: () => void;

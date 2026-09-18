@@ -23,6 +23,13 @@ export default (function init(App: AppKernel) {
   const VAD_SILENCE_MID_MS = 800;           // 中等长度（1.2~6s）：有预滚回溯兜底后可收紧，结尾不再拖沓
   const VAD_SILENCE_LONG_MS = 700;          // 长句（>6s）：说话越久意图越明确，快速切出
   const VAD_SILENCE_MID_BOUND_MS = 6.0 * 1000; // 中/长句分界
+  // 神经 VAD 判停档：Silero 直接回答「还有没有人在说」。
+  // 小智服务端同款内核默认 200ms，那是设备端 Opus 直连、无需考虑浏览器上传链路；
+  // 真人说话的句内自然停顿（换气、想词）实测可达 0.4~0.8s，阈值取 900~1200ms 留足余量，
+  // 否则会在句中切断，把一句话拆成两段识别。
+  const VAD_SILENCE_NEURAL_SHORT_MS = 1200;
+  const VAD_SILENCE_NEURAL_MID_MS = 1000;
+  const VAD_SILENCE_NEURAL_LONG_MS = 900;
   const VAD_SPEECH_DECAY = 0.997;            // 语音水平每帧衰减（约 4s 回落到 30%）
   const VAD_SILENCE_RATIO = 0.30;            // 静音判定 = 语音水平 × 此比例（相对阈值）
   const VAD_MAX_RECORD_MS = 30000;           // 录音上限（防噪声环境永远切不断）
@@ -85,6 +92,9 @@ export default (function init(App: AppKernel) {
   /** 综合判断当前是否为"人声"：能量达标 + 语音特性评分达标 */
   App.vadIsHumanVoice = function vadIsHumanVoice() {
     if (!App.VAD_VOICE_ENABLED) return true; // 关闭过滤 = 原逻辑（仅能量）
+    // 神经 VAD 优先：Silero 对稳态噪声（空调/键盘/音乐）的判别力远超频谱启发式
+    const neural = App.sileroVadIsVoice();
+    if (neural !== null) return neural;
     const score = App.vadIsVoice();
     // 不对称 EMA：人声一来快速上升（缩短确认时间），噪声走后缓慢回落（防误判）
     const alpha = score > vadVoiceEma ? VAD_VOICE_EMA_ATTACK : VAD_VOICE_EMA_RELEASE;
@@ -101,8 +111,14 @@ export default (function init(App: AppKernel) {
 
   /** 自适应静音超时：短句宽容（防切断），长句适度快速切出（提速） */
   App.vadGetSilenceMs = function vadGetSilenceMs() {
-    if (!vadRecordStart) return App.VAD_SILENCE_MS;
+    const neural = App.sileroVadReady();
+    if (!vadRecordStart) return neural ? VAD_SILENCE_NEURAL_SHORT_MS : App.VAD_SILENCE_MS;
     const dur = performance.now() - vadRecordStart;
+    if (neural) {
+      if (dur < VAD_SILENCE_SHORT_MS) return VAD_SILENCE_NEURAL_SHORT_MS;
+      if (dur < VAD_SILENCE_MID_BOUND_MS) return VAD_SILENCE_NEURAL_MID_MS;
+      return VAD_SILENCE_NEURAL_LONG_MS;
+    }
     if (dur < VAD_SILENCE_SHORT_MS) return App.VAD_SILENCE_MS;
     if (dur < VAD_SILENCE_MID_BOUND_MS) return VAD_SILENCE_MID_MS;
     return VAD_SILENCE_LONG_MS;
@@ -148,6 +164,7 @@ export default (function init(App: AppKernel) {
       const node = ctx.createScriptProcessor(2048, 1, 1);
       node.onaudioprocess = (e: AudioProcessingEvent) => {
         const inp = e.inputBuffer.getChannelData(0);
+        App.sileroVadPush(inp, vadPcmRate);
         if (!vadPreRoll) return;
         const capN = vadPreRoll.length;
         const first = Math.min(inp.length, capN - vadPreRollWrite);
@@ -299,6 +316,8 @@ export default (function init(App: AppKernel) {
     src.connect(App.vadAnalyser);
     // 常驻 PCM 采集 + 预滚环形缓冲：让"开头"在检测到人声之前就已经被录下来
     startVADPCMCapture(src);
+    // 神经 VAD（Silero）后台加载：加载完成前由频谱启发式顶着，不阻塞自动对话
+    App.sileroVadInit();
     vadEmaVol = 0;
     vadVoiceEma = 0; // 重置语音特性评分
     vadNoiseFloor = 0; // 重置噪声底
@@ -564,7 +583,14 @@ App.vadLoop = function vadLoop() {
       // 判停阈值再与"噪声底附近"取大：环境噪声较大时，噪声本身就会把音量顶在
       // silThr 之上导致永远录不完（直到 30s 上限），此时以噪声底为基准判定停顿
       const pauseThr = Math.max(silThr, vadNoiseFloor * 1.25);
-      if (vol < pauseThr) {
+      // 判停内核走神经 VAD（同小智）：它直接回答「还有没有人在说」，不受麦克风增益、
+      // 峰值保持衰减（vadSpeechLevel 需 ~6s 才回落到 30%）影响——旧逻辑正是「话说完半天切不断」的根因。
+      // 神经可用时以它为准；音量条件只在神经不可用时兜底。二者曾用 || 并联，
+      // 导致神经判定「还在说话」却被音量单方面掐断——句中轻声/换气正是这样被切成两段的。
+      const quiet = App.sileroVadReady()
+        ? App.sileroVadIsVoice() === false
+        : vol < pauseThr;
+      if (quiet) {
         if (App.vadSilenceStart === 0) App.vadSilenceStart = now;
         if (now - App.vadSilenceStart > App.vadGetSilenceMs()) {
           App.stopVADRecording();
@@ -709,6 +735,7 @@ App.vadLoop = function vadLoop() {
     vadVoiceEma = 0; // 重置语音特性评分，避免把 AI 自己的尾音当用户人声
     vadNoiseFloor = 0; // 重置噪声底，重新适应当前环境
     vadSpeechLevel = 0;
+    App.sileroVadReset(); // LSTM 状态里可能残留 AI 尾音，重置后再判人声
     // 丢弃残留的半截 PCM 录音，避免把 AI 尾音/静音尾巴拼进下一句开头
     vadPcmActive = false;
     vadPcmUsePcm = false;

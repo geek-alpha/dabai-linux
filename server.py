@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -29,6 +30,7 @@ import tempfile
 import threading
 import time
 import uuid
+import wave
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Callable, List, Optional
@@ -1384,6 +1386,16 @@ def _is_valid_audio(path: str) -> bool:
         return False
 
 
+def _is_16k_mono_pcm_wav(path: str) -> bool:
+    """判断文件是否已是 16k 单声道 16bit PCM WAV（ffmpeg 缺失时可直通给 STT）。"""
+    try:
+        with wave.open(path, "rb") as w:
+            return (w.getframerate() == 16000 and w.getnchannels() == 1
+                    and w.getsampwidth() == 2 and w.getcomptype() == "NONE")
+    except Exception:
+        return False
+
+
 def _mime_to_ext(mime_type: str) -> str:
     """将 MIME 类型映射为文件扩展名。
 
@@ -1455,6 +1467,16 @@ def convert_to_wav(input_path: str, output_path: str, noise_reduction: bool = Fa
     # 预处理：检查文件是否是常见音频格式
     if not _is_valid_audio(input_path):
         print(f"[ffmpeg] 跳过无效音频文件: {os.path.getsize(input_path)} 字节")
+        return False
+
+    # ffmpeg 缺失时不能让整条 STT 链路哑掉：前端 PCM 路径传来的本就是
+    # 16k 单声道 16bit WAV，可直接交给识别接口
+    if not shutil.which("ffmpeg"):
+        if _is_16k_mono_pcm_wav(input_path):
+            print("[ffmpeg] 未安装，输入已是 16k 单声道 PCM WAV → 直通")
+            shutil.copyfile(input_path, output_path)
+            return True
+        print("[ffmpeg] 未安装且输入不是 16k 单声道 PCM WAV，无法转码")
         return False
 
     # 注意 stop_periods 必须为 -1（去掉全部结尾静音）。
@@ -1572,10 +1594,10 @@ DEFAULT_STT_CONFIG = {
     "provider": "auto",                       # auto=云端优先，失败自动重试 | cloud=仅云端单次
     "api_url": "https://api.siliconflow.cn/v1/audio/transcriptions",
     "api_key": "",                            # 语音识别专用密钥；留空沿用大语言模型 API Key
-    "model": "Qwen/Qwen3-ASR-1.7B",           # 主模型（实测 5/5 成功、0.5s）
+    "model": "XingChenAGI/XingChenASR-V3.2",  # 主模型（2026-09-19 实测 200 OK、1.0~1.2s）
     # 兜底模型链：模型级过载会让请求整段挂死而不报错（实测 SenseVoiceSmall 20s
-    # 超时率 60%，同 key 同接口换 Qwen3-ASR 后 5/5 成功）→ 换模型比同模型重试有效
-    "fallback_models": ["XingChenAGI/XingChenASR-V3.2"],
+    # 超时率 60%，Qwen3-ASR 连续 5 次 ReadTimeout 15~40s）→ 换模型比同模型重试有效
+    "fallback_models": ["Qwen/Qwen3-ASR-1.7B"],
     "api_timeout": 10,                        # 单模型超时；挂死靠换模型兜底，不必等 30s
 }
 
@@ -1621,7 +1643,7 @@ def speech_to_text(wav_path: str) -> str:
 
     单个 ASR 模型过载时，请求会整段挂死而不返回任何错误码——这种故障换模型
     比同模型重试有效得多（实测同 key 同接口：SenseVoiceSmall 20s 超时率 60%，
-    Qwen3-ASR 5/5 成功 0.5s）。
+    Qwen3-ASR 连续 5 次 ReadTimeout 15~40s，XingChenASR 200 OK 1.0~1.2s）。
     provider: auto=走完整链（只配单个模型时=同模型重试 2 次）| cloud=仅主模型单次
     """
     import requests

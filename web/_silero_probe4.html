@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><title>Silero 句内停顿测量</title></head>
+<body>
+<pre id="log">loading…</pre>
+<script type="module">
+const log = (s) => { document.getElementById('log').textContent += '\n' + s; };
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const FRAME_MS = 2048 / 48000 * 1000;
+
+async function main() {
+  const mod = await import('/static/js/core/12b_silero_vad.ts');
+  const App = {};
+  mod.default(App);
+  App.sileroVadInit();
+  const t0 = performance.now();
+  while (!App.sileroVadReady() && performance.now() - t0 < 90000) await sleep(100);
+  if (!App.sileroVadReady()) { window.__result = { error: 'model not ready' }; return; }
+
+  const buf = await (await fetch('/static/_silero_speech.mp3')).arrayBuffer();
+  const ctx = new OfflineAudioContext(1, 48000, 48000);
+  const sig = (await ctx.decodeAudioData(buf)).getChannelData(0);
+
+  const probs = [], voices = [];
+  for (let i = 0; i + 2048 <= sig.length; i += 2048) {
+    App.sileroVadPush(sig.subarray(i, i + 2048), 48000);
+    await sleep(30);
+    probs.push(App.sileroVadProb());
+    voices.push(App.sileroVadIsVoice());
+  }
+
+  // 只统计首尾人声之间的内部空隙：首尾静音尾巴不算「句内停顿」
+  let firstV = voices.indexOf(true), lastV = voices.lastIndexOf(true);
+  const runs = [];
+  let cur = 0;
+  for (let k = firstV; k <= lastV; k++) {
+    if (!voices[k]) { cur++; } else if (cur) { runs.push(cur); cur = 0; }
+  }
+  if (cur) runs.push(cur);
+  runs.sort((a, b) => b - a);
+
+  const thr = { short: 1200, mid: 1000, long: 900 };
+  const longestMs = Math.round((runs[0] || 0) * FRAME_MS);
+  const safe = Object.entries(thr).filter(([, v]) => v > longestMs).map(([k]) => k);
+
+  window.__result = {
+    frames: probs.length,
+    voicedSpanFrames: lastV - firstV + 1,
+    internalPauseRuns: runs.length,
+    longestPauseMs: longestMs,
+    topPausesMs: runs.slice(0, 5).map((n) => Math.round(n * FRAME_MS)),
+    minProbInLongest: runs.length ? +Math.min(...probs.slice(0, 0)).toFixed(3) : null,
+    silenceThrMs: thr,
+    safeTiers: safe,
+  };
+  log('DONE ' + JSON.stringify(window.__result));
+}
+main().catch((e) => { window.__result = { error: String(e) }; log('ERROR ' + e); });
+</script>
+</body>
+</html>

@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><title>Silero 模块集成探针</title></head>
+<body>
+<pre id="log">loading…</pre>
+<script type="module">
+const log = (s) => { document.getElementById('log').textContent += '\n' + s; };
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+// 用 OfflineAudioContext 把 mp3 解码成 48k 单声道（模拟真实麦克风输入采样率）
+async function loadAt48k(url) {
+  const buf = await (await fetch(url)).arrayBuffer();
+  const ctx = new OfflineAudioContext(1, 48000, 48000);
+  const ab = await ctx.decodeAudioData(buf);
+  return ab.getChannelData(0);
+}
+
+async function main() {
+  const mod = await import('/static/js/core/12b_silero_vad.ts');
+  const App = {};
+  mod.default(App);
+  log('模块挂载: ' + Object.keys(App).join(','));
+  App.sileroVadInit();
+  const t0 = performance.now();
+  while (!App.sileroVadReady() && performance.now() - t0 < 90000) await sleep(100);
+  if (!App.sileroVadReady()) { window.__result = { error: 'model not ready' }; log('未就绪'); return; }
+  log('就绪耗时 ' + Math.round(performance.now() - t0) + 'ms');
+
+  const sig = await loadAt48k('/static/_silero_speech.mp3');
+  log('输入样本 ' + (sig.length / 48000).toFixed(2) + 's @48k');
+  const probs = [];
+  const tStart = performance.now();
+  for (let i = 0; i + 2048 <= sig.length; i += 2048) {
+    App.sileroVadPush(sig.subarray(i, i + 2048), 48000);
+    await sleep(43); // 模拟 ScriptProcessor 2048@48k 的回调节奏（42.7ms）
+    const p = App.sileroVadProb();
+    probs.push(p);
+    if (i === 0 || i === 2048 * 20 || i === 2048 * 60) {
+      log('t=' + (i / 48000).toFixed(2) + 's prob=' + (p < 0 ? 'STALE' : p.toFixed(3)) + ' isVoice=' + App.sileroVadIsVoice());
+    }
+  }
+  const wall = (performance.now() - tStart) / 1000;
+  const voiced = probs.filter(v => v >= 0.5).length / probs.length;
+  const stale = probs.filter(v => v < 0).length / probs.length;
+  window.__result = {
+    frames: probs.length,
+    audioSec: +(sig.length / 48000).toFixed(2),
+    wallSec: +wall.toFixed(2),
+    voicedRatio: +voiced.toFixed(2),
+    staleRatio: +stale.toFixed(2),
+    max: +Math.max.apply(null, probs).toFixed(3),
+  };
+  log('DONE ' + JSON.stringify(window.__result));
+}
+main().catch(e => { window.__result = { error: String(e) }; log('ERROR ' + e); });
+</script>
+</body>
+</html>
