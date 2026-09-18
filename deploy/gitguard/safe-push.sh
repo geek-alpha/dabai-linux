@@ -56,10 +56,16 @@ ok "干净"
 echo
 echo "② 密钥扫描（三道：暂存区 / 跟踪文件 / 全历史）"
 for m in --staged --tree --history; do
-  if timeout 180 python3 deploy/gitguard/secretscan.py "$m" >/tmp/dabai-safepush-scan.out 2>&1; then
+  timeout 900 python3 deploy/gitguard/secretscan.py "$m" >/tmp/dabai-safepush-scan.out 2>&1
+  ec=$?
+  if [ "$ec" = 0 ]; then
     ok "$m 通过"
   else
     sed 's/^/    /' /tmp/dabai-safepush-scan.out
+    # 超时（124）不是「发现密钥」：全历史扫描本机约 180s，仓库越大越慢，
+    # 掐在 180 会让闸门把「太慢」报成「不安全」，而且被 kill 时输出没 flush，
+    # 报错一片空白，看着像抓到了密钥却不说在哪。
+    [ "$ec" = 124 ] && die "$m 扫描超时（900s）—— 是闸门太慢，不是发现密钥"
     die "$m 未通过"
   fi
 done
