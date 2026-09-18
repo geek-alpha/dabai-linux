@@ -1,0 +1,15 @@
+[Unit]
+Description=定时检查大白新版
+Documentation=file:/home/wxf/dabai/deploy/release/README.md
+
+[Timer]
+# 凌晨四点——这个点几乎不会有人在跟我说话，重启打断的成本最低。
+OnCalendar=*-*-* 04:30:00
+# 三台机器错开最多 30 分钟，避免同时打 GitHub API、同时重启
+RandomizedDelaySec=30m
+AccuracySec=1min
+# 关机错过了就在开机后补跑一次
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -131,3 +131,51 @@ data/img_probe_*.png
 data/scheduled_tasks.json
 # 长跑引擎运行态（journal/state/heartbeat/STOP/lock 都不该进仓）
 data/longrun/
+
+# ── 大白联邦（peer_mesh）─────────────────────────────────────────────
+# cluster.key 是整个联邦的唯一凭证：拿到它就等于拿到所有实例的说话权。
+# 其余几份是本机身份/地址簿/收件箱，属于运行时状态，不该进仓库。
+data/cluster.key
+data/cluster.key.tmp
+data/node.json
+data/peers.json
+data/peer_inbox.jsonl
+data/peer_cursor.json
+
+# ── 发行版与经历分离（2026-09-18）─────────────────────────────────────
+# 下面这些文件是每个实例的「成长经历」，不属于基因组。
+#
+# 为什么要出仓：git 是基因组的分发通道，经历住在里面就永远处在「更新写入面」上，
+# 一次硬更新就能把某台机器的记忆覆盖成别人的。拆开之后，自动更新在结构上碰不到它。
+#
+# 新实例出生时这些文件不存在 —— 加载器已逐个验证会给出空结构（见
+# deploy/release/README.md 的「出生与成长」），之后它长成什么样，只由它自己的经历决定。
+/conviction.json
+/long_horizon.json
+/gene_stats.json
+/reward_memory.json
+/rlhf_model.json
+/rl_bandit.json
+/rl_interval.json
+/rl_mode_stats.json
+/rl_pushpull.json
+/world_model.json
+/music_playlists.json
+/video_favorites.json
+/video_history.json
+/video_sources.json
+/workspace_saved.json
+/role_card_users.json
+/agent_profiles.json
+/harness_tasks.json
+/harness_task_memory.json
+/harness_state.json
+/harness_bridge.json
+/codex_runtime.json
+/codex_runtime.json.lock
+# 运行态总目录：记忆库、联邦身份与收件箱、游标、断点、上传件、长跑工作区
+/data/
+# 技能自带的数据目录（skills/tasks/data/tasks.json 是用户的待办）
+/skills/*/data/
+# 发行包产物
+/deploy/release/dist/

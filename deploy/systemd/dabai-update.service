@@ -1,0 +1,26 @@
+[Unit]
+Description=大白自动更新（拉取最新发行版并装到安装目录）
+Documentation=file:/home/wxf/dabai/deploy/release/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=wxf
+Group=wxf
+
+# 跑在仓库之外的一份副本上，不跑 /home/wxf/dabai/deploy/release/update.py。
+# 理由：仓库正是被更新的对象。用待更新的代码去更新它自己，会在替换到一半时
+# 把正在执行的脚本换掉 —— 更新器的可信度不能建立在被更新物之上。
+ExecStart=/usr/bin/python3 /usr/local/lib/dabai-update/update.py --apply
+
+# 更新会停机重启，给足时间；超时则视为失败由 systemd 记账
+TimeoutStartSec=900
+# 别跟用户交互抢 CPU，也别把磁盘 IO 打满（树莓派还要跑别的东西）
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dabai-update

@@ -1,0 +1,125 @@
+name: 发行版
+
+# 发布路径的最后一道闸在 GitHub 这边，而不是在某个脚本里。
+#
+# 为什么：脚本闸门（deploy/gitguard/safe-push.sh）挡得住「推错东西」，挡不住
+# 「谁按下了推送」。而 environment: release 的 required reviewers 是 GitHub
+# 自己强制的 —— 管理员必须在网页上点 Approve，作业才会往下走。
+# 这是整套体系里唯一一个连大白自己都绕不过去的门。
+#
+# 启用方式（一次性，在仓库网页上做）：
+#   Settings → Environments → New environment → 名字填 release
+#   → 勾 Required reviewers → 选上管理员自己
+# 没配这个 environment 时工作流照跑，只是没人拦 —— 所以配了才算数。
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布的 tag（留空则用当前分支的最新提交）"
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: 打包
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 校验契约（三分类清单 + 地板不漂移）
+        run: python deploy/release/paths.py --selftest
+
+      - name: 打包（内含解包回验：sha256 全对、包内无受保护路径）
+        run: python deploy/release/build_release.py --out dist
+
+      - name: 展示产物摘要
+        run: |
+          cat dist/MANIFEST.json | python -c "import json,sys; m=json.load(sys.stdin); print(f\"版本 {m['version']} / {m['file_count']} 个文件 / {m['total_bytes']/1024:.0f} KB / commit {m['commit'][:8]}\")"
+          ls -la dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dabai-package
+          path: dist/dabai-*
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: 发布（需管理员批准）
+    needs: build
+    runs-on: ubuntu-latest
+    environment: release        # ← 管理员批准闸门在这里
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: dabai-package
+          path: dist
+
+      - name: 读出版本号
+        id: meta
+        run: |
+          VER=$(python -c "import json;print(json.load(open('dist/MANIFEST.json'))['version'])")
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VER" >> "$GITHUB_OUTPUT"
+
+      - name: 确认 tag 与清单版本一致
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ] && [ "${GITHUB_REF_NAME}" != "${{ steps.meta.outputs.tag }}" ]; then
+            echo "✘ 推送的 tag（${GITHUB_REF_NAME}）与清单版本（${{ steps.meta.outputs.tag }}）不一致"
+            exit 1
+          fi
+          echo "✔ tag 与清单版本一致"
+
+      - name: 生成发行说明
+        run: |
+          python - <<'PY' > notes.md
+          import json
+          m = json.load(open("dist/MANIFEST.json"))
+          print(f"## 大白 v{m['version']}\n")
+          print(f"- 文件 {m['file_count']} 个，{m['total_bytes']/1048576:.2f} MB")
+          print(f"- commit `{m['commit'][:12]}`")
+          print(f"- 打包于 {m['built_on']} {m['built_at']}")
+          print("\n### 安装\n")
+          print("节点侧自动更新会拉这个发行版。手动装：")
+          print("```\nsudo /usr/local/lib/dabai-update/update.py --apply\n```")
+          print("\n### 经历数据\n")
+          print("本包**只含代码**。信条、长期事业、基因统计、记忆、任务等 per-instance")
+          print("经历文件在打包阶段就被排除，不在包内 —— 更新不会覆盖任何一台大白的成长。")
+          PY
+          cat notes.md
+
+      - name: 建 GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.meta.outputs.tag }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "tag $TAG 已有发行版，改为上传/覆盖资产"
+            gh release upload "$TAG" dist/dabai-*.tar.gz dist/dabai-*.sha256 --clobber
+          else
+            gh release create "$TAG" \
+              --title "大白 $TAG" \
+              --notes-file notes.md \
+              dist/dabai-*.tar.gz \
+              dist/dabai-*.sha256
+          fi
+
+      - name: 发布后自检
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view "${{ steps.meta.outputs.tag }}" --json tagName,assets \
+            | python -c "import json,sys; d=json.load(sys.stdin); print('✔', d['tagName'], '资产：', [a['name'] for a in d['assets']])"
