@@ -560,3 +560,38 @@ def test_update_switches_to_named_tag(tmp_path, monkeypatch):
     assert rc == 0, rc
     assert any("/releases/tags/v1.0.0" in u for u in seen), seen
     assert not any(u.endswith("/releases/latest") for u in seen), seen
+
+
+def test_stale_updater_copy_is_detected(tmp_path):
+    """更新器副本落后必须查得出来 —— 它是「装了新版但新能力用不了」的唯一征兆。
+
+    更新器跑在仓库之外（仓库正是被更新的对象），所以它更新不了自己：
+    装发行版只刷新仓库里那份，systemd 跑的是 /usr/local/lib/dabai-update/ 的副本。
+    v1.0.0 的包里没有 --tag，装了它的机器反而切不了版本，且全程没有任何提示。
+    """
+    root = tmp_path / "repo"
+    packaged = root / "deploy" / "release" / "update.py"
+    packaged.parent.mkdir(parents=True)
+    packaged.write_text("# v1.0.1，带 --tag\n", encoding="utf-8")
+
+    # 直接跑仓库里那份（开发/演练）→ 不是副本，没什么可比的
+    assert update.updater_copy_stale(root, me=packaged) is None
+
+    # 副本已同步 → 内容相同，不该报警
+    synced = tmp_path / "usr-local" / "update.py"
+    synced.parent.mkdir(parents=True)
+    shutil.copyfile(packaged, synced)
+    assert update.updater_copy_stale(root, me=synced) is None
+
+    # 副本落后（装着 v1.0.0 那版）→ 必须查出来，且提示里给出重装命令
+    synced.write_text("# v1.0.0，没有 --tag\n", encoding="utf-8")
+    stale = update.updater_copy_stale(root, me=synced)
+    assert stale is not None
+    assert stale[0] == synced.resolve() and stale[1] == packaged.resolve()
+    note = "\n".join(update.stale_updater_note(stale))
+    assert "install-update.sh" in note
+    assert update.stale_updater_note(None) == []
+
+    # 仓库里那份不存在（更新器被单独部署）→ 无从比较，不误报
+    packaged.unlink()
+    assert update.updater_copy_stale(root, me=synced) is None

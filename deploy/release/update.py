@@ -250,6 +250,34 @@ def local_version(root: Path, fallback: str = "0.0.0") -> str:
     return fallback
 
 
+def updater_copy_stale(root: Path, me: Optional[Path] = None) -> Optional[Tuple[Path, Path]]:
+    """本机正在跑的更新器副本，是否落后于仓库里那份。落后则返回 (副本, 仓库版)。
+
+    更新器故意跑在仓库之外（仓库正是被更新的对象），代价是它更新不了自己：
+    装发行版只刷新 <root>/deploy/release/update.py，而 systemd 跑的是
+    /usr/local/lib/dabai-update/ 里那份副本，只有 install-update.sh 会换它。
+    不查这一下，新能力就静默不生效 —— v1.0.0 正是如此：包里没有 --tag，
+    装了它的机器反而切不了版本。
+    """
+    here = Path(me if me is not None else __file__).resolve()
+    packaged = (Path(root) / "deploy" / "release" / "update.py").resolve()
+    if here == packaged or not here.is_file() or not packaged.is_file():
+        return None
+    if hashlib.sha256(here.read_bytes()).hexdigest() == hashlib.sha256(packaged.read_bytes()).hexdigest():
+        return None
+    return (here, packaged)
+
+
+def stale_updater_note(stale: Optional[Tuple[Path, Path]]) -> List[str]:
+    if not stale:
+        return []
+    return [
+        f"⚠ 更新器副本落后：本机跑的是 {stale[0]}，仓库里已是新版",
+        "   它跑在仓库之外，更新不了自己 —— 新能力（如 --tag 版本切换）要重跑一次才生效：",
+        "   sudo bash deploy/release/install-update.sh",
+    ]
+
+
 # ── GitHub ───────────────────────────────────────────────────────────────
 def gh_request(url: str, token: str, timeout: int, raw: bool = False):
     headers = {
@@ -740,6 +768,8 @@ def run(args) -> int:
             log_line(cfg, "✘ 最新发行版没有版本号")
             return 1
         if args.check:
+            for line in stale_updater_note(updater_copy_stale(root)):
+                log_line(cfg, line)
             if vkey(remote_ver) > vkey(cur) or args.force:
                 log_line(cfg, f"有新版：本地 v{cur} → 远端 v{remote_ver}")
                 return 10
@@ -909,6 +939,11 @@ def run(args) -> int:
 
     (state_dir(cfg) / "current_version").write_text(ver + "\n", encoding="utf-8")
     log_line(cfg, f"✔ 更新完成：v{cur} → v{ver}")
+
+    # ── ⑩ 更新器副本自检 ────────────────────────────────────────────────
+    # 更新成功不等于能力到齐：副本是旧的，这次装上的新功能照样用不了。
+    for line in stale_updater_note(updater_copy_stale(root)):
+        log_line(cfg, line)
     return 0
 
 
