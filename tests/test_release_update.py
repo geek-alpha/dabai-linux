@@ -411,12 +411,20 @@ def test_real_repo_has_no_frontend_gaps():
     assert not gaps, "有前端资源被引用但没入仓：\n" + "\n".join(gaps)
 
 
-def test_vendor_is_soft_not_hard():
-    """web/vendor 是本机私有（paths.py:87 声明），只能提示、不能拦打包。
+def test_vendor_is_packaged():
+    """web/vendor 必须进包：index.html:27-29 的 importmap 指向它。
 
-    但必须提示：index.html:27-29 的 importmap 指向它，新机器上 3D 前端起不来。
+    它曾是 paths.py 里的「本机私有」（只提示、不拦打包），结果新机器装完
+    3D 前端直接 404。这条测试锁住这个结论：谁把 web/vendor/ 加回 .gitignore
+    或 paths.py 的忽略表，它就红。
     """
     pairs, _missing, _excluded = build_mod.collect(REPO)
-    _gaps, soft = build_mod.frontend_gap(REPO, pairs)
-    assert any("web/vendor" in s for s in soft), soft
-    assert all("web/vendor" not in g for g in _gaps), _gaps
+    packaged = {rel for rel, _ in pairs}
+    for target in (
+        "web/vendor/three/build/three.module.js",
+        "web/vendor/three-vrm/lib/three-vrm.module.min.js",
+    ):
+        assert target in packaged, f"{target} 没进包，importmap 会 404"
+    hard, soft = build_mod.frontend_gap(REPO, pairs)
+    assert not [g for g in hard + soft if "web/vendor" in g]
+

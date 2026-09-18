@@ -1,0 +1,104 @@
+{
+  "$schema": "./animation-library-schema.json",
+  "version": "1.0.0",
+  "description": "Mixamo 动作表情库配置 — 定义所有可用动作的元数据、情绪标签和播放参数",
+  "baseUrl": "/anim/",
+  "autoLoadOnBoot": true,
+  "categories": {},
+  "emotionMap": {
+    "happy": [
+      "laugh",
+      "happy_jump",
+      "wave",
+      "yes_gesture",
+      "walk_happy",
+      "idle_happy"
+    ],
+    "excited": [
+      "victory_cheer",
+      "excited_jump",
+      "jump",
+      "pose_victory",
+      "clap",
+      "run"
+    ],
+    "sad": [
+      "cry",
+      "kneel",
+      "no_gesture",
+      "walk_sad",
+      "idle_sad"
+    ],
+    "angry": [
+      "arms_crossed",
+      "walk_aggressive",
+      "idle_angry"
+    ],
+    "surprised": [
+      "surprise_react",
+      "scared",
+      "point"
+    ],
+    "shy": [
+      "shy_back",
+      "pose_shy",
+      "idle_shy"
+    ],
+    "thoughtful": [
+      "scratch_head",
+      "shrug",
+      "idle_think",
+      "sneak",
+      "arms_crossed"
+    ],
+    "tired": [
+      "sigh_deep",
+      "yawn",
+      "dizzy",
+      "lie_down"
+    ],
+    "calm": [
+      "praying",
+      "pose_meditate",
+      "sit_chair",
+      "sit_floor"
+    ],
+    "proud": [
+      "salute",
+      "thumbs_up",
+      "pose_hero",
+      "pose_cool",
+      "idle_flex"
+    ],
+    "playful": [
+      "taunt",
+      "come_here"
+    ],
+    "love": [
+      "blow_kiss",
+      "come_here"
+    ],
+    "neutral": [
+      "bow_respect",
+      "point",
+      "stop_gesture",
+      "phone_call",
+      "idle_normal",
+      "walk_normal",
+      "walk_backwards",
+      "turn_left",
+      "turn_right"
+    ],
+    "elegant": [
+      "bow_respect"
+    ],
+    "passionate": [
+      "wave",
+      "victory_cheer",
+      "come_here"
+    ],
+    "cool": [
+      "walk_cool"
+    ]
+  }
+}

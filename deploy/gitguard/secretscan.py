@@ -89,6 +89,15 @@ PLACEHOLDER_HINTS = (
     "redacted", "removed", "dummy", "fake", "test_key", "todo",
     "ollama", "localhost", "127.0.0.1", "0.0.0.0", "http://", "https://",
 )
+# 公开编码字母表 —— 「整串精确等于它」就绝不可能是密钥，而它在第三方库里出现频繁。
+#   web/vendor/three/examples/jsm/libs/draco/gltf/draco_decoder.js:21
+#   keyStr="ABCDEF…+/="  被 [keyStr] 词根命中过，是实打实的误报。
+# 只做整串精确匹配：不做子串、不做前缀，免得把「以字母表开头」的真密钥一起放过。
+_ALNUM = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+KNOWN_CONSTANT_VALUES = frozenset(
+    _ALNUM + tail + pad for tail in ("", "+/", "-_") for pad in ("", "=")
+)
+
 # 行内白名单标记（gitleaks 同款约定）
 ALLOW_MARKERS = ("allowlist secret", "nosecret", "noqa: secret")
 
@@ -153,6 +162,8 @@ def is_high_entropy_secret(value: str) -> bool:
     v = value.strip()
     if len(v) < 32 or len(v) > 512:
         return False
+    if v in KNOWN_CONSTANT_VALUES:
+        return False
     if looks_like_path(v):
         return False
     if any(c in _FORBIDDEN_CHARS for c in v):
@@ -201,6 +212,8 @@ def looks_like_path(value: str) -> bool:
 def looks_like_secret(value: str) -> bool:
     v = value.strip()
     if len(v) < MIN_VALUE_LEN:
+        return False
+    if v in KNOWN_CONSTANT_VALUES:
         return False
     if looks_like_path(v):
         return False

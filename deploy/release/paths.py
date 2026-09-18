@@ -83,8 +83,6 @@ LOCAL_GLOBS: tuple[str, ...] = (
     "models/**",
     "backgrounds/**",
     "audio_cache/**",
-    "web/anim/**",
-    "web/vendor/**",
     "web/generated/**",
     "mmd_tools_new/**",
     # 日志与备份

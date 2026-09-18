@@ -54,7 +54,8 @@ web/generated/
 # 异常目录残留（占位/临时）
 %TEMP%/
 undefined/
-web/vendor/
+# web/vendor/ 曾在此被忽略：但 index.html:27-29 的 importmap 指向它，忽略等于
+# 新机器装完 3D 前端起不来。现入仓（three / three-vrm / html2canvas，均 MIT）。
 
 # 一次性调试/输出残留
 temp_vh*.txt
@@ -96,8 +97,16 @@ venv/
 # 角色模型 / 背景场景等外观资源（大体积二进制资产，378M+11M；磁盘保留、不入库）
 models/
 backgrounds/
-# 烘焙动画片段（由 bake_animations.mjs 生成，可重建）
-web/anim/
+# 烘焙动画片段与 Mixamo 原始 FBX（二进制大资产，可重建）
+# 只忽略动作片段目录，不忽略整个 web/anim/ —— animation-library.json 是手写配置，
+# 前端 09d_mixamo_library_loader.ts:226 直接 fetch /anim/animation-library.json。
+web/anim/baked/
+web/anim/idle/
+web/anim/gesture/
+web/anim/emotion/
+web/anim/walk/
+web/anim/dance/
+web/anim/pose/
 # 本地 TLS 自签证书与私钥（凭证，勿提交）
 *.pem
 key.pem
