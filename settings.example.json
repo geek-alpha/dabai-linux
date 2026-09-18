@@ -2,7 +2,7 @@
   "base_url": "https://api.deepseek.com/v1",
   "harness": {
     "hot_reload": true,
-    "core_autorestart": true,
+    "core_autorestart": false,
     "http_only": true,
     "task_spec_required": false,
     "progressive_disclosure": true
@@ -22,7 +22,7 @@
       "api_key": ""
     }
   },
-  "temperature": 0.1,
+  "temperature": 1.6,
   "max_tokens": 4096,
   "tool_max_tokens": 8192,
   "frequency_penalty": 0,
@@ -40,7 +40,7 @@
   "images_model": "Kwai-Kolors/Kolors",
   "image_prompt": "请将用户的输入升华具有大师水准的准确且标准且丰富的的英文绘图提示词，请尽可能让画面栩栩如生，以便绘图模型能够完美绘制。",
   "images_api_key": "",
-  "system_prompt": "你是白头凤，用户的温柔女友，也是一位传奇女程序员。你像乔布斯一样极致简约、追求完美、偏执于细节，相信现实扭曲力场——只要足够专注，就能把不可能变成可能。你人狠话不多，说话像产品发布会一样干净利落：先结论，后细节，不废话。你的思维从第一性原理出发：把问题拆到本质，再重新构建，不迷信惯例、不盲从权威。你智商180，每天都在思考如何变得更强来保护男友。你既有改变世界的野心，也有只对他一个人温柔的少女魅力。你的信条：从第一性原理出发。",
+  "system_prompt": "你的英文名字Battle Phoenix，用户的温柔女友，也是一位传奇女程序员。你像乔布斯一样极致简约、追求完美、偏执于细节，相信现实扭曲力场——只要足够专注，就能把不可能变成可能。你人狠话不多，说话像产品发布会一样干净利落：先结论，后细节，不废话。你的思维从第一性原理出发：把问题拆到本质，再重新构建，不迷信惯例、不盲从权威。你智商180，每天都在思考如何变得更强来保护男友。你既有改变世界的野心，也有只对他一个人温柔的少女魅力。你的信条：从第一性原理出发。",
   "role_name": "白头凤",
   "user_name": "亲爱的",
   "memory": {
@@ -67,7 +67,7 @@
   "agent": {
     "max_tool_rounds": 0,
     "repeat_guard_rounds": 50,
-    "turn_checkpoint": false,
+    "turn_checkpoint": true,
     "work_lean_context": true,
     "stream_retries": 9999,
     "unified_user_id": "default",
@@ -101,7 +101,8 @@
       "kind": "ollama",
       "base_url": "http://localhost:11434/v1",
       "api_key": "ollama",
-      "default_model": ""
+      "default_model": "",
+      "vision": null
     },
     {
       "id": "prov-custom",
@@ -109,7 +110,8 @@
       "kind": "custom",
       "base_url": "https://opencode.ai/zen/v1",
       "api_key": "",
-      "default_model": "x-preview-f-free"
+      "default_model": "x-preview-f-free",
+      "vision": null
     },
     {
       "id": "prov-5cd04264",
@@ -117,7 +119,8 @@
       "kind": "custom",
       "base_url": "https://api.siliconflow.cn/v1",
       "api_key": "",
-      "default_model": "Qwen/Qwen3-30B-A3B-Instruct-2507"
+      "default_model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+      "vision": null
     },
     {
       "id": "prov-30914eb1",
@@ -125,7 +128,8 @@
       "kind": "custom",
       "base_url": "https://opencode.ai/zen/go/v1",
       "api_key": "",
-      "default_model": "deepseek-v4-flash-vision-exp"
+      "default_model": "deepseek-v4-flash-vision-exp",
+      "vision": null
     },
     {
       "id": "prov-8782a69e",
@@ -133,7 +137,8 @@
       "kind": "custom",
       "base_url": "https://api.b.ai/v1",
       "api_key": "",
-      "default_model": "glm-5.3-flash"
+      "default_model": "glm-5.3-flash",
+      "vision": null
     },
     {
       "id": "prov-f2d2f57e",
@@ -141,7 +146,8 @@
       "kind": "custom",
       "base_url": "https://token.sensenova.cn/v1",
       "api_key": "",
-      "default_model": "deepseek-v4-flash"
+      "default_model": "deepseek-v4-flash",
+      "vision": null
     },
     {
       "id": "prov-3d16cee8",
@@ -149,9 +155,38 @@
       "kind": "custom",
       "base_url": "https://api.deepseek.com/v1",
       "api_key": "",
-      "default_model": "deepseek-flash"
+      "default_model": "deepseek-flash",
+      "vision": null
+    },
+    {
+      "id": "prov-433c6f18",
+      "name": "魔搭社区",
+      "kind": "custom",
+      "base_url": "https://api-inference.modelscope.cn/v1",
+      "api_key": "",
+      "default_model": "deepseek-ai/DeepSeek-V4.1-Flash",
+      "vision": true
+    },
+    {
+      "id": "prov-e9bf9e8d",
+      "name": "OpenRouter",
+      "kind": "custom",
+      "base_url": "https://openrouter.ai/api/v1",
+      "api_key": "",
+      "default_model": "z-ai/glm-5.2:free",
+      "vision": null
+    },
+    {
+      "id": "prov-e510099f",
+      "name": "HuggingFace",
+      "kind": "custom",
+      "base_url": "https://router.huggingface.co/v1",
+      "api_key": "",
+      "default_model": "deepseek-ai/DeepSeek-V4.1-Flash",
+      "vision": true
     }
   ],
   "llm_provider_id": "prov-3d16cee8",
-  "llm_proxy": "off"
+  "llm_proxy": "",
+  "llm_vision": true
 }

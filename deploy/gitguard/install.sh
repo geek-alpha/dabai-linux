@@ -164,7 +164,9 @@ run_install() {
   fi
   local added=0 p
   for p in "${IGNORE_NEED[@]}"; do
-    if ! grep -qxF "$p" "$ROOT/.gitignore"; then
+    # 先 tr 掉 CR：.gitignore 里历史遗留的 CRLF 行会让 grep -qxF 永远不匹配，
+    # 于是每跑一次 install 就重复追加一遍同样的规则。
+    if ! tr -d '\r' < "$ROOT/.gitignore" | grep -qxF "$p"; then
       printf '%s\n' "$p" >> "$ROOT/.gitignore"; added=$((added + 1))
     fi
   done
