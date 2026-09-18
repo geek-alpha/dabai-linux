@@ -5,6 +5,11 @@ export default (function init(App: AppKernel) {
    *  事件绑定
    * ============================================================ */
   App.updateCameraSettingsUI = function updateCameraSettingsUI() {
+    // 隐私护栏：非管理员的滑块下限直接抬到护栏值，避免「拉到底却没反应」
+    if (window.__ROLE !== 'admin') {
+      if (App.camHeightRange) App.camHeightRange.min = String(App.USER_MIN_CAM_HEIGHT);
+      if (App.camDistanceRange) App.camDistanceRange.min = String(App.USER_MIN_CAM_DISTANCE);
+    }
     if (App.camHeightRange) {
       App.camHeightRange.value = String(App.cameraHeight);
       App.camHeightVal!.textContent = App.cameraHeight.toFixed(2);
@@ -29,9 +34,12 @@ export default (function init(App: AppKernel) {
     // 文本发送
     function submitText() {
       const text = App.textInput!.value.trim();
-      if (!text) return;
-      App.addUserMsg(text);
-      App.sendText(text);
+      // 附件先取快照：上传中的不发送，留在待发条里等传完
+      const atts = App.takeAttachments();
+      if (!text && !atts.length) return;
+      App.addUserMsg(text, false, atts);
+      App.sendText(text, atts);
+      App.clearAttachments();
       App.textInput!.value = '';
       App.textInput!.style.height = ''; // 清空后恢复单行高度
       App.setState(App.State.THINKING);
@@ -58,17 +66,35 @@ export default (function init(App: AppKernel) {
     App.textInput!.addEventListener('input', autoGrowInput);
     App.textInput!.addEventListener('compositionend', autoGrowInput);
 
-    // 语音按钮 - 纯按住说话（模式切换由 voice-mode-btn 负责，避免长按冲突）
+    // 输入聚焦 → 打字轻载（降到 20fps，不停帧）；失焦立即恢复。
+    // 半屏/默认态下 3D 舞台仍然看得见，绝不能再走「停掉整个帧循环」那条路 ——
+    // 那会让角色当场僵住、与全屏观感不一致。真正省 CPU 的是少画几帧，不是一帧不画。
+    // 不透明全屏的静默总闸另有语义（看不见才全停），见 13_messages.setChatFullscreen。
+    App.textInput!.addEventListener('focus', () => {
+      if (App.setTypingLite) App.setTypingLite(true);
+    });
+    App.textInput!.addEventListener('blur', () => {
+      if (App.setTypingLite) App.setTypingLite(false);
+    });
+
+    // 语音按钮 - 二合一：短按切换模式（按住说话 ↔ 自动对话），长按按住说话
     let voicePressed = false,
-      pressY = 0;
+      pressY = 0,
+      isLongPress = false,
+      pressTimer: ReturnType<typeof setTimeout> | null = null;
     const pressStart = (e: TouchEvent | MouseEvent) => {
       e.preventDefault();
-      // 非按住模式（自动对话）不响应按住（改由对应按钮切换）
-      if (App.voiceMode !== 'press') return;
       if (voicePressed) return;
       voicePressed = true;
+      isLongPress = false;
       pressY = 'touches' in e ? e.touches[0].clientY : e.clientY;
-      App.startRecording();
+      // 超过阈值视为长按（按住说话）；否则松手视为短按（切换模式）
+      pressTimer = setTimeout(() => {
+        pressTimer = null;
+        isLongPress = true;
+        // 长按录音仅在按住说话模式生效；自动对话模式由 VAD 接管
+        if (App.voiceMode === 'press') App.startRecording();
+      }, 320);
     };
     const pressMove = (e: TouchEvent | MouseEvent) => {
       if (!voicePressed) return;
@@ -78,9 +104,23 @@ export default (function init(App: AppKernel) {
     const pressEnd = (e: TouchEvent | MouseEvent) => {
       if (!voicePressed) return;
       voicePressed = false;
+      if (pressTimer) {
+        clearTimeout(pressTimer);
+        pressTimer = null;
+      }
       const y = 'changedTouches' in e ? e.changedTouches[0].clientY : e.clientY;
-      const cancel = pressY - y > 60;
-      App.stopRecording(cancel);
+      if (isLongPress) {
+        isLongPress = false;
+        // 仅在按住说话模式下有录音要停；自动模式长按无副作用
+        if (App.voiceMode === 'press') {
+          const cancel = pressY - y > 60;
+          App.stopRecording(cancel);
+        }
+      } else {
+        // 短按 → 切换模式
+        const target = App.voiceMode === 'auto' ? 'press' : 'auto';
+        App.setVoiceMode(target);
+      }
     };
     App.voiceBtn!.addEventListener('touchstart', pressStart, {
       passive: false
@@ -91,20 +131,18 @@ export default (function init(App: AppKernel) {
     App.voiceBtn!.addEventListener('touchend', pressEnd);
     App.voiceBtn!.addEventListener('touchcancel', () => {
       voicePressed = false;
-      App.stopRecording(true);
+      if (pressTimer) {
+        clearTimeout(pressTimer);
+        pressTimer = null;
+      }
+      if (isLongPress) {
+        isLongPress = false;
+        if (App.voiceMode === 'press') App.stopRecording(true);
+      }
     });
     App.voiceBtn!.addEventListener('mousedown', pressStart);
     window.addEventListener('mousemove', pressMove);
     window.addEventListener('mouseup', pressEnd);
-
-    // 独立的模式切换按钮（按住说话 ↔ 自动对话）
-    const voiceModeBtn = App.$('voice-mode-btn');
-    if (voiceModeBtn) {
-      voiceModeBtn.addEventListener('click', () => {
-        const target = App.voiceMode === 'auto' ? 'press' : 'auto';
-        App.setVoiceMode(target);
-      });
-    }
 
     // 背景场景管理
     App.bgBtn!.addEventListener('click', App.openBgModal);
@@ -174,33 +212,9 @@ export default (function init(App: AppKernel) {
       if (e.key === 'Enter') App.saveWorkspace();
     });
 
-    // 重置视角
+    // 重置视角（状态复位统一走 App.resetViewState，刷新角色复用同一套基准）
     App.resetCamBtn!.addEventListener('click', () => {
-      App.dragOrbitYaw = 0;
-      App.dragOrbitPitch = 0;
-      App.camZoom = 1.0;
-      App.camOffsetX = 0;
-      App.camOffsetY = 0;
-      App.camOffsetZ = 0;
-      App.cameraHeight = 2.55;
-      App.cameraTiltDeg = 9;
-      App.cameraDistance = 2.5;
-      App.DEFAULT_CAM_POS!.set(0, 2.55, 2.5);
-      App.targetCamPos!.set(0, App.cameraHeight, App.cameraDistance);
-      // 角色立刻回到原点
-      App.resetAvatarToOrigin();
-      // 立即让角色面朝【目标】相机位置，而非当前相机位置
-      // 否则相机从侧面 lerp 回默认位置时，身体会经过背影区域
-      if (App.currentAvatar) {
-        App.smoothRotY = App.computeBodyFaceCam(App.currentAvatar, App.targetCamPos);
-        App.smoothRotX = 0;
-      }
-      // 触发一次短暂的心有灵犀凝视
-      App.gazeBoostUntil = Date.now() / 1000 + 2;
-      App.gazeHeadTiltAcc = 0.03; // 起始歪头幅度较小
-      App.wasMutualGaze = true; // 跳过转身动画（已通过 snap 面朝相机，避免额外偏转）
-      App.recordInteraction();
-      App.saveSceneState();
+      App.resetViewState();
       App.showToast('视角已重置');
       App.sendAIAction('（用户重置了视角，现在重新端详着你的样子，好好展示自己吧）', true);
     });
@@ -211,7 +225,8 @@ export default (function init(App: AppKernel) {
     if (App.camSettingsModal) App.camSettingsModal.querySelector('.modal-backdrop')!.addEventListener('click', App.closeCamSettingsModal);
     if (App.camHeightRange) {
       App.camHeightRange.addEventListener('input', () => {
-        App.cameraHeight = parseFloat(App.camHeightRange!.value);
+        App.cameraHeight = Math.max(parseFloat(App.camHeightRange!.value), App.userMinCamHeight());
+        App.camHeightRange!.value = String(App.cameraHeight);
         App.camHeightVal!.textContent = App.cameraHeight.toFixed(2);
         App.saveCameraSettings();
         App.recordInteraction();
@@ -219,7 +234,8 @@ export default (function init(App: AppKernel) {
     }
     if (App.camDistanceRange) {
       App.camDistanceRange.addEventListener('input', () => {
-        App.cameraDistance = parseFloat(App.camDistanceRange!.value);
+        App.cameraDistance = Math.max(parseFloat(App.camDistanceRange!.value), App.userMinCamDistance());
+        App.camDistanceRange!.value = String(App.cameraDistance);
         App.camDistanceVal!.textContent = App.cameraDistance.toFixed(2);
         App.targetCamPos!.z = App.cameraDistance;
         App.DEFAULT_CAM_POS!.z = App.cameraDistance;
@@ -259,8 +275,8 @@ export default (function init(App: AppKernel) {
 
     // VR模式开关（WebXR 沉浸会话；由 webxr-vr.js 统一调度）
     const gyroBtn = document.getElementById('gyro-btn')!;
-    // 仅在支持 WebXR 的设备上显示按钮
-    if (typeof navigator !== 'undefined' && navigator.xr) {
+    // 仅管理员 + 支持 WebXR 的设备才显示按钮（VR 是部署层能力，普通用户无入口）
+    if (typeof navigator !== 'undefined' && navigator.xr && window.__ROLE === 'admin') {
       gyroBtn.style.display = '';
     }
     // VR模式：晃动强度 → AI 感知反馈（每帧调用，由RL系统统一调度反馈时机）

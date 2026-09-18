@@ -25,19 +25,53 @@ PROMPT = (
     '工具名都带 todo_ 前缀。子任务状态更新后父任务状态会自动汇总。'
 )
 
-# ---------- 模块级单例：服务 + 提醒调度器 ----------
+# ---------- 按用户隔离的服务实例：服务 + 提醒调度器 ----------
+# 每个执行者一份 TodoService，uid 从沙箱身份层取（user_store.current_uid），技能层
+# 不传身份。空 uid = 主人/系统身份 → 技能目录里的全局文件（既有任务零迁移）；
+# 普通用户 → data/users/<uid>/todo/tasks.json，互相看不见。
 
-_service = None
+_services: dict = {}
+_services_lock = threading.RLock()
 _scheduler = None
 _scheduler_lock = threading.Lock()
 
 
+def _service_for(uid: str):
+    with _services_lock:
+        svc = _services.get(uid)
+        if svc is None:
+            import user_store
+            from todo_service import TodoService
+            data_dir = (user_store.scoped_dir('todo', uid) if uid
+                        else os.path.join(_SKILL_DIR, 'data'))
+            svc = TodoService(data_dir)
+            _services[uid] = svc
+        return svc
+
+
 def _get_service():
-    global _service
-    if _service is None:
-        from todo_service import TodoService
-        _service = TodoService()
-    return _service
+    import user_store
+    return _service_for(user_store.current_uid())
+
+
+class _AllUserServices:
+    """提醒调度器面对的门面：一轮检查遍历所有已实例化的用户库。
+
+    调度器是常驻线程、只认一个 service，而库是按用户分的 —— 用门面把「检查所有
+    用户」伪装成「检查一个 service」，调度器本身一行不用改。已建过的库留在
+    _services 里不回收，用户设置完提醒就走开也照样会被检查到。
+    """
+
+    def fire_reminder(self, now=None, on_fire=None) -> list:
+        with _services_lock:
+            svcs = list(_services.values())
+        out = []
+        for svc in svcs:
+            try:
+                out.extend(svc.fire_reminder(now=now, on_fire=on_fire) or [])
+            except Exception as e:  # noqa: BLE001 —— 单个用户的库坏了不能拖垮提醒线程
+                print(f'[todo] 提醒检查失败（{svc.data_dir}）: {e}')
+        return out
 
 
 def _get_scheduler():
@@ -45,13 +79,14 @@ def _get_scheduler():
     with _scheduler_lock:
         if _scheduler is None:
             from todo_scheduler import ReminderScheduler
-            _scheduler = ReminderScheduler(_get_service())
+            _scheduler = ReminderScheduler(_AllUserServices())
         return _scheduler
 
 
 def on_load(ctx):
     """技能加载时启动提醒调度线程（幂等）。"""
     try:
+        _service_for('')  # 主人那份先建出来，提醒线程一起来就能检查到它
         _get_scheduler().start()
     except Exception as e:  # noqa: BLE001
         print(f'[todo] 提醒调度器启动失败: {e}')

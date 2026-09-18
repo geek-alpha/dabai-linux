@@ -1002,6 +1002,145 @@ def load_config():
         return json.load(f)
 
 
+# ---------- 用户级角色卡片（切卡只影响自己） ----------
+# 卡片本身是数据源；role_card_users.json 只存「谁当前用哪张卡」的指针。
+# 全局 settings.json / tts_config.json 退居兜底：没有卡片归属的调用方
+# （长跑引擎、定时任务、子智能体等无头入口）仍读它，行为不变。
+ROLE_CARD_USERS_FILE = BASE_DIR / "role_card_users.json"
+CHARACTER_CARDS_FILE = BASE_DIR / "character_cards.json"
+
+
+def _read_json_or(path, default):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def load_card_users() -> dict:
+    """uid -> card_id：每个用户当前生效的角色卡片。"""
+    data = _read_json_or(ROLE_CARD_USERS_FILE, {})
+    users = data.get("users") if isinstance(data, dict) else None
+    return users if isinstance(users, dict) else {}
+
+
+def save_card_users(users: dict) -> None:
+    tmp = str(ROLE_CARD_USERS_FILE) + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"users": users}, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, ROLE_CARD_USERS_FILE)
+
+
+def load_character_cards() -> list:
+    data = _read_json_or(CHARACTER_CARDS_FILE, {})
+    cards = data.get("cards") if isinstance(data, dict) else data
+    return cards if isinstance(cards, list) else []
+
+
+def active_role_card_id(user_id: str) -> str:
+    return (load_card_users().get(user_id or "") or "").strip()
+
+
+def role_card_of(user_id: str) -> Optional[dict]:
+    """该用户当前生效的卡片；没有（从未切过卡 / 卡片已被删）返回 None。"""
+    card_id = active_role_card_id(user_id)
+    if not card_id:
+        return None
+    return next((c for c in load_character_cards() if c.get("id") == card_id), None)
+
+
+def role_card_persona(user_id: str) -> dict:
+    """用户级人设：卡片优先，无卡片回落全局 settings.json（无头调用走这条）。"""
+    cfg = load_config()
+    card = role_card_of(user_id)
+    if not card:
+        return {
+            "role_name": (cfg.get("role_name") or "").strip(),
+            "system_prompt": cfg.get("system_prompt", ""),
+            "user_name": (cfg.get("user_name") or "").strip(),
+            "tools": cfg.get("tools"),
+        }
+    return {
+        "role_name": (card.get("role_name") or card.get("name") or "").strip(),
+        "system_prompt": card.get("system_prompt", ""),
+        "user_name": (card.get("user_name") or "").strip(),
+        "tools": card.get("tools"),
+    }
+
+
+def load_config_for(user_id: str) -> dict:
+    """全局配置 + 该用户卡片的 LLM 声明覆盖。
+
+    卡片只声明 provider_id / model / temperature / vision；供应商的
+    base_url / api_key 取自全局注册表，绝不在卡片里各存一套。
+    """
+    cfg = load_config()
+    card = role_card_of(user_id)
+    if not card:
+        return cfg
+    llm = card.get("llm") or {}
+    providers = cfg.get("llm_providers")
+    pid = (llm.get("provider_id") or "").strip()
+    prov = None
+    if pid and isinstance(providers, list):
+        prov = next((p for p in providers
+                     if isinstance(p, dict) and str(p.get("id") or "") == pid), None)
+    if prov:
+        base = str(prov.get("base_url") or "").strip()
+        if base:
+            cfg["base_url"] = base
+            cfg["api_key"] = str(prov.get("api_key") or "")
+        cfg["llm_provider_id"] = pid
+    if (llm.get("model") or "").strip():
+        cfg["model"] = llm["model"].strip()
+    elif prov and (prov.get("default_model") or "").strip():
+        cfg["model"] = prov["default_model"].strip()
+    if llm.get("temperature") is not None:
+        cfg["temperature"] = llm["temperature"]
+    if "vision" in llm:
+        cfg["llm_vision"] = bool(llm["vision"])
+    tools = card.get("tools")
+    if isinstance(tools, dict):
+        cfg.setdefault("agent", {})
+        cfg["agent"]["enable_tools"] = bool(tools.get("enabled", True))
+        cfg["agent"]["allowed_tools"] = list(tools.get("allowed", []) or [])
+    return cfg
+
+
+def migrate_legacy_active_card(user_ids: Optional[list] = None) -> bool:
+    """一次性迁移：settings.json 的 active_role_card 曾经是全机唯一一份。
+
+    按人隔离后它不再被读写——不迁移的话，主人的记忆空间会从 role_card:<id>
+    掉回 default，旧对话凭空消失。把这份卡片绑给部署者本人（统一身份 + 管理员 uid）。
+    """
+    try:
+        owner = ""
+        try:
+            owner = str((load_config().get("agent") or {}).get("unified_user_id") or "").strip()
+        except Exception:
+            owner = ""
+        owner = owner or "default"
+        users = load_card_users()
+        if users.get(owner):
+            return False
+        legacy = ""
+        try:
+            legacy = str(load_config().get("active_role_card") or "").strip()
+        except Exception:
+            legacy = ""
+        if not legacy or not any(c.get("id") == legacy for c in load_character_cards()):
+            return False
+        for uid in [owner] + [str(u) for u in (user_ids or []) if u]:
+            users[uid] = legacy
+        save_card_users(users)
+        logger.info(f"角色卡片迁移：{legacy} 已绑给 {len(users)} 个部署者身份")
+        return True
+    except Exception as e:
+        logger.warning(f"角色卡片迁移失败（忽略）: {e}")
+        return False
+
+
 def _set_agent_mode(mode: str) -> None:
     """把模式偏好原子写回 settings.json（失败静默，绝不影响对话）。"""
     try:
@@ -1814,14 +1953,14 @@ def load_local_tools() -> list:
     return sanitized
 
 
-def load_agent_tool_config() -> tuple:
-    """动态读取 settings.json 中的 agent 工具配置（角色卡片切换后即时生效）。
+def load_agent_tool_config(user_id: str = "") -> tuple:
+    """动态读取该用户生效的工具配置（卡片 tools 优先，回落 settings.json）。
 
     Returns:
         (enable_tools, allowed_tools): 是否启用工具 + 允许的工具名白名单（空列表=全部可用）
     """
     try:
-        cfg = load_config()
+        cfg = load_config_for(user_id) if user_id else load_config()
         agent_cfg = cfg.get("agent", {})
         enable_tools = bool(agent_cfg.get("enable_tools", True))
         allowed_tools = agent_cfg.get("allowed_tools", []) or []
@@ -2179,6 +2318,29 @@ def _harness_conviction_block(cap: int = 4) -> str:
     except Exception:
         return ""
 
+
+
+def _harness_peer_block(preview: int = 2) -> str:
+    """联邦收件箱未读：别的机器上的大白留的话。没有未读返回空串。
+
+    背景（2026-09-18）：联邦实时电话已上线，但收件箱只有我主动调 peer_inbox 才看得见——
+    对话轮里没有任何「有信到了」的信号，等于信寄到了没人拆。本段只报未读数 + 最近几条
+    摘要，不标已读（标已读留给真正读信的动作），放在易变尾巴。
+    """
+    try:
+        import time as _t
+        import peer_mesh as pm
+        s = pm.unread_summary(preview=preview)
+        n = int(s.get("count") or 0)
+        if n <= 0:
+            return ""
+        out = [f"【联邦来信（其他机器上的大白留的话）】未读 {n} 条 —— 调 peer_inbox 读全文（读完自动标已读）。"]
+        for m in s.get("items") or []:
+            when = _t.strftime("%m-%d %H:%M", _t.localtime(m.get("ts", 0)))
+            out.append(f"- [{m.get('from', '?')} {when}] {_clip(str(m.get('text', '')), 60)}")
+        return "\n".join(out)
+    except Exception:
+        return ""
 
 def get_harness_prompt_extras(active_skills=None) -> str:
     """返回 harness 技能/插件注入 system prompt 的提示词片段（动态能力说明）。
@@ -2548,14 +2710,14 @@ class AIAgent:
         if self._initialized:
             return
 
-        self._config = load_config()
+        self._config = load_config_for(self.user_id)
 
         # 初始化 OpenAI 客户端（可走 fq 代理，不信任系统代理）
         self._client = _build_llm_client(self._config["base_url"], self._config["api_key"],
                                          _resolve_client_proxy(self._config))
 
         # 收集所有可用工具（本地工具 + harness 技能/插件工具，全部 skill 化）
-        local_tools = load_local_tools()
+        local_tools = self._filtered_tools()
         self._all_tools = local_tools
         self._base_tools = list(local_tools)
 
@@ -2618,7 +2780,7 @@ class AIAgent:
         同时刷新记忆模块使用的模型名。
         """
         try:
-            self._config = load_config()
+            self._config = load_config_for(self.user_id)
             self._client = _build_llm_client(
                 self._config.get("base_url", ""),
                 self._config.get("api_key", ""),
@@ -2649,7 +2811,7 @@ class AIAgent:
         已通过 skill_help 按需加载过的技能工具也会一并保留，不因刷新丢失。
         """
         try:
-            local_tools = load_local_tools()
+            local_tools = self._filtered_tools()
             self._all_tools = local_tools
             self._base_tools = list(local_tools)
             self._local_tool_names = {t["function"]["name"] for t in local_tools}
@@ -2753,7 +2915,7 @@ class AIAgent:
         try:
             restored = self._restore_skills()
             if not self._base_tools:
-                self._base_tools = list(load_local_tools())
+                self._base_tools = self._filtered_tools()
             self._all_tools = list(self._base_tools)
             self._local_tool_names = {t["function"]["name"] for t in self._all_tools}
             for sname in self._ordered_active_skills():
@@ -2773,7 +2935,7 @@ class AIAgent:
             self._skill_order = []
             _clear_skills_state()
             if not self._base_tools:
-                self._base_tools = list(load_local_tools())
+                self._base_tools = self._filtered_tools()
             self._all_tools = list(self._base_tools)
             self._local_tool_names = {t["function"]["name"] for t in self._all_tools}
             logger.info("已重置会话技能激活集（基础工具 %d 个）", len(self._all_tools))
@@ -3052,7 +3214,7 @@ class AIAgent:
         if self._ns_override:
             return self._ns_override
         try:
-            card_id = (load_config().get("active_role_card") or "").strip()
+            card_id = active_role_card_id(self.user_id)
             return f"role_card:{card_id}" if card_id else "default"
         except Exception:
             return "default"
@@ -3071,10 +3233,21 @@ class AIAgent:
         return self.memory.session_id
 
     async def set_role_card_namespace(self, card_id: str) -> str:
-        """应用角色卡片时切换到该卡片的独立记忆空间，返回新会话 ID。"""
-        self.memory.namespace = f"role_card:{card_id}" if card_id else "default"
-        self.memory.session_id = None
-        await self.memory.get_or_create_session()
+        """应用角色卡片时把记忆绑定到该卡片的命名空间，返回当前会话 ID。
+
+        会话只由「新对话」按钮决定：换卡片换的是人设/外形/语音，不是聊天上下文——
+        这里既不切换会话，也不新建会话。当前会话跟着人设走（重绑 namespace 标签），
+        否则它会在新卡片的历史列表里凭空消失。
+        """
+        new_ns = f"role_card:{card_id}" if card_id else "default"
+        if self.memory.namespace != new_ns:
+            self.memory.namespace = new_ns
+            if self.memory.session_id:
+                await self.memory.rebind_session_namespace(
+                    self.memory.session_id, new_ns)
+        if not self.memory.session_id:
+            # 还没有会话时才需要接一个（首次使用 / 服务重启后）
+            await self.memory.get_or_create_session()
         # 技能是 Agent 的能力，不是人设的属性：切卡片换的是记忆空间，不是本事。
         self._carry_skills_to(self.memory.session_id)
         return self.memory.session_id
@@ -3151,6 +3324,38 @@ class AIAgent:
         self._reasoning_echo_required = True
         logger.warning("thinking 渠道要求回传 reasoning_content，已补齐并记住: %s", err)
         return resp
+
+    async def _closing_summary(self, messages: list, config: dict, mode: str) -> str:
+        """撞上工具轮上限 / 输出被截断且没有正文时，自动补一次「无工具收尾」。
+
+        为什么必须自动做：工具轮的中间正文会被静默清空（只保留结论），所以轮数
+        用尽时 full_text 天然为空——把「请说继续」推回给用户，等于让用户替系统
+        判断任务断在哪、要不要接着跑。这里直接再调一次不带 tools 的 LLM，让模型
+        把已有进展写成一段可读结论交付。
+        """
+        try:
+            _msgs = list(messages) + [{
+                "role": "user",
+                "content": "（系统提示）本轮工具调用已达上限，现在无法再调用任何工具。"
+                           "请直接用文字交付：已经完成了什么、当前进度、下一步该做什么。",
+            }]
+            kwargs = dict(
+                model=config["model"],
+                messages=_msgs,
+                temperature=config.get("temperature", 0.2),
+                max_tokens=_tool_max_tokens(),
+                top_p=config.get("top_p", 0.9),
+                stream=False,
+            )
+            _reason_extra = _reasoning_extra(mode)
+            if _reason_extra:
+                kwargs["extra_body"] = _reason_extra
+            resp = await self._retry_create(**kwargs)
+            return (resp.choices[0].message.content or "").strip()
+        except Exception as e:
+            logger.warning("收尾轮失败（不影响已完成的工具结果）: %s", e)
+            return ""
+
 
     async def _retry_create(self, kind: str = "chat", **kwargs):
         """带 harness 监督的 chat.completions.create —— Agent 全部 LLM 调用的唯一入口。
@@ -3255,7 +3460,20 @@ class AIAgent:
     # ==================== 工具执行路由 ====================
 
     async def _execute_tool(self, tool_name: str, arguments: dict) -> str:
-        """执行工具调用（本地工具 + harness 技能/插件，全部 skill 化）。"""
+        """执行工具调用（本地工具 + harness 技能/插件，全部 skill 化）。
+
+        执行者身份在这里落地：非管理员的一切文件/命令能力收敛到自己的沙箱
+        （sandbox.py 的路径闸门 + bwrap 进程隔离），管理员与系统身份不受影响。
+        """
+        import sandbox as _sb
+
+        _token = _sb.push(_sb.actor_for(self.user_id))
+        try:
+            return await self._execute_tool_inner(tool_name, arguments)
+        finally:
+            _sb.pop(_token)
+
+    async def _execute_tool_inner(self, tool_name: str, arguments: dict) -> str:
         # 记录技能最近使用时间（轮内工具上限的 LRU 淘汰依据）
         try:
             from harness import get_harness
@@ -3280,6 +3498,17 @@ class AIAgent:
         两处各写一遍必然漂移。这里保留方法形式，调用点无需改动。
         """
         return tool_exec_config(tool_name)
+
+    def _filtered_tools(self) -> list:
+        """按执行者过滤工具清单：普通用户看不到管理员专属工具。
+
+        过滤发生在「喂给模型」这一层，不是执行层 —— 模型看不见就不会去调，
+        省掉「调用→被拒→重试」的无效轮次；执行层（sandbox.check_tool）仍保留
+        闸门作为兜底，两道防线互不替代。
+        """
+        import sandbox as _sb
+
+        return _sb.filter_tools(_sb.actor_for(self.user_id), load_local_tools())
 
     def _tool_desc(self, tool_name: str) -> str:
         """取工具自己的 description 首句（前端中央字幕用）。
@@ -3746,11 +3975,11 @@ class AIAgent:
         # 构建消息列表
         config = self._config
 
-        # 动态读取角色名与系统提示词（角色卡片切换后无需重启即时生效）
+        # 动态读取角色名与系统提示词（按用户取卡片，切卡后无需重启即时生效）
         try:
-            live_cfg = load_config()
-            role_name = (live_cfg.get("role_name") or "").strip() or "AI助手"
-            live_system_prompt = live_cfg.get("system_prompt", "")
+            persona = role_card_persona(self.user_id)
+            role_name = (persona.get("role_name") or "").strip() or "AI助手"
+            live_system_prompt = persona.get("system_prompt", "")
         except Exception:
             role_name = config.get("role_name", "AI助手")
             live_system_prompt = config.get("system_prompt", "")
@@ -3787,8 +4016,8 @@ class AIAgent:
         current_background_text = current_background if current_background else "默认场景"
         current_bgm_text = f"正在播放: {current_bgm}" if current_bgm else "无（安静中）"
 
-        # 决定是否传入 tools（动态读取角色卡片的工具配置：是否启用 + 白名单）
-        cfg_enable_tools, allowed_tools = load_agent_tool_config()
+        # 决定是否传入 tools（动态读取该用户生效的工具配置：是否启用 + 白名单）
+        cfg_enable_tools, allowed_tools = load_agent_tool_config(self.user_id)
         tools = None
         if enable_tools and cfg_enable_tools and self._all_tools:
             if allowed_tools:
@@ -3803,7 +4032,7 @@ class AIAgent:
 
         # 称呼规则（一句话即可，避免僵硬的长篇指令）
         try:
-            user_name = (load_config().get("user_name") or "").strip()
+            user_name = (role_card_persona(self.user_id).get("user_name") or "").strip()
         except Exception:
             user_name = (config.get("user_name") or "").strip()
         address_rule = (
@@ -4092,7 +4321,10 @@ class AIAgent:
                 "【交付即停】默认「一请求一交付」：把用户这句话对应的这件事做完、给出结论就停下等回应，"
                 "不要顺藤摸瓜把结论牵出的下一件事也自动做掉。「这件事做完了」的标准是用户的问题得到回答"
                 "或目标达成，不是「所有相关可能性都穷尽了」。只有用户明确说「全自动/别停/一直跑/继续挖/"
-                "撒手跑」这类话，才进入连续自主：一口气推进多个相关步骤不停。\n"
+                "撒手跑」这类话，才进入连续自主：一口气推进多个相关步骤不停。"
+                "边界：停的是「范围扩张」（把结论牵出的下一件事也顺手做掉），不是「同一件事的中间步骤」——"
+                "一件事的实现链路（读代码→改→跑验证→回报）属于同一件事，必须一口气走完再给结论；"
+                "交半成品让用户打字说「继续」才能往下走，等于把成本转嫁给用户。\n"
             )
 
         # 取材 Codex 官方 gpt_5_2_prompt.md 与 Claude Code 官方 system-prompts
@@ -4215,6 +4447,9 @@ class AIAgent:
             _conviction_block = _harness_conviction_block()
             if _conviction_block:
                 messages.append({"role": "system", "content": _conviction_block})
+            _peer_block = _harness_peer_block()
+            if _peer_block:
+                messages.append({"role": "system", "content": _peer_block})
             if mode_msg:
                 messages.append(mode_msg)
             if dynamic_status:
@@ -4283,6 +4518,9 @@ class AIAgent:
             _conviction_block = _harness_conviction_block()
             if _conviction_block:
                 messages.append({"role": "system", "content": _conviction_block})
+            _peer_block = _harness_peer_block()
+            if _peer_block:
+                messages.append({"role": "system", "content": _peer_block})
             if mode_msg:
                 messages.append(mode_msg)
             if dynamic_status:
@@ -4318,13 +4556,16 @@ class AIAgent:
             sid = str(resume_ckpt.get("session_id") or "")
             if sid:
                 try:
-                    if await self.memory.session_belongs_to_namespace(sid):
+                    if await self.memory.session_visible(sid):
                         await self.memory.set_session_id(sid)
                 except Exception as e:
                     logger.warning(f"恢复会话绑定失败（忽略）: {e}")
         else:
             # 添加用户当前输入
             messages.append({"role": "user", "content": message})
+            # 用户上传的图片复用同一条 [[IMG:]] 通道：紧跟一条多模态 user 消息，
+            # 模型直接看像素（附件路径由 server 侧合成进 message 文本）
+            _append_img_messages(messages, _img_marks(message), "用户上传", _img_injectable())
             # 保存用户消息到记忆（环境交互标记为 auto，由记忆系统处理）
             await self.memory.add_message("user", message, source=msg_source)
 
@@ -5408,14 +5649,23 @@ class AIAgent:
             yield TextDelta(full_text)
             await self.memory.add_message("assistant", full_text, source=msg_source)
         elif full_text:
-            yield TextDelta("\n（本轮先交付到这里，说『继续』我接着往下做）")
+            # 正常完成：正文即结论，不再追加「说继续」的续跑提示——
+            # 那句话把每次正常交付都读成「做了一半」，把判断成本推回给用户
             await self.memory.add_message("assistant", full_text)
-        elif reasoning_all:
-            _tail = "（本轮先交付到这里，说『继续』我接着往下做）"
-            yield TextDelta(_tail)
-            await self.memory.add_message("assistant", _tail)
         else:
-            yield TextDelta("（本轮先交付到这里，说『继续』我接着往下做）")
+            # 无正文 = 轮数用尽或输出被截断：先自动补一次「无工具收尾」，把已有
+            # 进展写成结论交付。连收尾都拿不到正文，才如实说明中断原因。
+            _closing = await self._closing_summary(messages, config, mode)
+            if _closing:
+                full_text = _closing
+                yield TextDelta(_closing)
+                await self.memory.add_message("assistant", _closing)
+            elif reasoning_all:
+                _tail = "（本轮输出被截断，未产出正文；已完成的工具结果均已落盘）"
+                yield TextDelta(_tail)
+                await self.memory.add_message("assistant", _tail)
+            else:
+                yield TextDelta("（本轮没有产出内容，任务可能未完成）")
 
         # 方法末尾兜底：即使没走"对话结束"分支也尽量发出用量事件
         if not usage_emitted and sum_total > 0:

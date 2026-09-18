@@ -158,6 +158,12 @@ export default (function init(App: AppKernel) {
     App.refreshBgListSelection(currentSaved && currentSaved.url !== 'default' ? currentSaved.name : null);
   };
   App.uploadBackgroundFile = async function uploadBackgroundFile(file: File) {
+    // 背景库同样是部署层资源（/api/background/upload 对普通用户 403）。
+    // 弹窗「导入」卡片、拖拽到舞台共用这个入口。
+    if (window.__ROLE !== 'admin') {
+      App.showToast('上传背景仅管理员可用');
+      return;
+    }
     const ext = file.name.split('.').pop()!.toLowerCase();
     if (!['glb', 'gltf', 'vrm'].includes(ext)) {
       App.showToast('仅支持 .glb / .gltf / .vrm');

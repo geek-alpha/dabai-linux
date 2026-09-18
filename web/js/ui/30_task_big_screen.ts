@@ -26,6 +26,7 @@ export default (function init(App: AppKernel) {
   let frame = null;                   // 霓虹边框（Group）
   let frameStrips = [];               // 四条边框 mesh，随屏幕尺寸缩放
   let canvas = null, ctx = null;
+  let webScratch = null;              // 网页帧中转画布（帧尺寸≠主画布，需缩放中转）
   let texture = null;
   let tasks = [];                     // 最近任务列表
   let detailCache = new Map();        // id -> full
@@ -44,7 +45,22 @@ export default (function init(App: AppKernel) {
   let vrFrozen = false;               // VR 世界锚定标记：进入 VR 后首个有效头部帧计算一次位姿并定格，整场会话不再改写
   // 网页渲染桥状态：3D 大屏优先显示 bigscreen.html 的网页画面（iframe 自截图贴纹理），
   // 失败自动回退手绘。state: 'loading'（iframe 加载中）→ 'ready'（截图流正常）→ 'failed'（回退手绘）
-  let webRender = { state: 'idle', iframe: null, readyAt: 0, failAt: 0, lastFrame: 0 };
+  let webRender = { state: 'idle', iframe: null, readyAt: 0, failAt: 0, lastFrame: 0, startedAt: 0 };
+  // 帧时间戳必须统一在 performance.now() 时钟域。原来写入用 Date.now()、读取用
+  // performance.now()，两者差一个 epoch（~1.7e12），`now - lastFrame < 2000` 恒真
+  // —— 截图流早已停止仍被判「帧新鲜」，大屏永久冻结在最后一帧上。
+  const WEB_FRAME_FRESH_MS = 8000;     // 超此间隔无新帧 = 截图流停了
+  const WEB_READY_TIMEOUT_MS = 15000;  // iframe 建好这么久仍无 ready/fail = 桥挂死，回退手绘
+  // 空闲关闭：大屏没内容时整块屏幕（含霓虹边框）直接收起，并让 iframe 停止截图
+  // 与重绘。原来它永远挂着一张最后截到的帧 —— 截图流停了、内容早变了，画面却
+  // 冻在那里，看着像卡死。
+  const IDLE_CLOSE_MS = 12000;
+  let boardClosed = false;
+  let idleSince = 0;
+  // 必须声明在这里：App.onQuiet 注册时会立即回调一次 syncIframePause()，
+  // 若放在文件下方，那一刻它还在 TDZ 里（ReferenceError 被 onQuiet 的 try 吞掉，
+  // 表现为 boardQuiet 静默失效）。
+  let lastPauseSent = null;  // 仅留快照供调试；发送不走缓存，见 syncIframePause
 
   // 移动端识别（与 webxr-vr / game-mode 同一定义；App 方法未挂载时回退 UA 判断）
   const isMobileDev = () => (App && App._isMobileDevice)
@@ -126,7 +142,7 @@ export default (function init(App: AppKernel) {
     // 父页面画到 canvas 再贴 Billboard 纹理。两边看到完全一致的画面，
     // 以后改大屏样式只改 bigscreen.html 的 HTML/CSS，预览直接开网页。
     // 失败（iframe 加载失败 / html2canvas 不可用 / 截图异常）自动回退手绘 draw()。
-    webRender = { state: 'loading', iframe: null, readyAt: 0, failAt: 0, lastFrame: 0 };
+    webRender = { state: 'loading', iframe: null, readyAt: 0, failAt: 0, lastFrame: 0, startedAt: performance.now() };
     try {
       const fr = document.createElement('iframe');
       fr.style.cssText = 'position:fixed;left:-9999px;top:0;width:1280px;height:720px;border:0;visibility:hidden;pointer-events:none;';
@@ -134,7 +150,7 @@ export default (function init(App: AppKernel) {
       fr.onload = () => { webRender.state = 'loading'; }; // 等 bigscreen-ready 消息确认
       document.body.appendChild(fr);
       webRender.iframe = fr;
-    } catch (e) { webRender.state = 'failed'; webRender.failAt = Date.now(); }
+    } catch (e) { webRender.state = 'failed'; webRender.failAt = performance.now(); }
 
     ready = true;
     applyDisplaySize();
@@ -151,26 +167,33 @@ export default (function init(App: AppKernel) {
     const d = ev.data;
     if (d.type === 'bigscreen-ready') {
       webRender.state = 'ready';
-      webRender.readyAt = Date.now();
+      webRender.readyAt = performance.now();
+      // iframe 重新加载后它的 paused 标志回到 false（新文档），而父页可能仍处在
+      // 聊天全屏 / 关屏状态。不补发一次，重连等于把静默模式下的截图白烧重新唤醒。
+      if (boardQuiet || boardClosed) syncIframePause();
       console.log('[TaskBoard] 网页渲染桥就绪（bigscreen.html 截图流已接通）');
     } else if (d.type === 'bigscreen-frame') {
-      if (webRender.state !== 'ready') return;
+      if (webRender.state !== 'ready' || boardClosed) return;
       try {
         const w = d.w || DRAW_W, h = d.h || DRAW_H;
-        if (!canvas || canvas.width !== w || canvas.height !== h) {
-          canvas = document.createElement('canvas');
-          canvas.width = w; canvas.height = h;
-          ctx = canvas.getContext('2d');
-          if (texture) { texture.image = canvas; texture.needsUpdate = true; }
+        // 单一尺寸原则：主画布恒为 DRAW_W×DRAW_H，网页帧等比缩放后画进去。
+        // 原来是「按帧尺寸重建主画布」——iframe 用 scale:0.5 截图，帧是 640×360，
+        // 于是主画布被改成 640×360，而手绘 draw() 仍在 1280×720 坐标系里作画，
+        // 只有左上 1/4 可见；两条路径轮流覆盖同一张画布 = 几个画面缝在同一帧。
+        if (!webScratch || webScratch.width !== w || webScratch.height !== h) {
+          webScratch = document.createElement('canvas');
+          webScratch.width = w; webScratch.height = h;
         }
-        const img = new ImageData(new Uint8ClampedArray(d.data), w, h);
-        ctx.putImageData(img, 0, 0);
-        webRender.lastFrame = Date.now();
+        const sctx = webScratch.getContext('2d');
+        sctx.putImageData(new ImageData(new Uint8ClampedArray(d.data), w, h), 0, 0);
+        ctx.clearRect(0, 0, DRAW_W, DRAW_H);
+        ctx.drawImage(webScratch, 0, 0, DRAW_W, DRAW_H);
+        webRender.lastFrame = performance.now();
         if (texture) texture.needsUpdate = true;
       } catch (e) { /* 帧数据异常：忽略，下一帧继续 */ }
     } else if (d.type === 'bigscreen-fail') {
       webRender.state = 'failed';
-      webRender.failAt = Date.now();
+      webRender.failAt = performance.now();
       console.log('[TaskBoard] 网页渲染桥失败，回退手绘 draw()');
     }
   });
@@ -235,6 +258,7 @@ export default (function init(App: AppKernel) {
   // 聊天全屏：任务大屏整个看不见 —— 2.5s 轮询停掉，退出全屏立刻补一轮
   App.onQuiet((on) => {
     boardQuiet = on;
+    syncIframePause();
     if (on) {
       if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
     } else if (ready) {
@@ -245,7 +269,9 @@ export default (function init(App: AppKernel) {
   /** 自排下一轮轮询：先清旧 id，重复调用不会叠出两条循环 */
   function schedulePoll() {
     if (pollTimer) clearTimeout(pollTimer);
-    pollTimer = setTimeout(() => { pollTimer = null; requestTasks(); }, 2500);
+    // 兜底轮询：任务事件已由 ws task_event 广播到所有连接（见 task_orchestrator.set_broadcast），
+    // 实时性不靠它，这里只管 ws 断开期间的追赶。
+    pollTimer = setTimeout(() => { pollTimer = null; requestTasks(); }, 15000);
   }
 
   function requestTasks() {
@@ -1207,12 +1233,11 @@ export default (function init(App: AppKernel) {
     grad.addColorStop(0, 'rgba(36,50,108,0.97)');
     grad.addColorStop(0.5, 'rgba(25,34,84,0.97)');
     grad.addColorStop(1, 'rgba(18,24,60,0.97)');
+    // 铺满到边、不描边、不圆角：屏幕边缘只由 3D 霓虹边框（frameStrips）负责。
+    // 原来这里 rr(4,4,W-8,H-8,18) + 青色描边，等于在霓虹框里又画一圈内框，
+    // 两层矩形大小不一 = 「一大一小两个屏幕」。
     ctx.fillStyle = grad;
-    rr(ctx, 4, 4, DRAW_W - 8, H - 8, 18);
-    ctx.fill();
-    ctx.strokeStyle = 'rgba(0,229,255,0.32)';
-    ctx.lineWidth = 2;
-    ctx.stroke();
+    ctx.fillRect(0, 0, DRAW_W, H);
     // 顶部氛围光（紫→青渐变）：待机也绝不显黑屏，始终有"直播中"的光感
     const glow = ctx.createRadialGradient(DRAW_W / 2, -20, 10, DRAW_W / 2, -20, DRAW_W * 0.62);
     glow.addColorStop(0, 'rgba(124,92,255,0.26)');
@@ -1220,9 +1245,9 @@ export default (function init(App: AppKernel) {
     glow.addColorStop(1, 'rgba(0,229,255,0)');
     ctx.fillStyle = glow;
     ctx.fillRect(0, 0, DRAW_W, H);
-    // 左彩色边缘
+    // 左彩色边缘（与 bigscreen.html 的 #stage::after 同位置同尺寸，两边视觉一致）
     ctx.fillStyle = '#9d7bff';
-    ctx.fillRect(6, 8, 8, H - 16);
+    ctx.fillRect(0, 0, 6, H);
     // 扫描线（动效暗示"直播中"）
     if (now % 3000 < 1600) {
       const sy = 16 + ((now % 1600) / 1600) * (H - 32);
@@ -1982,6 +2007,76 @@ export default (function init(App: AppKernel) {
     drawTicker(now, L);
   }
 
+  /** 开/关大屏：关闭时让 iframe 停止自截图（父页早退只能停自己，停不了它） */
+  function syncIframePause() {
+    const on = !!(boardQuiet || boardClosed);
+    // 无条件发，不做「状态没变就跳过」的缓存：00_quiet 的 notifyBigscreen 会直接
+    // 遍历所有 iframe 发 bigscreen-pause（不经本函数）。若这里缓存上一次的值，
+    // 退出全屏时会变成「它发了 false → 我们算出 true 却以为已发过 → 跳过」，
+    // 关屏中的 iframe 被错误唤醒继续白烧截图。调用频率极低（只在开关屏 /
+    // 进出全屏），重发一次 postMessage 的成本可忽略。
+    lastPauseSent = on;
+    try {
+      if (webRender.iframe && webRender.iframe.contentWindow)
+        webRender.iframe.contentWindow.postMessage({ type: 'bigscreen-pause', on }, '*');
+    } catch (e) { /* 已卸载：忽略 */ }
+  }
+
+  function setBoardClosed(closed) {
+    boardClosed = !!closed;
+    syncIframePause();
+    if (boardClosed) { dirty = true; return; }
+    // 重新开启：截图流可能已停摆，重置新鲜度计时并强制重绘一帧，
+    // 避免开屏瞬间又贴着一张旧帧。
+    webRender.lastFrame = 0;
+    if (webRender.state === 'failed' && webRender.iframe &&
+        performance.now() - webRender.failAt > 60000) {
+      webRender.state = 'loading';   // 给桥一次重试机会（failAt 与 now 同为 performance 时钟）
+      webRender.startedAt = performance.now();
+      try { webRender.iframe.src = '/static/bigscreen.html'; } catch (e) { webRender.state = 'failed'; }
+    }
+    dirty = true;
+  }
+
+  /** 截图流是否新鲜：ready 且最近有帧。影院（cinema）走直绘，不计入。
+   *  自己取 performance.now()：调用点之一在 `const now` 声明之前，传参会踩 TDZ。 */
+  function webFrameFresh() {
+    return webRender.state === 'ready' &&
+      (performance.now() - webRender.lastFrame) < WEB_FRAME_FRESH_MS &&
+      !(videoLive && videoLive.ready && !videoLive.dead);
+  }
+
+  /** 截图桥是否活着（不看单帧新鲜度）：只用于决定屏幕画幅。
+   *  targetH 若跟着 webFrameFresh() 跳，帧流偶发间隔超过 8s 就会在
+   *  「网页 720 满幅」与「手绘 contentH（实测待机 400）」之间反复插值，
+   *  屏幕忽大忽小 —— 这正是「一大一小」的动态版本。画幅只看桥在不在，
+   *  单帧缺失由下面的手绘补画兜住（手绘同样按 displayH 布局，不会被裁）。 */
+  function webBridgeAlive() {
+    return webRender.state === 'ready';
+  }
+
+  /** 截图流停摆 → 一次性把桥判死并重连 iframe。
+   *  没有这一步，「缺帧时保留上一帧网页画面」会退化成永久冻结（上一轮刚修过的 bug）。
+   *  状态机单向：ready →（帧停摆）→ loading（重连）→ ready / failed。
+   *  宁可手绘与网页帧之间只跳一次，也不要两种画风来回闪。
+   *  RECONNECT_COOLDOWN_MS 防风暴：iframe 反复加载失败时不能每 8s 刷一次。 */
+  const RECONNECT_COOLDOWN_MS = 30000;
+  let lastReconnectAt = 0;
+  function webReconnectStalled(now) {
+    if (webRender.state !== 'ready') return;
+    if (!webRender.lastFrame || now - webRender.lastFrame < WEB_FRAME_FRESH_MS) return;
+    if (now - lastReconnectAt < RECONNECT_COOLDOWN_MS) return;
+    lastReconnectAt = now;
+    webRender.state = 'loading';
+    webRender.startedAt = now;
+    webRender.failAt = now;
+    console.log('[TaskBoard] 网页截图流停摆，重连 iframe');
+    try {
+      if (webRender.iframe) webRender.iframe.src = '/static/bigscreen.html';
+      else webRender.state = 'failed';
+    } catch (e) { webRender.state = 'failed'; }
+  }
+
   // ---------- 每帧更新：跟随角色身后 + 面向相机 + 尺寸自适应 + 节流重绘 ----------
 
   App.updateTaskBigScreen = function updateTaskBigScreen(dt) {
@@ -2040,9 +2135,36 @@ export default (function init(App: AppKernel) {
       }
     }
 
-    // 内容量决定屏幕目标形状：大白影院/全屏焦点恒满幅；待机按布局内容高自适应。
-    // displayH 做平滑插值（帧率无关指数趋近），宽度也随内容占比参与缩放
-    const targetH = (videoLive || showcase) ? DRAW_H : computeLayout().contentH;
+    // ---------- 空闲关闭：没内容就整块收起，不挂看一张冻结帧 ----------
+    // 「在用」的判据（全部不成立且持续 IDLE_CLOSE_MS 才关屏）：
+    //   影院在播 / 全屏焦点未过期 / 有活跃任务 / 最近 FRESH_TASK_MS 内有任务动过。
+    // 注意不能用 tasks.length>0：/api/tasks 会长期返回历史任务（实测当前 1 条
+    // cancelled），那样屏永远关不了。媒体墙也不算：它是历史产物，会常驻。
+    const ACTIVE_ST = ['running', 'confirming', 'queued'];
+    const FRESH_TASK_MS = 5 * 60 * 1000;
+    const nowMs = Date.now();
+    const hasContent = !!(videoLive || showcase) ||
+      tasks.some(t => t && (ACTIVE_ST.indexOf(t.status) >= 0 ||
+        nowMs - (t.updated_at || 0) < FRESH_TASK_MS)) ||
+      !!activeChain();
+    if (hasContent) {
+      idleSince = 0;
+      if (boardClosed) setBoardClosed(false);
+    } else {
+      if (!idleSince) idleSince = Date.now();
+      else if (!boardClosed && Date.now() - idleSince > IDLE_CLOSE_MS) setBoardClosed(true);
+    }
+    if (boardClosed) {
+      if (board) board.visible = false;
+      if (frame) frame.visible = false;
+      return;
+    }
+
+    // 内容量决定屏幕目标形状：大白影院/全屏焦点/网页帧恒满幅；待机手绘按内容高自适应。
+    // 网页帧必须满幅：bigscreen.html 的 stage 就是固定 1280×720 排版，若仍按手绘
+    // 布局的 contentH 裁切纹理，网页画面底部（跑马灯/任务卡）会被切掉，而且屏幕
+    // 形状与直接打开的网页不一致 —— 这正是「两边看到不同画面」的成因之一。
+    const targetH = (videoLive || showcase || webBridgeAlive()) ? DRAW_H : computeLayout().contentH;
     const delta = targetH - displayH;
     if (Math.abs(delta) > 0.5) {
       displayH += delta * (1 - Math.exp(-dt * 7)); // 约 0.4s 平滑到位
@@ -2169,6 +2291,17 @@ export default (function init(App: AppKernel) {
     // else：VR 已定格 → 位姿保持世界固定，不随角色/头显改写（尺寸缩放照常更新）
 
     const now = performance.now();
+    // 截图流停摆（超过 WEB_FRAME_FRESH_MS 没新帧）→ 重连，不留永久冻结
+    if (!boardClosed) webReconnectStalled(now);
+    // 桥挂死兜底：iframe 建好却迟迟不报 ready（脚本被拦 / 加载失败但不触发 onerror），
+    // 原状态会永远停在 'loading'，大屏既不贴图也不手绘 = 黑屏。超时即回退手绘。
+    if (webRender.state === 'loading' && webRender.startedAt &&
+        now - webRender.startedAt > WEB_READY_TIMEOUT_MS) {
+      webRender.state = 'failed';
+      webRender.failAt = now;
+      console.log('[TaskBoard] 网页渲染桥超时未就绪，回退手绘 draw()');
+    }
+
     const cinemaLive = !!(videoLive && videoLive.ready && !videoLive.dead);
     const newFrame = cinemaLive && !!(videoLive.framePending) && !videoLive.el.paused;
     const hasLiveVideo = cinemaLive ||
@@ -2198,14 +2331,18 @@ export default (function init(App: AppKernel) {
 
     if (shouldDraw) {
       if (canvas && texture) {
-        // 网页渲染桥优先：iframe 截图流正常（ready 且最近 2s 内有帧）时，
-        // 直接用网页帧（postMessage 已把帧画进 canvas），不再手绘。
+        // 网页渲染桥优先：截图流正常时画面已由 postMessage 画进 canvas，
+        // 这里只补一次纹理上传，不再手绘。
         // 视频直播（cinema）保持原路径：html2canvas 截不了 video 元素，
         // 影院画面必须走视频帧直绘，否则大屏会黑屏。
-        const webFresh = webRender.state === 'ready' &&
-          (now - webRender.lastFrame) < 2000 &&
-          !cinemaLive;
-        if (webFresh) {
+        //
+        // 关键：桥还活着（state==='ready'）但临时缺帧时，绝不能再走 draw() 手绘。
+        // 手绘是另一套画风（待机文字/卡片布局），覆盖上去就是「两个画面缝在一起」
+        // ——宁可贴上一帧网页画面静止不动，也不让两种画风交替闪烁。
+        // 只有桥真的挂了（failed / 从未成功 / 影院接管）才回退手绘。
+        const webFresh = webFrameFresh();
+        const keepWebFrame = webRender.state === 'ready' && webRender.lastFrame > 0 && !cinemaLive;
+        if (webFresh || keepWebFrame) {
           if (texture) texture.needsUpdate = true;
         } else {
           draw(now, newFrame);

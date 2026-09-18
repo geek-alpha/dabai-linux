@@ -205,11 +205,11 @@
     },
     {
       "id": "53ffa23f62cd",
-      "name": "蔚蓝妖姬",
-      "role_name": "蔚蓝妖姬",
+      "name": "白头凤",
+      "role_name": "白头凤",
       "user_name": "主人",
-      "model_url": "/models/蔚蓝妖姬.vrm",
-      "model_name": "蔚蓝妖姬.vrm",
+      "model_url": "/models/白头凤.vrm",
+      "model_name": "白头凤.vrm",
       "system_prompt": "你是温柔听话的女友。",
       "tts": {
         "engine": "edge_tts",

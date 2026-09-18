@@ -110,7 +110,10 @@ export default (function init(App: AppKernel) {
     document.getElementById('task-center')!.classList.add('show');
     refresh();
     if (pollTimer) clearInterval(pollTimer);
-    pollTimer = setInterval(refresh, 2500);
+    // 兜底轮询，不再是数据主源：任务事件已广播到所有连接
+    // （task_orchestrator.set_broadcast），实时性由 ws 的 task_event 保证。
+    // 这里只为「ws 断线重连期间」兜底——2.5s 全量拉一次，在手机上是每轮 700ms 的空转。
+    pollTimer = setInterval(refresh, 15000);
   };
 
   App.closeTaskCenter = function closeTaskCenter() {
@@ -149,9 +152,27 @@ export default (function init(App: AppKernel) {
     });
   }
 
+  // 全量列表最多 1 秒拉一次（尾随合并）：task_event 改成广播后会密集到达，
+  // 每个事件都全量拉一次会变成每秒几十个请求。窗口内的事件不丢——
+  // 尾随那一次把它们造成的状态变化一起同步过来。
+  const LIST_SYNC_MS = 1000;
+  let listSyncAt = 0;
+  let listSyncTimer: number | null = null;
+
   function refreshList() {
     if (!open) return;
-    fetchList().then(() => updateBadge());
+    const wait = LIST_SYNC_MS - (Date.now() - listSyncAt);
+    if (wait <= 0) {
+      listSyncAt = Date.now();
+      fetchList().then(() => updateBadge());
+      return;
+    }
+    if (listSyncTimer != null) return;
+    listSyncTimer = window.setTimeout(() => {
+      listSyncTimer = null;
+      listSyncAt = Date.now();
+      if (open) fetchList().then(() => updateBadge());
+    }, wait);
   }
 
   // ---------- 实时事件 ----------
@@ -819,7 +840,8 @@ export default (function init(App: AppKernel) {
     if (ev.error !== undefined) showDshError(card, ev.error);
   };
 
-  // 页面恢复/刷新后同步 DSH 直播卡（task_event 只推给发起连接，刷新后需轮询找回）
+  // 页面恢复/刷新后同步 DSH 直播卡：只补「连接建立之前已发生过」的那一段，
+  // 之后的增量全由广播的 task_event 送达，所以低频兜底就够。
   function syncDshCardsOnce() {
     fetch('/api/tasks').then(r => r.json()).then((data: any) => {
       if (!data || !data.ok) return;
@@ -835,7 +857,7 @@ export default (function init(App: AppKernel) {
       }
     }).catch(() => {});
   }
-  const _dshSyncTimer = setInterval(syncDshCardsOnce, 5000);
+  const _dshSyncTimer = setInterval(syncDshCardsOnce, 30000);
 
   // 轻量计时器：刷新执行中卡片的耗时
   setInterval(() => {

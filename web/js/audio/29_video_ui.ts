@@ -683,6 +683,8 @@ export default function init_29_video_ui(App: AppKernel) {
 
   /* ---------- 收藏夹：页签 ---------- */
   App.switchVideoTab = function switchVideoTab(tab: 'search' | 'favorites' | 'history' | 'sources') {
+    // 视频源页签只对管理员存在（DOM 上标了 data-admin-only），兜底防别处误调
+    if (tab === 'sources' && window.__ROLE !== 'admin') tab = 'search';
     const isSearch = tab === 'search';
     const isFav = tab === 'favorites';
     const isHist = tab === 'history';
@@ -898,6 +900,8 @@ export default function init_29_video_ui(App: AppKernel) {
   /* ---------- 收藏夹：分类管理 ---------- */
   /* ---------- 视频源：拉取 & 渲染（内置平台开关 + 自定义源管理） ---------- */
   App.refreshVideoSources = async function refreshVideoSources() {
+    // 视频源是管理员配置层：列源接口对普通用户 403，别发无谓请求
+    if (window.__ROLE !== 'admin') return;
     try {
       const res = await fetch('/api/video_hub/api/sources');
       if (!res.ok) throw new Error('HTTP ' + res.status);
@@ -1047,6 +1051,8 @@ export default function init_29_video_ui(App: AppKernel) {
 
   /* ---------- 视频源：同步搜索页 chips（只显示启用的平台 + 自定义源） ---------- */
   async function syncPlatformChips() {
+    // 平台清单属于管理员配置：普通用户不重建 chips，静态 chips 只有「全部」+ 排序
+    if (window.__ROLE !== 'admin') return;
     try {
       const res = await fetch('/api/video_hub/api/sources');
       if (!res.ok) return;

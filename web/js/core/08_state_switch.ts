@@ -104,14 +104,40 @@ export default (function init(App: AppKernel) {
     App.showToast('帧率: ' + fps + 'fps · ' + (fps <= 20 ? '极致省电' : fps <= 30 ? '流畅省电' : '最佳画质'));
   };
 
+  /** 打字轻载：输入框聚焦时的帧率上限（20fps）。见 setTypingLite */
+  App._typingLite = false;
+  const TYPING_LITE_SKIP = 3;
+
   /** 渲染帧节流：返回true表示本帧应该渲染 */
   App.shouldRenderFrame = function shouldRenderFrame() {
     App._renderFrameCount++;
-    if (App._renderFrameCount >= App._renderFrameSkip) {
+    const skip = App._typingLite
+      ? Math.max(App._renderFrameSkip, TYPING_LITE_SKIP)
+      : App._renderFrameSkip;
+    if (App._renderFrameCount >= skip) {
       App._renderFrameCount = 0;
       return true;
     }
     return false;
+  };
+
+  /**
+   * 打字轻载开关：输入框聚焦时把帧率压到 20fps，失焦立即恢复。
+   *
+   * 为什么不是停帧：旧实现 focus 时 renderer.setAnimationLoop(null) 把 3D 帧循环
+   * 整个掐掉，半屏下角色当场僵住、与全屏观感不一致（屏幕上舞台还看得见，
+   * 一帧都不画是错的）。降帧才是对的方向 —— 逻辑/口型/动画照常每帧更新，
+   * 只是少画几帧，主线程与 GPU 开销按帧数线性下降。
+   *
+   * 只碰 shouldRenderFrame 的有效 skip，不改 _renderFrameSkip 本体：那是性能档位
+   * 与 adaptiveFrame 环境降载的共同状态，写它会被 resetAdaptiveDPR 覆盖、也会
+   * 污染档位语义。这里读时叠加，天然幂等，失焦即回原状。
+   */
+  App.setTypingLite = function setTypingLite(on: boolean) {
+    const next = !!on;
+    if (next === App._typingLite) return;
+    App._typingLite = next;
+    App._renderFrameCount = 0;   // 换档即重置计数：避免按旧节奏卡在长间隔上
   };
 
   /** VAD帧节流：返回true表示本帧应该执行VAD检测 */
@@ -151,6 +177,10 @@ export default (function init(App: AppKernel) {
   /** 每帧调用（仅渲染帧）：统计真实帧率，按需动态降载环境（不降分辨率） */
   App.adaptiveFrame = function adaptiveFrame(dt: number) {
     if (!App._adaptiveDPR || !App.renderer || App.perfTier === 'low') return;
+    // 打字轻载期间的低帧率是**我们自己造成的**，不是设备跑不动。
+    // 不跳过就会误判 → 环境降载升到 level 3 → 把 _renderFrameSkip 永久抬高，
+    // 失焦恢复后帧率反而比打字前更低（降载回收要 6s 且条件苛刻）。
+    if (App._typingLite) { App._fpsAccum = 0; App._fpsCount = 0; return; }
     // XR 会话中帧缓冲尺寸由头显接管，setPixelRatio/setSize 是无效调用
     // （three.js 会告警并返回），还会基于 XR 高帧率误判 —— 直接跳过
     if (App.renderer.xr && App.renderer.xr.isPresenting) return;

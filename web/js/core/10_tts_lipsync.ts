@@ -353,8 +353,10 @@ export default (function init(App: AppKernel) {
       App.currentAudio = null;
     }
   };
-  /* 主动打断：停止本地播放 + 通知服务端取消 */
-  App.triggerInterrupt = function triggerInterrupt() {
+  /* 主动打断：停止本地播放 + 通知服务端取消
+   * force=true：用户显式点「中断」按钮 → 服务端即使正在跑工具任务也照取消；
+   * 缺省 false：VAD/看门狗等自动来源，工具任务执行中会被服务端忽略（改排队）。 */
+  App.triggerInterrupt = function triggerInterrupt(force?: boolean) {
     App.clearAudioQueue();
     // 会话栅栏：记住被打断的 session，拦截其迟到的 audio_chunk/audio_end
     // （服务端任务被取消前可能仍会冲刷出残余 TTS 分片，若不拦截，
@@ -377,7 +379,8 @@ export default (function init(App: AppKernel) {
     }
     if (App.ws && App.ws.readyState === WebSocket.OPEN) {
       App.ws.send(JSON.stringify({
-        type: 'interrupt'
+        type: 'interrupt',
+        force: !!force
       }));
     }
   };

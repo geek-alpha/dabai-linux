@@ -45,7 +45,7 @@ export default (function init(App: AppKernel) {
     const mcY = 1.0;
     // 根据当前 FPV 距离更新 camZoom，使后续缩放从合理基准开始
     const dist = Math.hypot(App.fpvPos.x, App.fpvPos.z);
-    App.camZoom = THREE.MathUtils.clamp(dist / App.cameraDistance, App.MIN_ZOOM, App.MAX_ZOOM);
+    App.camZoom = THREE.MathUtils.clamp(dist / App.cameraDistance, App.userMinZoom(), App.MAX_ZOOM);
     // 用更新后的 camZoom 计算默认目标位置，再求偏移
     const baseZ = App.cameraDistance * App.camZoom;
     const baseY = mcY + (App.cameraHeight - mcY) * App.camZoom;
@@ -126,6 +126,25 @@ export default (function init(App: AppKernel) {
       // forward = (-sinY, 0, -cosY), right = (cosY, 0, -sinY)
       App.fpvPos.x += (-sinY * forward + cosY * strafe) * speed;
       App.fpvPos.z += (-cosY * forward - sinY * strafe) * speed;
+    }
+    // 隐私护栏（非管理员）：视点不许低于腰部、也不许贴到角色身上
+    if (!App.IS_ADMIN) {
+      App.fpvPos.y = Math.max(App.fpvPos.y, App.USER_FPV_MIN_HEIGHT);
+      const g = App.modelGroup;
+      if (g) {
+        const dx = App.fpvPos.x - g.position.x;
+        const dz = App.fpvPos.z - g.position.z;
+        const d = Math.hypot(dx, dz);
+        if (d < App.USER_FPV_MIN_DISTANCE) {
+          if (d > 1e-4) {
+            const k = App.USER_FPV_MIN_DISTANCE / d;
+            App.fpvPos.x = g.position.x + dx * k;
+            App.fpvPos.z = g.position.z + dz * k;
+          } else {
+            App.fpvPos.z = g.position.z + App.USER_FPV_MIN_DISTANCE;
+          }
+        }
+      }
     }
     App.camera!.position.copy(App.fpvPos);
     App.camera!.rotation.set(App.fpvPitch, App.fpvYaw, 0, 'YXZ');

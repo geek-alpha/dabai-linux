@@ -77,6 +77,41 @@ export default (function init(App: AppKernel) {
   App.camZoom = 1.0; // 缩放倍率 (0.05=极限拉近, 12.0=极限拉远)
   App.MIN_ZOOM = 0.05;
   App.MAX_ZOOM = 12.0;
+  /* ---------- 隐私护栏（非管理员）：收紧上下环绕角度与最近距离 ----------
+   * 普通用户不许贴到角色身上，也不许从下往上打量（穿模 / 走光）。
+   * 管理员全部走原始值，行为不变。 */
+  App.IS_ADMIN = window.__ROLE === 'admin';
+  App.USER_ORBIT_PITCH_LIMIT = Math.PI / 3; // 上下环绕角度上限（弧度，60°）
+  App.USER_MIN_CAM_DISTANCE = 1.0; // 相机基准距离下限（米）
+  App.USER_MIN_CAM_HORIZ = 1.0; // 相机与角色的水平距离硬下限（米，再近就穿模）
+  App.USER_MIN_CAM_HEIGHT = 1.8; // 相机高度下限（米，防贴地仰视）
+  App.USER_MIN_VIEW_HEIGHT = 1.0; // 相机高度绝对下限（米）
+  App.USER_FPV_MIN_HEIGHT = 1.2; // 第一人称视点最低高度（米）
+  App.USER_FPV_MIN_DISTANCE = 1.0; // 第一人称与角色的最小水平距离（米）
+  // 缩放下限与基准距离联动：距离滑块调到多小，镜头都恰好推到 USER_MIN_CAM_HORIZ 为止
+  App.userMinZoom = () => (App.IS_ADMIN ? App.MIN_ZOOM : Math.max(App.MIN_ZOOM, Math.min(1, App.USER_MIN_CAM_HORIZ / Math.max(App.cameraDistance, 0.1))));
+  App.userMinCamDistance = () => (App.IS_ADMIN ? 0.1 : App.USER_MIN_CAM_DISTANCE);
+  App.userMinCamHeight = () => (App.IS_ADMIN ? 0.1 : App.USER_MIN_CAM_HEIGHT);
+  // 每帧兜底：拖拽/缩放之外还有 FPV 偏移、聚焦退出偏移、脏存档三条路径能改相机，
+  // 光靠输入处夹紧拦不住，所以最终目标位置再过一道。
+  App.clampCameraForUser = function clampCameraForUser(p) {
+    const cx = App.autoLookTarget ? App.autoLookTarget.x : 0;
+    const cz = App.autoLookTarget ? App.autoLookTarget.z : 0;
+    const dx = p.x - cx;
+    const dz = p.z - cz;
+    const horiz = Math.hypot(dx, dz);
+    const minHoriz = App.USER_MIN_CAM_HORIZ;
+    if (horiz < minHoriz) {
+      if (horiz > 1e-4) {
+        const k = minHoriz / horiz;
+        p.x = cx + dx * k;
+        p.z = cz + dz * k;
+      } else {
+        p.z = cz + minHoriz;
+      }
+    }
+    if (p.y < App.USER_MIN_VIEW_HEIGHT) p.y = App.USER_MIN_VIEW_HEIGHT;
+  };
   App.PINCH_SENSITIVITY = 1.8; // 双指捏合缩放灵敏度，>1 响应更快
   // FPV 退出后保留的相机偏移（让探索时调整的视角在退出后不丢失）
   App.camOffsetX = 0;
@@ -1809,7 +1844,7 @@ export default (function init(App: AppKernel) {
   App.fpvLookLastY = 0;
   App.vrmBones = {};
   App.gltfLoader = new GLTFLoader();
-  // 注册 Draco 解码器：支持 KHR_draco_mesh_compression 压缩模型（如蔚蓝妖姬_draco3.vrm）
+  // 注册 Draco 解码器：支持 KHR_draco_mesh_compression 压缩模型（如白头凤_draco3.vrm）
   const dracoLoader = new DRACOLoader();
   // 必须是绝对静态路径：/static 挂载 web/ 根 → /static/vendor/three/... 命中解码器
   // 不要写成相对的，页面在根 URL '/' 时 resolve 成顶级 /vendor → 404，压缩模型直接加载失败
@@ -2013,6 +2048,10 @@ export default (function init(App: AppKernel) {
         const dX = (e.clientY - lastY) * 0.01;
         App.dragOrbitYaw -= dY;
         App.dragOrbitPitch += dX;
+        // 隐私护栏：夹累加值本身，否则拖到极限后反向拖要先「还债」，手感像橡皮筋
+        if (!App.IS_ADMIN) {
+          App.dragOrbitPitch = Math.max(-App.USER_ORBIT_PITCH_LIMIT, Math.min(App.USER_ORBIT_PITCH_LIMIT, App.dragOrbitPitch));
+        }
         App.dragTotalRot += Math.abs(dY) + Math.abs(dX);
         // 拖拽控制相机环绕角色：水平拖拽=水平环绕，垂直拖拽=上下打量
         lastX = e.clientX;
@@ -2029,7 +2068,8 @@ export default (function init(App: AppKernel) {
       if (App.xrMode && App.xrMode !== 'off') return;
       if (App.fpvMode) {
         // 第一人称模式下：滚轮调整视点高度
-        App.fpvPos.y = THREE.MathUtils.clamp(App.fpvPos.y - e.deltaY * 0.005, 0.3, 8);
+        const minEyeY = App.IS_ADMIN ? 0.3 : App.USER_FPV_MIN_HEIGHT;
+        App.fpvPos.y = THREE.MathUtils.clamp(App.fpvPos.y - e.deltaY * 0.005, minEyeY, 8);
         return;
       }
       if (App.moveMode && App.selectedTarget) {
@@ -2037,7 +2077,7 @@ export default (function init(App: AppKernel) {
         App.debouncedSaveScene();
       } else {
         App.camZoom += e.deltaY * 0.006;
-        App.camZoom = Math.max(App.MIN_ZOOM, Math.min(App.MAX_ZOOM, App.camZoom));
+        App.camZoom = Math.max(App.userMinZoom(), Math.min(App.MAX_ZOOM, App.camZoom));
         App.exitFocusMode();
         App.debouncedSaveScene();
         // 缩放防抖：停止滚动300ms后触发AI反应
@@ -2091,7 +2131,7 @@ export default (function init(App: AppKernel) {
             const prevZoom = App.camZoom;
             const ratio = pinchDist / d;
             App.camZoom *= Math.pow(ratio, App.PINCH_SENSITIVITY);
-            App.camZoom = Math.max(App.MIN_ZOOM, Math.min(App.MAX_ZOOM, App.camZoom));
+            App.camZoom = Math.max(App.userMinZoom(), Math.min(App.MAX_ZOOM, App.camZoom));
             const delta = App.camZoom - prevZoom;
             App.zoomNet += delta;
             App.zoomAbsTotal += Math.abs(delta);
@@ -2132,6 +2172,9 @@ export default (function init(App: AppKernel) {
     // 在 sessionstart/sessionend 自动切换 XR 帧循环，避免 VR 入口手动切换
     // requestAnimationFrame / setAnimationLoop 造成双重循环或会话失败后画面停摆
     App.renderer.setAnimationLoop(App.animate);
+    // 帧循环刚起：此刻可能已经处于聊天全屏静默（手机上模型加载比用户点 ⤢ 慢），
+    // 立刻按回去 —— 否则全屏里模型一直在渲染，手机发烫且再也回不到静默
+    if (App.syncQuietLoop) App.syncQuietLoop();
   };
   App.addStars = function addStars() {
     // 按当前性能档位的 _starCount 生成粒子：default=80、low=不生成（省显存/GPU）

@@ -439,8 +439,64 @@ ssh -O check win     # 主连接是否活着
 ls ~/.ssh/cm-*       # 套接字文件名 = 实际连的 HostName
 ```
 
-套接字名从 `cm-wangxingfeng@192.168.31.144-22` 变成 `cm-wangxingfeng@desktop-apb0bda-22`，
-是「真的在走主机名」的铁证。
+套接字名从 `cm-wangxingfeng@192.168.31.144-22` 变成 `cm-wangxingfeng@desktop-apb0bda-22`，是「真的在走主机名」的铁证。
+
+**在 Windows 上跑 PowerShell（必读坑）**
+
+`ssh win "<命令>"` 落地是 `cmd.exe`：双引号会被吃掉、`|` 被当管道符拆开，
+任何带引号/管道/`$_` 的 PowerShell 命令都会静默走样（实测 `-match "A|B"` 直接报
+`'A' 不是内部或外部命令`；`$s="$env:LOCALAPPDATA\..."; Get-ChildItem "$s$d"` 也会静默取到空路径）。
+
+正确姿势：脚本写成 `.ps1`，用 UTF-16LE base64 传给 `-EncodedCommand`——base64 对 cmd 只是纯文本，不会被解析：
+
+```bash
+sh tools/winps.sh /tmp/xxx.ps1     # 封装好了，注释里写了原因
+```
+
+**实测用例**：在 Windows 上离线构建 Android APK（`apps/dabai-android`）——AGP 8.7.2 已在
+`~/.gradle/caches/modules-2` 里，`maven.google.com` 直连超时但 `repo1.maven.org` 通，
+所以 `gradle --offline assembleDebug` 31s 出包，全程零下载。
+
+
+### 6.10 WSL 里的大白开机自启（Windows 侧，`\WSL-Dabai-KeepAlive`）
+
+**目标**：Windows 登录后 WSL Debian 实例自动起来、`dabai.service` 常驻；`.wslconfig` 里 `networkingMode=mirrored`
+让 WSL 的 `:8000` 直通主机网卡（不需要 netsh portproxy，实测 portproxy 表为空）。
+
+三层链路，缺一层就静默失效：
+
+1. `/etc/wsl.conf` → `[boot] systemd=true`（已配）→ 实例一启动，systemd 自动拉起 enabled 的 `dabai.service`
+2. 任务动作 `wsl.exe -d Debian -u root -e sleep infinity` —— **必须有进程挂住实例**：
+   WSL2 最后一个会话退出约 8 秒后 VM 关闭，服务跟着陪葬（journal 里能看到一串短命的 `-- Boot xxx --`）
+3. 任务设置（旧任务死在这三条上）：
+   - `ExecutionTimeLimit=PT0S` —— 默认 `PT72H`，保活进程跑满 3 天被杀，且不会自愈
+   - `DisallowStartIfOnBatteries=false` / `StopIfGoingOnBatteries=false`
+   - `StartWhenAvailable=true`、`MultipleInstances=IgnoreNew`
+   - 触发器 = LogonTrigger（延迟 15s）+ TimeTrigger 每 5 分钟无限重复 → 实例被杀后 5 分钟内自动拉起
+
+**验收实测（2026-09-17）**：`wsl --terminate Debian` → Stopped → `Start-ScheduledTask` → Running →
+`systemctl is-active dabai` = `active`、`:8000` 在听。
+
+**回滚**：旧定义备份在 `C:\Users\wangxingfeng\WSL-Dabai-KeepAlive.bak-<时间戳>.xml`，
+`Register-ScheduledTask -TaskName 'WSL-Dabai-KeepAlive' -Xml (Get-Content <备份> -Raw) -Force`。
+
+**边界**：WSL 需要用户会话——Windows 停在登录界面时不会起，要真正「开机即起」得配自动登录。
+**硬依赖：WSL 里必须装 Node >= 22.13**（2026-09-17 踩坑）。`server.py` 的 `TSTranspileMiddleware` 用 Node 的 `module.stripTypeScriptTypes` 把 `.ts` 实时转译成 ESM JS；node 缺失时 `except` 会**静默退回原样直服**（server.py:429-430），浏览器拿到 TS 源码当 JS 跑 → 整个 module 图崩掉 → 页面永远停在 `index.html:39` 的初始「连接中…」，且公网/局域网都复现。诊断法：比 `磁盘 .ts 的 md5` 与 `HTTP 下发的 md5`，相同=原样直服（坏）。**别用 `head` 看开头判断——import 语句在 TS/JS 里长得一样，必须比 md5。**
+
+Debian 13 apt 的 `nodejs` 只有 20.19.2，不够（`stripTypeScriptTypes` 下限 v22.13.0 / v23.2.0）。装官方二进制：
+
+```bash
+curl -L -o /tmp/node24.tar.xz https://registry.npmmirror.com/-/binary/node/v24.21.0/node-v24.21.0-linux-x64.tar.xz
+cd /tmp && tar -xf node24.tar.xz && mkdir -p /usr/local/lib/nodejs
+mv node-v24.21.0-linux-x64 /usr/local/lib/nodejs/
+ln -sf /usr/local/lib/nodejs/node-v24.21.0-linux-x64/bin/{node,npm,npx} /usr/local/bin/
+```
+
+装完**必须重启 `dabai.service`**：`_ts_node_broken` 是进程级一次性标志（server.py:313），置位后不再重试。实测重启后 WSL 的 `/static/app.ts` 下发 5607 字节、md5 `0b8fd06d4121d6143104aa2c34372aaf`，与树莓派侧转译输出**逐字节相同**。
+
+**已知待办**：`wsl.battlephoenix.tech` 隧道指向 `https://192.168.31.144:8002`（cloudflared config.yml），但 WSL 只监听 **8000** —— 该子域当前是坏的。
+
+**访问方式（已查清）**
 
 
 ## 7. 回滚（Linux 兼容层，§1–§5）

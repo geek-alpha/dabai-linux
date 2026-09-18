@@ -37,10 +37,23 @@ async def shell_run(args: dict) -> str:
     if not cmd:
         return "错误：command 不能为空"
     timeout = max(1, min(int(args.get("timeout") or 60), 1200))
+    # 普通用户：整条命令进 bwrap 沙箱（系统目录只读 + 只有自己目录可写 + 断网），
+    # 工作目录也锁进沙箱；管理员与系统身份保持原行为（见 sandbox.py）。
+    argv = None
+    cwd = str(args.get("root") or "").strip() or None
+    try:
+        import sandbox as _sb
+
+        actor = _sb.current()
+        if actor is not None and not actor.is_admin:
+            work = str(_sb.resolve_path(actor, cwd)) if cwd else str(actor.sandbox)
+            argv, cwd = _sb.wrap_shell(actor, cmd, work)
+    except Exception as e:  # noqa: BLE001
+        return f"沙箱拒绝：{e}"
     try:
         exe = _executor()
         out = await asyncio.wait_for(
-            asyncio.to_thread(exe.run_sync, cmd, timeout), timeout=timeout + 10)
+            asyncio.to_thread(exe.run_sync, cmd, timeout, argv, cwd), timeout=timeout + 10)
     except TimeoutError:
         return f"命令超时（>{timeout}s），已终止：{cmd}"
     except Exception as e:

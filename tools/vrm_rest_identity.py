@@ -1,7 +1,7 @@
 ﻿"""
 vrm_rest_identity.py —— MMD → VRM 手臂自然下垂（最终方案 PlanB）。
 
-机制（实测蔚蓝妖姬 + 数学推导）：
+机制（实测白头凤 + 数学推导）：
 - skinning: final = Σ w * (jointMatrix * IBM) * bindVertex。
 - IBM 对应原始骨骼 rest（world_old）。若把骨骼 rest 改为 world_new（手臂绕肩
   转 ±90° 下垂）而 IBM 不变，则 rest 渲染 = world_new * inv(world_old) * bindVertex：

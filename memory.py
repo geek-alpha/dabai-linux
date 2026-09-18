@@ -803,6 +803,41 @@ except Exception as e:
     logger.error(f'SQLite 初始化异常，继续以懒重试模式运行: {e}')
 
 
+def _strict_user_scope(uid: str) -> bool:
+    """该身份是否按 user_id 严格隔离记忆与会话。
+
+    为什么需要这个判据：单系统模式要求「最近活跃会话被当前身份接管」，多设备/
+    刷新后才续得上同一条对话；而公网多用户下这个行为是灾难 —— 普通用户一登录
+    就会接管管理员正在聊的会话，等于读到对方全部历史。
+
+    判据：真实注册的普通用户 = 严格隔离；管理员与系统身份（default/unified）
+    = 保持旧行为。管理员不严格是刻意的：她自己的机器、自己的历史（含注册账号
+    之前的 default 会话）应当照旧可见可续；但即便管理员也不会抢走其他注册
+    用户的会话（见 get_or_create_session）。
+    """
+    try:
+        import auth_core
+
+        u = auth_core.get_user(str(uid or ""))
+        if not u:
+            return False
+        return str(u.get("role") or "user") != "admin"
+    except Exception:
+        return False
+
+
+def _is_registered_user(uid: str) -> bool:
+    """uid 是否为已注册登录账号（区别于浏览器匿名 u_* 与系统 default 桶）。"""
+    if not uid or str(uid).strip() in ("", "default"):
+        return False
+    try:
+        import auth_core
+
+        return bool(auth_core.get_user(str(uid)))
+    except Exception:
+        return False
+
+
 class ChatMemory:
     """对话记忆管理器。
 
@@ -887,23 +922,37 @@ class ChatMemory:
                 self._message_count = cnt
                 return sid
 
-            # 1) 单系统模式：取「当前命名空间内所有身份里最近活跃」的会话——
-            #    服务重启/刷新后续上同一条对话；若属于旧的设备级身份（u_*），
-            #    自动接管（user_id 改为当前统一用户），历史对话无缝延续
-            row = conn.execute(
+            # 1) 续上最近活跃会话：
+            #    - 严格身份（普通用户）：只认自己名下的会话，绝不接管别人的；
+            #    - 管理员/系统身份：保持单系统旧行为（可接管 default 等旧身份），
+            #      但不碰**其他注册用户**的会话——否则管理员一登录就把别人正在聊的
+            #      会话抢过来，对方下一句话就开在新会话里了。
+            strict = _strict_user_scope(self.user_id)
+            rows = conn.execute(
                 "SELECT id, user_id FROM sessions "
                 "WHERE namespace=? AND is_active=1 AND archived=0 "
-                "ORDER BY updated_at DESC LIMIT 1",
+                "ORDER BY updated_at DESC LIMIT 20",
                 (self.namespace,),
-            ).fetchone()
-            if row:
-                if row["user_id"] != self.user_id:
-                    conn.execute(
-                        "UPDATE sessions SET user_id=? WHERE id=?",
-                        (self.user_id, row["id"]),
-                    )
-                    conn.commit()
-                return _adopt(row["id"])
+            ).fetchall()
+            for r in rows:
+                if r["user_id"] == self.user_id:
+                    return _adopt(r["id"])
+                if strict:
+                    continue
+                # 非严格身份（管理员/系统）：只接管「系统旧身份桶」（default/空串）的历史——
+                # 必须自己是已注册登录身份，且对方是旧桶；其余（别的注册用户、其他浏览器
+                # 的匿名 u_* 会话）一律视为他人绝不接管：否则管理员一登录就把访客正在聊的
+                # 会话抢走，两人串到同一条对话线上。
+                if self.user_id in ("", "default") or not _is_registered_user(self.user_id):
+                    continue
+                if r["user_id"] not in ("", "default"):
+                    continue
+                conn.execute(
+                    "UPDATE sessions SET user_id=? WHERE id=?",
+                    (self.user_id, r["id"]),
+                )
+                conn.commit()
+                return _adopt(r["id"])
             # 2) 兼容旧逻辑：近期活动会话（15 分钟内，仅限当前命名空间）
             recent = now - 900
             row = conn.execute(
@@ -929,6 +978,24 @@ class ChatMemory:
             return sid
 
         return await asyncio.to_thread(_do)
+
+    async def rebind_session_namespace(self, session_id: str, namespace: str) -> None:
+        """把某个会话的归属命名空间改掉（换角色卡片时让当前会话跟着人设走）。
+
+        只改标签，不动消息：会话列表/可见性都按 namespace 过滤，不重绑的话
+        正在聊的这条会话会在新卡片的历史列表里凭空消失。
+        """
+        if not session_id or not namespace:
+            return
+
+        @_with_db_lock
+        def _do():
+            conn = _get_db()
+            conn.execute("UPDATE sessions SET namespace=? WHERE id=?",
+                         (namespace, session_id))
+            conn.commit()
+
+        await asyncio.to_thread(_do)
 
     async def create_new_session(self, title: str = "") -> str:
         """强制创建全新会话（不复用近期活动会话）。
@@ -1051,6 +1118,38 @@ class ChatMemory:
             return bool(row and row["namespace"] == self.namespace)
         return await asyncio.to_thread(_do)
 
+    async def session_visible(self, session_id: str) -> bool:
+        """会话对当前身份是否可见：namespace 相符 + （严格身份下）归属自己。
+
+        比 session_belongs_to_namespace 多一层用户归属校验 —— 后者只按角色卡片
+        命名空间判定，多用户下普通用户拿到别人的 session_id 就能读全文。
+        """
+        if not session_id:
+            return False
+        strict = _strict_user_scope(self.user_id)
+
+        def _do():
+            conn = _get_db()
+            row = conn.execute(
+                "SELECT namespace, user_id FROM sessions WHERE id=?", (session_id,)
+            ).fetchone()
+            conn.close()
+            if not row or row["namespace"] != self.namespace:
+                return False
+            if row["user_id"] != self.user_id:
+                # 别人的会话一律不可见。非严格身份（管理员）额外可见的只是
+                # 系统旧身份桶（default/空串）——且自身必须是已注册登录身份；
+                # 匿名浏览器 u_* 会话、别的注册用户，一概不可见（防串线）。
+                if strict:
+                    return False
+                if self.user_id in ("", "default") or not _is_registered_user(self.user_id):
+                    return False
+                if row["user_id"] not in ("", "default"):
+                    return False
+            return True
+
+        return await asyncio.to_thread(_do)
+
     async def list_sessions(self, limit: int = 50, query: str = None,
                             include_archived: bool = False) -> list:
         """列出当前命名空间下的所有会话（含消息数/摘要/token 估算/置顶/归档）。
@@ -1086,6 +1185,16 @@ class ChatMemory:
                 "WHERE s.namespace=? "
             )
             params: list = [self.namespace]
+            if _strict_user_scope(self.user_id) or not _is_registered_user(self.user_id):
+                # 普通用户 & 匿名浏览器身份：会话列表只含自己的 —— 混入别人的
+                # 会话（管理员/旧设备身份/别的浏览器）即隐私泄漏 + 一键串线。
+                sql += "AND s.user_id=? "
+                params.append(self.user_id)
+            else:
+                # 管理员/系统身份：只列出自己的 + 系统旧身份桶（default/空串）历史，
+                # 其余一律排除 —— 实测漏洞：管理员列表混进普通用户会话，点开即接管。
+                sql += "AND (s.user_id=? OR s.user_id IN ('', 'default')) "
+                params.append(self.user_id)
             # 搜索时覆盖归档会话（用户搜历史内容通常也包括归档）；纯列表才默认排除
             if not include_archived and not like:
                 sql += "AND s.archived=0 "

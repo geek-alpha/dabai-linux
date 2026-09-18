@@ -58,8 +58,10 @@ export default (function init(App: AppKernel) {
   };
 
   App.startRecording = async function startRecording() {
-    // 按下麦克风即打断当前 AI 回复（让用户随时插话）
-    App.triggerInterrupt();
+    // 按下麦克风即打断当前 AI 回复（让用户随时插话）；工具任务执行中只停本地播报，
+    // 不取消服务端——这句话由服务端排队，等工具干完再回
+    if (App._turnInTools) App.clearAudioQueue();
+    else App.triggerInterrupt();
     try {
       const { stream } = await App._acquireMicStream();
 

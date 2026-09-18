@@ -25,15 +25,16 @@
     display: flex; align-items: center; justify-content: center;
     background: #000;
   }
+  /* 刻意不加 border / border-radius / box-shadow：3D 侧已有霓虹边框（frameStrips）
+   * 贴着屏幕四边。这里再画一圈就是「框中框」——而且取帧用 backgroundColor:null，
+   * 圆角外是透明的，方形霓虹框里套一张圆角缩进的画，四角透出 3D 场景，
+   * 看着像一大一小两块屏。屏幕边缘只由 3D 边框负责，本画面必须铺满到边。 */
   #stage {
     position: relative;
     width: 1280px; height: 720px;
     transform-origin: center center;
     background: linear-gradient(180deg, rgba(36,50,108,0.97), rgba(25,34,84,0.97) 50%, rgba(18,24,60,0.97));
-    border: 2px solid rgba(0,229,255,0.32);
-    border-radius: 18px;
     overflow: hidden;
-    box-shadow: 0 0 60px rgba(0,229,255,0.15);
   }
   /* 顶部氛围光（紫→青） */
   #stage::before {
@@ -42,10 +43,10 @@
     background: radial-gradient(ellipse at center, rgba(124,92,255,0.26), rgba(0,229,255,0.10) 55%, transparent 70%);
     pointer-events: none;
   }
-  /* 左彩色边缘 */
+  /* 左彩色边缘：贴死左边（原来内缩 6/8px，等于又画了一道内框） */
   #stage::after {
-    content: ''; position: absolute; left: 6px; top: 8px; bottom: 8px; width: 8px;
-    background: #9d7bff; border-radius: 4px; pointer-events: none;
+    content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 6px;
+    background: #9d7bff; pointer-events: none;
   }
   /* 扫描线动效（直播中暗示） */
   #scanline {
@@ -393,7 +394,8 @@
         render();
       }
     }).catch(() => {});
-    setTimeout(requestTasks, 2500);
+    // 兜底轮询：本页有自己的 ws，task_event 已广播到所有连接，实时性不靠它
+    setTimeout(requestTasks, 15000);
   }
 
   // ---------- WebSocket 实时推送 ----------
@@ -455,7 +457,10 @@
       }
     }
     render();
-    requestTasks();
+    // 只补「列表里还没有这个任务」的情况（新建/刚恢复）。
+    // 无条件 requestTasks() 等于「每个事件一次全量拉」——task_event 改成广播后
+    // 这条路会把轮询放大成雪崩（实测每秒 1~4 次 /api/tasks）。
+    if (!tasks.some(t => t && t.id === ev.id)) requestTasks();
   }
 
   // ---------- 媒体墙 ----------
@@ -511,6 +516,21 @@
   }
 
   // ---------- 渲染 ----------
+  // 全屏焦点到期回待机。原来 SHOWCASE_MS 定义了却从未被使用 —— 网页版的
+  // 一条任务结果会永远霸屏（父页 3D 版有这条超时，两边不一致，也是
+  // 「几个画面缝在一起」的来源之一：iframe 停在旧焦点、手绘已回待机）。
+  function tickShowcase() {
+    if (!showcase) return;
+    if (showcase.kind === 'media') {
+      const it = mediaItems.find(x => x.url === showcase.url);
+      if (it && it.dead) {
+        if (!showcase.deadAt) showcase.deadAt = Date.now();
+        else if (Date.now() - showcase.deadAt > 3000) { showcase = null; render(); return; }
+      }
+    }
+    if (Date.now() - showcase.ts >= SHOWCASE_MS) { showcase = null; render(); }
+  }
+
   function render() {
     window.__bsFrameDirty = true;   // 内容变了 → 末尾的取帧桥立刻取一张（静止时降频兜底）
     renderClock();
@@ -716,6 +736,7 @@
     fit();
     renderClock();
     setInterval(renderClock, 1000);
+    setInterval(tickShowcase, 1000);   // 到期检查要周期跑：无新事件时也得准时回待机
     requestTasks();
     connectWS();
   }
@@ -756,7 +777,7 @@
       const d = ev.data;
       if (d && d.type === 'bigscreen-pause') paused = !!d.on;
     });
-    const ACTIVE_MS = 300, IDLE_MS = 1000;
+    const ACTIVE_MS = 500, IDLE_MS = 2000;
     setInterval(() => {
       if (!h2c || document.hidden || paused) return;
       const stage = document.getElementById('stage');
@@ -766,7 +787,7 @@
       if (now - lastShot < (dirty ? ACTIVE_MS : IDLE_MS)) return;
       window.__bsFrameDirty = false;
       lastShot = now;
-      h2c(stage, { backgroundColor: null, scale: 1, logging: false, useCORS: true })
+      h2c(stage, { backgroundColor: null, scale: 0.5, logging: false, useCORS: true })
         .then(cv => {
           const c = cv.getContext('2d');
           const id = c.getImageData(0, 0, cv.width, cv.height);

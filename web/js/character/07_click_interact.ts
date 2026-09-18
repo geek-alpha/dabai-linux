@@ -190,6 +190,9 @@ export default (function init(App: AppKernel) {
   // 戳一戳核心交互（DOM 点击与 VR 手柄共用）
   App.triggerPokeAt = function triggerPokeAt(hitPoint, result) {
     if (!App.currentAvatar) return;
+    // 非管理员触碰身体：静默忽略，不给任何反馈（DOM 点击与 VR 手柄射线都汇聚到这里，
+    // 一次拦截即关闭击退摇晃、相机聚焦与亲密互动消息三条副作用）
+    if (!App.IS_ADMIN) return;
 
     // 触发击退 + 身体摇晃：基于物理的力矩计算
     // 力方向 = 从视点指向点击点（即推的方向）；WebXR 中用真实头部位置
@@ -237,11 +240,11 @@ export default (function init(App: AppKernel) {
         App.showToast(`戳了${result.name}一下~`);
       } else {
         const camToPart = App.camera.position.clone().sub(result.center).normalize();
-        const focusDist = 1.2;
+        const focusDist = App.IS_ADMIN ? 1.2 : 2.0;
         App.focusPart.active = true;
         App.focusPart.lookAt.copy(result.center);
         App.focusPart.target.copy(result.center).addScaledVector(camToPart, focusDist);
-        App.focusPart.target.y = Math.max(0.3, App.focusPart.target.y);
+        App.focusPart.target.y = Math.max(App.IS_ADMIN ? 0.3 : App.USER_MIN_VIEW_HEIGHT, App.focusPart.target.y);
         App.focusPart.time = 0;
         App.focusPart.name = result.name;
       }
@@ -483,7 +486,11 @@ export default (function init(App: AppKernel) {
       const baseY = mcY + (App.cameraHeight - mcY) * App.camZoom; // 基准高度
       // 球面坐标：gyroYaw+拖拽控制水平环绕，gyroPitch+拖拽控制垂直视角
       const orbYaw = App.gyroYaw + App.dragOrbitYaw;
-      const orbPitch = App.gyroPitch + App.dragOrbitPitch;
+      let orbPitch = App.gyroPitch + App.dragOrbitPitch;
+      // 隐私护栏：陀螺仪与拖拽两条输入在这里汇总，非管理员统一夹紧上下打量幅度
+      if (!App.IS_ADMIN) {
+        orbPitch = Math.max(-App.USER_ORBIT_PITCH_LIMIT, Math.min(App.USER_ORBIT_PITCH_LIMIT, orbPitch));
+      }
       // 摄像机自动跟踪角色：无操作超过15秒，相机跟随角色移动
       const now = Date.now() / 1000;
       const idleDuration = now - App.lastInteractionTime;
@@ -506,6 +513,7 @@ export default (function init(App: AppKernel) {
       const effectiveDist = orbitR * Math.cos(orbPitch);
       const tiltOffset = effectiveDist * Math.tan(cameraTiltRad);
       App.targetCamPos.set(App.camOffsetX + App.autoLookTarget.x + orbitR * Math.sin(orbYaw) * Math.cos(orbPitch), baseY + App.camOffsetY + orbitR * Math.sin(orbPitch), App.camOffsetZ + App.autoLookTarget.z + orbitR * Math.cos(orbYaw) * Math.cos(orbPitch));
+      if (!App.IS_ADMIN) App.clampCameraForUser(App.targetCamPos);
       // 相机平滑过渡
       App.camera.position.lerp(App.targetCamPos, 0.10);
       // 看向带倾斜偏移的角色位置
@@ -1079,9 +1087,11 @@ export default (function init(App: AppKernel) {
   // 可传入 camPos 计算指定相机位置下的目标角度（用于重置时直接对齐默认视角）
   App.computeBodyFaceCam = function computeBodyFaceCam(modelRoot, camPos) {
     if (!modelRoot || App.fpvMode) return 0;
-    const p = camPos || App.camera.position;
-    const dx = p.x - modelRoot.position.x;
-    const dz = p.z - modelRoot.position.z;
+    // 省略 camPos = 基准机位方位（相机基准偏移固定，不含拖拽环绕/陀螺仪）：
+    // 用户转视角时角色朝向不动 —— 60° 打量的是用户的视点，不是让角色转角度
+    if (!camPos) return Math.atan2(App.camOffsetX, App.camOffsetZ + App.cameraDistance * App.camZoom);
+    const dx = camPos.x - modelRoot.position.x;
+    const dz = camPos.z - modelRoot.position.z;
     return Math.atan2(dx, dz);
   };
   /* 安全设置 VRM 表情：仅在 expressionMap 中存在时才设置 */

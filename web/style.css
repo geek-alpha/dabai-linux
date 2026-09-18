@@ -159,8 +159,9 @@ html, body {
     border-radius: 0;
     border-top: none;
     background: linear-gradient(180deg, rgba(16,16,34,1), rgba(10,10,20,1));
-    backdrop-filter: blur(2px) saturate(1.05);
-    -webkit-backdrop-filter: blur(2px) saturate(1.05);
+    /* 背景完全不透明，backdrop-filter 在屏幕上一点都看不到 —— 但它会在合成器里
+     * 撑起一个全屏 backdrop root，每帧都要重算背后那片内容。全屏聊天的目标是
+     * 「屏幕只剩对话、GPU 尽量闲」，这种只赔不赚的滤镜直接去掉。 */
     /* 80 = 高于全部氛围浮层（礼物 64 / 彩带 68 / 粒子闪光 69-70 / 评级大字 71 /
      * 成就通知 72）。全屏不透明时用户要的是「屏幕上只剩对话」：面板必须在它们
      * 之上，否则特效会飘在聊天框上面继续动。
@@ -194,8 +195,11 @@ html, body {
 #chat-panel.chat-fs.chat-ghost .messages > *:first-child { margin-top: auto; }
 /* 输入栏与输入框一起透出去，否则整屏只剩底部一条不透明的板 */
 #chat-panel.chat-fs.chat-ghost ~ #controls { background: rgba(10, 10, 20, 0.2); }
-#chat-panel.chat-fs.chat-ghost ~ #controls #text-input {
+/* 底色在容器上（textarea 已透明），文字投影保证任何场景前都读得清 */
+#chat-panel.chat-fs.chat-ghost ~ #controls #composer {
     background: rgba(10, 12, 26, 0.5);
+}
+#chat-panel.chat-fs.chat-ghost ~ #controls #text-input {
     text-shadow: 0 1px 4px rgba(0, 0, 0, 0.7);
 }
 #chat-ghost-btn.active { background: rgba(0,229,255,0.32); color: #fff; }
@@ -545,6 +549,216 @@ html, body {
     line-height: 1.4;
 }
 
+/* ===== 待发附件条：输入框内部的第一行，有附件才出现 =====
+   放在 #composer 里，框子会随缩略图一起长高；收起 / 沉浸 / VR 由 #controls
+   一并带走，不需要兄弟选择器，也不会在输入栏隐藏时单独悬在屏幕上。 */
+.attach-strip {
+    display: none;
+    gap: 8px;
+    padding: 8px 10px 0;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+}
+.attach-strip.show { display: flex; }
+.attach-strip::-webkit-scrollbar { display: none; }
+
+.attach-chip {
+    position: relative;
+    flex: 0 0 auto;
+    width: 52px;
+    height: 52px;
+    border-radius: 10px;
+    background: rgba(24, 22, 40, 0.82);
+    border: 1px solid rgba(124, 92, 255, 0.35);
+    color: #e9e9f5;
+    animation: pop 0.18s ease;
+}
+.attach-chip.uploading { opacity: 0.55; }
+.attach-chip img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    border-radius: 9px;
+    display: block;
+}
+.attach-chip-ext {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    height: 100%;
+    border-radius: 9px;
+    background: rgba(124, 92, 255, 0.18);
+    color: var(--accent);
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.3px;
+}
+/* 上传中角标：图还没到，进度得看得见 */
+.attach-chip-tag {
+    position: absolute;
+    left: 4px;
+    bottom: 4px;
+    padding: 1px 5px;
+    border-radius: 6px;
+    background: rgba(10, 10, 20, 0.72);
+    color: #e9e9f5;
+    font-size: 9.5px;
+    font-weight: 700;
+    letter-spacing: 0.3px;
+    pointer-events: none;
+}
+/* 触摸设备没有 hover，× 必须常驻可见，所以钉在右上角、压出缩略图外沿 */
+.attach-chip-del {
+    position: absolute;
+    top: -7px;
+    right: -7px;
+    width: 20px;
+    height: 20px;
+    line-height: 1;
+    padding: 0;
+    border: 1px solid rgba(124, 92, 255, 0.5);
+    border-radius: 50%;
+    background: rgba(18, 16, 30, 0.92);
+    color: #fff;
+    font-size: 13px;
+    cursor: pointer;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.45);
+}
+.attach-chip-del:hover { background: rgba(255, 80, 80, 0.85); border-color: transparent; }
+
+/* 拖拽进聊天区：整屏给一层落点提示 */
+body.attach-drag::after {
+    content: '松手就发给我 📎';
+    position: fixed;
+    inset: 0;
+    z-index: 9999;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 15px;
+    color: #fff;
+    background: rgba(12, 10, 24, 0.55);
+    border: 2px dashed var(--accent);
+    pointer-events: none;
+}
+
+/* 消息里的附件（用户发的图/文件 + 历史消息里剥出的 [[IMG:]]） */
+.msg-attach {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 4px;
+}
+.msg-attach .msg-media-img {
+    max-width: 190px;
+    max-height: 190px;
+    border-radius: 10px;
+}
+/* ===== 附件排版：图片等格网格、文件整行卡片 =====
+   旧的 flex-wrap 方案里横图/竖图各按自己比例缩到 190px，同一行高低参差；
+   文件名条又是 inline 小字，跟大图并排像打补丁。这里图片与文件各自成块。 */
+.msg-attach.imgs {
+    display: grid;
+    gap: 4px;
+    width: max-content;
+    max-width: 100%;
+}
+.msg-attach.imgs[data-count="1"] { grid-template-columns: max-content; }
+.msg-attach.imgs[data-count="2"],
+.msg-attach.imgs[data-count="4"] { grid-template-columns: repeat(2, clamp(96px, 30vw, 132px)); }
+.msg-attach.imgs[data-count="3"],
+.msg-attach.imgs[data-count="5"],
+.msg-attach.imgs[data-count="6"],
+.msg-attach.imgs[data-count="7"],
+.msg-attach.imgs[data-count="8"],
+.msg-attach.imgs[data-count="9"] { grid-template-columns: repeat(3, clamp(66px, 20vw, 92px)); }
+/* 单张不裁切：照片看全，只限个上限 */
+.msg-attach.imgs[data-count="1"] .msg-media-img {
+    width: auto;
+    height: auto;
+    max-width: min(240px, 62vw);
+    max-height: min(240px, 62vw);
+    object-fit: contain;
+    border-radius: 12px;
+}
+/* 多张：等格正方形，cover 裁齐，一行里不再高低错落 */
+.msg-attach.imgs:not([data-count="1"]) .msg-media-link {
+    display: block;
+    width: 100%;
+    margin: 0;
+    aspect-ratio: 1;
+    border-radius: 10px;
+    overflow: hidden;
+    line-height: 0;
+}
+.msg-attach.imgs:not([data-count="1"]) .msg-media-img {
+    width: 100%;
+    height: 100%;
+    max-width: none;
+    max-height: none;
+    object-fit: cover;
+    border-radius: 0;
+    border: none;
+    background: rgba(0, 0, 0, 0.25);
+}
+
+/* 文件附件：整行卡片（类型徽章 + 名字截断 + 体积） */
+.msg-files {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    width: max-content;
+    max-width: 100%;
+    margin-bottom: 4px;
+}
+.msg-file {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    box-sizing: border-box;
+    width: min(244px, 68vw);
+    padding: 7px 10px;
+    border-radius: 11px;
+    background: rgba(124, 92, 255, 0.16);
+    border: 1px solid rgba(124, 92, 255, 0.26);
+    color: #fff;
+    text-decoration: none;
+    transition: background 0.18s, border-color 0.18s;
+}
+.msg-file:active { background: rgba(124, 92, 255, 0.3); }
+.msg-file-badge {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 34px;
+    height: 34px;
+    border-radius: 9px;
+    font-size: 9.5px;
+    font-weight: 700;
+    letter-spacing: 0.3px;
+    color: #fff;
+    background: linear-gradient(135deg, #8b6bff, #5b3fd6);
+}
+.msg-file-badge.tone-red { background: linear-gradient(135deg, #ff5a6e, #c62b41); }
+.msg-file-badge.tone-blue { background: linear-gradient(135deg, #4a8bff, #2a5bd7); }
+.msg-file-badge.tone-green { background: linear-gradient(135deg, #2fbf71, #1a8a4e); }
+.msg-file-badge.tone-orange { background: linear-gradient(135deg, #ff9f43, #d97316); }
+.msg-file-badge.tone-amber { background: linear-gradient(135deg, #f7c948, #c99a10); color: #2a2000; }
+.msg-file-badge.tone-cyan { background: linear-gradient(135deg, #22d3ee, #0e8fa8); }
+.msg-file-meta { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.msg-file-name {
+    font-size: 13px;
+    line-height: 1.3;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.msg-file-size { font-size: 10.5px; line-height: 1.3; color: rgba(255, 255, 255, 0.55); }
+.msg-body { display: block; }
+
 /* ===== 控制区（浮层覆盖，默认折叠） ===== */
 #controls {
     position: fixed;
@@ -568,32 +782,44 @@ html, body {
     pointer-events: none;
 }
 
-#text-input {
+/* 输入框容器：圆角、边框、底色在这里，文字与待发缩略图都在框内，框子随内容变高 */
+#composer {
     flex: 1;
-    min-height: 42px;
-    max-height: 140px;
-    padding: 11px 16px;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
     background: var(--bg-0);
     border: 1px solid rgba(124,92,255,0.25);
-    border-radius: 21px;
+    border-radius: 18px;
+    transition: border-color 0.2s, box-shadow 0.2s;
+}
+#composer:focus-within {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(124,92,255,0.18), 0 0 18px rgba(124,92,255,0.25);
+}
+
+/* 外观交给 #composer，textarea 只负责文字；高度由 JS 按内容自增 */
+#text-input {
+    flex: none;
+    width: 100%;
+    min-height: 36px;
+    max-height: 140px;
+    padding: 8px 14px;
+    background: transparent;
+    border: none;
     color: var(--text);
     font-size: 16px; /* 防止 iOS 缩放 */
     line-height: 1.4;
     resize: none;
     overflow-y: auto;
     outline: none;
-    transition: border-color 0.2s;
-}
-#text-input:focus {
-    border-color: var(--accent);
-    box-shadow: 0 0 0 3px rgba(124,92,255,0.18), 0 0 18px rgba(124,92,255,0.25);
 }
 #text-input::placeholder { color: var(--text-dim); }
 
 .btn-icon {
     flex: 0 0 auto;
-    width: 44px;
-    height: 44px;
+    width: 36px;
+    height: 36px;
     border: none;
     border-radius: 50%;
     background: var(--accent);
@@ -619,16 +845,11 @@ html, body {
     background: linear-gradient(135deg, #00e5ff, #7c5cff);
     animation: auto-listen 2.4s ease-in-out infinite;
 }
-/* 模式切换按钮：比主按钮小，作为辅助切换 */
-.btn-icon.voice-mode {
-    width: 38px; height: 38px;
+/* 新会话按钮：低调辅助色，与主按钮区分 */
+.btn-icon.new-session {
     background: var(--bg-0);
     border: 1px solid rgba(124,92,255,0.3);
-}
-.btn-icon.voice-mode.active {
-    background: linear-gradient(135deg, #00e5ff, #7c5cff);
-    border-color: transparent;
-    animation: auto-listen 2.4s ease-in-out infinite;
+    color: var(--text);
 }
 @keyframes auto-listen {
     0%, 100% { box-shadow: 0 0 0 0 rgba(0,229,255,0.45); }
@@ -1018,6 +1239,24 @@ html, body {
     .msg.ai { max-width: 92%; }
 }
 
+/* 「开启新会话」钉在整行最右：order 大于其他 flex item 的默认 0，DOM 顺序不用动 */
+#quick-new-session-btn { order: 1; }
+
+/* ===== 窄屏（手机）：输入栏一行的横向预算很紧 =====
+   这行是 nowrap 的：5 个 36px 圆按钮 + 4 个 8px 间距 + 24px 内边距 = 244px 固定占用，
+   390 宽的屏上输入框只剩 146px，360 宽机型只剩 116px —— 整行塞满、发送按钮贴到屏幕边缘。
+   窄屏把按钮和间距一起收：767 以下 32px/5px，360 以下 30px/4px。
+   320 宽机型固定占用 5×30 + 5×4 + 10 = 180px，输入框仍留 140px。 */
+@media (max-width: 767px) {
+    #controls { gap: 5px; padding-left: 6px; padding-right: 6px; }
+    .btn-icon { width: 32px; height: 32px; }
+    #controls .btn-icon svg { width: 16px; height: 16px; }
+}
+@media (max-width: 360px) {
+    #controls { gap: 4px; padding-left: 5px; padding-right: 5px; }
+    .btn-icon { width: 30px; height: 30px; }
+}
+
 @media (orientation: landscape) and (max-height: 500px) {
     /* 3D 场景始终全屏，无需调整 */
 }
@@ -1079,8 +1318,8 @@ html, body {
 /* 竖排按钮容器：固定高度，超出的按钮滚动切换 */
 .stage-tools-ring {
     position: relative;
-    width: 44px;
-    height: 260px;              /* 同时可见 6 个按钮（运行时由 33_stage_wheel 按屏高覆盖） */
+    width: 38px;
+    height: 260px;              /* 同时可见 4 个按钮（运行时由 33_stage_wheel 按屏高覆盖） */
     overflow: hidden;
     pointer-events: auto;
 }
@@ -1102,7 +1341,7 @@ html, body {
 }
 .stage-tool-btn {
     position: relative;
-    width: 40px; height: 40px;
+    width: 34px; height: 34px;
     flex: 0 0 auto;
     border: 1px solid rgba(255,255,255,0.12);
     background: rgba(0,0,0,0.4);
@@ -1118,6 +1357,8 @@ html, body {
     pointer-events: auto;
 }
 .stage-tool-btn svg {
+    width: 17px;
+    height: 17px;
     transition: transform 0.3s;
 }
 .stage-tool-btn:active { transform: scale(0.9); }
@@ -1135,20 +1376,9 @@ html, body {
 .stage-tool-btn.wheel-hidden { opacity: 0.35; }
 .stage-tool-btn.wheel-hidden:hover { opacity: 1; background: rgba(124,92,255,0.25); }
 
-/* 固定在外的按钮（锁屏键等）：恢复普通流式布局 */
-.stage-tools > .stage-tool-btn.stage-tools-fixed {
-    position: relative;
-    margin: 0;
-    transform: none;
-    width: 38px; height: 38px;
-    pointer-events: auto;
-}
-.stage-tools > .stage-tool-btn.stage-tools-fixed:active { transform: scale(0.9); }
-.stage-tools > .stage-tool-btn.stage-tools-fixed.wheel-front { transform: scale(1.1); }
-
 /* 上/下切换按钮 */
 .stage-tools-arrow {
-    width: 30px; height: 30px;
+    width: 26px; height: 26px;
     border: 1px solid rgba(124,92,255,0.35);
     background: rgba(0,0,0,0.45);
     backdrop-filter: blur(8px);
@@ -2381,14 +2611,20 @@ html, body {
 /* 锁屏：屏蔽画布全部手势（拖拽旋转 / 点击角色 / 捏合缩放 / 滚轮） */
 body.locked #three-canvas { pointer-events: none !important; }
 
-/* 锁屏：隐藏工具栏全部按钮（仅保留锁屏键） */
-body.locked .stage-tools > *:not(#lock-mode-btn) { display: none !important; }
-/* 锁屏时即使工具栏处于收缩状态，也强制显示锁屏键（否则无法解锁） */
-body.locked .stage-tools.collapsed #lock-mode-btn { display: flex !important; }
+/* 锁屏：工具栏只留锁屏键。锁屏键在 ring 里，得先保住 ring 容器再隐藏
+   track 内的其他按钮 —— 老写法直接隐藏 .stage-tools 的所有非锁屏键子元素，
+   会把整个 ring 连锁屏键一起藏掉，锁上就解不开了。 */
+body.locked .stage-tools > *:not(.stage-tools-ring),
+body.locked .wheel-track > *:not(#lock-mode-btn) { display: none !important; }
+body.locked .stage-tools > .stage-tools-ring { display: block !important; }
+/* 锁屏键此刻是唯一保留的按钮：收缩态、wheel-hidden 都要照常可见可点 */
+body.locked #lock-mode-btn { display: flex !important; opacity: 1 !important; }
+/* ring 这时只剩一颗按钮高，front 的 1.15 倍放大会溢出 3px 被 overflow:hidden 裁掉 */
+body.locked #lock-mode-btn.wheel-front { transform: none; }
 
 /* 锁屏：隐藏聊天切换按钮与文本输入（仅保留语音对话） */
 body.locked #chat-toggle { display: none !important; }
-body.locked #text-input,
+body.locked #composer,
 body.locked #send-btn { display: none !important; }
 
 /* 锁屏：隐藏所有3D辅助UI */
@@ -7733,9 +7969,10 @@ html.cast-t2.casting .cf-ring { animation-duration: calc(2s * var(--cf-boost, 1)
 html.chat-quiet #stage > *:not(#three-canvas) { display: none !important; }
 html.chat-quiet #stage > #three-canvas { visibility: hidden; }
 /* 挂在 #stage 之外、且 z-index 高于聊天面板的氛围层：全屏时整体移出渲染树。
- * #live-hot 用 body > 限定：同一个热度 HUD 被聊天头部复用时不该被藏掉。 */
+ * #live-hot / #gfx-hud 用 body > 限定：同一个 HUD 被聊天头部复用时不该被藏掉
+ * （实测半屏头部 gfx-hud 宽 69px、进全屏变 0px —— 同一行信息两种形态，就是不一致）。 */
 html.chat-quiet #gfx-flash,
-html.chat-quiet #gfx-hud,
+html.chat-quiet body > #gfx-hud,
 html.chat-quiet #gfx-ach-panel,
 html.chat-quiet #arcade-fx,
 html.chat-quiet #cast-fx,
@@ -7785,4 +8022,54 @@ html.chat-quiet .gfx-ach-toast {
     .lv-hot .lv-timer { display: none; }
     .lv-hot .lv-spark { height: 10px; }
     .lv-hot .lv-spark i:nth-child(even) { display: none; }
+}
+
+/* ============================================================
+ *  矮屏 / 横屏的聊天框几何（本轮新增，同样必须在文件末尾）
+ *
+ *  实测三组数据（关掉过渡后取最终态）：
+ *    竖屏 390x844  面板 321px、消息区 286px      —— 可用
+ *    横屏 844x390  面板 148px、消息区 109px      —— 约 4 行，基本没法读
+ *    桌面 1280x800 面板 304px、消息区 265px      —— 可用
+ *
+ *  148px 的来源就是上面那条 38dvh：dvh 跟着视口高度走，横屏时高度只剩
+ *  390，38% 就是 148。百分比在「矮」这个方向上会失效，所以矮屏改用
+ *  绝对下限 —— 让面板至少 220px，再按剩余空间封顶。
+ *
+ *  同时 #controls 在 min-width:768px 下被撑成 720px 居中条（1014 行），
+ *  横屏 844 宽时它是居中的、面板是全宽的，两者边缘对不齐 —— 输入栏
+ *  左右各缩进 62px，看着就像另一套布局。矮屏让输入栏回到全宽。
+ * ============================================================ */
+@media (max-height: 560px) {
+    /* 必须排除 .chat-fs：它同样匹配 :not(.collapsed)，写在这里会按「后出现者胜」
+     * 反过来压掉全屏的 max-height:none —— 实测 844x390 全屏面板被打回 242px。 */
+    #chat-panel:not(.collapsed):not(.chat-fs) {
+        /* 220px 保底，但不超过视口 62%（给输入栏和舞台留位置） */
+        max-height: max(220px, 62dvh);
+    }
+    #controls {
+        max-width: none;
+        width: 100%;
+    }
+    /* 头部一行在矮屏更金贵：先让两个 HUD 让位，保住标题与按钮 */
+    .chat-head { padding: 4px 8px 4px 10px; }
+    #gfx-hud,
+    .lv-hot .lv-spark { display: none; }
+}
+
+/* 触摸设备：视觉尺寸不动，把可点范围撑到 34px 见方。
+ * 24x24 的按钮在手指下命中率很差，但直接放大到 44px 会把头部一行挤爆
+ * （实测 390px 宽时整行已占 357px）。用 ::after 外扩命中区，零布局成本。 */
+@media (hover: none) and (pointer: coarse) {
+    .chat-head-btn {
+        position: relative;
+        width: 28px;
+        height: 28px;
+    }
+    .chat-head-btn::after {
+        content: "";
+        position: absolute;
+        inset: -5px;
+    }
+    .chat-head-actions { gap: 8px; }
 }

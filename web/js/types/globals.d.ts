@@ -30,6 +30,8 @@ declare global {
     _modelGroup?: unknown;
     _smoothRotY?: unknown;
     _currentAvatar?: unknown;
+    /** 服务端注入的当前角色（server.py 的 index 路由）：admin | user */
+    __ROLE?: string;
   }
 
   interface Navigator {

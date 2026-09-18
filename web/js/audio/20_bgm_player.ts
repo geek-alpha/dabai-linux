@@ -13,7 +13,7 @@ export default function init_20_bgm_player(App: AppKernel) {
       const v = Number(JSON.parse(localStorage.getItem(MUSIC_VOLUME_KEY) || 'null'));
       if (isFinite(v) && v >= 0 && v <= 1) return v;
     } catch (e) { /* 读取失败用默认 */ }
-    return 0.8;
+    return 0.5;
   }
   let volume = loadMusicVolume();
   let lastTime = 0;       // 上次记录的播放位置

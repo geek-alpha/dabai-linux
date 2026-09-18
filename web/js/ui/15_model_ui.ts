@@ -160,6 +160,12 @@ export default (function init(App: AppKernel) {
     })[c]!);
   };
   App.uploadModelFile = async function uploadModelFile(file: File) {
+    // 模型库是部署层资源（/api/model/upload 对普通用户 403）。闸门放在函数入口：
+    // 卡片「+」按钮、拖拽到舞台、控制台直接调用三条路径一次覆盖。
+    if (window.__ROLE !== 'admin') {
+      App.showToast('上传模型仅管理员可用');
+      return;
+    }
     const ext = file.name.split('.').pop()!.toLowerCase();
     if (!['glb', 'gltf', 'vrm'].includes(ext)) {
       App.showToast('仅支持 .glb / .gltf / .vrm');

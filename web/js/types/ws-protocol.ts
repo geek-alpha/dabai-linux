@@ -180,7 +180,7 @@ export type ClientMessage =
   | { type: 'set_avatar'; name: string }
   | { type: 'set_background'; name: string }
   | { type: 'ping' }
-  | { type: 'text'; content: string }
+  | { type: 'text'; content: string; attachments?: unknown[] }
   | { type: 'list_sessions'; q?: string; include_archived?: boolean }
   | { type: 'search_sessions'; q?: string }
   | { type: 'new_session' }

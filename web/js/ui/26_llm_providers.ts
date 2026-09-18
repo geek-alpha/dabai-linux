@@ -5,6 +5,12 @@ export default (function init(App: AppKernel) {
    *  模型供应商（全局资源）：大厅「供应商」按钮 → 列表 / 添加 / 编辑 / 删除 / 设为当前
    * ============================================================ */
   App.openProviderModal = function openProviderModal() {
+    // 供应商是全局凭证库（/api/llm、/api/config 对普通用户 403）。闸门放在打开函数里：
+    // 轮盘「供应商」按钮、角色卡「管理供应商」两条入口共用。
+    if (window.__ROLE !== 'admin') {
+      App.showToast('模型供应商仅管理员可管理');
+      return;
+    }
     App.providerModal?.classList.add('show');
     App.refreshProviderList();
   };

@@ -26,10 +26,16 @@ export default (function init(App: AppKernel) {
         url,
         name
       }));
-      // 恢复上次场景中的位置/缩放（VR 模式下跳过：出生点已在 applyLoadedModel
-      // 中设为当前角色位置，此处若恢复会把新角色拉回旧坐标，覆盖新出生点）
+      // 视角归属：刷新页面与主动换角色都等同「重置视角」——启动阶段 restoreSceneState
+      // 已经丢弃存档视角，这里只补背景布局；主动换角色则直接回基准机位。
+      // 换的是造型，不是机位，新角色该站在默认基准位面朝用户，而不是接着旧视角看。
+      // VR 两边都跳过：出生点已在 applyLoadedModel 中设为当前角色位置，恢复旧坐标
+      // 会把新角色拉走，XR 相机也不归轨道逻辑管。
       const inVR = !!(App.xrPresenting || (App.xrMode && App.xrMode !== 'off'));
-      if (!inVR) setTimeout(App.applySavedPositions, 200);
+      if (!inVR) {
+        if (App._isBooting) setTimeout(App.applySavedPositions, 200);
+        else App.resetViewState();
+      }
       App.saveSceneState();
       App.showToast(`已切换为 ${name}`);
 

@@ -3,10 +3,5 @@
   "api_url": "",
   "api_key": "",
   "model": "FunAudioLLM/SenseVoiceSmall",
-  "api_timeout": 6,
-  "local_enabled": true,
-  "local_model": "Systran/faster-whisper-medium",
-  "local_device": "cpu",
-  "local_compute_type": "int8",
-  "hf_endpoint": "https://hf-mirror.com"
+  "api_timeout": 6
 }

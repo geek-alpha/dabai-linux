@@ -466,6 +466,17 @@ class SkillRegistry:
 
     async def execute_tool(self, skill_name: str, tool_name: str, arguments: dict) -> tuple:
         """执行技能内的某个工具。返回 (result_text, 'skill')；未命中返回 (None, '')。"""
+        # 沙箱闸门：非管理员只能碰自己沙箱内的路径，危险工具直接拒（见 sandbox.py）
+        import sandbox as _sb
+
+        actor = _sb.current()
+        deny = _sb.check_tool(actor, tool_name)
+        if deny:
+            return deny, "skill"
+        try:
+            arguments = _sb.prepare_args(actor, tool_name, arguments)
+        except _sb.SandboxError as e:
+            return f"沙箱拒绝：{e}", "skill"
         entry = self._loaded.get(skill_name)
         if entry is None:
             return None, ""

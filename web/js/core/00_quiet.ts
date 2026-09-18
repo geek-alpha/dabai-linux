@@ -28,6 +28,34 @@ export default (function init(App: AppKernel) {
 
   let loopStopped = false;
 
+  /** 3D 帧循环与静默态对齐（幂等）：每次调用都按目标状态写一遍，不看旧标志位。
+   *  原来的「状态没变就早退」有个致命漂移 —— 若某次调用时 renderer 还没建好
+   *  （早期调用、模块顺序变化），标志位已经翻成 true 而帧循环根本没停；之后再调就
+   *  早退，永远修不回来。用户看到的就是「点了全屏，模型还在动」。 */
+  const alignFrameLoop = (on: boolean) => {
+    try {
+      const renderer = App.renderer;
+      if (!renderer) return;
+      if (on) {
+        if (!App.xrPresenting) { renderer.setAnimationLoop(null); loopStopped = true; }
+      } else if (loopStopped) {
+        // 只在确实停过时才恢复：XR 会话期间没停过，就别去抢 three 的帧调度
+        renderer.setAnimationLoop(App.animate);
+        loopStopped = false;
+      }
+    } catch { /* three 未就绪：忽略 */ }
+  };
+
+  /** 帧循环「刚被谁拉起来」之后必须调它一次（initThree 的最后一行）。
+   *  为什么必须有：手机上模型（24MB VRM）加载要好几秒，比用户点 ⤢ 慢得多 ——
+   *  setQuiet(true) 那一刻 renderer 还不存在，随后 initThree 无条件
+   *  setAnimationLoop(App.animate)，帧循环就在静默态里跑起来了。
+   *  实测（真实 initThree 再跑一次 = 帧循环晚到）：全屏静默下 4 秒内仍出帧，
+   *  且 quietSnapshot().loopStopped 还停在 true —— 标志位在撒谎，手机一直发烫。 */
+  App.syncQuietLoop = function syncQuietLoop() {
+    alignFrameLoop(App.chatQuiet);
+  };
+
   /** 任务大屏 iframe 在自截图：父页面停帧循环拦不住它，必须显式通知 */
   const notifyBigscreen = (on: boolean) => {
     try {
@@ -46,23 +74,7 @@ export default (function init(App: AppKernel) {
     document.documentElement.classList.toggle('chat-quiet', on);
 
     // 1) 3D 帧循环 —— 最大的一块开销。WebXR 会话中帧由头显驱动，不能停。
-    //    这里是**幂等对齐**：不看 changed、也不看 loopStopped 的旧值，每次调用都按
-    //    目标状态写一遍。原来的「状态没变就早退」有个致命漂移 —— 若某次调用时
-    //    renderer 还没建好（早期调用、模块顺序变化），标志位已经翻成 true 而帧循环
-    //    根本没停；之后再调就早退，永远修不回来。用户看到的就是「点了全屏，模型
-    //    还在动」。改成每次都能自愈。
-    try {
-      const renderer = App.renderer;
-      if (renderer) {
-        if (on) {
-          if (!App.xrPresenting) { renderer.setAnimationLoop(null); loopStopped = true; }
-        } else if (loopStopped) {
-          // 只在确实停过时才恢复：XR 会话期间没停过，就别去抢 three 的帧调度
-          renderer.setAnimationLoop(App.animate);
-          loopStopped = false;
-        }
-      }
-    } catch { /* three 未就绪：忽略 */ }
+    alignFrameLoop(on);
 
     // 2) 任务大屏 iframe 自截图
     notifyBigscreen(on);

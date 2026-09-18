@@ -66,16 +66,11 @@ export default (function init(App: AppKernel) {
     try {
       const s = JSON.parse(localStorage.getItem(App.SCENE_KEY));
       if (!s) return;
-      if (typeof s.camZoom === 'number') App.camZoom = THREE.MathUtils.clamp(s.camZoom, App.MIN_ZOOM, App.MAX_ZOOM);
-      if (typeof s.camOffsetX === 'number') {
-        App.camOffsetX = s.camOffsetX;
-        App.camOffsetY = s.camOffsetY || 0;
-        App.camOffsetZ = s.camOffsetZ || 0;
-      }
       // 背景自转
       if (typeof s.backgroundAutoRotate === 'boolean') App.backgroundAutoRotate = s.backgroundAutoRotate;
-      // 角色/背景位置在模型加载后恢复
-      window._restoredScene = s;
+      // 刷新页面 = 重置视角：存档里的视角（缩放/平移）与角色位置一律不还原，
+      // 只留背景布局 —— 开机画面必须和按下「重置视角」的结果一致。
+      window._restoredScene = { bgPos: s.bgPos, bgScale: s.bgScale, moveMode: s.moveMode };
     } catch (e) {}
   };
   App.loadCameraSettings = function loadCameraSettings() {
@@ -83,13 +78,13 @@ export default (function init(App: AppKernel) {
       const s = JSON.parse(localStorage.getItem(App.CAM_SETTINGS_KEY));
       if (!s) return;
       if (typeof s.cameraHeight === 'number') {
-        App.cameraHeight = THREE.MathUtils.clamp(s.cameraHeight, 0.1, 10.0);
+        App.cameraHeight = THREE.MathUtils.clamp(s.cameraHeight, App.userMinCamHeight(), 10.0);
       }
       if (typeof s.cameraTiltDeg === 'number') {
         App.cameraTiltDeg = THREE.MathUtils.clamp(s.cameraTiltDeg, -80, 80);
       }
       if (typeof s.cameraDistance === 'number') {
-        App.cameraDistance = THREE.MathUtils.clamp(s.cameraDistance, 0.1, 10.0);
+        App.cameraDistance = THREE.MathUtils.clamp(s.cameraDistance, App.userMinCamDistance(), 10.0);
         App.DEFAULT_CAM_POS.z = App.cameraDistance;
         App.targetCamPos.z = App.cameraDistance;
       }
@@ -146,6 +141,32 @@ export default (function init(App: AppKernel) {
     App.nextActionTimer = 0;
     App.saveSceneState();
   };
+  /* 「重置视角」的可复用内核：相机与角色回到统一基准姿态。
+   * 交互反馈（toast / AI 台词）由调用方给——刷新角色时不该再插一句台词。 */
+  App.resetViewState = function resetViewState() {
+    App.dragOrbitYaw = 0;
+    App.dragOrbitPitch = 0;
+    App.camZoom = 1.0;
+    App.camOffsetX = 0;
+    App.camOffsetY = 0;
+    App.camOffsetZ = 0;
+    // 基准机位 = 相机设置里配置的高度/倾斜/距离：刷新页面走的是同一套基准，两边结果必须一致
+    App.DEFAULT_CAM_POS!.set(0, App.cameraHeight, App.cameraDistance);
+    App.targetCamPos!.set(0, App.cameraHeight, App.cameraDistance);
+    App.resetAvatarToOrigin();
+    // 立刻面朝【目标】相机位置而非当前位置：否则相机从侧面 lerp 回默认位时，
+    // 身体会从背影区转过来
+    if (App.currentAvatar) {
+      App.smoothRotY = App.computeBodyFaceCam(App.currentAvatar, App.targetCamPos);
+      App.smoothRotX = 0;
+    }
+    // 一次短暂的心有灵犀凝视
+    App.gazeBoostUntil = Date.now() / 1000 + 2;
+    App.gazeHeadTiltAcc = 0.03;
+    App.wasMutualGaze = true; // 已 snap 面朝相机，跳过转身动画
+    App.recordInteraction();
+    App.saveSceneState();
+  };
   App.applySavedPositions = function applySavedPositions() {
     const s = window._restoredScene;
     if (!s) return;
@@ -177,6 +198,22 @@ export default (function init(App: AppKernel) {
     if (s.moveMode) App.setMoveMode(true);
   };
   App.connectWS = function connectWS() {
+    // 防止并发重连（超时回调和 onclose 各排一个 connectWS，双 timer 竞态）
+    if (App._wsConnecting) return;
+    App._wsConnecting = true;
+    // 先关旧连接：不关的话旧 ws 的 onmessage 仍会触发，
+    // 服务端 manager.active 里旧连接也未移除，广播时新旧各收一份 → 文字/语音/工具全部重复
+    if (App.ws) {
+      const oldWs = App.ws;
+      oldWs.onopen = null;
+      oldWs.onmessage = null;
+      oldWs.onerror = null;
+      oldWs.onclose = null;
+      if (oldWs.readyState === WebSocket.OPEN || oldWs.readyState === WebSocket.CONNECTING) {
+        oldWs.close();
+      }
+      App.ws = null;
+    }
     // 清理旧的定时器
     if (App.wsHeartbeat) {
       clearInterval(App.wsHeartbeat);
@@ -203,12 +240,14 @@ export default (function init(App: AppKernel) {
         App.ws.close();
         App.ws = null;
       }
+      App._wsConnecting = false;
       App.statusBadge.textContent = '连接超时，重连中…';
       App.wsReconnectTimer = setTimeout(App.connectWS, 2000);
     }, 3000);
     try {
       App.ws = new WebSocket(`${proto}://${location.host}/ws`);
     } catch (e) {
+      App._wsConnecting = false;
       App.statusBadge.textContent = '连接失败，重连中…';
       App.wsReconnectTimer = setTimeout(App.connectWS, 2000);
       return;
@@ -216,6 +255,7 @@ export default (function init(App: AppKernel) {
     App.ws.onopen = () => {
       clearTimeout(App.wsConnTimeout);
       App.wsConnTimeout = null;
+      App._wsConnecting = false;
       App.statusBadge.textContent = '已连接';
       App.setState(App.State.IDLE);
       // 只在首次连接提示；热重载/重启后的自动重连不刷屏
@@ -302,11 +342,13 @@ export default (function init(App: AppKernel) {
     App.ws.onerror = () => {
       clearTimeout(App.wsConnTimeout);
       App.wsConnTimeout = null;
+      App._wsConnecting = false;
       App.statusBadge.textContent = '连接出错，重连中…';
     };
     App.ws.onclose = () => {
       clearTimeout(App.wsConnTimeout);
       App.wsConnTimeout = null;
+      App._wsConnecting = false;
       if (App.wsHeartbeat) {
         clearInterval(App.wsHeartbeat);
         App.wsHeartbeat = null;
@@ -321,6 +363,13 @@ export default (function init(App: AppKernel) {
   };
   App.handleWSMessage = function handleWSMessage(msg) {
     switch (msg.type) {
+      case 'server_restart':
+        // 服务端计划内重启（改核心代码生效 / systemctl restart）：
+        // 先把话说清楚，再让 onclose 的重连逻辑接管——同一件事，
+        // 用户看到「大白正在升级」而不是「跑着跑着莫名掉线」
+        if (App.setTurnStatus) App.setTurnStatus(msg.text || '大白正在升级，几秒后自动回来…');
+        if (App.showToast) App.showToast(msg.text || '大白正在升级，几秒后自动回来…');
+        break;
       case 'ready':
         App.setState(App.State.IDLE);
         break;
@@ -336,7 +385,7 @@ export default (function init(App: AppKernel) {
             App.messagesEl.innerHTML = '';
             App.addSystemMsg('已连接');
             for (const h of msg.history) {
-              if (h.user) App.addUserMsg(h.user);
+              if (h.user) App.addUserMsg(h.user, false, (h as any).atts);
               if (h.ai) App.addAIMsg(h.ai);
             }
             // 历史恢复：强制定位到最新一条（绕过"上滑暂停跟随"）
@@ -430,6 +479,7 @@ export default (function init(App: AppKernel) {
         break;
       case 'audio_end':
         if (App.noteTurnActivity) App.noteTurnActivity();
+        App._turnInTools = false;   // 回合结束：工具执行期保护解除
         App.handleAudioEnd(msg);
         break;
       case 'usage':
@@ -440,6 +490,7 @@ export default (function init(App: AppKernel) {
         // 过期 session 的中断信号不处理：避免误清新一轮的队列/工具链
         if (App.currentReplySession && msg.session_id &&
             msg.session_id !== App.currentReplySession) break;
+        App._turnInTools = false;   // 回合被取消：工具执行期保护解除
         App.handleInterrupted(msg);
         if (App.toolChainAbort) App.toolChainAbort();
         break;
@@ -451,6 +502,8 @@ export default (function init(App: AppKernel) {
         // 工具调用开始：并入当前轮次的「工作流工具链」卡片
         if (App.noteTurnActivity) App.noteTurnActivity();
         App._toolRunningSince = Date.now();
+        // 工具一旦开跑，语音就不再打断本轮（VAD 只停本地播报，服务端排队这句）
+        App._turnInTools = true;
         App.removeTyping();
         // tool_desc：工具自己的说明，供中央字幕显示（前端不维护映射表）
         if (App.toolChainStart) App.toolChainStart(msg.tool_name, msg.arguments, msg.tool_desc);
@@ -482,7 +535,7 @@ export default (function init(App: AppKernel) {
         }
         if (msg.history && msg.history.length > 0) {
           for (const h of msg.history) {
-            if (h.user) App.addUserMsg(h.user);
+            if (h.user) App.addUserMsg(h.user, false, (h as any).atts);
             if (h.ai) App.addAIMsg(h.ai);
           }
           requestAnimationFrame(() => App.scrollToBottom(true));
@@ -914,15 +967,21 @@ export default (function init(App: AppKernel) {
       App.sessionArchiveToggle.classList.toggle('on', App._sessionShowArchived);
       App.requestSessionList();
     });
-    App.newSessionBtn.addEventListener('click', () => {
+    const doNewSession = () => {
       if (App.ws && App.ws.readyState === WebSocket.OPEN) {
         App.ws.send(JSON.stringify({
           type: 'new_session'
         } satisfies ClientMessage));
         App.messagesEl.innerHTML = '';
-        App.sessionModalEl.classList.remove('show');
       }
+    };
+    App.newSessionBtn.addEventListener('click', () => {
+      doNewSession();
+      App.sessionModalEl.classList.remove('show');
     });
+    // 底部快捷「新会话」按钮（与弹窗内按钮共用同一逻辑，仅不关弹窗）
+    const quickNewSessionBtn = document.getElementById('quick-new-session-btn');
+    if (quickNewSessionBtn) quickNewSessionBtn.addEventListener('click', doNewSession);
   };
   App.requestSessionList = function requestSessionList() {
     if (!App.ws || App.ws.readyState !== WebSocket.OPEN) return;
@@ -1038,7 +1097,7 @@ export default (function init(App: AppKernel) {
   App.renderSessionListFromState = function renderSessionListFromState() {
     App.requestSessionList();
   };
-  App.sendText = function sendText(text) {
+  App.sendText = function sendText(text, attachments) {
     if (!App.ws || App.ws.readyState !== WebSocket.OPEN) {
       App.showToast('未连接到服务器');
       return;
@@ -1054,7 +1113,9 @@ export default (function init(App: AppKernel) {
     // AI 移动不再因用户发消息而打断（AI 可以边走边聊，活人感）
     App.ws.send(JSON.stringify({
       type: 'text',
-      content: text
+      content: text,
+      // 附件只传服务器返回的元数据（路径/名字/类型），文件本体已经上传完了
+      attachments: attachments && attachments.length ? attachments : undefined
     } satisfies ClientMessage));
   };
   /* ============================================================

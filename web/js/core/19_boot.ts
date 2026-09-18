@@ -29,6 +29,11 @@ export default (function init(App: AppKernel) {
 
     // 始终初始化3D场景（低功耗模式也需要渲染角色形象）
     App.initThree();
+    // 默认态 = 非透明全屏：不等模型加载完就能直接对话；全屏静默停掉 3D 帧循环
+    // （省电、手机不发热）。锁屏模式保持原样 —— 锁屏本就是「界面收起、仅语音」。
+    if (localStorage.getItem(App.LOCK_KEY) !== '1' && App.setChatFullscreen) {
+      App.setChatFullscreen(true);
+    }
     App.restoreSceneState();
     setTimeout(() => {
       App.applySavedPositions();

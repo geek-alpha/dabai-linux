@@ -51,6 +51,7 @@ import init_38_live_room from './js/ui/38_live_room.ts';
 import init_39_cast_fx from './js/ui/39_cast_fx.ts';
 import init_40_turn_clock from './js/ui/40_turn_clock.ts';
 import init_41_holo_stage from './js/ui/41_holo_stage.ts';
+import init_42_attach from './js/ui/42_attach.ts';
 
 // 静默总闸最先装：后面每个模块 init 时都能立刻 App.onQuiet 注册自己的启停
 init_00_quiet(App);
@@ -77,6 +78,8 @@ init_14_toast(App);
 init_15_model_ui(App);
 init_16_bg_ui(App);
 init_17_events(App);
+// 附件在事件绑定之后挂：submitText 通过 App.takeAttachments 取待发附件
+init_42_attach(App);
 init_18_tts_settings(App);
 init_19_boot(App);
 init_20_bgm_player(App);

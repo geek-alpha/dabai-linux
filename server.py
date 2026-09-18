@@ -4,7 +4,7 @@
 
 特性：
 - WebSocket 实时双向通信（文本 + 语音）
-- 语音转文字 (SiliconFlow SenseVoiceSmall，API 失败自动降级 faster-whisper 本地模型)
+- 语音转文字 (SiliconFlow SenseVoiceSmall 云端 API)
 - 文字转语音 (edge-tts)
 - 3D 模型导入与管理 (glb/gltf/vrm)
 - 静态前端托管 (web/)
@@ -14,7 +14,9 @@
 """
 import asyncio
 import base64
+import contextvars
 import difflib
+import hashlib
 import importlib
 import json
 import logging
@@ -38,15 +40,22 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, H
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.websockets import WebSocketState
 
+import attach_text
+import auth_core
+import email_verify
 import music_lib
+import peer_mesh
+import turn_quota
 import video_fav_lib
 import video_history_lib
 import video_sources_lib
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from agent import (AIAgent, TextDelta, ToolCallProgress, ToolCallResult,
                    ToolCallStart, ThinkingDelta, StreamDelta, ReasoningDelta,
-                   FinalText, UsageEvent, TurnStatus, get_available_tools)
+                   FinalText, UsageEvent, TurnStatus, get_available_tools,
+                   active_role_card_id, load_card_users, role_card_of, save_card_users,
+                   migrate_legacy_active_card)
 from ai_autonomy import AutonomyHub
 from perception_dispatcher import PerceptionDispatcher, EventCategory
 from reward_memory import RewardMemory
@@ -110,10 +119,13 @@ WEB_DIR = BASE_DIR / "web"
 AUDIO_DIR = BASE_DIR / "audio_cache"
 MODELS_DIR = BASE_DIR / "models"
 BACKGROUNDS_DIR = BASE_DIR / "backgrounds"
+# 聊天附件（用户发来的图片/文件）：按用户隔离、按天分目录，入口见 /api/upload
+UPLOADS_DIR = BASE_DIR / "data" / "uploads"
 SERVER_PORT = 8000
 AUDIO_DIR.mkdir(exist_ok=True)
 MODELS_DIR.mkdir(exist_ok=True)
 BACKGROUNDS_DIR.mkdir(exist_ok=True)
+UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 @asynccontextmanager
@@ -129,6 +141,18 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"[TaskCenter] codex 独立进程恢复失败: {e}")
     logger.info("[TaskCenter] 任务中心已启动（DSH/Codex/后台任务统一调度）")
+    # 角色卡片按人隔离：老状态里 active_role_card 是全机唯一一份，迁移给部署者身份，
+    # 否则主人的记忆空间会从 role_card:<id> 掉回 default，旧对话凭空消失。
+    try:
+        _admins = [u.get("id") for u in auth_core.list_users()
+                   if auth_core.is_admin(u.get("id"))]
+    except Exception:
+        _admins = []
+    try:
+        if migrate_legacy_active_card(_admins):
+            logger.info("[RoleCard] 老状态已迁移到按人隔离")
+    except Exception as e:
+        logger.warning(f"[RoleCard] 老状态迁移失败: {e}")
     # 热重载/重启后：自主恢复被中断的角色对话轮（断点续跑，不依赖客户端在场）
     try:
         asyncio.ensure_future(_resume_pending_turns())
@@ -141,6 +165,14 @@ async def lifespan(app: FastAPI):
         logger.info("[Harness] 插件已接入 FastAPI（REST 路由挂载完成）")
     except Exception as e:
         logger.warning(f"[Harness] 插件接入 FastAPI 失败: {e}")
+    # 联邦耳朵：同伴来电当场响铃 + 回话（把异步留言变成打电话）。
+    # 丢进线程池：它是个常驻循环且要调阻塞的 LLM HTTP，放事件循环里会卡住对话。
+    try:
+        import peer_watch
+        asyncio.get_running_loop().run_in_executor(None, peer_watch.main, [])
+        logger.info("[Peer] 联邦耳朵已开（同伴来电即时响铃 + 回话）")
+    except Exception as e:
+        logger.warning(f"[Peer] 联邦耳朵启动失败: {e}")
     # harness 任务系统完成事件 → WebSocket 实时推送（前端 toast，任务完成即知）
     try:
         async def _harness_task_notifier(report: dict):
@@ -168,22 +200,6 @@ async def lifespan(app: FastAPI):
         logger.info("[SubAgent] 通用子智能体系统已启动（任意任务可下发、并行分派、完成汇报）")
     except Exception as e:
         logger.warning(f"[SubAgent] 通用子智能体初始化失败: {e}")
-    # 本地 STT 模型预热：首次加载 ~8s，若等用户第一次说话才加载，语音通话会干等 8 秒。
-    # 后台线程预热，不阻塞服务启动；失败静默（首次使用时仍会懒加载）。
-    try:
-        import threading as _th
-        def _warmup_local_stt():
-            try:
-                _t0 = time.time()
-                _m = _load_local_stt_model()
-                if _m is not False:
-                    logger.info(f"[STT-Local] 模型预热完成，耗时 {time.time() - _t0:.1f}s")
-            except Exception as _e:
-                logger.warning(f"[STT-Local] 模型预热失败（首次使用时重试）: {_e}")
-        _th.Thread(target=_warmup_local_stt, name="stt-warmup", daemon=True).start()
-        logger.info("[STT-Local] 本地模型预热已启动（后台）")
-    except Exception as e:
-        logger.warning(f"[STT-Local] 模型预热任务启动失败: {e}")
     # 定时任务调度器（长任务自动化）：到期任务派发为通用子智能体后台执行，
     # 完成/出错自动记录到 data/scheduled_tasks.json 并沿子智能体汇报链路转述
     try:
@@ -210,6 +226,21 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    # ---- shutdown：兜底广播（主路径是 systemd ExecStop 调的 /api/system/restart_notice）----
+    # 为什么不指望这里：uvicorn 的关闭顺序是「先对所有连接 transport.close()（TCP 直接断，
+    # 连 close 帧都不发），再跑 lifespan shutdown」——到这里 ws 多半已是 DISCONNECTED。
+    # 留着是因为 hot_reload 的 os.execv 自替换不经过 systemd（ExecStop 不触发），
+    # 那是这里唯一的通知机会。日志里的送达计数就是这段到底有没有用的判据。
+    try:
+        delivered = 0
+        for _ws in list(manager.active):
+            if await safe_send_json(_ws, {"type": "server_restart",
+                                          "text": "大白正在升级，几秒后自动回来…"}):
+                delivered += 1
+        logger.info("[Shutdown] 重启通知兜底：活跃连接 %d，送达 %d", len(manager.active), delivered)
+    except Exception as e:
+        logger.warning(f"[Shutdown] 重启通知广播失败: {e}")
+
     # ---- shutdown：通知插件清理已挂载的 REST 路由/资源 ----
     try:
         _harness().on_server_stop()
@@ -218,6 +249,11 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="白头凤【BattlePhoenix】", lifespan=lifespan)
+
+# 大白联邦：让散落在树莓派/阿里云/WSL 上的大白互相找到、互相说话。
+# 这些路由自己验共享密钥，所以路径在下面的 _AUTH_EXEMPT_PREFIX 里豁免会话中间件——
+# 别的实例没有、也不该有本机的会话 cookie。
+app.include_router(peer_mesh.router)
 
 # 静态资源缓存分级（首屏/刷新性能关键）。
 # 之前对 /static 一律 no-store：模型 24MB、vendor 库、87 个 .ts 模块每次刷新全量重下
@@ -499,10 +535,415 @@ class GZipTextMiddleware:
 
 app.add_middleware(GZipTextMiddleware)
 
+# ============================================================
+# 账号鉴权：公网访问强制登录，局域网 / 本机直连不受影响
+#
+# 为什么按请求头而不是源 IP 判“来自公网”：cloudflared 隧道进程是从
+# 127.0.0.1 连进来的，源 IP 永远是回环，判不出公网；而隧道一定注入
+# CF-Connecting-IP / CF-Ray。局域网直连（192.168.x.x:8000）不带这些头
+# → 免登录，原有“一个服务器一套状态”的用法完全不变，本机工具
+# （如 code_ops 的 workspace_impl 走 127.0.0.1）也不会被挡。
+#
+# 中间件顺序：AuthGate 最后 add = 最外层，未登录直接短路，不走 GZip/转译。
+# TSTranspileMiddleware 仍是“处理响应体”的最外层，不受影响。
+# ============================================================
+SESSION_COOKIE = "dabai_sid"
+# 全站统一钥匙：社区站（主站 / GitHub 登录）下发的是 .battlephoenix.tech 域的
+# bp_sess，用的是同一份 auth_secret 签的 token —— 读它，主站登录过的人进
+# dabai 子域就不用再登一次。dabai_sid 是统一之前的旧 cookie，留着只为
+# 不让老设备（含已装 App）掉线。
+SHARED_COOKIE = "bp_sess"
+SHARED_COOKIE_DOMAIN = ".battlephoenix.tech"
+_PUBLIC_HEADERS = ("cf-connecting-ip", "cf-ray")
+# 注意：不用 x-forwarded-for 做判据——nginx 前置（8000 TLS → 8001）会对所有请求
+# 注入它，拿它当信号会把局域网访问也当成公网。CF 隧道头才是精准信号。
+_AUTH_EXEMPT = {
+    "/login", "/api/auth/login", "/api/auth/register", "/api/auth/me",
+    "/api/auth/status", "/api/auth/email/send",
+    "/favicon.ico", "/manifest.webmanifest", "/sw.js", "/setup", "/dabai-ca.crt",
+    # App 启动就要查它，不能等登录
+    "/api/frontend-build",
+}
+# /api/peer/ 走自己的密钥认证（peer_mesh），不认会话 cookie：联邦里的每个实例
+# 都是独立进程，互相之间不存在登录关系。
+_AUTH_EXEMPT_PREFIX = ("/static/", "/icons/", "/api/peer/")
+
+# 系统级 API：普通用户一律 403。这些接口要么泄漏全局信息（任务中心能看到
+# 管理员的任务与日志），要么直接改服务器状态（工作区/执行器/LLM 配置）。
+# 与工具层的 sandbox 拒绝清单同一判据：超出「一个用户在自己的沙箱里玩」。
+_ADMIN_API_PREFIX = (
+    "/api/tasks", "/api/harness", "/api/workspace", "/api/workspaces",
+    "/api/codex", "/api/llm", "/api/config", "/api/bridge", "/api/longrun",
+    "/api/mixamo", "/api/agent", "/api/info", "/api/tools", "/api/vision",
+    # 视频源（列源 + 启停 + 自定义源增删改）：属于部署配置层——自定义源的搜索 URL
+    # 写进去就是一条任意取数通道，跟 /api/config 同级，不能交给普通用户看或改。
+    "/api/video_hub/api/sources", "/api/video_hub/api/platforms",
+)
+# 资源类接口：普通用户可以看（首屏要列角色卡片/模型），但不能改。
+_ADMIN_WRITE_PREFIX = (
+    "/api/models", "/api/model/", "/api/background", "/api/character_cards",
+    "/api/tts", "/api/stt",
+)
+_WRITE_METHODS = ("POST", "PUT", "PATCH", "DELETE")
+
+
+# 普通用户也能写的例外：切换角色卡片（apply）只改「当前生效的角色」，不碰卡片内容本身。
+# 卡片的增/改/删仍属部署层——写的是全机唯一一套 settings.json + tts_config.json。
+_CARD_APPLY_PATH = re.compile(r"^/api/character_cards/[^/]+/apply$")
+
+
+def _admin_api_blocked(path: str, method: str) -> bool:
+    if path.startswith(_ADMIN_API_PREFIX):
+        return True
+    if method.upper() not in _WRITE_METHODS:
+        return False
+    if _CARD_APPLY_PATH.match(path):
+        return False
+    return path.startswith(_ADMIN_WRITE_PREFIX)
+
+
+def _is_public_request(request: Optional[Request]) -> bool:
+    if request is None:
+        return False
+    for h in _PUBLIC_HEADERS:
+        if request.headers.get(h):
+            return True
+    return False
+
+
+def _client_is_https(request: Optional[Request]) -> bool:
+    """客户端到边缘用的是不是 HTTPS。
+
+    不能拿 request.url.scheme 当判据：cloudflared 用 TLS 回源 nginx:8000，nginx 又
+    传 X-Forwarded-Proto: https，源站看到的永远是 https —— 但用户可能是明文 HTTP
+    进来的。给 HTTP 用户下发带 Secure 的 cookie，浏览器直接丢弃，登录后每个请求
+    都不带 cookie、被中间件弹回登录页，表现成「登录不进去」的死循环（实测 nginx
+    日志：POST /api/auth/register 200 紧跟 GET / 302，Referer 是 http:// 开头的
+    登录页）。CF 的 cf-visitor 才是客户端侧协议。
+    """
+    if request is None:
+        return False
+    v = request.headers.get("cf-visitor")
+    if v:
+        try:
+            scheme = json.loads(v).get("scheme")
+            if scheme in ("http", "https"):
+                return scheme == "https"
+        except (ValueError, AttributeError):
+            pass
+    return request.url.scheme == "https"
+
+
+def _session_uid(request: Optional[Request]) -> str:
+    """请求携带的有效会话用户 ID；没有（局域网直连/未登录）返回空串。
+
+    统一钥匙优先：主域下发的 bp_sess 认不出来才回落到旧的 dabai_sid。
+    """
+    if request is None:
+        return ""
+    try:
+        cookies = request.cookies
+    except Exception:
+        return ""
+    for name in (SHARED_COOKIE, SESSION_COOKIE):
+        uid = auth_core.verify_token(cookies.get(name, ""))
+        if uid:
+            return uid
+    return ""
+
+
+def _uid_of(request: Optional[Request] = None, payload: Optional[dict] = None) -> str:
+    """当前请求的用户身份：公网会话用户优先，否则回落单系统统一身份。
+
+    公网路径上绝不信前端传的 user_id——那是个越权入口（改个 id 就能读别人的会话）。
+    局域网直连时保持旧行为，兼容既有前端。
+    """
+    uid = _session_uid(request)
+    if uid:
+        return uid
+    if payload and not _is_public_request(request):
+        return payload.get("user_id") or _unified_user_id()
+    return _unified_user_id()
+
+
+def _card_uid(request: Optional[Request], payload: Optional[dict] = None) -> str:
+    """角色卡片的用户身份：公网只认会话 cookie，局域网认前端 uid（与 WS 侧同一把钥匙）。
+
+    局域网直连没有 cookie，而 WS 侧的用户身份来自前端 localStorage.dabai.userId——
+    HTTP 侧不认它就会写成 default，与 agent 实际用的 uid 对不上，切卡看着成功却不生效。
+    """
+    uid = _session_uid(request)
+    if uid:
+        return uid
+    if request is not None and not _is_public_request(request):
+        raw = str((payload or {}).get("user_id") or "")
+        if not raw:
+            try:
+                raw = str(request.query_params.get("user_id") or "")
+            except Exception:
+                raw = ""
+        if raw.strip():
+            return raw.strip()
+    return _unified_user_id()
+
+
+def _store_uid(request: Optional[Request] = None) -> str:
+    """个性化数据（视频历史 / 视频收藏 / 音乐歌单）的存储身份。
+
+    管理员回落空串 → 与 AI 工具调用（agent 侧不携带用户身份）共用项目根目录的
+    全局文件，也就是部署者本人的一份数据：既有数据零迁移，且「大白帮我收藏」
+    不会落到别人的目录里。
+    普通用户用自己的 uid → data/users/<uid>/，互相看不见。
+    """
+    uid = _session_uid(request)
+    if not uid or auth_core.is_admin(uid):
+        return ""
+    return uid
+
+
+def _auth_exempt(path: str) -> bool:
+    return path in _AUTH_EXEMPT or path.startswith(_AUTH_EXEMPT_PREFIX)
+
+
+def _set_session_cookie(resp: Response, uid: str, secure: bool = True) -> None:
+    """一个 token 下发两份 cookie：主域共享的 bp_sess + 本子域的 dabai_sid。
+
+    两份内容一样，只是作用域不同 —— 前者让主站 / GitHub 登录一次全站通行，
+    后者兼容统一之前就装在手机上的 App。
+    """
+    tok = auth_core.make_token(uid)
+    resp.set_cookie(
+        SESSION_COOKIE, tok,
+        max_age=auth_core.TOKEN_TTL, httponly=True, samesite="lax",
+        secure=secure, path="/",
+    )
+    resp.set_cookie(
+        SHARED_COOKIE, tok, domain=SHARED_COOKIE_DOMAIN,
+        max_age=auth_core.TOKEN_TTL, httponly=True, samesite="lax",
+        secure=secure, path="/",
+    )
+
+
+class AuthGateMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        path = request.url.path
+        if _auth_exempt(path) or not _is_public_request(request):
+            return await call_next(request)
+        uid = _session_uid(request)
+        if uid:
+            request.state.user_id = uid
+            if not auth_core.is_admin(uid) and _admin_api_blocked(path, request.method):
+                return JSONResponse(
+                    {"error": "该接口仅管理员可用", "code": "forbidden"}, status_code=403)
+            return await call_next(request)
+        if path.startswith("/api/") or path.startswith("/ws"):
+            return JSONResponse({"error": "未登录", "code": "unauthorized"}, status_code=401)
+        # OAuth 失败时主站把 ?oauth=xxx 带回来：转发给登录页显示原因，
+        # 否则用户只看到又弹一次登录框，分不清是授权被拒还是没配置。
+        q = request.url.query
+        return RedirectResponse("/login" + (("?" + q) if q else ""), status_code=302)
+
+
+app.add_middleware(AuthGateMiddleware)
+
+
+@app.get("/login")
+async def login_page():
+    """登录/注册页（自包含 HTML，未登录也能打开）。"""
+    page = WEB_DIR / "login.html"
+    if not page.is_file():
+        return JSONResponse({"error": "login.html 缺失"}, status_code=500)
+    return FileResponse(page)
+
+
+# ---- 前端版本指纹（给 Android 壳用）----
+# App 把前端预打包进 APK 换取零请求首屏，代价是「改了 web/ 但手机还是旧界面」。
+# 这里实时算源码指纹，App 启动后异步比对，对不上就整体降级走网络。
+# 规则必须与 apps/dabai-android/tools/build_web_assets.py 的 web_fingerprint() 完全一致：
+# 扩展名白名单、跳过 vendor/anim/node_modules、按路径排序、hash(path:mtime_ns:size)。
+_FP_EXTS = {".ts", ".js", ".mjs", ".css", ".html", ".webmanifest"}
+_FP_SKIP_DIRS = {"vendor", "anim", "node_modules"}
+
+
+def _web_source_fingerprint() -> str:
+    h = hashlib.sha256()
+    items = []
+    for fp in WEB_DIR.rglob("*"):
+        if not fp.is_file() or fp.suffix.lower() not in _FP_EXTS:
+            continue
+        rel = fp.relative_to(WEB_DIR)
+        if rel.parts and rel.parts[0] in _FP_SKIP_DIRS:
+            continue
+        items.append(rel)
+    for rel in sorted(items, key=str):
+        try:
+            st = (WEB_DIR / rel).stat()
+        except OSError:
+            continue
+        h.update(f"{rel}:{st.st_mtime_ns}:{st.st_size}\n".encode("utf-8"))
+    return h.hexdigest()[:16]
+
+
+@app.get("/api/frontend-build")
+async def frontend_build():
+    return {"fingerprint": _web_source_fingerprint()}
+
+
+def _client_device(request: Request) -> str:
+    return (request.headers.get("user-agent", "") or "")[:64]
+
+
+def _client_ip(request: Request) -> str:
+    """注册限速的键。只对公网请求生效：局域网直连本来就是系统身份，不该被限。
+
+    CF 隧道一定注入 cf-connecting-ip（源 IP 恒为回环，判不出公网）；x-real-ip 是
+    nginx 前置注入的真实客户端。两者都可能被伪造，所以还有全局速率兜底。
+    """
+    if not _is_public_request(request):
+        return ""
+    for h in ("cf-connecting-ip", "x-real-ip"):
+        v = (request.headers.get(h) or "").strip()
+        if v:
+            return v[:64]
+    return (request.client.host if request.client else "") or "unknown"
+
+
+@app.get("/api/auth/status")
+async def auth_status():
+    """登录页启动时问一句：要不要显示注册 tab。免登录可访问，不泄用户名单。"""
+    return {"ok": True, "registration_open": auth_core.registration_open(),
+            "email_ready": email_verify.smtp_ready(),
+            "first_run": auth_core.user_count() == 0}
+
+
+@app.post("/api/auth/email/send")
+def auth_email_send(payload: dict, request: Request):
+    """发注册验证码。免登录可访问 —— 所以三重限速是必须的，否则这个端点就是
+    一台免费发信机（拿它轰炸别人邮箱，域名先被拉黑）。
+
+    用 def 不用 async：SMTP 握手是阻塞的（树莓派上 1~3 秒），FastAPI 会把 def
+    端点丢线程池，不会卡住事件循环。
+    """
+    email = str(payload.get("email", "") or "").strip().lower()
+    if auth_core.find_by_name(email):
+        return JSONResponse({"error": "这个邮箱已经注册过了，直接登录就行",
+                             "code": "name_taken"}, status_code=400)
+    try:
+        out = email_verify.send_code(email, _client_ip(request) or "lan")
+    except email_verify.MailError as e:
+        status = 429 if e.code in ("rate_limited", "cooldown") else 400
+        return JSONResponse({"error": e.msg, "code": e.code}, status_code=status)
+    return out
+
+
+@app.post("/api/auth/register")
+async def auth_register(payload: dict, request: Request):
+    """自助注册。只认两条路：邮箱（先收验证码）或 GitHub（走 OAuth，不经这里）。
+
+    验证码在这一层换成票据、票据再进 auth_core：前端拿不到票据，也就不存在
+    「捡一个票据去注册别人邮箱」的路径。预检排在换票据之前 —— 码是一次性的，
+    让「密码太短」这种错白白烧掉一个码，用户得再等 60 秒。
+
+    ip 兜一个 "lan"：局域网直连原本判不出公网 IP，但注册不能因此免闸门 ——
+    同一个 WiFi 下的别人也是别人。
+    """
+    name = str(payload.get("name", "") or "").strip()
+    pwd = payload.get("pwd", "")
+    if len(str(pwd or "")) < 6:
+        return JSONResponse({"error": "密码至少 6 位", "code": "bad_pwd"}, status_code=400)
+    if "@" not in name:
+        return JSONResponse({"error": "请用邮箱注册（收验证码），或直接用 GitHub 登录",
+                             "code": "email_required"}, status_code=400)
+    try:
+        ticket = email_verify.check_code(name, payload.get("email_code", ""))
+    except email_verify.MailError as e:
+        return JSONResponse({"error": e.msg, "code": e.code}, status_code=400)
+    try:
+        user = auth_core.register(name, pwd, _client_device(request),
+                                  ip=_client_ip(request) or "lan", email_ticket=ticket)
+    except auth_core.AuthError as e:
+        status = 400
+        if e.code == "rate_limited":
+            status = 429
+        elif e.code == "registration_closed":
+            status = 403
+        return JSONResponse({"error": e.msg, "code": e.code}, status_code=status)
+    resp = JSONResponse({"ok": True, "user": user})
+    _set_session_cookie(resp, user["id"], secure=_client_is_https(request))
+    logger.info(f"[Auth] 注册新用户 {user['name']} ({user['id']})")
+    return resp
+
+
+@app.post("/api/auth/login")
+async def auth_login(payload: dict, request: Request):
+    try:
+        user = auth_core.login(payload.get("name", ""), payload.get("pwd", ""),
+                               _client_device(request))
+    except auth_core.AuthError as e:
+        status = 429 if e.code == "rate_limited" else 401
+        return JSONResponse({"error": e.msg, "code": e.code}, status_code=status)
+    resp = JSONResponse({"ok": True, "user": user})
+    _set_session_cookie(resp, user["id"], secure=_client_is_https(request))
+    logger.info(f"[Auth] 登录 {user['name']} ({user['id']})")
+    return resp
+
+
+@app.post("/api/auth/logout")
+async def auth_logout():
+    resp = JSONResponse({"ok": True})
+    resp.delete_cookie(SESSION_COOKIE, path="/")
+    resp.delete_cookie(SHARED_COOKIE, path="/", domain=SHARED_COOKIE_DOMAIN)
+    return resp
+
+
+@app.get("/api/auth/me")
+async def auth_me(request: Request):
+    uid = _session_uid(request)
+    if not uid:
+        return JSONResponse({"error": "未登录", "code": "unauthorized"}, status_code=401)
+    return {"ok": True, "user": auth_core.get_user(uid), "public": _is_public_request(request)}
+
+
+def _is_admin_request(request: Request) -> bool:
+    """当前请求是否具备管理员权限。
+
+    局域网直连（不带 CF 头、无 cookie）本来就是系统身份，与工具层
+    sandbox.actor_for 的口径一致——两处判据必须同源，否则会出现
+    「工具能干、管理接口不能干」的怪异状态。
+    """
+    uid = _session_uid(request)
+    if not uid:
+        return not _is_public_request(request)
+    return auth_core.is_admin(uid)
+
+
+@app.get("/api/auth/users")
+async def auth_users(request: Request):
+    """用户清单（含角色），仅管理员。"""
+    if not _is_admin_request(request):
+        return JSONResponse({"error": "仅管理员可查看", "code": "forbidden"}, status_code=403)
+    return {"ok": True, "users": auth_core.list_users()}
+
+
+@app.post("/api/auth/role")
+async def auth_set_role(payload: dict, request: Request):
+    """改用户角色（仅管理员）。body: {uid, role: admin|user}"""
+    if not _is_admin_request(request):
+        return JSONResponse({"error": "仅管理员可操作", "code": "forbidden"}, status_code=403)
+    try:
+        user = auth_core.set_role(str(payload.get("uid") or ""), str(payload.get("role") or ""))
+    except auth_core.AuthError as e:
+        return JSONResponse({"error": e.msg, "code": e.code}, status_code=400)
+    logger.info(f"[Auth] {_session_uid(request) or 'local'} 把 {user['name']} 角色改为 {user['role']}")
+    return {"ok": True, "user": user}
+
+
 # 托管生成的音频文件
 app.mount("/audio", StaticFiles(directory=str(AUDIO_DIR)), name="audio")
 # 托管上传的 3D 模型
 app.mount("/models", StaticFiles(directory=str(MODELS_DIR)), name="models")
+# 聊天附件（用户上传的图片/文件）：不豁免鉴权，公网未登录拿不到
+app.mount("/uploads", StaticFiles(directory=str(UPLOADS_DIR)), name="uploads")
 # 托管上传的 3D 背景模型
 app.mount("/backgrounds", StaticFiles(directory=str(BACKGROUNDS_DIR)), name="backgrounds")
 # 托管前端静态资源 (css/js)
@@ -866,35 +1307,62 @@ async def generate_tts_api(text: str, api_url: str, api_key: str,
     return (bytes(data), "audio/mpeg")
 
 
-async def generate_tts(text: str):
+def _effective_tts_config(uid: str = "") -> dict:
+    """该用户生效的 TTS 配置：卡片 tts 覆盖全局（空值不覆盖，防 Invalid voice）。"""
+    cfg = dict(tts_config)
+    if not uid:
+        return cfg
+    try:
+        card = role_card_of(uid)
+    except Exception:
+        card = None
+    if not card:
+        return cfg
+    tts = card.get("tts") or {}
+    for k in ("engine", "edge_rate", "gptsovits_url", "gptsovits_ref_audio",
+              "gptsovits_character", "api_url", "api_key", "api_model", "api_voice"):
+        v = tts.get(k)
+        if isinstance(v, str):
+            if v.strip():
+                cfg[k] = v
+        elif v:
+            cfg[k] = v
+    if (tts.get("edge_voice") or "").strip():
+        cfg["edge_voice"] = tts["edge_voice"].strip()
+    return cfg
+
+
+async def generate_tts(text: str, uid: str = ""):
     """根据当前引擎生成 TTS，返回 (audio_bytes, mime_type) 或 None，失败自动回退 edge_tts。
 
     引擎来源：edge_tts（免费在线）| gpt_sovits（本地）| api（当前供应商的 API TTS）。
+    uid 非空时用该用户卡片的音色；空 uid（无头调用 / 从未切卡）用全局配置。
     """
-    engine = tts_config.get("engine", "edge_tts")
+    cfg = _effective_tts_config(uid)
+    engine = cfg.get("engine", "edge_tts")
     try:
         if engine == "gpt_sovits":
             return await asyncio.to_thread(
                 generate_tts_gptsovits,
                 text,
-                tts_config["gptsovits_ref_audio"],
-                tts_config["gptsovits_url"],
-                tts_config.get("gptsovits_character", ""),
+                cfg["gptsovits_ref_audio"],
+                cfg["gptsovits_url"],
+                cfg.get("gptsovits_character", ""),
             )
         if engine == "api":
             return await generate_tts_api(
                 text,
-                tts_config.get("api_url", ""),
-                tts_config.get("api_key", ""),
-                tts_config.get("api_model", ""),
-                tts_config.get("api_voice", ""),
+                cfg.get("api_url", ""),
+                cfg.get("api_key", ""),
+                cfg.get("api_model", ""),
+                cfg.get("api_voice", ""),
             )
-        return await generate_tts_edge(text, tts_config["edge_voice"], tts_config["edge_rate"])
+        return await generate_tts_edge(text, cfg["edge_voice"], cfg["edge_rate"])
     except Exception as e:
         print(f"[TTS] {engine} 失败，回退 edge_tts: {e}")
         try:
-            fallback_voice = (tts_config.get("edge_voice") or "").strip() or DEFAULT_VOICE
-            fallback_rate = (tts_config.get("edge_rate") or "").strip() or "+8%"
+            fallback_voice = (cfg.get("edge_voice") or "").strip() or DEFAULT_VOICE
+            fallback_rate = (cfg.get("edge_rate") or "").strip() or "+8%"
             return await generate_tts_edge(text, fallback_voice, fallback_rate)
         except Exception as e2:
             print(f"[TTS] edge_tts 也失败: {e2}")
@@ -1097,89 +1565,20 @@ def convert_to_wav(input_path: str, output_path: str, noise_reduction: bool = Fa
 
 # ---------- STT（语音转文字）独立配置 ----------
 # 与 TTS 配置同模式：独立文件 stt_config.json，运行时可经 /api/stt/config 修改。
-# 云端优先（快、准）；云端超时/失败自动降级本地 faster-whisper，保证语音通话不卡死。
+# 只走云端 API（SiliconFlow）；本地 faster-whisper 引擎已移除，
+# 省 515M 模型缓存与启动预热线程。
 STT_CONFIG_FILE = BASE_DIR / "stt_config.json"
 DEFAULT_STT_CONFIG = {
-    "provider": "auto",                          # auto=云端优先+本地兜底 | cloud=仅云端 | local=仅本地
+    "provider": "auto",                       # auto=云端优先，失败自动重试 | cloud=仅云端单次
     "api_url": "https://api.siliconflow.cn/v1/audio/transcriptions",
-    "api_key": "",                              # 语音识别专用密钥；留空沿用大语言模型 API Key
-    "model": "FunAudioLLM/SenseVoiceSmall",     # 云端识别模型名
-    "api_timeout": 6,                            # 云端超时：本地识别仅 ~0.5s，云端抖动实测 30s+，
-                                                 # 15s 会让用户干等；6s 内不出结果立刻降级本地
-    # 本地降级（faster-whisper）：云端抖动时的兜底，首次使用自动下载模型
-    "local_enabled": True,
-    "local_model": "Systran/faster-whisper-medium",  # medium：中文识别明显优于 base，
-                                                 # 实测 CPU/int8 推理耗时与 base 持平（~0.5s）
-    "local_device": "cpu",
-    "local_compute_type": "int8",
-    "hf_endpoint": "https://hf-mirror.com",
+    "api_key": "",                            # 语音识别专用密钥；留空沿用大语言模型 API Key
+    "model": "Qwen/Qwen3-ASR-1.7B",           # 主模型（实测 5/5 成功、0.5s）
+    # 兜底模型链：模型级过载会让请求整段挂死而不报错（实测 SenseVoiceSmall 20s
+    # 超时率 60%，同 key 同接口换 Qwen3-ASR 后 5/5 成功）→ 换模型比同模型重试有效
+    "fallback_models": ["XingChenAGI/XingChenASR-V3.2"],
+    "api_timeout": 10,                        # 单模型超时；挂死靠换模型兜底，不必等 30s
 }
 
-# 本地模型懒加载句柄：None=未加载，False=加载失败（避免反复重试）
-_local_stt_model = None
-_local_stt_lock = threading.Lock()
-
-
-def _get_local_stt_config():
-    """读取 STT 本地降级配置（来自独立的 stt_config.json）。"""
-    return {
-        "enabled": bool(stt_config.get("local_enabled", True)),
-        "model": stt_config.get("local_model", "base"),
-        "device": stt_config.get("local_device", "cpu"),
-        "compute_type": stt_config.get("local_compute_type", "int8"),
-        "api_timeout": stt_config.get("api_timeout", 15),
-        "hf_endpoint": stt_config.get("hf_endpoint", "https://hf-mirror.com"),
-    }
-
-
-def _load_local_stt_model():
-    """懒加载本地 faster-whisper 模型（线程安全，只加载一次）。"""
-    global _local_stt_model
-    if _local_stt_model is not None:
-        return _local_stt_model
-    with _local_stt_lock:
-        if _local_stt_model is not None:
-            return _local_stt_model
-        cfg = _get_local_stt_config()
-        # 必须直接赋值而非 setdefault：已有环境变量会阻止镜像生效
-        hf_endpoint = (cfg.get("hf_endpoint") or "").strip()
-        if hf_endpoint:
-            os.environ["HF_ENDPOINT"] = hf_endpoint
-            os.environ["HF_HUB_ENDPOINT"] = hf_endpoint
-        print(f"[STT-Local] 加载本地模型 faster-whisper/{cfg['model']}"
-              f"（{cfg['device']}/{cfg['compute_type']}）…")
-        try:
-            from faster_whisper import WhisperModel
-            _local_stt_model = WhisperModel(
-                cfg["model"], device=cfg["device"], compute_type=cfg["compute_type"])
-            print("[STT-Local] ✅ 本地模型就绪")
-        except Exception as e:
-            print(f"[STT-Local] ❌ 模型加载失败: {e}")
-            _local_stt_model = False
-        return _local_stt_model
-
-
-def speech_to_text_local(wav_path: str) -> str:
-    """本地 faster-whisper 识别（云端降级方案）。"""
-    model = _load_local_stt_model()
-    if model is False:
-        raise RuntimeError("本地 STT 模型未就绪")
-    initial_prompt = "以下是普通话日常对话内容。"
-    segments, _info = model.transcribe(
-        wav_path, beam_size=5, language="zh",
-        temperature=0.0, initial_prompt=initial_prompt,
-        vad_filter=True,
-        vad_parameters=dict(min_silence_duration_ms=400, threshold=0.5),
-        condition_on_previous_text=False,
-        no_speech_threshold=0.6,
-        compression_ratio_threshold=2.4,
-        log_prob_threshold=-1.0,
-        without_timestamps=True)
-    text = " ".join(seg.text.strip() for seg in segments)
-    if not text:
-        raise RuntimeError("本地模型未识别到语音内容")
-    print(f"[STT-Local] 识别结果: {text[:60]}")
-    return text
 
 
 def _load_stt_config():
@@ -1218,70 +1617,169 @@ stt_config = _load_stt_config()
 
 
 def speech_to_text(wav_path: str) -> str:
-    """语音识别：云端 API 优先，超时/失败自动降级本地 faster-whisper。
+    """语音识别：云端 API（SiliconFlow），按「主模型 + 兜底模型链」依次尝试。
 
-    provider: auto=云端优先+本地兜底 | cloud=仅云端 | local=仅本地
+    单个 ASR 模型过载时，请求会整段挂死而不返回任何错误码——这种故障换模型
+    比同模型重试有效得多（实测同 key 同接口：SenseVoiceSmall 20s 超时率 60%，
+    Qwen3-ASR 5/5 成功 0.5s）。
+    provider: auto=走完整链（只配单个模型时=同模型重试 2 次）| cloud=仅主模型单次
     """
     import requests
-    provider = (stt_config.get("provider") or "auto").strip()
-    local_cfg = _get_local_stt_config()
+    provider = (stt_config.get("provider") or "cloud").strip()
+    if provider not in ("auto", "cloud"):
+        provider = "cloud"
 
     # 云端密钥：优先用 STT 专用 Key；未单独填写时兼容旧版沿用大语言模型 API Key
     dedicated_key = (stt_config.get("api_key") or "").strip()
     api_key = dedicated_key or (load_config().get("api_key") or "").strip()
-    can_cloud = provider != "local" and bool(api_key) \
-        and (bool(dedicated_key) or api_key.startswith("sk-"))
+    if not api_key:
+        raise RuntimeError("语音识别失败：未配置 API Key")
 
-    if can_cloud:
-        url = (stt_config.get("api_url") or "").strip() or DEFAULT_STT_CONFIG["api_url"]
-        model = (stt_config.get("model") or "").strip() or DEFAULT_STT_CONFIG["model"]
-        headers = {"Authorization": f"Bearer {api_key}"}
-        timeout = float(local_cfg["api_timeout"])
-        # 云端抖动实测可达 30s+，通话场景宁可快速降级本地，也不让用户干等
-        cloud_attempts = 1 if provider == "auto" else 2
-        last_err: Exception = RuntimeError("未请求")
-        for attempt in range(cloud_attempts):
-            with open(wav_path, "rb") as f:
-                files = {"file": ("audio.wav", f, "audio/wav")}
-                data = {"model": model}
-                try:
-                    resp = requests.post(url, headers=headers, files=files, data=data,
-                                         timeout=timeout,
-                                         proxies=requests_proxies(_cloud_proxy_for(url)))
-                    resp.raise_for_status()
-                    text = resp.json().get("text", "").strip()
-                    if text:
-                        return text
-                    raise RuntimeError("API 返回空文本")
-                except Exception as e:
-                    last_err = e
-                    print(f"[STT-API] 第{attempt + 1}次失败（{e}）")
-                    msg = str(e).lower()
-                    transient = any(k in msg for k in ("timeout", "timed out", "connection", "ssl"))
-                    if not transient:
-                        break
-                    time.sleep(0.4)
-        if provider == "cloud":
-            raise RuntimeError(f"语音识别失败（仅云端模式）: {last_err}")
-        print(f"[STT-API] 云端识别失败（{last_err}），降级本地识别…")
-    elif provider != "local":
-        print("[STT-API] 未配置云端密钥，直接使用本地识别…")
+    url = (stt_config.get("api_url") or "").strip() or DEFAULT_STT_CONFIG["api_url"]
+    primary = (stt_config.get("model") or "").strip() or DEFAULT_STT_CONFIG["model"]
+    fallbacks = stt_config.get("fallback_models") or []
+    chain = [primary] + [str(m).strip() for m in fallbacks
+                         if str(m).strip() and str(m).strip() != primary]
+    if provider == "cloud":
+        chain = chain[:1]
+    elif len(chain) == 1:
+        chain = chain * 2  # 没配兜底模型时保持旧的「同模型重试一次」行为
 
-    # 第二选择：本地 faster-whisper 降级
-    if local_cfg["enabled"]:
+    headers = {"Authorization": f"Bearer {api_key}", "Expect": ""}
+    # SiliconFlow 是国内 API：实测走 fq 代理(7890) 100% read timeout，直连稳定
+    timeout = float(stt_config.get("api_timeout", 30) or 30)
+    with open(wav_path, "rb") as f:
+        audio = f.read()
+
+    last_err: Exception = RuntimeError("未请求")
+    for idx, model in enumerate(chain):
         try:
-            return speech_to_text_local(wav_path)
-        except Exception as e2:
-            print(f"[STT-Local] 降级也失败: {e2}")
-            raise RuntimeError("语音识别失败（云端 + 本地均失败）") from e2
-    raise RuntimeError("语音识别失败且本地降级已禁用")
+            resp = requests.post(url, headers=headers,
+                                 files={"file": ("audio.wav", audio, "audio/wav")},
+                                 data={"model": model}, timeout=timeout)
+            resp.raise_for_status()
+            text = resp.json().get("text", "").strip()
+            if text:
+                if idx:
+                    print(f"[STT-API] 主模型未出结果，兜底模型 {model} 成功")
+                return text
+            raise RuntimeError("API 返回空文本")
+        except Exception as e:
+            last_err = e
+            print(f"[STT-API] {model} 第{idx + 1}/{len(chain)}次失败（{e}）")
+            msg = str(e).lower()
+            # 密钥/权限问题换模型也没用，直接放弃；其余（超时、空文本、5xx）继续换下一个
+            if any(k in msg for k in ("401", "403", "unauthorized", "invalid api key")):
+                break
+    raise RuntimeError(f"语音识别失败: {last_err}")
 
 
 # ---------- 路由 ----------
+_INDEX_CACHE: tuple = (0, "")
+
+
+def _index_template() -> str:
+    """index.html 原文，按 mtime 缓存（改前端不必重启服务）。"""
+    global _INDEX_CACHE
+    p = WEB_DIR / "index.html"
+    mtime = p.stat().st_mtime_ns
+    if _INDEX_CACHE[0] != mtime:
+        _INDEX_CACHE = (mtime, p.read_text(encoding="utf-8"))
+    return _INDEX_CACHE[1]
+
+
 @app.get("/")
-async def index():
-    resp = FileResponse(str(WEB_DIR / "index.html"))
+async def index(request: Request):
+    """主界面，把当前角色同步注入 <head>。
+
+    前端要按角色隐藏管理员专属入口（任务中心/工作区），而按钮是模块初始化时被
+    工具栏轮盘一次性收进数组的：异步 fetch /api/auth/me 拿到的角色永远晚一步，
+    按结果删按钮会在轮盘里留一个空扇区。所以角色必须同步给到。
+    """
+    role = auth_core.ROLE_ADMIN if _is_admin_request(request) else auth_core.ROLE_USER
+    boot = ("<script>window.__ROLE=" + json.dumps(role)
+            + ";document.documentElement.dataset.role=" + json.dumps(role) + ";</script>\n</head>")
+    # 必须注入在**真正的** head 收尾标签前：模板注释里也出现过字面 </head>，
+    # 用 replace(...,1) 会命中注释里那个，脚本被吞进注释、永不执行（实测
+    # window.__ROLE 为 undefined，管理员过滤整体失效）。rpartition 锁定最后一处。
+    head, _, tail = _index_template().rpartition("</head>")
+    html = head + boot + tail
+    resp = Response(content=html, media_type="text/html")
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    return resp
+
+
+# ---------- PWA：Service Worker 与 manifest 必须走根路径 ----------
+# Service Worker 能控制的 scope 上限由脚本自身 URL 决定：脚本放 /static/ 下，
+# 最多只能接管 /static/，导航请求和 API 就落不进缓存层。所以这两个文件直出根路径。
+@app.get("/sw.js")
+async def service_worker():
+    resp = FileResponse(str(WEB_DIR / "sw.js"), media_type="application/javascript")
+    resp.headers["Service-Worker-Allowed"] = "/"
+    resp.headers["Cache-Control"] = "no-cache"
+    return resp
+
+
+@app.get("/manifest.webmanifest")
+async def pwa_manifest():
+    resp = FileResponse(str(WEB_DIR / "manifest.webmanifest"),
+                        media_type="application/manifest+json")
+    resp.headers["Cache-Control"] = "public, max-age=3600"
+    return resp
+
+
+@app.get("/setup-qr.png")
+async def setup_qr(request: Request):
+    """引导页二维码：按访问主机实时生成。
+
+    为什么必须动态生成：二维码内容里含局域网 IP，硬编码成图片后路由器一换段
+    （192.168.31.x → 192.168.x.x）二维码就指向一个不存在的地址，而这张图在手机上
+    看不出错，只会表现为「扫了打不开」——极难排查。实时生成永远对。
+
+    为什么指向 HTTP 回源端口而非 HTTPS 主站：扫码的设备还没装 CA，扫 HTTPS 地址
+    第一眼就是「不安全」红页，用户得手动点「高级 → 继续访问」才进得来（装证书的
+    入口反而要用户先跳过证书警告，这是死循环）。HTTP 引导页无警告，装完 CA 页内
+    按钮再跳 HTTPS，形成单向流程。
+    """
+    import io
+    import qrcode
+
+    # 8001 = http_only 模式下的回源端口（见本文件 __main__ 里 _serve_port 的定义）
+    host = request.url.hostname or "127.0.0.1"
+    target = f"http://{host}:8001/setup"
+
+    q = qrcode.QRCode(box_size=8, border=2,
+                      error_correction=qrcode.constants.ERROR_CORRECT_M)
+    q.add_data(target)
+    q.make(fit=True)
+    img = q.make_image(fill_color="#0b0a18", back_color="white")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return Response(content=buf.getvalue(), media_type="image/png",
+                    headers={"Cache-Control": "no-cache",
+                             "X-QR-Target": target})
+
+
+# ---------- 手机接入向导 ----------
+# 自签 CA 必须能被手机下载安装，否则 HTTPS 不被信任、Service Worker 拒绝注册，
+# 「加到主屏幕 + 离线秒开」整条链路都起不来。这个页面就是那一步的入口。
+@app.get("/setup")
+async def setup_page():
+    resp = FileResponse(str(WEB_DIR / "setup.html"))
+    resp.headers["Cache-Control"] = "no-cache"
+    return resp
+
+
+@app.get("/dabai-ca.crt")
+async def dabai_ca_cert():
+    """下发根证书。iOS 认 application/x-x509-ca-cert，Android 认 .crt 后缀 + 附件下载。"""
+    path = WEB_DIR / "dabai-ca.crt"
+    if not path.is_file():
+        return JSONResponse({"error": "根证书缺失：web/dabai-ca.crt"}, status_code=404)
+    resp = FileResponse(str(path), media_type="application/x-x509-ca-cert",
+                        filename="dabai-ca.crt")
+    resp.headers["Content-Disposition"] = 'attachment; filename="dabai-ca.crt"'
+    resp.headers["Cache-Control"] = "no-cache"
     return resp
 
 
@@ -1515,7 +2013,7 @@ async def stt_config_set(payload: dict):
         if k in payload and payload[k] is not None:
             v = payload[k]
             stt_config[k] = str(v).strip() if isinstance(v, str) else v
-    if stt_config.get("provider") not in ("auto", "cloud", "local"):
+    if stt_config.get("provider") not in ("auto", "cloud"):
         stt_config["provider"] = "cloud"
     _save_stt_config({k: stt_config[k] for k in DEFAULT_STT_CONFIG})
     logger.info(
@@ -1532,6 +2030,7 @@ async def stt_config_set(payload: dict):
 # ============================================================
 from task_orchestrator import (
     get_orchestrator,
+    set_broadcast,
     TaskOrchestrator,
     STATUS_CONFIRMING,
     STATUS_QUEUED,
@@ -2236,6 +2735,26 @@ async def api_longrun_ctl(action: str):
     return {"ok": True, "action": action, "message": msg}
 
 
+@app.post("/api/system/restart_notice")
+async def system_restart_notice():
+    """重启前广播「计划内升级」：把意外掉线变成有预告的升级。
+
+    调用方是 systemd 的 ExecStop=（先跑这条 HTTP，再发 SIGTERM）——那一刻服务还活着、
+    WS 还连着，广播发得出去。不能靠 lifespan shutdown：uvicorn 先对所有连接
+    transport.close()，再跑 lifespan，到那时广播必然发不出去。
+    """
+    notified = 0
+    for ws in list(manager.active):
+        if await safe_send_json(ws, {"type": "server_restart",
+                                     "text": "大白正在升级，几秒后自动回来…"}):
+            notified += 1
+    if notified:
+        # 等浏览器把提示画出来：send_json 只是把帧交给内核，进程立刻退会丢帧
+        await asyncio.sleep(1.5)
+    logger.info("[Restart] 重启通知已广播：活跃连接 %d，送达 %d", len(manager.active), notified)
+    return {"ok": True, "notified": notified}
+
+
 @app.get("/api/longrun/trace/{cycle}")
 async def api_longrun_trace(cycle: int):
     """某一轮的原始 trace（prompt 摘要 / 工具调用序列 / 退出码），任务中心下钻用。
@@ -2359,22 +2878,6 @@ def _save_character_cards(cards: list):
             json.dump({"cards": cards}, f, ensure_ascii=False, indent=2)
     except Exception as e:
         logger.warning(f"保存角色卡片失败: {e}")
-
-
-def _save_role_config(role_name: str, system_prompt: str, user_name: str = "", tools: dict = None):
-    """更新 settings.json 中的角色名、系统提示词、用户称呼与工具配置（应用角色卡片时调用）。"""
-    path = BASE_DIR / "settings.json"
-    with open(path, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
-    cfg["role_name"] = role_name
-    cfg["system_prompt"] = system_prompt
-    cfg["user_name"] = user_name
-    if tools is not None:
-        cfg.setdefault("agent", {})
-        cfg["agent"]["enable_tools"] = bool(tools.get("enabled", True))
-        cfg["agent"]["allowed_tools"] = list(tools.get("allowed", []) or [])
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
 
 
 # ---------- 大语言模型（LLM）供应商（全局资源） ----------
@@ -3161,11 +3664,11 @@ async def workspaces_activate(path: str):
 
 
 @app.get("/api/character_cards")
-async def character_cards_list():
-    """获取所有角色卡片 + 当前服务端激活的卡片（单系统模式：以服务端为准）。"""
+async def character_cards_list(request: Request):
+    """获取所有角色卡片 + 当前用户生效的卡片（按人隔离：各人各自一份）。"""
     active_id = ""
     try:
-        active_id = str(_load_settings().get("active_role_card") or "")
+        active_id = active_role_card_id(_card_uid(request))
     except Exception:
         pass
     return {"cards": _load_character_cards(), "active_id": active_id}
@@ -3365,16 +3868,16 @@ async def character_cards_delete(card_id: str):
     if len(remain) == len(cards):
         raise HTTPException(404, "卡片不存在")
     _save_character_cards(remain)
-    # 若删除的是当前活动卡片，清除活动标记（记忆空间回到 default）
+    # 用这张卡的人一并回落默认，否则指针指向一张已不存在的卡
     try:
-        with open(BASE_DIR / "settings.json", "r", encoding="utf-8") as f:
-            _cfg = json.load(f)
-        if _cfg.get("active_role_card") == card_id:
-            _cfg["active_role_card"] = ""
-            with open(BASE_DIR / "settings.json", "w", encoding="utf-8") as f:
-                json.dump(_cfg, f, ensure_ascii=False, indent=2)
+        users = load_card_users()
+        holders = [u for u, cid in users.items() if cid == card_id]
+        if holders:
+            for u in holders:
+                users.pop(u, None)
+            save_card_users(users)
     except Exception as e:
-        logger.warning(f"清除活动角色卡片标记失败: {e}")
+        logger.warning(f"清除用户角色卡片指针失败: {e}")
     return {"ok": True}
 
 
@@ -3402,125 +3905,41 @@ async def api_vision_check(provider_id: str = "", model: str = "", override: str
 
 
 @app.post("/api/character_cards/{card_id}/apply")
-async def character_cards_apply(card_id: str):
-    """应用角色卡片：更新角色名/系统提示词（settings.json）+ TTS 配置（tts_config.json）。"""
+async def character_cards_apply(card_id: str, request: Request):
+    """应用角色卡片（按人隔离）：只把该用户的指针指向这张卡。
+
+    卡片是数据源——人设 / 声音 / 模型 / LLM 全在解析时按 uid 取（agent.role_card_*）。
+    全局 settings.json / tts_config.json 退居「无卡片时的兜底」，切卡不再改写它们：
+    否则任一登录用户点一下卡片，全机（含主人）的人设、音色、模型都会被换掉。
+    """
     cards = _load_character_cards()
     card = next((c for c in cards if c.get("id") == card_id), None)
     if not card:
         raise HTTPException(404, "卡片不存在")
-    # 检测人设是否变化：系统提示词或角色名变了 → 开全新会话，
-    # 避免旧会话历史把人设带偏，让新系统提示词立即生效
-    persona_changed = False
+
     try:
-        with open(BASE_DIR / "settings.json", "r", encoding="utf-8") as f:
-            _prev_cfg = json.load(f)
-        new_prompt = (card.get("system_prompt") or "").strip()
-        new_role = (card.get("role_name") or card.get("name") or "AI助手").strip()
-        persona_changed = (
-            (_prev_cfg.get("system_prompt") or "").strip() != new_prompt
-            or (_prev_cfg.get("role_name") or "").strip() != new_role
-        )
+        _body = await request.json()
     except Exception:
-        persona_changed = True
-    # 1. 更新 settings.json 角色名 + 系统提示词 + 用户称呼 + 工具配置（agent 每次对话动态读取，即时生效）
-    _save_role_config(
-        (card.get("role_name") or card.get("name") or "AI助手").strip(),
-        card.get("system_prompt", ""),
-        (card.get("user_name") or "").strip(),
-        card.get("tools"),
-    )
-    # 2. 更新 TTS 配置（空 edge_voice 不覆盖全局，防止 Invalid voice）
-    tts = card.get("tts", {})
-    for k in ("engine", "edge_rate",
-              "gptsovits_url", "gptsovits_ref_audio", "gptsovits_character",
-              "api_url", "api_key", "api_model", "api_voice"):
-        if k in tts and (tts[k] or k == "engine"):
-            tts_config[k] = tts[k]
-            tts_config[k] = tts[k]
-    if (tts.get("edge_voice") or "").strip():
-        tts_config["edge_voice"] = tts["edge_voice"].strip()
-        global _edge_voices_cache
-        _edge_voices_cache = None
-    if not (tts_config.get("edge_voice") or "").strip():
-        tts_config["edge_voice"] = DEFAULT_VOICE
-    _save_tts_config({k: tts_config[k] for k in DEFAULT_TTS_CONFIG})
-    # 3. 更新 LLM 配置（settings.json + 运行时 agent 客户端）
-    # 卡片只声明供应商（provider_id）+ 模型名；供应商的 base_url/api_key 取自全局
-    # 注册表，绝不在卡片里各自存一套（避免 Ollama 串用自定义 API 配置）。
-    # 兼容旧卡：provider（档位名）/ base_url / api_key 作为迁移信息匹配供应商。
-    llm = card.get("llm") or {}
-    llm_provider_id = (llm.get("provider_id") or "").strip()
-    llm_model = (llm.get("model") or "").strip()
-    llm_temperature = llm.get("temperature")
-    llm_vision = _norm_vision(llm.get("vision"))
-    legacy_provider = (llm.get("provider") or "").strip()
-    legacy_base_url = (llm.get("base_url") or "").strip()
-    legacy_api_key = (llm.get("api_key") or "").strip()
-    if (llm_provider_id or llm_model or legacy_provider or legacy_base_url
-            or legacy_api_key or llm_temperature is not None or llm_vision is not None):
-        try:
-            _cfg = _load_settings()
-            providers = _ensure_llm_providers(_cfg)
-            prov = None
-            if llm_provider_id:
-                prov = next((p for p in providers if p["id"] == llm_provider_id), None)
-            if prov is None and legacy_base_url:
-                matches = [p for p in providers
-                           if (p.get("base_url") or "").strip() == legacy_base_url]
-                if len(matches) == 1:
-                    prov = matches[0]
-            if prov is None and legacy_provider in LLM_PROVIDER_KINDS:
-                prov = next((p for p in providers if p["kind"] == legacy_provider), None)
-            if prov is None:
-                prov = _active_provider(_cfg)
-            if prov:
-                _cfg["llm_provider_id"] = prov["id"]
-                _sync_llm_legacy_mirror(_cfg, prov)
-            if llm_model:
-                _cfg["model"] = llm_model
-                if prov:
-                    _kind = prov.get("kind") or "custom"
-                    _cfg.setdefault("llm_profiles", {})
-                    _cfg["llm_profiles"].setdefault(_kind, {})["model"] = llm_model
-            if llm_temperature is not None:
-                _cfg["temperature"] = llm_temperature
-            # 卡片声明了读图能力就覆盖全局：读图技能按 cfg["llm_vision"] 判当前模型。
-            # 只在卡片显式带 vision 字段时写，免得把上一张卡的声明带过来。
-            if "vision" in llm:
-                _cfg["llm_vision"] = llm_vision
-            _save_settings(_cfg)
-            # 重载全部共享 Agent（按 user_id 分实例），确保保存/切换卡片后
-            # 每个用户正在使用的 Agent 都立即换成新供应商模型，而不是只重载 default。
-            reloaded = await _reload_shared_agents()
-            logger.info(
-                f"应用角色卡片 LLM 配置已生效: provider_id={_cfg.get('llm_provider_id', '')} "
-                f"model={_cfg.get('model', '')} base_url={_cfg.get('base_url', '')} "
-                f"reloaded={reloaded}"
-            )
-        except Exception as e:
-            logger.warning(f"应用角色卡片 LLM 配置失败: {e}")
-    # 4. 持久化当前活动角色卡片（记忆命名空间按卡片隔离）
+        _body = None
+    uid = _card_uid(request, _body if isinstance(_body, dict) else None)
     try:
-        with open(BASE_DIR / "settings.json", "r", encoding="utf-8") as f:
-            _cfg = json.load(f)
-        _cfg["active_role_card"] = card_id
-        with open(BASE_DIR / "settings.json", "w", encoding="utf-8") as f:
-            json.dump(_cfg, f, ensure_ascii=False, indent=2)
+        users = load_card_users()
+        users[uid] = card_id
+        save_card_users(users)
     except Exception as e:
-        logger.warning(f"保存活动角色卡片失败: {e}")
-    # 5. 切换到该卡片的独立记忆空间（避免跨角色记忆混淆），返回该卡片对应的会话
+        logger.warning(f"保存用户角色卡片失败: {e}")
+        raise HTTPException(500, "保存角色卡片失败")
+
+    # 该用户的 Agent 立刻切到这张卡：重建 LLM 客户端（卡片 llm 声明覆盖全局）
+    # + 绑定该卡片的记忆空间，不等重启。
     session_id = None
     try:
-        agent = await get_shared_agent()
-        if persona_changed:
-            # 人设已变：强制开新会话，新系统提示词立即生效，不被旧历史带偏
-            session_id = await agent.create_fresh_session(card_id)
-            logger.info(f"人设已变化，为角色卡片 {card.get('name')} 开启全新会话")
-        else:
-            session_id = await agent.set_role_card_namespace(card_id)
+        agent = await get_shared_agent(uid)
+        await agent.reload_llm_config()
+        session_id = await agent.set_role_card_namespace(card_id)
     except Exception as e:
         logger.warning(f"切换角色卡片记忆空间失败: {e}")
-    logger.info(f"应用角色卡片: {card.get('name')}")
+    logger.info(f"应用角色卡片: {card.get('name')} (uid={uid})")
     return {
         "ok": True,
         "card": card,
@@ -3546,6 +3965,200 @@ async def list_models():
             })
     models.sort(key=lambda m: m["mtime"], reverse=True)
     return {"models": models}
+
+
+# ---------- 聊天附件上传（图片 / 文档 / 任意文件） ----------
+# 用户发来的文件落盘到 data/uploads/<uid|local>/<YYYYMMDD>/<sha1_16><ext>，
+# 前端拿绝对路径 + URL，随消息经 WS 的 attachments 字段回传。
+# 图片在 agent 侧走 [[IMG:]] 通道进多模态请求体（模型直接看像素）；
+# 其余类型只给路径，由工具按需读——不做格式解析，任何类型都能发。
+UPLOAD_MAX_BYTES = 30 * 1024 * 1024
+UPLOAD_MAX_FILES = 8
+_UPLOAD_IMAGE_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".avif"}
+# 这些扩展名存进来就是同源可执行页面（/uploads/x.html 打开即跑任意 JS），
+# 静态挂载没法按文件加 CSP，只能在入口拒掉；要发就打包成 zip。
+_UPLOAD_BLOCK_EXT = {".html", ".htm", ".xhtml", ".svg", ".js", ".mjs", ".ts", ".jsx", ".tsx"}
+
+
+# 内联预算：能转文本的附件直接进上下文，模型当轮就能处理，不用先调工具读一遍。
+# 但要卡住上限——一份 200 页 PDF 塞进上下文会把对话直接撑爆。
+_ATTACH_INLINE_CHARS = 16000
+_ATTACH_TOTAL_CHARS = 40000
+
+
+def _attachments_prompt(attachments) -> str:
+    """附件 → 给模型看的文本：图片带 [[IMG:]] 标记（agent 注入像素），
+    文本/PDF/Office 直接内联正文，其余给路径由工具按需读。
+
+    只接受落在 UPLOADS_DIR 内的路径：WS 消息是客户端可控输入，
+    不校验就等于开了一条「让模型去读服务器任意文件」的通道。
+    """
+    if not isinstance(attachments, list):
+        return ""
+    lines, imgs, budget = [], 0, _ATTACH_TOTAL_CHARS
+    for a in attachments[:UPLOAD_MAX_FILES]:
+        raw = a.get("path") if isinstance(a, dict) else a
+        if not raw:
+            continue
+        try:
+            real = Path(str(raw)).resolve()
+            real.relative_to(UPLOADS_DIR.resolve())
+        except Exception:
+            logger.warning(f"[Upload] 拒绝越界附件路径: {raw}")
+            continue
+        if not real.is_file():
+            continue
+        name = str((a.get("name") if isinstance(a, dict) else "") or real.name)
+        size = real.stat().st_size
+        if real.suffix.lower() in _UPLOAD_IMAGE_EXT:
+            imgs += 1
+            lines.append(f"[图片{imgs}：{name}] [[IMG:{real}]]")
+            continue
+        if budget > 0:
+            body, why = attach_text.extract(real, _ATTACH_INLINE_CHARS)
+            if body is not None:
+                body, cut = attach_text.clamp(body, min(_ATTACH_INLINE_CHARS, budget))
+                budget -= len(body)
+                tail = (f"\n…（只给了前 {len(body)} 字符，需要更多用 read_file 读 {real}）"
+                        if cut else "")
+                lines.append(f"[附件：{name}，{size} 字节，{why}，路径 {real}]\n```\n{body}\n```{tail}")
+                continue
+        else:
+            why = "本轮内联额度已用完"
+        lines.append(f"[附件：{name}，{size} 字节，{why}，路径 {real}"
+                     f"——要看内容用 read_file / code_read 打开]")
+    if not lines:
+        return ""
+    return "【我上传了文件】\n" + "\n".join(lines)
+
+
+_ATTACH_BLOCK_HEAD = "【我上传了文件】"
+_IMG_LINE_RE = re.compile(r"^\[图片\d+：(.+?)\]\s*\[\[IMG:(.+?)\]\]$")
+_FILE_LINE_RE = re.compile(r"^\[附件：(.+?)，(\d+) 字节，(.+?)\](.*)$")
+_CUT_TAIL_RE = re.compile(r"^…（只给了前 \d+ 字符，需要更多用 read_file 读 (.+?)）$")
+
+
+def _uploads_url(path) -> str:
+    """上传文件绝对路径 → 浏览器 URL；不在 UPLOADS_DIR 内一律给空串。
+
+    历史文本里的路径虽然是落盘时校验过的，但渲染成 <a href> 之前必须再校验一次：
+    脏数据/手工构造的历史不该把任意本地路径变成可下载链接。
+    """
+    try:
+        rel = Path(str(path)).resolve().relative_to(UPLOADS_DIR.resolve())
+    except Exception:
+        return ""
+    return "/uploads/" + rel.as_posix()
+
+
+def _split_attach_block(text):
+    """把「给模型看的」附件块从用户消息里剥出来 → (展示文本, 附件元数据)。
+
+    同一条 user 文本要服务两个相反的诉求：模型要 [[IMG:]] 绝对路径和文档正文，
+    气泡要缩略图网格和文件卡片。存进历史的只能是前者，所以渲染时在这里反解一次——
+    历史里的老消息（块已经连着正文存进库了）也一并受益，不必迁移数据。
+    解不出来就原样返回：宁可难看，也不能把用户说的话弄丢。
+    """
+    if not isinstance(text, str) or _ATTACH_BLOCK_HEAD not in text:
+        return text, []
+    head = text.find(_ATTACH_BLOCK_HEAD)
+    display = text[:head].rstrip()
+    lines = text[head + len(_ATTACH_BLOCK_HEAD):].split("\n")
+    atts, i = [], 0
+    while i < len(lines):
+        ln = lines[i].strip()
+        m = _IMG_LINE_RE.match(ln)
+        if m:
+            atts.append({"name": m.group(1), "url": _uploads_url(m.group(2)),
+                         "kind": "image"})
+            i += 1
+            continue
+        m = _FILE_LINE_RE.match(ln)
+        if not m:
+            i += 1
+            continue
+        name, size, why, _rest = m.groups()
+        real = ""
+        if "，路径 " in why:          # 路径写在头行里（只给路径的、以及新格式的内联附件）
+            why, real = why.split("，路径 ", 1)
+            real = real.split("——")[0].strip()
+        i += 1
+        # 内联正文：连 ``` 围栏和「只给了前 N 字符」尾注一起跳过——正文是喂模型的，
+        # 进了气泡就是一屏代码块；顺带防止正文里恰好出现的「[附件：…]」行被误判成附件
+        if i < len(lines) and lines[i].startswith("```"):
+            i += 1
+            while i < len(lines) and not lines[i].startswith("```"):
+                i += 1
+            i += 1
+            if i < len(lines):
+                mt = _CUT_TAIL_RE.match(lines[i].strip())
+                if mt:
+                    real = real or mt.group(1).strip()
+                    i += 1
+        atts.append({"name": name, "size": int(size),
+                     "url": _uploads_url(real), "kind": "file"})
+    if not atts:
+        return text, []      # 用户自己打了「【我上传了文件】」这几个字：别当成块切掉
+    return display, atts
+
+
+def _history_for_client(history):
+    """历史轮次 → 前端渲染用：附件块从 user 文本剥掉，改挂 atts 元数据。
+
+    只读不改：history 同时是连接级短期记忆（喂模型用），原地改写会污染模型上下文。
+    """
+    out = []
+    for h in history or []:
+        if not isinstance(h, dict):
+            continue
+        item = dict(h)
+        user, atts = _split_attach_block(h.get("user") or "")
+        item["user"] = user
+        if atts:
+            item["atts"] = atts
+        out.append(item)
+    return out
+
+
+@app.post("/api/upload")
+async def upload_attachments(request: Request, files: List[UploadFile] = File(...)):
+    """聊天附件上传：图片/文档/任意文件，返回绝对路径与可访问 URL。"""
+    if not files:
+        raise HTTPException(400, "没有文件")
+    if len(files) > UPLOAD_MAX_FILES:
+        raise HTTPException(400, f"一次最多 {UPLOAD_MAX_FILES} 个文件")
+    uid = _store_uid(request) or "local"
+    target_dir = UPLOADS_DIR / uid / time.strftime("%Y%m%d")
+    target_dir.mkdir(parents=True, exist_ok=True)
+    out = []
+    for f in files:
+        raw_name = Path(f.filename or "file").name
+        ext = Path(raw_name).suffix.lower()
+        if ext in _UPLOAD_BLOCK_EXT:
+            raise HTTPException(400, f"出于安全考虑不支持 {ext}（可压缩成 zip 再发）")
+        data = await f.read()
+        if not data:
+            continue
+        if len(data) > UPLOAD_MAX_BYTES:
+            raise HTTPException(
+                413, f"{raw_name} 过大（{len(data) // 1024 // 1024}MB），"
+                     f"上限 {UPLOAD_MAX_BYTES // 1024 // 1024}MB")
+        # 内容哈希做文件名：同名不同内容不互相覆盖，重发同一张也不堆垃圾
+        target = target_dir / f"{hashlib.sha1(data).hexdigest()[:16]}{ext}"
+        if not target.exists():
+            target.write_bytes(data)
+        out.append({
+            "name": raw_name,
+            "path": str(target),
+            "url": f"/uploads/{uid}/{target_dir.name}/{target.name}",
+            "size": len(data),
+            "ext": ext.lstrip("."),
+            "kind": "image" if ext in _UPLOAD_IMAGE_EXT else "file",
+        })
+    if not out:
+        raise HTTPException(400, "文件为空")
+    logger.info(f"[Upload] {len(out)} 个附件 → {target_dir}")
+    return {"ok": True, "files": out}
 
 
 @app.post("/api/model/upload")
@@ -3758,47 +4371,47 @@ def music_api_board_songs(pid: str):
 
 
 @app.get("/api/music/playlists")
-def music_api_list_playlists():
-    """列出用户自建歌单。"""
-    return {"playlists": music_lib.list_playlists()}
+def music_api_list_playlists(request: Request):
+    """列出当前用户的自建歌单。"""
+    return {"playlists": music_lib.list_playlists(_store_uid(request))}
 
 
 @app.post("/api/music/playlists")
-def music_api_create_playlist(payload: dict):
+def music_api_create_playlist(payload: dict, request: Request):
     """创建自建歌单。body: {"name": "..."}"""
     name = (payload.get("name") or "").strip()
     if not name:
         raise HTTPException(400, "歌单名不能为空")
     try:
-        pl = music_lib.create_playlist(name)
+        pl = music_lib.create_playlist(name, _store_uid(request))
     except ValueError as e:
         raise HTTPException(400, str(e))
     return {"ok": True, "playlist": pl}
 
 
 @app.get("/api/music/playlists/{pid}")
-def music_api_get_playlist(pid: str):
+def music_api_get_playlist(pid: str, request: Request):
     """获取自建歌单详情（含歌曲列表）。"""
-    pl = music_lib.get_playlist(pid)
+    pl = music_lib.get_playlist(pid, _store_uid(request))
     if not pl:
         raise HTTPException(404, "歌单不存在")
     return {"playlist": pl}
 
 
 @app.delete("/api/music/playlists/{pid}")
-def music_api_delete_playlist(pid: str):
+def music_api_delete_playlist(pid: str, request: Request):
     """删除自建歌单。"""
-    if not music_lib.delete_playlist(pid):
+    if not music_lib.delete_playlist(pid, _store_uid(request)):
         raise HTTPException(404, "歌单不存在")
     return {"ok": True, "deleted": pid}
 
 
 @app.post("/api/music/playlists/{pid}/songs")
-def music_api_add_song(pid: str, payload: dict):
+def music_api_add_song(pid: str, payload: dict, request: Request):
     """向歌单加入歌曲。body: {"song": {"source","id","name","artists"}}"""
     song = payload.get("song") or {}
     try:
-        pl = music_lib.add_song(pid, song)
+        pl = music_lib.add_song(pid, song, _store_uid(request))
     except ValueError as e:
         raise HTTPException(400, str(e))
     if not pl:
@@ -3807,9 +4420,9 @@ def music_api_add_song(pid: str, payload: dict):
 
 
 @app.delete("/api/music/playlists/{pid}/songs/{song_id}")
-def music_api_remove_song(pid: str, song_id: str):
+def music_api_remove_song(pid: str, song_id: str, request: Request):
     """从歌单移除歌曲。"""
-    if not music_lib.remove_song(pid, song_id):
+    if not music_lib.remove_song(pid, song_id, _store_uid(request)):
         raise HTTPException(404, "歌单不存在或歌曲不在歌单中")
     return {"ok": True, "removed": song_id}
 
@@ -3858,13 +4471,14 @@ async def agent_status():
 
 
 @app.get("/api/sessions")
-async def list_sessions(user_id: str = "default", q: str = ""):
+async def list_sessions(request: Request, user_id: str = "default", q: str = ""):
     """列出当前角色卡片记忆空间下用户的所有会话。
 
     q 非空时按标题或消息内容模糊搜索（兼容旧调用：不带 q 行为不变，
     返回字段在原有基础上新增 message_count/summary/approx_tokens/pinned/
     archived/is_current，旧前端只读原字段不受影响）。
     """
+    user_id = _uid_of(request, {"user_id": user_id})
     agent = await get_shared_agent(user_id)
     await agent.sync_memory_namespace()
     sessions = await agent.get_sessions(query=(q or "").strip() or None)
@@ -3872,103 +4486,112 @@ async def list_sessions(user_id: str = "default", q: str = ""):
 
 
 @app.post("/api/sessions/switch")
-async def switch_session(payload: dict):
+async def switch_session(payload: dict, request: Request):
     """切换到指定会话（仅限当前角色卡片记忆空间内的会话）。
 
     返回该会话的完整历史（user/ai 轮次，最多 300 轮）与最新摘要，
     供前端对话栏完整渲染；旧字段形状保持不变。
     """
-    user_id = payload.get("user_id", "default")
+    user_id = _uid_of(request, payload)
     session_id = payload.get("session_id", "")
     if not session_id:
         raise HTTPException(400, "缺少 session_id")
     agent = await get_shared_agent(user_id)
     await agent.sync_memory_namespace()
-    if not await agent.memory.session_belongs_to_namespace(session_id):
+    if not await agent.memory.session_visible(session_id):
         raise HTTPException(400, "该会话不属于当前角色卡片")
     await agent.switch_session(session_id)
     history = await agent.get_session_history(session_id, max_rounds=300)
     summary = await agent.get_session_summary(session_id)
-    return {"session_id": session_id, "history": history, "summary": summary}
+    return {"session_id": session_id, "history": _history_for_client(history),
+            "summary": summary}
 
 
 @app.post("/api/sessions/rename")
-async def rename_session(payload: dict):
+async def rename_session(payload: dict, request: Request):
     """重命名指定会话（标题 1-60 字符）。"""
-    user_id = payload.get("user_id", "default")
+    user_id = _uid_of(request, payload)
     session_id = payload.get("session_id", "")
     title = (payload.get("title") or "").strip()
     if not session_id or not title:
         raise HTTPException(400, "缺少 session_id 或 title")
     agent = await get_shared_agent(user_id)
     await agent.sync_memory_namespace()
-    if not await agent.memory.session_belongs_to_namespace(session_id):
+    if not await agent.memory.session_visible(session_id):
         raise HTTPException(400, "该会话不属于当前角色卡片")
     await agent.rename_session(session_id, title)
     return {"ok": True, "session_id": session_id, "title": title[:60]}
 
 
 @app.post("/api/sessions/pin")
-async def pin_session(payload: dict):
+async def pin_session(payload: dict, request: Request):
     """置顶 / 取消置顶指定会话。"""
-    user_id = payload.get("user_id", "default")
+    user_id = _uid_of(request, payload)
     session_id = payload.get("session_id", "")
     pinned = bool(payload.get("pinned", True))
     if not session_id:
         raise HTTPException(400, "缺少 session_id")
     agent = await get_shared_agent(user_id)
     await agent.sync_memory_namespace()
-    if not await agent.memory.session_belongs_to_namespace(session_id):
+    if not await agent.memory.session_visible(session_id):
         raise HTTPException(400, "该会话不属于当前角色卡片")
     await agent.set_session_pinned(session_id, pinned)
     return {"ok": True, "session_id": session_id, "pinned": pinned}
 
 
 @app.post("/api/sessions/archive")
-async def archive_session(payload: dict):
+async def archive_session(payload: dict, request: Request):
     """归档 / 取消归档指定会话（归档后不出现在默认列表、不被自动复用）。"""
-    user_id = payload.get("user_id", "default")
+    user_id = _uid_of(request, payload)
     session_id = payload.get("session_id", "")
     archived = bool(payload.get("archived", True))
     if not session_id:
         raise HTTPException(400, "缺少 session_id")
     agent = await get_shared_agent(user_id)
     await agent.sync_memory_namespace()
-    if not await agent.memory.session_belongs_to_namespace(session_id):
+    if not await agent.memory.session_visible(session_id):
         raise HTTPException(400, "该会话不属于当前角色卡片")
     await agent.set_session_archived(session_id, archived)
     return {"ok": True, "session_id": session_id, "archived": archived}
 
 
 @app.get("/api/sessions/{session_id}/history")
-async def session_history(session_id: str, user_id: str = "default"):
+async def session_history(session_id: str, request: Request, user_id: str = "default"):
     """获取指定会话的完整历史（user/ai 轮次）与最新摘要。"""
+    user_id = _uid_of(request, {"user_id": user_id})
     agent = await get_shared_agent(user_id)
     await agent.sync_memory_namespace()
-    if not await agent.memory.session_belongs_to_namespace(session_id):
+    if not await agent.memory.session_visible(session_id):
         raise HTTPException(400, "该会话不属于当前角色卡片")
     history = await agent.get_session_history(session_id, max_rounds=300)
     summary = await agent.get_session_summary(session_id)
-    return {"session_id": session_id, "history": history, "summary": summary}
+    return {"session_id": session_id, "history": _history_for_client(history),
+            "summary": summary}
 
 
 @app.post("/api/sessions/new")
-async def new_session(payload: dict):
+async def new_session(payload: dict, request: Request):
     """创建新会话。"""
-    user_id = payload.get("user_id", "default")
+    user_id = _uid_of(request, payload)
     agent = await get_shared_agent(user_id)
     await agent.close_current_session()
     # 先同步当前角色卡片记忆空间，再创建新会话
     await agent.sync_memory_namespace()
-    agent.memory.session_id = None
-    sid = await agent.memory.get_or_create_session()
+    # 与 WS 的 new_session 分支同一语义：新对话必须真新建。
+    # get_or_create_session 会接管命名空间里最近的活跃会话（点了新对话却回到旧对话）。
+    sid = await agent.memory.create_new_session()
     return {"session_id": sid}
 
 
 @app.delete("/api/sessions/{session_id}")
-async def delete_session(session_id: str, user_id: str = "default"):
+async def delete_session(session_id: str, request: Request, user_id: str = "default"):
     """删除指定会话。"""
+    user_id = _uid_of(request, {"user_id": user_id})
     agent = await get_shared_agent(user_id)
+    await agent.sync_memory_namespace()
+    # 删除是不可逆的：这里原先没有归属校验，拿到别人的 session_id 就能删
+    if not await agent.memory.session_visible(session_id):
+        raise HTTPException(400, "该会话不属于当前角色卡片")
     await agent.delete_session(session_id)
     return {"deleted": session_id}
 
@@ -4022,6 +4645,9 @@ async def codex_task_kill(tid: str):
 class ConnectionManager:
     def __init__(self):
         self.active: List[WebSocket] = []
+        # 连接 → 用户绑定：广播按 uid 定向投递，不同用户的流式回复/工具事件
+        # 不再互串（set_user 时绑定，断连时解绑）
+        self._uids: dict = {}
 
     async def connect(self, ws: WebSocket):
         await ws.accept()
@@ -4030,6 +4656,17 @@ class ConnectionManager:
     def disconnect(self, ws: WebSocket):
         if ws in self.active:
             self.active.remove(ws)
+        self._uids.pop(id(ws), None)
+
+    def bind_user(self, ws: WebSocket, uid: str) -> None:
+        if uid:
+            self._uids[id(ws)] = uid
+
+    def targets(self, uid: str = "") -> List[WebSocket]:
+        """广播目标：按 uid 只挑同用户的连接；uid 为空（未绑定/后台任务）保持旧的全量行为。"""
+        if not uid:
+            return list(self.active)
+        return [w for w in self.active if self._uids.get(id(w)) == uid]
 
 
 manager = ConnectionManager()
@@ -4075,7 +4712,8 @@ async def safe_send_json(ws: WebSocket, data: dict) -> bool:
 # 无缝接管展示。只有用户文字/语音输入（或用户主动点中断）能取消活跃轮。
 class _ActiveTurn:
     __slots__ = ("task", "session_id", "state", "user_text", "resume",
-                 "started_at", "full_text", "reasoning_tail", "tool_events", "done")
+                 "started_at", "full_text", "reasoning_tail", "tool_events", "done",
+                 "pending_voice", "uid")
 
     def __init__(self, task, session_id, state, user_text, resume):
         self.task = task
@@ -4087,33 +4725,52 @@ class _ActiveTurn:
         self.full_text = ""         # 已流出的正文累积（刷新后重放）
         self.reasoning_tail = ""    # 最近一次思考指示尾部
         self.tool_events: list = [] # 工具事件序列（刷新后重放工具链状态）
+        # 工具执行期间收到的语音输入：排队等本轮结束再补发（语音不得掐掉正在跑的工具）
+        self.pending_voice: list = []
         self.done = False
 
 
-_ACTIVE_TURN: dict = {"turn": None}
+# 活跃对话轮按 uid 分槽：每个用户各跑各的轮，互不打断、互不接管
+_ACTIVE_TURNS: dict = {}
+
+# 当前轮所属用户（asyncio task 上下文隔离）：广播代理据此只投递给同 uid 的连接。
+# 每条 WS 连接一个 task，set_user 后该 task 及它派生的对话轮 task 都能读到。
+_TURN_UID: "contextvars.ContextVar[str]" = contextvars.ContextVar("dabai_turn_uid", default="")
 
 
-def _turn_is_alive() -> bool:
-    t = _ACTIVE_TURN.get("turn")
+def _turn_of(uid: str = "") -> Optional["_ActiveTurn"]:
+    uid = uid or _TURN_UID.get()
+    return _ACTIVE_TURNS.get(uid) if uid else None
+
+
+def _turn_is_alive(uid: str = "") -> bool:
+    t = _turn_of(uid)
     return bool(t and not t.done and t.task and not t.task.done())
 
 
 def _register_active_turn(task, session_id, state, user_text, resume) -> None:
-    """登记新的活跃对话轮（旧轮若仍在跑会被新轮取代引用，由调用方先取消）。"""
+    """登记新的活跃对话轮（同 uid 的旧轮会被新轮取代引用，由调用方先取消）。"""
     t = _ActiveTurn(task, session_id, state, user_text, resume)
-    _ACTIVE_TURN["turn"] = t
+    uid = getattr(state, "user_id", "") or "default"
+    t.uid = uid
+    _ACTIVE_TURNS[uid] = t
 
     def _clear(_t, _t_ref=t):
-        cur = _ACTIVE_TURN.get("turn")
+        cur = _ACTIVE_TURNS.get(uid)
         if cur is _t_ref:
             cur.done = True
-            _ACTIVE_TURN["turn"] = None
+            _ACTIVE_TURNS.pop(uid, None)
+            _drain_queued_voice(cur)  # 工具轮跑完 → 补发排队中的语音输入
+        elif cur is not None and _t_ref.pending_voice:
+            # 旧轮被新输入取代（用户打字插话）：排队语音转交新轮，别丢用户的话
+            cur.pending_voice.extend(_t_ref.pending_voice)
+            _t_ref.pending_voice = []
     task.add_done_callback(_clear)
 
 
-def _cancel_active_turn() -> bool:
+def _cancel_active_turn(uid: str = "") -> bool:
     """取消后台活跃对话轮（仅用户文字/语音输入、用户点中断时调用）。"""
-    t = _ACTIVE_TURN.get("turn")
+    t = _turn_of(uid)
     if not t or not t.task or t.task.done():
         return False
     try:
@@ -4123,6 +4780,48 @@ def _cancel_active_turn() -> bool:
         pass
     t.task.cancel()  # CancelledError → agent 落「已暂停」断点，说『继续』可恢复
     return True
+
+
+def _turn_in_tools(uid: str = "") -> bool:
+    """活跃轮是否已进入工具执行阶段。
+
+    工具一旦开跑，用户语音就只能排队（见 WS audio 分支的排队逻辑），不得取消本轮——
+    否则环境噪音/VAD 误触发会把一个跑了几分钟的工具任务整轮掐掉。
+    """
+    t = _turn_of(uid)
+    return bool(t and not t.done and t.tool_events)
+
+
+def _drain_queued_voice(t) -> None:
+    """工具轮结束后，把排队中的语音合并成一条用户输入补发。
+
+    语音插话的两种命运在这里收口：能打断的（AI 只是说话/思考）当场打断；
+    不能打断的（工具在跑）先排队，轮结束自动接上，用户的话一句不丢。
+    """
+    if t is None or not t.pending_voice:
+        return
+    text = "\n".join(t.pending_voice).strip()
+    t.pending_voice = []
+    if not text:
+        return
+    state = t.state
+    history = getattr(state, "_ws_history", None)
+    if history is None:
+        logger.warning("[语音排队] 无历史镜像，丢弃排队语音: %s", text[:40])
+        return
+    try:
+        sid = state.new_session()
+        _TURN_UID.set(getattr(state, "user_id", "") or "")  # 补发轮同样只广播给本人
+        state.active_task = asyncio.create_task(
+            handle_user_message_stream(_BROADCAST_WS, text, history, sid, state,
+                current_model=state.current_model,
+                current_background=state.current_background,
+                current_bgm=state.current_bgm)
+        )
+        _register_active_turn(state.active_task, sid, state, text, False)
+        logger.info("[语音排队] 工具轮结束，补发排队语音: %s", text[:60])
+    except Exception as e:
+        logger.warning("[语音排队] 补发失败: %s", e)
 
 
 class _BroadcastWS:
@@ -4138,14 +4837,15 @@ class _BroadcastWS:
 
     async def send_json(self, data: dict) -> bool:
         sent = False
-        for w in list(manager.active):
+        uid = _TURN_UID.get()
+        for w in manager.targets(uid):
             try:
                 if await safe_send_json(w, data):
                     sent = True
             except Exception:
                 continue
         # 活跃轮进度缓冲：重连时通过 turn_in_progress 重放
-        t = _ACTIVE_TURN.get("turn")
+        t = _turn_of(uid)
         if t is not None and not t.done:
             mtype = data.get("type")
             if mtype == "stream_text":
@@ -4162,6 +4862,10 @@ class _BroadcastWS:
 # 模块级单例：媒体/子智能体 worker 用 ws 身份（is）做归属匹配与去重，
 # 全轮次复用同一实例才能跨轮次匹配（停止播放/播完回报的联动不丢）
 _BROADCAST_WS = _BroadcastWS()
+
+# 任务中心事件走同一个广播出口：task_event 原先只推给发起连接，前端一刷新/换设备
+# 就收不到进度（背景见 task_orchestrator.set_broadcast 的注释）。
+set_broadcast(_BROADCAST_WS.send_json)
 
 
 def _ws_owns(worker_ws, ws) -> bool:
@@ -4180,8 +4884,10 @@ _agent_lock = asyncio.Lock()
 #    记忆/会话，切换设备不断档；
 # 2) 全局共享历史：所有 WebSocket 连接共用同一份 history 列表（内存镜像），
 #    任何设备发消息都追加到同一份，刷新/换设备后看到的是同一条对话线。
-_global_history: list = []
-_global_history_ready: bool = False
+# 按用户分桶：uid -> 内存镜像列表。多用户（公网账号）各一份，互不串线；
+# 局域网统一身份走 uid=default 那一桶，行为与旧版一致。
+_global_history: dict = {}
+_global_history_ready: set = set()
 
 
 def _unified_user_id() -> str:
@@ -4193,20 +4899,22 @@ def _unified_user_id() -> str:
         return "default"
 
 
-async def _ensure_global_history() -> list:
-    """首次连接时把统一用户的持久化历史载入全局共享列表。"""
-    global _global_history, _global_history_ready
-    if not _global_history_ready:
+async def _ensure_global_history(uid: str = "") -> list:
+    """首次连接时把该用户的持久化历史载入内存镜像（按 uid 分桶）。"""
+    global _global_history
+    uid = uid or _unified_user_id()
+    if uid not in _global_history_ready:
         try:
-            agent = await get_shared_agent(_unified_user_id())
+            agent = await get_shared_agent(uid)
             hist = await agent.get_history()
             if len(hist) > 200:
                 hist = hist[-100:]
-            _global_history[:] = hist
+            _global_history[uid] = hist
         except Exception as e:
             logger.warning(f"加载全局历史失败（忽略）: {e}")
-        _global_history_ready = True
-    return _global_history
+            _global_history[uid] = []
+        _global_history_ready.add(uid)
+    return _global_history[uid]
 
 
 async def get_shared_agent(user_id: str = "default") -> AIAgent:
@@ -4588,9 +5296,6 @@ class WSState:
         self._last_proactive_speak: float = 0
         # RL 决策的快照间隔（秒），由快照间隔控制器学习得出（大厅/游戏共用）
         self._current_snapshot_interval: float = 30.0
-        # 执行中排队消息（FIFO）：AI 正在跑时用户输入不打断，先入队，
-        # 当前轮结束后自动续跑队首；元素为 (text, record_history, msg_source)
-        self.pending_messages: list = []
 
     def new_session(self) -> str:
         """开启新回复会话：把旧会话标记为取消，返回新 session_id。"""
@@ -4760,7 +5465,8 @@ async def handle_user_message_stream(ws: WebSocket, user_text: str, history: lis
     async def _gen_tts_audio(sentence: str):
         """生成单句 TTS 音频（base64 编码）。"""
         try:
-            result = await generate_tts(sentence)
+            result = await generate_tts(
+                sentence, _TURN_UID.get() or getattr(state, "user_id", ""))
             if result:
                 audio_bytes, mime_type = result
                 b64 = base64.b64encode(audio_bytes).decode("utf-8")
@@ -4913,7 +5619,7 @@ async def handle_user_message_stream(ws: WebSocket, user_text: str, history: lis
                 if agent.memory:
                     try:
                         await agent.sync_memory_namespace()
-                        if await agent.memory.session_belongs_to_namespace(cp_sid):
+                        if await agent.memory.session_visible(cp_sid):
                             await agent.memory.set_session_id(cp_sid)
                     except Exception as e:
                         logger.warning(f"[Resume] 会话绑定失败: {e}")
@@ -4923,7 +5629,7 @@ async def handle_user_message_stream(ws: WebSocket, user_text: str, history: lis
             # state 中的会话若不属于当前命名空间（如切卡后未刷新）则改用命名空间当前会话
             if agent.memory:
                 await agent.sync_memory_namespace()
-                if state.chat_session_id and await agent.memory.session_belongs_to_namespace(state.chat_session_id):
+                if state.chat_session_id and await agent.memory.session_visible(state.chat_session_id):
                     agent.memory.session_id = state.chat_session_id
                 else:
                     state.chat_session_id = agent.memory.session_id
@@ -5233,6 +5939,22 @@ async def handle_user_message_stream(ws: WebSocket, user_text: str, history: lis
             logger.warning(f"汇报轮次强制摘要失败（忽略）: {e}")
 
 
+async def _quota_gate(ws: WebSocket, state: WSState) -> bool:
+    """用户驱动的一轮开跑前扣当日额度；被限流时回一句提示并返回 False。
+
+    只在「真正要开跑的用户轮」调用 —— 主动说话、UI 自动上报、断点续跑都不经过。
+    """
+    q = turn_quota.consume(state.user_id)
+    if q["allowed"]:
+        return True
+    await safe_send_json(ws, {
+        "type": "system_msg",
+        "text": (f"今天的对话额度用完了（{q['used']}/{q['limit']} 轮），"
+                 f"明天 0 点自动恢复。"),
+    })
+    return False
+
+
 async def _kickoff_response(ws: WebSocket, text: str, history: list, state: WSState,
                            allow_interrupt: bool = False,
                            proactive: bool = False,
@@ -5268,8 +5990,8 @@ async def _kickoff_response(ws: WebSocket, text: str, history: list, state: WSSt
     if proactive:
         if state.active_task is not None and not state.active_task.done():
             return False  # AI 正在说话，主动路径不得打断
-        if _turn_is_alive():
-            return False  # 后台对话轮仍在执行（可能来自旧连接）：主动路径同样不得打断
+        if _turn_is_alive(state.user_id):
+            return False  # 该用户的后台对话轮仍在执行（可能来自旧连接）：主动路径同样不得打断
         if not external_trigger:
             # 用户活跃窗口守卫：用户 1 分钟内有主动对话/回复 → 禁止主动说话，
             # 避免 AI 在用户活跃交流时不断插话"废话"。
@@ -5282,13 +6004,18 @@ async def _kickoff_response(ws: WebSocket, text: str, history: list, state: WSSt
     if not allow_interrupt:
         if state.active_task is not None and not state.active_task.done():
             return False  # AI正在说话，被动事件不得打断
-        if _turn_is_alive():
-            return False  # 后台对话轮仍在执行：被动事件不得打断
+        if _turn_is_alive(state.user_id):
+            return False  # 该用户的后台对话轮仍在执行：被动事件不得打断
         if time.time() - state.last_response_done < 3.0:
             return False  # 回复刚结束冷却期，被动事件不得打断
+    # 每日轮次上限：只卡用户驱动的一轮，且放在取消当前轮之前 ——
+    # 被限流时不该顺手把用户正在跑的那一轮掐掉。
+    if not proactive and msg_source == "chat":
+        if not await _quota_gate(ws, state):
+            return False
     # 取消正在进行的回复（如果有）——只有用户输入（allow_interrupt=True）可打断
     if allow_interrupt:
-        _cancel_active_turn()  # 跨连接：取消后台注册表中的活跃轮（含旧连接启动的）
+        _cancel_active_turn(state.user_id)  # 取消该用户注册表中的活跃轮（含旧连接启动的）
     state.cancel_current()
     if state.active_task and not state.active_task.done():
         state.active_task.cancel()
@@ -5312,15 +6039,6 @@ async def _kickoff_response(ws: WebSocket, text: str, history: list, state: WSSt
     # 登记为全局活跃轮：事件广播 + 进度缓冲，前端刷新重连可无缝接管
     _register_active_turn(state.active_task, sid, state, text, False)
 
-    def _drain_pending(_t):
-        # 本轮结束：若执行中收到过留言，自动续跑队首（FIFO），实现「插话不打断」
-        if not state.pending_messages:
-            return
-        nxt, rec, src = state.pending_messages.pop(0)
-        asyncio.create_task(
-            _kickoff_response(ws, nxt, history, state, allow_interrupt=True,
-                              record_history=rec, msg_source=src))
-    state.active_task.add_done_callback(_drain_pending)
     return True
 
 
@@ -5338,7 +6056,7 @@ async def _kickoff_resume(ws, state, checkpoint: dict) -> bool:
         agent = await get_shared_agent(cp_user)
         if agent.memory and cp_sid:
             await agent.sync_memory_namespace()
-            if not await agent.memory.session_belongs_to_namespace(cp_sid):
+            if not await agent.memory.session_visible(cp_sid):
                 # 角色卡片已切换：断点会话不属于当前命名空间，放弃恢复
                 from agent import clear_ckpt_slot
                 clear_ckpt_slot(cp_user, str(checkpoint.get("turn_id") or ""))
@@ -5354,6 +6072,7 @@ async def _kickoff_resume(ws, state, checkpoint: dict) -> bool:
         state = WSState()
     state.user_id = cp_user
     state.chat_session_id = cp_sid
+    _TURN_UID.set(cp_user)  # 恢复轮的事件只投递给该用户的连接
     _resume_inflight.add(cp_user)
 
     # sid 前置创建：注册活跃轮时即可携带（事件广播/重连接管都靠它）
@@ -5513,6 +6232,11 @@ async def _handle_rl_decision(ws: WebSocket, data: dict, state: WSState, history
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
+    # 公网来源必须带有效会话 cookie 才能握手（局域网直连免鉴权）：
+    # HTTP 中间件管不到 WebSocket scope，这里单独把门。
+    if _is_public_request(ws) and not _session_uid(ws):
+        await ws.close(code=4401)
+        return
     # 先显式完成 WebSocket 握手再进入消息循环：
     # 热重载/整进程重启瞬间，连接可能已处于半死状态，直接收消息会报
     # "WebSocket is not connected. Need to call accept first" 并让前端永久卡在“连接中”。
@@ -5523,8 +6247,8 @@ async def websocket_endpoint(ws: WebSocket):
         print(f"[WS] 握手失败，放弃连接: {e}")
         return
     manager.active.append(ws)
-    # 单系统模式：所有连接共享同一份全局历史（刷新/换设备不断档）
-    history: list = await _ensure_global_history()
+    # 该连接所属用户的历史镜像（公网登录用户按账号隔离）
+    history: list = await _ensure_global_history(_session_uid(ws) or _unified_user_id())
     state = WSState()
     state._ws_history = history  # 子智能体汇报等外部触发复用同一份短期记忆
     _last_chat_conn["ws"] = ws
@@ -5558,7 +6282,7 @@ async def websocket_endpoint(ws: WebSocket):
                     continue
                 # 后台活跃轮仍在执行（可能来自旧连接，页面刷新后新连接 state 为空）：
                 # 同样丢弃，保证只有用户文字/语音输入能打断
-                if _turn_is_alive():
+                if _turn_is_alive(state.user_id):
                     continue
                 # AI刚说完：冷却期内丢弃，保证所有语音句段播放完
                 if time.time() - state.last_response_done < _RESPONSE_COOLDOWN:
@@ -5584,29 +6308,38 @@ async def websocket_endpoint(ws: WebSocket):
 
             # === 用户身份设置 ===
             if mtype == "set_user":
-                # 单系统模式：忽略各设备自己生成的 user_id，一律归一到统一身份，
-                # 保证所有网页端共享同一份记忆与对话
-                state.user_id = _unified_user_id()
+                # 身份优先级：登录 cookie > 前端浏览器 uid > 统一身份。
+                # 前端每个浏览器 localStorage 持有独立随机 uid——局域网下管理员/访客
+                # 各用各的桶，不再全部坍缩成同一个 default（那会让两台浏览器共用
+                # 同一个 Agent 实例与 session_id，互相串线）。公网 ws 已强制登录，
+                # 此分支只会走到 cookie 路径，前端 uid 不会在公网被采纳。
+                state.user_id = (
+                    _session_uid(ws)
+                    or str(msg.get("user_id") or "").strip()
+                    or _unified_user_id()
+                )
+                manager.bind_user(ws, state.user_id)
+                _TURN_UID.set(state.user_id)
                 # 预初始化该用户的 Agent
                 agent = await get_shared_agent(state.user_id)
                 # 绑定当前活动角色卡片的记忆命名空间（角色卡片独立记忆空间）
                 if agent.memory:
                     await agent.sync_memory_namespace()
                 state.chat_session_id = agent.memory.session_id if agent.memory else None
-                # 全局共享历史：直接复用同一份列表，不按连接重建
-                history = await _ensure_global_history()
+                # 全局共享历史：同一用户复用同一份列表，不按连接重建
+                history = await _ensure_global_history(state.user_id)
                 state._ws_history = history
                 await safe_send_json(ws, {
                     "type": "user_set",
                     "user_id": state.user_id,
                     "chat_session_id": state.chat_session_id,
-                    "history": history,
+                    "history": _history_for_client(history),
                 })
                 # 页面刷新/断线重连：后台对话轮仍在执行 → 发送进度快照，
                 # 前端无缝接管回合气泡；后续事件经 _BroadcastWS 广播自然到达。
                 # 不再触发断点续跑，避免同一任务被重复执行（旧轮还在跑）。
-                if _turn_is_alive():
-                    t = _ACTIVE_TURN["turn"]
+                if _turn_is_alive(state.user_id):
+                    t = _turn_of(state.user_id)
                     await safe_send_json(ws, {
                         "type": "turn_in_progress",
                         "session_id": t.session_id,
@@ -5660,7 +6393,7 @@ async def websocket_endpoint(ws: WebSocket):
                     agent = await get_shared_agent(state.user_id)
                     # 先绑定当前角色卡片的记忆空间，拒绝跨卡片会话（防止串记忆）
                     await agent.sync_memory_namespace()
-                    if not await agent.memory.session_belongs_to_namespace(sid):
+                    if not await agent.memory.session_visible(sid):
                         await safe_send_json(ws, {"type": "error", "message": "该会话不属于当前角色卡片"})
                         continue
                     await agent.switch_session(sid)
@@ -5673,7 +6406,7 @@ async def websocket_endpoint(ws: WebSocket):
                     await safe_send_json(ws, {
                         "type": "session_switched",
                         "session_id": sid,
-                        "history": history,
+                        "history": _history_for_client(history),
                         "summary": summary,
                     })
                 continue
@@ -5683,9 +6416,10 @@ async def websocket_endpoint(ws: WebSocket):
                 await agent.close_current_session()
                 # 绑定当前角色卡片的记忆空间后再创建新会话
                 await agent.sync_memory_namespace()
-                # 重新初始化会创建新会话
-                agent.memory.session_id = None
-                await agent.memory.get_or_create_session()
+                # 「新对话」按钮是唯一开新对话的入口，这里必须真新建：
+                # get_or_create_session 会接管命名空间里最近的活跃会话，
+                # 于是点了新对话却回到旧对话里。
+                await agent.memory.create_new_session()
                 state.chat_session_id = agent.memory.session_id
                 history[:] = []                    # 原地清空全局共享列表
                 state._ws_history = history
@@ -5701,7 +6435,7 @@ async def websocket_endpoint(ws: WebSocket):
                 if sid and title:
                     agent = await get_shared_agent(state.user_id)
                     await agent.sync_memory_namespace()
-                    if await agent.memory.session_belongs_to_namespace(sid):
+                    if await agent.memory.session_visible(sid):
                         await agent.rename_session(sid, title)
                         await safe_send_json(ws, {
                             "type": "session_renamed", "session_id": sid, "title": title[:60]})
@@ -5901,8 +6635,16 @@ async def websocket_endpoint(ws: WebSocket):
             #      前端据此复位状态徽章，避免打断后一直卡在「说话中」） ===
             if mtype == "interrupt":
                 _interrupted_sid = state.current_session
+                # 工具任务执行中：VAD 自动打断不得掐掉正在跑的工具（前端在工具轮
+                # 不再发 interrupt；看门狗「中断」按钮带 force=true 仍立即取消）
+                if _turn_in_tools(state.user_id) and not msg.get("force"):
+                    await safe_send_json(ws, {
+                        "type": "system_msg",
+                        "text": "⏳ 工具任务执行中，不打断（说『停止』或点中断按钮才真停）",
+                    })
+                    continue
                 # 跨连接：后台注册表中的活跃轮（旧连接启动的）一并取消
-                _cancel_active_turn()
+                _cancel_active_turn(state.user_id)
                 state.cancel_current()
                 if state.active_task and not state.active_task.done():
                     state.active_task.cancel()
@@ -5931,6 +6673,11 @@ async def websocket_endpoint(ws: WebSocket):
 
             if mtype == "text":
                 text = msg.get("content", "")
+                # 附件（图片/文件）→ 文本提示 + [[IMG:]] 标记，与用户文字合成一条消息
+                att_prompt = await asyncio.to_thread(
+                    _attachments_prompt, msg.get("attachments"))
+                if att_prompt:
+                    text = f"{text}\n\n{att_prompt}".strip()
                 if not text.strip():
                     continue
                 # ui=True 的系统点击消息不进短期记忆（由记忆系统按 auto 处理）
@@ -5957,20 +6704,16 @@ async def websocket_endpoint(ws: WebSocket):
                     coord.settle_forced(AgentChoice.AI_AGENT, unified)
                 except Exception as e:
                     logger.warning(f"RL强制路由记录失败: {e}")
-                _ai_busy = (_turn_is_alive()
+                _ai_busy = (_turn_is_alive(state.user_id)
                             or (state.active_task is not None
                                 and not state.active_task.done()))
                 if _ai_busy and _is_stop_word(text):
-                    state.pending_messages.clear()
-                    _cancel_active_turn()
+                    _cancel_active_turn(state.user_id)
                     await safe_send_json(ws, {"type": "system_msg", "text": "⏹ 已停止"})
                     continue
-                if _ai_busy:
-                    state.pending_messages.append((text, not ui_auto,
-                                                   "auto" if ui_auto else "chat"))
-                    await safe_send_json(ws, {"type": "system_msg",
-                        "text": f"⏳ 已记下你的话，这轮干完就接上（排队 {len(state.pending_messages)} 条）"})
-                    continue
+                if _ai_busy and ui_auto:
+                    continue  # 界面自动上报的消息不打断进行中的回复
+                # 用户打字 = 打断意图：取消当前轮（落「已暂停」断点，说『继续』可恢复）后开新轮
                 await _kickoff_response(
                     ws, text, history, state, allow_interrupt=True,
                     record_history=not ui_auto,
@@ -6100,8 +6843,31 @@ async def websocket_endpoint(ws: WebSocket):
                 except Exception as e:
                     logger.warning(f"RL强制路由记录失败: {e}")
                 await safe_send_json(ws, {"type": "transcript", "text": text})
+                # 语音插话分两种命运：
+                #   ① 本轮尚未进入工具执行 → 照旧打断（正常对话插话，体验不变）
+                #   ② 本轮已在跑工具 → 不取消，只把话排队，等这轮干完自动补发
+                #      （VAD 被环境噪音/随口一句话触发，曾把整轮工具任务掐掉）
+                # 例外：明确的停止词（「停止」「停」…）是急停指令，永远立即生效。
+                if _is_stop_word(text):
+                    _cancel_active_turn(state.user_id)
+                    state.cancel_current()
+                    if state.active_task and not state.active_task.done():
+                        state.active_task.cancel()
+                    await safe_send_json(ws, {"type": "system_msg", "text": "⏹ 已停止"})
+                    continue
+                t_active = _turn_of(state.user_id)
+                if t_active is not None and not t_active.done and t_active.tool_events:
+                    t_active.pending_voice.append(text)
+                    await safe_send_json(ws, {
+                        "type": "system_msg",
+                        "text": "⏳ 工具任务执行中，这句先排队——它干完就回你",
+                    })
+                    continue
+                # 每日额度：语音与打字同一口径 —— 都在这里开跑，都要扣
+                if not await _quota_gate(ws, state):
+                    continue
                 # 语音转文字成功 = 用户输入：可打断当前轮（含旧连接启动的后台活跃轮）
-                _cancel_active_turn()
+                _cancel_active_turn(state.user_id)
                 state.cancel_current()
                 if state.active_task and not state.active_task.done():
                     state.active_task.cancel()
@@ -6776,15 +7542,16 @@ async def vhs_remove_custom(cid: str):
 
 # ---------- 视频收藏夹（分类 + 收藏，本地持久化到 video_favorites.json） ----------
 @app.get("/api/video_hub/api/favorites")
-async def vhf_list():
-    """列出全部分类与收藏视频。"""
-    return await asyncio.to_thread(video_fav_lib.list_all)
+async def vhf_list(request: Request):
+    """列出当前用户的分类与收藏视频。"""
+    return await asyncio.to_thread(video_fav_lib.list_all, _store_uid(request))
 
 
 @app.get("/api/video_hub/api/history")
-async def vhh_list(limit: int = 200):
-    """列出观看历史（按观看时间倒序，最新在前）。"""
-    return {"history": await asyncio.to_thread(video_history_lib.list_history, limit)}
+async def vhh_list(request: Request, limit: int = 200):
+    """列出当前用户的观看历史（按观看时间倒序，最新在前）。"""
+    return {"history": await asyncio.to_thread(
+        video_history_lib.list_history, limit, _store_uid(request))}
 
 
 @app.post("/api/video_hub/api/history")
@@ -6795,24 +7562,26 @@ async def vhh_add(request: Request):
     if not isinstance(video, dict):
         return JSONResponse({"error": "缺少 video 字段"}, status_code=400)
     try:
-        out = await asyncio.to_thread(video_history_lib.add_history, video)
+        out = await asyncio.to_thread(
+            video_history_lib.add_history, video, _store_uid(request))
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
     return {"ok": True, **out}
 
 
 @app.delete("/api/video_hub/api/history/{hid}")
-async def vhh_remove(hid: str):
+async def vhh_remove(hid: str, request: Request):
     """删除一条观看历史。"""
-    if not await asyncio.to_thread(video_history_lib.remove_history, hid):
+    if not await asyncio.to_thread(
+            video_history_lib.remove_history, hid, _store_uid(request)):
         return JSONResponse({"error": "记录不存在"}, status_code=404)
     return {"ok": True, "removed": hid}
 
 
 @app.delete("/api/video_hub/api/history")
-async def vhh_clear():
-    """清空全部观看历史。"""
-    if not await asyncio.to_thread(video_history_lib.clear_history):
+async def vhh_clear(request: Request):
+    """清空当前用户的全部观看历史。"""
+    if not await asyncio.to_thread(video_history_lib.clear_history, _store_uid(request)):
         return JSONResponse({"error": "历史本来就是空的"}, status_code=404)
     return {"ok": True, "cleared": True}
 
@@ -6825,7 +7594,8 @@ async def vhf_create_category(request: Request):
     if not name:
         return JSONResponse({"error": "分类名不能为空"}, status_code=400)
     try:
-        cat = await asyncio.to_thread(video_fav_lib.create_category, name)
+        cat = await asyncio.to_thread(
+            video_fav_lib.create_category, name, _store_uid(request))
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
     return {"ok": True, "category": cat}
@@ -6839,7 +7609,8 @@ async def vhf_rename_category(cid: str, request: Request):
     if not name:
         return JSONResponse({"error": "分类名不能为空"}, status_code=400)
     try:
-        cat = await asyncio.to_thread(video_fav_lib.rename_category, cid, name)
+        cat = await asyncio.to_thread(
+            video_fav_lib.rename_category, cid, name, _store_uid(request))
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
     if not cat:
@@ -6848,9 +7619,10 @@ async def vhf_rename_category(cid: str, request: Request):
 
 
 @app.delete("/api/video_hub/api/favorites/categories/{cid}")
-async def vhf_delete_category(cid: str):
+async def vhf_delete_category(cid: str, request: Request):
     """删除收藏分类；分类下视频自动归入「未分类」。"""
-    if not await asyncio.to_thread(video_fav_lib.delete_category, cid):
+    if not await asyncio.to_thread(
+            video_fav_lib.delete_category, cid, _store_uid(request)):
         return JSONResponse({"error": "分类不存在"}, status_code=404)
     return {"ok": True, "deleted": cid}
 
@@ -6866,16 +7638,18 @@ async def vhf_add(request: Request):
     if category_id is not None:
         category_id = str(category_id) or None
     try:
-        out = await asyncio.to_thread(video_fav_lib.add_favorite, video, category_id)
+        out = await asyncio.to_thread(
+            video_fav_lib.add_favorite, video, category_id, _store_uid(request))
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
     return {"ok": True, **out}
 
 
 @app.delete("/api/video_hub/api/favorites/{fid}")
-async def vhf_remove(fid: str):
+async def vhf_remove(fid: str, request: Request):
     """取消收藏。"""
-    if not await asyncio.to_thread(video_fav_lib.remove_favorite, fid):
+    if not await asyncio.to_thread(
+            video_fav_lib.remove_favorite, fid, _store_uid(request)):
         return JSONResponse({"error": "收藏不存在"}, status_code=404)
     return {"ok": True, "removed": fid}
 
@@ -6888,7 +7662,8 @@ async def vhf_move(fid: str, request: Request):
     if category_id is not None:
         category_id = str(category_id) or None
     try:
-        moved = await asyncio.to_thread(video_fav_lib.move_favorite, fid, category_id)
+        moved = await asyncio.to_thread(
+            video_fav_lib.move_favorite, fid, category_id, _store_uid(request))
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
     if not moved:

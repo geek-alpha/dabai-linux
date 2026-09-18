@@ -9,8 +9,8 @@
 每个任务有 id、通道、状态机、进度步骤、实时日志、结果与归属 ws。
 确认闸门对所有智能体委派（dsh/codex/opencode）一视同仁：未确认前一律停在
 confirming 状态，绝不执行，防止智能体擅自切换/误操作。
-每次状态/进度/日志变化都会向归属前端推送 task_event 增量事件，
-前端任务中心据此实时渲染（接近 DSH 网页会话的"任务/工具调用"视图）。
+每次状态/进度/日志变化都推送 task_event 增量事件（默认广播给所有活跃连接，
+见 set_broadcast），前端任务中心据此实时渲染（接近 DSH 网页会话的"任务/工具调用"视图）。
 """
 
 from __future__ import annotations
@@ -33,6 +33,19 @@ STATUS_ERROR = "error"             # 失败
 STATUS_CANCELLED = "cancelled"     # 用户取消/中断
 
 TASK_TTL = 6 * 3600  # 终态任务保留 6 小时后清理
+
+# 事件出口：server 启动时注入广播器（server.py 的 _BROADCAST_WS）。
+# 原先 task.ws 是「归属连接」，事件只推给发起者——前端一刷新、或换个设备看，
+# 就再也收不到进度，只能靠任务中心 2.5s / DSH 卡片 5s 的全量轮询兜底
+# （每次 700ms 往返，手机上肉眼可见地钝）。单用户单系统，广播不会串台。
+# 未注入时退回单播，独立使用本模块的测试不受影响。
+_BROADCAST: Optional[Callable[[dict], Any]] = None
+
+
+def set_broadcast(fn: Optional[Callable[[dict], Any]]) -> None:
+    """注入事件广播器：接收一条待发消息，负责投递给所有活跃连接。"""
+    global _BROADCAST
+    _BROADCAST = fn
 
 # ---------- 智能体目录（Agent Directory） ----------
 # 唯一的"谁是谁"事实源：DSH / OpenCode / Codex / 后台命令 / 多步命令。
@@ -233,19 +246,23 @@ class TaskOrchestrator:
     # ---------- 状态变更（每个变更都推送 task_event） ----------
 
     async def _push(self, task: Task, patch: dict) -> None:
-        if task.ws is None:
+        if _BROADCAST is None and task.ws is None:
             return
+        payload = {
+            "type": "task_event",
+            "event": {
+                "id": task.id,
+                "channel": task.channel,
+                "kind": task.kind,
+                "title": task.title,
+                **patch,
+            },
+        }
         try:
-            await task.ws.send_json({
-                "type": "task_event",
-                "event": {
-                    "id": task.id,
-                    "channel": task.channel,
-                    "kind": task.kind,
-                    "title": task.title,
-                    **patch,
-                },
-            })
+            if _BROADCAST is not None:
+                await _BROADCAST(payload)
+            else:
+                await task.ws.send_json(payload)
         except Exception:
             pass  # 连接断开就静默（前端打开任务中心时会拉全量）
 

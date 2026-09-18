@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextvars
 import threading
 from typing import Any, Callable
 
@@ -49,13 +50,19 @@ def _wrap(fn: Callable, *args):
 
 
 async def run_in_tool_thread(fn: Callable, *args, max_workers: int = 8) -> Any:
-    """把同步函数提交到工具专用线程池执行（事件循环永不阻塞）。"""
+    """把同步函数提交到工具专用线程池执行（事件循环永不阻塞）。
+
+    必须显式 copy_context：run_in_executor 不会把 contextvars 带进工作线程，
+    而执行者身份（sandbox.current()）就是靠 contextvar 传到工具实现里的 ——
+    少了这一步，工具线程里读到 None，会被当成系统身份（=管理员）放行。
+    """
     global _QUEUED
     with _STATS_LOCK:
         _QUEUED += 1
     loop = asyncio.get_running_loop()
+    ctx = contextvars.copy_context()
     return await loop.run_in_executor(
-        _pool(max_workers), _wrap, fn, *args)
+        _pool(max_workers), ctx.run, _wrap, fn, *args)
 
 
 def tool_thread_stats() -> dict:

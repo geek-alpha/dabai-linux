@@ -236,9 +236,17 @@ export default (function init(App: AppKernel) {
   App.mdToHtml = mdToHtml;
 
   // 把文本渲染进消息元素：Markdown 结构化 + 媒体链接内联成 <img>/<video>，其余转义
-  App.renderMsgMedia = function renderMsgMedia(el: HTMLElement | null, text: string) {
+  App.renderMsgMedia = function renderMsgMedia(el: HTMLElement | null, text: string, asUser = false) {
     if (!el) return;
-    if (!text) { el.textContent = ''; return; }
+    // 服务器侧的图片标记（[[IMG:/abs/x.png]]：用户上传的图 / 工具截图）剥成同源
+    // <img>，字面标记不给人看。历史消息从记忆里读回来时也带这个标记，
+    // 不处理就会在旧会话里看到一串本地路径。
+    const imgMarks: string[] = [];
+    text = String(text || '').replace(/\[\[IMG:([^\]\n]+)\]\]/g, (_m, p) => {
+      imgMarks.push(App.toMediaUrl ? App.toMediaUrl(String(p)) : String(p));
+      return '';
+    }).trim();
+    if (!text && !imgMarks.length) { el.textContent = ''; return; }
     const urls = App.extractMediaUrls(text);
     let html = mdToHtml(text);
     // 媒体链接：把渲染出的普通链接升级成内联 <img>/<video>
@@ -272,6 +280,28 @@ export default (function init(App: AppKernel) {
       }
     }
     el.innerHTML = html;
+    // 标记剥出来的图贴在正文上方（点击可放大）
+    if (imgMarks.length) {
+      const box = document.createElement('div');
+      // 用户附件图走等格网格；历史消息重载回来只有 [[IMG:]] 标记，也要跟刚发时长得一样
+      box.className = asUser ? 'msg-attach imgs' : 'msg-attach';
+      box.dataset.count = String(Math.min(imgMarks.length, 9));
+      imgMarks.forEach((u) => {
+        const a = document.createElement('a');
+        a.className = 'msg-media-link';
+        a.href = u;
+        a.target = '_blank';
+        a.rel = 'noopener';
+        const img = document.createElement('img');
+        img.className = 'msg-media msg-media-img';
+        img.src = u;
+        img.alt = '图片';
+        img.loading = 'lazy';
+        a.appendChild(img);
+        box.appendChild(a);
+      });
+      el.prepend(box);
+    }
     // 视频起播：浏览器默认不自动播放（黑框），消息渲染完成后尝试自动播放。
     // 注意：renderMsgMedia 执行时 el 可能还未 append 到 DOM（addAIMsg 先渲染后挂载），
     // 此时 play() 会被拒绝、loadedmetadata 也可能提前触发被 once 消费，
@@ -407,11 +437,99 @@ export default (function init(App: AppKernel) {
   App.messagesEl!.addEventListener('scroll', App.updateScrollHint, { passive: true });
   App.scrollHint!.addEventListener('click', () => App.scrollToBottom(true));
 
-  App.addUserMsg = function addUserMsg(text: string, fromVoice = false) {
+  const EXT_TONES: Record<string, string> = {
+    pdf: 'tone-red',
+    doc: 'tone-blue', docx: 'tone-blue', rtf: 'tone-blue', pages: 'tone-blue',
+    xls: 'tone-green', xlsx: 'tone-green', csv: 'tone-green', tsv: 'tone-green',
+    ppt: 'tone-orange', pptx: 'tone-orange', key: 'tone-orange',
+    zip: 'tone-amber', rar: 'tone-amber', '7z': 'tone-amber', tar: 'tone-amber', gz: 'tone-amber',
+    png: 'tone-cyan', jpg: 'tone-cyan', jpeg: 'tone-cyan', gif: 'tone-cyan', webp: 'tone-cyan',
+  };
+
+  function fmtSize(n: any) {
+    const b = Number(n) || 0;
+    if (b < 1024) return b + ' B';
+    if (b < 1048576) return (b / 1024).toFixed(b < 10240 ? 1 : 0) + ' KB';
+    return (b / 1048576).toFixed(b < 10485760 ? 1 : 0) + ' MB';
+  }
+
+  /** 文件卡片：类型徽章 + 文件名（超长省略）+ 体积，整行成块。
+      url 为空（历史里剥出来的老附件、越界路径）→ 降级成不可点的静态卡片，
+      不要留个 href="" 的链接——点一下会把整页刷掉。 */
+  function buildFileCard(a: any) {
+    const f: any = document.createElement(a.url ? 'a' : 'span');
+    f.className = 'msg-file';
+    if (a.url) {
+      f.href = a.url;
+      f.target = '_blank';
+      f.rel = 'noopener';
+    }
+    f.title = a.name || '文件';
+    const ext = String(a.ext || (a.name || '').split('.').pop() || 'file').toUpperCase().slice(0, 4);
+    const badge = document.createElement('span');
+    badge.className = 'msg-file-badge ' + (EXT_TONES[ext.toLowerCase()] || 'tone-violet');
+    badge.textContent = ext;
+    const meta = document.createElement('span');
+    meta.className = 'msg-file-meta';
+    const nm = document.createElement('span');
+    nm.className = 'msg-file-name';
+    nm.textContent = a.name || '文件';
+    const sz = document.createElement('span');
+    sz.className = 'msg-file-size';
+    sz.textContent = fmtSize(a.size);
+    meta.appendChild(nm);
+    meta.appendChild(sz);
+    f.appendChild(badge);
+    f.appendChild(meta);
+    return f;
+  }
+
+  App.addUserMsg = function addUserMsg(text: string, fromVoice = false, attachments?: any[]) {
     const el = document.createElement('div');
     el.className = 'msg user';
-    if (App.renderMsgMedia) App.renderMsgMedia(el, text);
-    else el.textContent = text;
+    // 刚发出去的附件 + 历史里剥出来的附件：图片成组给网格缩略图、
+    // 其它成组给文件卡片，点开看原件
+    const atts = (attachments || []).filter((a: any) => a && (a.url || a.name));
+    if (atts.length) {
+      // 图片成组走等格网格、文件成组走整行卡片：混在同一个 flex 行里必然大小参差、基线乱。
+      // 拿不到 URL 的图片进不了 <img>，当文件卡片展示，至少让用户知道发过这张图。
+      const pics = atts.filter((a: any) => a.kind === 'image' && a.url);
+      const docs = atts.filter((a: any) => a.kind !== 'image' || !a.url);
+      if (pics.length) {
+        const grid = document.createElement('div');
+        grid.className = 'msg-attach imgs';
+        grid.dataset.count = String(Math.min(pics.length, 9));
+        pics.forEach((a: any) => {
+          const link = document.createElement('a');
+          link.className = 'msg-media-link';
+          link.href = a.url;
+          link.target = '_blank';
+          link.rel = 'noopener';
+          const img = document.createElement('img');
+          img.className = 'msg-media msg-media-img';
+          img.src = a.url;
+          img.alt = a.name || '图片';
+          img.loading = 'lazy';
+          link.appendChild(img);
+          grid.appendChild(link);
+        });
+        el.appendChild(grid);
+      }
+      if (docs.length) {
+        const list = document.createElement('div');
+        list.className = 'msg-files';
+        docs.forEach((a: any) => list.appendChild(buildFileCard(a)));
+        el.appendChild(list);
+      }
+    }
+    // 只有附件没有文字时不塞空正文（气泡里只有图）
+    if (text) {
+      const body = document.createElement('div');
+      body.className = 'msg-body';
+      if (App.renderMsgMedia) App.renderMsgMedia(body, text, true);
+      else body.textContent = text;
+      el.appendChild(body);
+    }
     if (fromVoice) el.title = '来自语音输入';
     App.messagesEl!.appendChild(el);
     App._trimMessages();
@@ -601,6 +719,8 @@ export default (function init(App: AppKernel) {
     if (cur && document.body.contains(cur) && sid && cur.dataset.session === sid) return;
     App.currentReplySession = sid;
     App._interruptedSession = null; // 接管进行中的会话，解除旧栅栏
+    // 刷新重连后按快照恢复「工具执行中」状态：此时语音同样只排队不打断
+    App._turnInTools = !!(m && Array.isArray(m.tool_events) && m.tool_events.length);
     App.currentReplyText = String(m && m.full_text || '');
     App.currentReplySeg = '';
     App.audioQueue = [];
@@ -691,7 +811,8 @@ export default (function init(App: AppKernel) {
       '<button class="turn-stuck-btn" type="button" title="中断当前回复，之后说『继续』可恢复">中断后说『继续』恢复</button>';
     const btn = stuckEl.querySelector('.turn-stuck-btn');
     if (btn) btn.addEventListener('click', () => {
-      if (App.triggerInterrupt) App.triggerInterrupt();
+      // 看门狗按钮 = 用户显式要停：force 让服务端即使正在跑工具任务也照取消
+      if (App.triggerInterrupt) App.triggerInterrupt(true);
     });
     b.appendChild(stuckEl);
     App.scrollToBottom();

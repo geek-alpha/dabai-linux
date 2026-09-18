@@ -19,7 +19,6 @@ anthropic
 certifi
 edge-tts
 fastapi
-faster-whisper
 gradio_client
 httpx
 mss

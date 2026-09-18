@@ -15,6 +15,11 @@ export default (function init(App: AppKernel) {
    * ============================================================ */
   App.roleCardActiveId = localStorage.getItem('dabai.activeRoleCard') || null;
 
+  // 卡片分两层权限：切换（apply）谁都能点——点一张卡就换成它的人设/外形/声音；
+  // 编辑（新建/改/删）只留给管理员，卡片写的是全机唯一一套运行配置
+  // （settings.json + tts_config.json），服务端对卡片增删改一律 403。
+  const canManageCards = () => window.__ROLE === 'admin';
+
   App.initRoleCards = function initRoleCards() {
     // 打开 / 关闭列表弹窗
     App.roleCardBtn?.addEventListener('click', App.openRoleCardModal);
@@ -87,7 +92,8 @@ export default (function init(App: AppKernel) {
   App.refreshRoleCardList = async function refreshRoleCardList() {
     try {
       await App.loadRcLlmGlobalConfig(true);
-      const res = await fetch('/api/character_cards');
+      const _uid = localStorage.getItem('dabai.userId') || '';
+      const res = await fetch('/api/character_cards?user_id=' + encodeURIComponent(_uid));
       const data = await res.json();
       App.renderRoleCardList(data.cards || []);
     } catch (e) {
@@ -98,7 +104,9 @@ export default (function init(App: AppKernel) {
   App.renderRoleCardList = function renderRoleCardList(cards) {
     App.roleCardList.innerHTML = '';
     if (!cards.length) {
-      App.roleCardList.innerHTML = '<div style="text-align:center;color:var(--text-dim);padding:20px">还没有角色卡片，点击下方按钮从当前配置创建</div>';
+      App.roleCardList.innerHTML = canManageCards()
+        ? '<div style="text-align:center;color:var(--text-dim);padding:20px">还没有角色卡片，点击下方按钮从当前配置创建</div>'
+        : '<div style="text-align:center;color:var(--text-dim);padding:20px">还没有角色卡片</div>';
       return;
     }
     for (const c of cards) {
@@ -148,20 +156,21 @@ export default (function init(App: AppKernel) {
                         <span class="role-card-tag">${App.escapeHtml(promptBrief)}</span>
                     </div>
                 </div>
+                ${canManageCards() ? `
                 <div class="role-card-actions">
                     <button class="role-card-edit" title="编辑">
                         <svg viewBox="0 0 24 24" width="15" height="15"><path fill="currentColor" d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04c.39-.39.39-1.02 0-1.41l-2.34-2.34c-.39-.39-1.02-.39-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/></svg>
                     </button>
-                </div>
+                </div>` : ''}
                 <div class="role-card-check" style="display:${isActive ? 'block' : 'none'}">✓</div>
             `;
-      // 点击卡片 → 一键切换
+      // 点击卡片 → 一键切换（所有登录用户都能切；编辑按钮只对管理员渲染）
       card.addEventListener('click', e => {
         if ((e.target as HTMLElement).closest('.role-card-edit')) return;
         App.applyRoleCard(c.id);
       });
       // 编辑
-      card.querySelector('.role-card-edit').addEventListener('click', e => {
+      card.querySelector('.role-card-edit')?.addEventListener('click', e => {
         e.stopPropagation();
         App.openRoleCardEditor(c.id);
       });
@@ -171,6 +180,10 @@ export default (function init(App: AppKernel) {
 
   /* ---------- 编辑弹窗 ---------- */
   App.openRoleCardEditor = async function openRoleCardEditor(cardId) {
+    if (!canManageCards()) {
+      App.showToast('角色卡片由管理员管理');
+      return;
+    }
     // 每次打开编辑器重置预填模型缓存，避免上一次编辑的模型串进来
     App._rcPresetModel = '';
     App.rcEditingId = cardId || null;
@@ -813,6 +826,10 @@ export default (function init(App: AppKernel) {
 
   /* ---------- 保存 / 应用 / 删除 ---------- */
   App.saveRoleCard = async function saveRoleCard() {
+    if (!canManageCards()) {
+      App.showToast('角色卡片由管理员管理');
+      return;
+    }
     const payload = App.collectRoleCardForm();
     if (!payload.name) {
       App.showToast('请填写卡片名称');
@@ -842,23 +859,38 @@ export default (function init(App: AppKernel) {
       }
       App.roleCardEditModal?.classList.remove('show');
       App.showToast('卡片已保存');
-      await App.applyRoleCard(cardId);
+      // 保存只改配置：仅当编辑的是当前生效卡片时静默同步一遍（人设/模型/语音/动作即时生效）。
+      // 绝不碰会话——开新对话/切对话只归「新对话」按钮和会话列表管。
+      if (cardId && cardId === App.roleCardActiveId) {
+        await App.applyRoleCard(cardId, { notify: false, toast: '' });
+      }
     } catch (err) {
       App.showToast('保存失败：' + (err.message || err));
     }
   };
 
-  App.applyRoleCard = async function applyRoleCard(cardId) {
+  /** 应用角色卡片：写配置 + 换外形/语音/动作。opts.notify=false 不通知 AI，
+   *  opts.toast='' 不弹提示。会话永远不动（开/切对话只归「新对话」按钮）。 */
+  App.applyRoleCard = async function applyRoleCard(cardId, opts) {
+    const _opts = opts || {};
     try {
-      const res = await fetch(`/api/character_cards/${cardId}/apply`, { method: 'POST' });
+      const _uid = localStorage.getItem('dabai.userId') || '';
+      const res = await fetch(`/api/character_cards/${cardId}/apply`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ user_id: _uid })
+      });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       const card = data.card || {};
       App.roleCardActiveId = cardId;
       localStorage.setItem('dabai.activeRoleCard', cardId);
-      // 1. 切换外形
+      // 1. 切换外形（model_url 未变时跳过重载，避免编辑卡片内容也重新加载 VRM）
       if (data.model_url) {
-        await App.loadModelFromUrl(data.model_url, data.model_name);
+        const currentModel = JSON.parse(localStorage.getItem('dabai.currentModel') || '{}');
+        if (currentModel.url !== data.model_url) {
+          await App.loadModelFromUrl(data.model_url, data.model_name);
+        }
       }
       // 1.5 应用专属动作配置（未配置 → 执行全部动作）
       if (App.setRoleAnimationConfig) {
@@ -870,12 +902,10 @@ export default (function init(App: AppKernel) {
         const ttsCfg = await ttsRes.json();
         App.applyTTSConfig(ttsCfg);
       } catch (e) { /* 忽略 */ }
-      // 3. 切换到该卡片独立记忆空间的会话（WS 按序处理：先切会话，后续 AI 动作落在新卡片记忆里）
+      // 3. 只刷新会话列表（记忆空间换了，列表要跟着变）。
+      //    不切会话：当前这条对话由「新对话」按钮和会话列表决定，卡片操作一律不动它。
       if (App.ws && App.ws.readyState === WebSocket.OPEN) {
         App.ws.send(JSON.stringify({ type: 'list_sessions' }));
-        if (data.session_id) {
-          App.ws.send(JSON.stringify({ type: 'switch_session', session_id: data.session_id }));
-        }
       }
       // 4. 通知 AI 人设已切换
       const roleName = card.role_name || card.name || 'AI助手';
@@ -892,10 +922,12 @@ export default (function init(App: AppKernel) {
       } else if (toolsCfg.allowed && toolsCfg.allowed.length) {
         toolsHint = `，你当前只能调用以下工具：${toolsCfg.allowed.join('、')}`;
       }
-      App.sendAIAction(
-        `（用户为你切换了完整的角色设定：你现在叫「${roleName}」，用「${voiceDesc}」说话，人设也更新了${nameHint}${toolsHint}。` +
-        `请完全按照新的人设来认识自己和与用户相处，说话语气、性格、与用户的关系都以角色设定为准，` +
-        `不要刻意提"用户切换了角色"这件事）`, true);
+      if (_opts.notify !== false) {
+        App.sendAIAction(
+          `（用户为你切换了完整的角色设定：你现在叫「${roleName}」，用「${voiceDesc}」说话，人设也更新了${nameHint}${toolsHint}。` +
+          `请完全按照新的人设来认识自己和与用户相处，说话语气、性格、与用户的关系都以角色设定为准，` +
+          `不要刻意提"用户切换了角色"这件事）`, true);
+      }
       // 4. 刷新列表选中态
       App.refreshRoleCardList();
       // 4.1 在提示里带上当前生效的供应商 + 模型，明确「保存后立刻生效」
@@ -908,7 +940,9 @@ export default (function init(App: AppKernel) {
         const pName = ap ? ap.name : '';
         modelHint = pName ? (`，模型：${pName} · ${llmCfg.model || '默认'}`) : '';
       } catch (e) { /* 提示里不带模型信息也不影响 */ }
-      App.showToast(`已切换角色：${card.name || roleName}${modelHint}`);
+      if (_opts.toast !== '') {
+        App.showToast(_opts.toast || `已切换角色：${card.name || roleName}${modelHint}`);
+      }
       App.closeRoleCardModalIfOpen();
     } catch (err) {
       App.showToast('切换失败：' + (err.message || err));
@@ -918,10 +952,11 @@ export default (function init(App: AppKernel) {
   /** 启动时静默恢复上次使用的角色卡片配置（仅返回卡片数据，不触发切换动作/AI 消息） */
   App.restoreActiveRoleCard = async function restoreActiveRoleCard() {
     try {
-      const res = await fetch('/api/character_cards');
+      const _uid = localStorage.getItem('dabai.userId') || '';
+      const res = await fetch('/api/character_cards?user_id=' + encodeURIComponent(_uid));
       const data = await res.json();
-      // 单系统模式：以服务端激活的卡片为准（settings.json -> active_role_card），
-      // 所有设备收敛到同一套角色设定；本地 localStorage 只作无网络时的兜底。
+      // 按人隔离：服务端返回的是「本用户」当前生效的卡片（各人各自一份），
+      // 本地 localStorage 只作无网络时的兜底。
       const activeId = data.active_id || App.roleCardActiveId;
       if (activeId) App.roleCardActiveId = activeId;
       const card = (data.cards || []).find(c => c.id === activeId);
@@ -939,6 +974,10 @@ export default (function init(App: AppKernel) {
   };
 
   App.deleteRoleCard = async function deleteRoleCard() {
+    if (!canManageCards()) {
+      App.showToast('角色卡片由管理员管理');
+      return;
+    }
     if (!App.rcEditingId) return;
     if (!confirm('删除这张角色卡片？')) return;
     try {

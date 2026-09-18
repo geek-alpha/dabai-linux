@@ -299,3 +299,53 @@ def test_regression_guard_catches_old_bug(monkeypatch):
         "本套测试对旧 bug 实际是盲的" % len(calls)
     )
 
+
+
+# ---------- 轮内保护：active_turns()==0 不等于「可以重启」 ----------
+#
+# 背景（2026-09-14 19:33）：写 agent.py 后 39 秒进程就 execv 自替换，而
+# RESTART_DEFER_MAX 是 1800 秒 —— 说明那一刻 _active_turns_running() 判成了
+# 「空闲」。两个漏洞都在判据本身，不在延迟逻辑：
+#   1. agent.py 的 _turn_end() 在 finally 首行，落库/清断点还在后面跑，
+#      计数归零的瞬间 execv 会把收尾连同正文一起丢（用户看到「没有产出正文」）；
+#   2. except Exception: return False 把「判不出来」当成了「空闲」。
+# 修法：TURN_END_GRACE 宽限期 + 异常分支保守返回 True。
+
+
+def _install_fake_agent(monkeypatch, count: int):
+    """替身 agent 模块：active_turns 由返回的 state 字典驱动。"""
+    import types
+    mod = types.ModuleType("agent")
+    state = {"n": count}
+    mod.active_turns = lambda: state["n"]
+    monkeypatch.setitem(sys.modules, "agent", mod)
+    return state
+
+
+def test_active_turn_blocks_restart(monkeypatch):
+    monkeypatch.setattr(hr, "_last_turn_active_ts", 0.0)
+    _install_fake_agent(monkeypatch, 1)
+    assert hr._active_turns_running() is True
+    assert hr._last_turn_active_ts > 0, "观测到活跃轮必须刷新时间戳"
+
+
+def test_turn_end_grace_covers_persist_window(monkeypatch):
+    """★ 计数刚归零仍算忙：收尾/落库还在 finally 里跑，这时重启会丢正文。"""
+    import time
+    monkeypatch.setattr(hr, "_last_turn_active_ts", time.time())
+    _install_fake_agent(monkeypatch, 0)
+    assert hr._active_turns_running() is True
+
+
+def test_turn_end_grace_expires(monkeypatch):
+    """宽限期过后必须放行，否则改了核心代码永远不生效。"""
+    import time
+    monkeypatch.setattr(hr, "_last_turn_active_ts", time.time() - hr.TURN_END_GRACE - 1)
+    _install_fake_agent(monkeypatch, 0)
+    assert hr._active_turns_running() is False
+
+
+def test_unknown_state_treated_as_busy(monkeypatch):
+    """判不出来时按忙处理：延迟重启只是晚几秒，误判空闲是不可逆的。"""
+    monkeypatch.setitem(sys.modules, "agent", None)
+    assert hr._active_turns_running() is True

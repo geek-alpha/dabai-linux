@@ -66,7 +66,7 @@ def main() -> int:
     missing = [m for m in core if not _has(m)]
     check("核心依赖", FAIL if missing else OK, "缺少：" + ", ".join(missing) if missing else "")
 
-    optional = ["PIL", "mss", "edge_tts", "faster_whisper", "playwright", "yt_dlp", "netifaces"]
+    optional = ["PIL", "mss", "edge_tts", "playwright", "yt_dlp", "netifaces"]
     missing_opt = [m for m in optional if not _has(m)]
     check("可选依赖", WARN if missing_opt else OK,
           "未安装（对应能力降级）：" + ", ".join(missing_opt) if missing_opt else "")

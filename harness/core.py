@@ -419,6 +419,17 @@ class Harness:
         if owner is None:
             return None, ""
         kind, owner_name = owner
+        # 沙箱闸门（插件与技能共用；技能层还有一道，双层兜底）
+        import sandbox as _sb
+
+        actor = _sb.current()
+        deny = _sb.check_tool(actor, tool_name)
+        if deny:
+            return deny, kind
+        try:
+            arguments = _sb.prepare_args(actor, tool_name, arguments)
+        except _sb.SandboxError as e:
+            return f"沙箱拒绝：{e}", kind
         try:
             if kind == "skill":
                 return await self.skills.execute_tool(owner_name, tool_name, arguments)

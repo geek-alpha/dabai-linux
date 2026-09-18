@@ -949,12 +949,22 @@ class Executor:
             self.cwd = str(BASE_DIR)
         self.tasks = {}
 
-    def run_sync(self, cmd: str, timeout: int = None) -> str:
+    def run_sync(self, cmd: str, timeout: int = None, argv: list = None,
+                 cwd: str = None) -> str:
+        """执行一条命令。argv 非空时直传 exec（不走 shell），cwd 覆盖实例默认工作目录。
+
+        argv/cwd 是给沙箱用的：普通用户的命令要经 bwrap 包装后按 argv 直接执行，
+        且工作目录必须锁进他的沙箱目录。
+        """
         timeout = timeout or AGENT_CFG.get('sync_timeout_sec', 120)
+        work = cwd or self.cwd
         try:
-            p = subprocess.run(
-                cmd, shell=True, cwd=self.cwd, capture_output=True, timeout=timeout
-            )
+            if argv:
+                p = subprocess.run(argv, cwd=work, capture_output=True, timeout=timeout)
+            else:
+                p = subprocess.run(
+                    cmd, shell=True, cwd=work, capture_output=True, timeout=timeout
+                )
             text = decode_bytes(p.stdout)
             err = decode_bytes(p.stderr)
             if err.strip():

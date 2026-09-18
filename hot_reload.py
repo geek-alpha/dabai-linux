@@ -44,6 +44,8 @@ COALESCE_WINDOW = 8.0          # 合并节流：核心文件最后一次变化�
 COALESCE_MAX = 60.0            # 合并节流硬上限：从首个变化起最多收集 60 秒，之后强制重启（防持续写入饿死更新）
 EXT_COALESCE_WINDOW = 2.0      # 技能/插件热重载的合并窗口（秒）
 EXT_COALESCE_MAX = 30.0        # 技能/插件热重载收集硬上限（秒）
+TURN_END_GRACE = 30.0          # 对话轮结束后仍视为「忙」的宽限期（秒）：覆盖收尾/落库窗口
+_last_turn_active_ts = 0.0     # 最近一次观测到「有活跃对话轮」的时间戳（进程启动为 0 = 空闲）
 
 
 # ---------- 扫描快照 ----------
@@ -139,12 +141,24 @@ def _active_turns_running() -> bool:
     大白自己在工具执行中修改核心代码（agent.py/server.py/harness 等）时，
     不能立刻重启——否则正在跑的工具被掐断、前端闪现『已连接到 AI』、
     执行链路被打断。这里把重启推迟到本轮对话结束（由断点续跑兜底保底）。
+
+    两处防漏（实测踩过：19:33:32 写 agent.py → 19:34:11 就 execv，39 秒的
+    窗口里 active_turns() 已归零，保护形同虚设）：
+    - 计数归零不等于「可以重启」：agent.py 的 _turn_end() 在 finally 首行，
+      落库/清断点还在后面跑，此时 execv 会把收尾连同正文一起丢。用
+      TURN_END_GRACE 宽限期兜住这段尾巴。
+    - 判不出来时按「忙」处理：延迟重启只是晚几秒生效，误判空闲却是不可逆的。
     """
+    global _last_turn_active_ts
     try:
         from agent import active_turns
-        return active_turns() > 0
+        n = active_turns()
     except Exception:
-        return False
+        return True
+    if n > 0:
+        _last_turn_active_ts = time.time()
+        return True
+    return (time.time() - _last_turn_active_ts) < TURN_END_GRACE
 
 
 def _restart_process(changed_paths: list[Path], reason: str) -> bool:

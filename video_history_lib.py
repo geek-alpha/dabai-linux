@@ -20,17 +20,22 @@ import threading
 import time
 from pathlib import Path
 
+import user_store
+
 BASE_DIR = Path(__file__).resolve().parent
-HIST_FILE = BASE_DIR / 'video_history.json'
+HIST_NAME = 'video_history.json'
+# 全局文件（uid 为空 = 本机主人 / 无用户上下文），保留常量供外部引用
+HIST_FILE = BASE_DIR / HIST_NAME
 
 _save_lock = threading.RLock()
 
 MAX_HISTORY = 1000
 
 
-def _load() -> dict:
+def _load(uid=None) -> dict:
+    path = user_store.user_file(HIST_NAME, uid)
     try:
-        with open(HIST_FILE, 'r', encoding='utf-8') as f:
+        with open(path, 'r', encoding='utf-8') as f:
             data = json.load(f)
     except Exception:
         return {'history': []}
@@ -40,16 +45,17 @@ def _load() -> dict:
     return data
 
 
-def _save(data: dict) -> None:
-    tmp = str(HIST_FILE) + '.tmp'
+def _save(data: dict, uid=None) -> None:
+    path = user_store.user_file(HIST_NAME, uid)
+    tmp = str(path) + '.tmp'
     with open(tmp, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     try:
         tmp_path = Path(tmp)
-        tmp_path.replace(HIST_FILE)  # 原子替换，防写一半损坏
+        tmp_path.replace(path)  # 原子替换，防写一半损坏
     except Exception:
         # 极端情况（如 Windows 文件占用）：直接覆盖写
-        with open(HIST_FILE, 'w', encoding='utf-8') as f:
+        with open(path, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
 
 
@@ -59,10 +65,10 @@ def _hist_id(webpage_url: str) -> str:
 
 # ---------------- 查询 ----------------
 
-def list_history(limit: int = 200) -> list:
+def list_history(limit: int = 200, uid=None) -> list:
     """按观看时间倒序返回历史（最新在前）。"""
     with _save_lock:
-        data = _load()
+        data = _load(uid)
         items = sorted(data['history'],
                        key=lambda h: h.get('watched_at') or 0, reverse=True)
         if limit and limit > 0:
@@ -72,7 +78,7 @@ def list_history(limit: int = 200) -> list:
 
 # ---------------- 记录管理 ----------------
 
-def add_history(video: dict) -> dict:
+def add_history(video: dict, uid=None) -> dict:
     """记录一次观看（按 webpage_url 幂等去重：重复观看更新时间戳并置顶）。
 
     超出 MAX_HISTORY 自动裁剪最旧记录。video 用白名单字段保存，丢弃未知字段。
@@ -92,7 +98,7 @@ def add_history(video: dict) -> dict:
     hid = _hist_id(url)
     now = int(time.time())
     with _save_lock:
-        data = _load()
+        data = _load(uid)
         existed = False
         for h in data['history']:
             if h['id'] == hid:
@@ -106,26 +112,26 @@ def add_history(video: dict) -> dict:
         data['history'].sort(key=lambda h: h.get('watched_at') or 0, reverse=True)
         if len(data['history']) > MAX_HISTORY:
             data['history'] = data['history'][:MAX_HISTORY]
-        _save(data)
+        _save(data, uid)
         return {'history': data['history'][0], 'existed': existed}
 
 
-def remove_history(hid: str) -> bool:
+def remove_history(hid: str, uid=None) -> bool:
     with _save_lock:
-        data = _load()
+        data = _load(uid)
         before = len(data['history'])
         data['history'] = [h for h in data['history'] if h['id'] != hid]
         if len(data['history']) == before:
             return False
-        _save(data)
+        _save(data, uid)
         return True
 
 
-def clear_history() -> bool:
+def clear_history(uid=None) -> bool:
     with _save_lock:
-        data = _load()
+        data = _load(uid)
         if not data['history']:
             return False
         data['history'] = []
-        _save(data)
+        _save(data, uid)
         return True

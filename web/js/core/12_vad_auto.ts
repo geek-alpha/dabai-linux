@@ -307,11 +307,36 @@ export default (function init(App: AppKernel) {
     console.log('[VAD] 自动对话模式已启动 (fftSize=' + App.vadAnalyser.fftSize + ')');
     return true;
   };
-  App.stopVADMode = function stopVADMode() {
-    if (App.vadRAF) {
-      cancelAnimationFrame(App.vadRAF);
+  /* VAD 帧调度：非静默走 rAF（本来就在出帧，白捡的节拍）；聊天全屏静默时改用定时器 ——
+   * 00_quiet 已经把 3D 帧循环停掉，此时 rAF 每帧仍会逼浏览器产出一个 vsync 帧：
+   * 屏幕上一个像素都不变，却把显示管线一直叫醒，手机进不了低功耗（用户反馈「全屏了还是烫」）。
+   * 定时器不绑 vsync，节拍间隔按档位换算，检测频率与 rAF 下完全一致。 */
+  const VAD_FRAME_MS = 16.7;
+  let vadTimer: ReturnType<typeof setTimeout> | null = null;
+  // 走定时器还是走 rAF，全模块只此一处判据（调度与检测门控必须用同一条，否则节奏会重叠）
+  const useTimerSchedule = () => App.chatQuiet && !document.hidden;
+  const scheduleVAD = () => {
+    // 页面不可见时仍走 rAF：浏览器会把挂起的 rAF 彻底暂停（零唤醒），定时器只会被压到 1Hz
+    // —— 手机锁屏后每秒白醒一次。可见时再用定时器，那时才是「rAF 逼着出帧」的代价。
+    if (useTimerSchedule()) {
       App.vadRAF = null;
+      vadTimer = setTimeout(App.vadLoop, Math.round(VAD_FRAME_MS * Math.max(1, App._vadFrameSkip || 1)));
+    } else {
+      vadTimer = null;
+      App.vadRAF = requestAnimationFrame(App.vadLoop);
     }
+  };
+  const cancelVADSchedule = () => {
+    if (App.vadRAF) { cancelAnimationFrame(App.vadRAF); App.vadRAF = null; }
+    if (vadTimer) { clearTimeout(vadTimer); vadTimer = null; }
+  };
+  // 静默开关切换 = 换调度器：取消挂着的那一个，立刻用新调度器续上（VAD 不能断档）
+  if (App.onQuiet) App.onQuiet(() => {
+    if (App.voiceMode === 'auto' && App.vadAnalyser) { cancelVADSchedule(); scheduleVAD(); }
+  });
+
+  App.stopVADMode = function stopVADMode() {
+    cancelVADSchedule();
     // 停止当前录音（如果有的话）
     if (App.vadRecorder && App.vadRecorder.state !== 'inactive') {
       try { App.vadRecorder.stop(); } catch (e) {}
@@ -353,30 +378,26 @@ export default (function init(App: AppKernel) {
   App.setVoiceMode = function setVoiceMode(mode: VoiceMode) {
     App.voiceMode = mode;
     localStorage.setItem('dabai.voiceMode', mode);
-    const modeBtn = App.$('voice-mode-btn');
     if (mode === 'auto') {
       App.startVADMode().then(ok => {
         if (!ok) {
           App.voiceMode = 'press';
           localStorage.setItem('dabai.voiceMode', 'press');
           App.voiceBtn!.classList.remove('auto');
-          App.voiceBtn!.title = '按住说话';
-          if (modeBtn) modeBtn.classList.remove('active');
+          App.voiceBtn!.title = '点击切换模式 · 长按说话';
           return;
         }
         App.vadState = 'idle';
         App.vadLoop();
         App.voiceBtn!.classList.add('auto');
-        App.voiceBtn!.title = '自动对话中（用左侧按钮切回按住说话）';
-        if (modeBtn) modeBtn.classList.add('active');
+        App.voiceBtn!.title = '自动对话中 · 点击切回按住说话';
         App.showToast('已切换为自动对话 · 直接说话即可');
         App.sendAIAction('（用户解放了双手，现在你能一直听到Ta的声音了，可以更自然随意地聊天）', true);
       });
     } else {
       App.stopVADMode();
       App.voiceBtn!.classList.remove('auto');
-      App.voiceBtn!.title = '按住说话';
-      if (modeBtn) modeBtn.classList.remove('active');
+      App.voiceBtn!.title = '点击切换模式 · 长按说话';
       App.showToast('已切换为按住说话');
       App.sendAIAction('（用户切换了对话方式，现在需要按住按钮才能听到Ta说话，等Ta准备好再说）', true);
     }
@@ -409,7 +430,7 @@ App.vadLoop = function vadLoop() {
     if (App.audioCtx && App.audioCtx.state === 'suspended') {
       App.audioCtx.resume().then(() => console.log('[VAD] AudioContext 已自动恢复'));
       // 等待下一个周期再检测，让 resume 生效
-      App.vadRAF = requestAnimationFrame(App.vadLoop);
+      scheduleVAD();
       return;
     }
     if (!App.vadAnalyser) return;
@@ -429,10 +450,12 @@ App.vadLoop = function vadLoop() {
       });
       return;
     }
-    App.vadRAF = requestAnimationFrame(App.vadLoop);
+    scheduleVAD();
 
-    // 性能分级：降频VAD检测以节省CPU
-    if (!App.shouldVADFrame()) return;
+    // 性能分级：降频VAD检测以节省CPU。
+    // 走定时器时间隔已经按 skip 换算过，每次 tick 都该检测 —— 再 skip 一次等于把频率砍半，
+    // 打断会变迟钝，而全屏聊天恰恰是最需要随时打断的场景。
+    if (!useTimerSchedule() && !App.shouldVADFrame()) return;
 
     const vol = App.vadGetVolume();
     const now = performance.now();
@@ -452,8 +475,15 @@ App.vadLoop = function vadLoop() {
       if (vol > App.VAD_INTERRUPT_THRESHOLD) {
         if (App.vadInterruptStart === 0) App.vadInterruptStart = now;
         if (now - App.vadInterruptStart > App.VAD_INTERRUPT_MS) {
-          console.log('[VAD] 检测到用户输入，打断AI输出 vol=', vol.toFixed(3));
-          App.triggerInterrupt();
+          if (App._turnInTools) {
+            // 工具任务执行中：只停本地播报，不发 interrupt——服务端把这句排队，
+            // 等工具干完再回（语音不得掐掉正在跑的工具任务）
+            console.log('[VAD] 工具任务执行中，语音排队不打断 vol=', vol.toFixed(3));
+            App.clearAudioQueue();
+          } else {
+            console.log('[VAD] 检测到用户输入，打断AI输出 vol=', vol.toFixed(3));
+            App.triggerInterrupt();
+          }
           App.vadInterruptStart = 0;
           // 立即切到 IDLE，防止本函数下一帧再次进打断分支
           App.currentState = App.State.IDLE;
@@ -474,8 +504,14 @@ App.vadLoop = function vadLoop() {
       if (voiceDetected) {
         if (App.vadInterruptStart === 0) App.vadInterruptStart = now;
         if (now - App.vadInterruptStart > App.VAD_INTERRUPT_MS) {
-          console.log('[VAD] 检测到用户输入，打断AI思考，进入聆听 vol=', vol.toFixed(3));
-          App.triggerInterrupt();
+          if (App._turnInTools) {
+            // 工具任务执行中：只停本地播报，不发 interrupt——服务端把这句排队
+            console.log('[VAD] 工具任务执行中，语音排队不打断（思考态） vol=', vol.toFixed(3));
+            App.clearAudioQueue();
+          } else {
+            console.log('[VAD] 检测到用户输入，打断AI思考，进入聆听 vol=', vol.toFixed(3));
+            App.triggerInterrupt();
+          }
           App.vadInterruptStart = 0;
           // 立即切到 IDLE，防止本函数下一帧再次进打断分支
           App.currentState = App.State.IDLE;

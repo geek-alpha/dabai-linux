@@ -12,7 +12,6 @@ dabai_ears
 dabai_voice
 edge_tts
 fastapi
-faster_whisper
 fuctions_all_you_need_base
 google
 gradio_client

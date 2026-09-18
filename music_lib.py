@@ -17,8 +17,12 @@ from pathlib import Path
 
 import requests
 
+import user_store
+
 BASE_DIR = Path(__file__).resolve().parent
-PLAYLISTS_FILE = BASE_DIR / 'music_playlists.json'
+PLAYLISTS_NAME = 'music_playlists.json'
+# 全局文件（uid 为空 = 本机主人 / 无用户上下文），保留常量供外部引用
+PLAYLISTS_FILE = BASE_DIR / PLAYLISTS_NAME
 
 UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
       '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36')
@@ -341,53 +345,55 @@ def pick_song(args: dict):
 # ---------------- 用户歌单存储 ----------------
 
 
-def _load_playlists() -> list[dict]:
+def _load_playlists(uid=None) -> list[dict]:
+    path = user_store.user_file(PLAYLISTS_NAME, uid)
     try:
-        with open(PLAYLISTS_FILE, 'r', encoding='utf-8') as f:
+        with open(path, 'r', encoding='utf-8') as f:
             data = json.load(f)
         return data if isinstance(data, list) else []
     except Exception:
         return []
 
 
-def _save_playlists(pls: list[dict]) -> None:
-    with open(PLAYLISTS_FILE, 'w', encoding='utf-8') as f:
+def _save_playlists(pls: list[dict], uid=None) -> None:
+    path = user_store.user_file(PLAYLISTS_NAME, uid)
+    with open(path, 'w', encoding='utf-8') as f:
         json.dump(pls, f, ensure_ascii=False, indent=2)
 
 
-def list_playlists() -> list[dict]:
-    pls = _load_playlists()
+def list_playlists(uid=None) -> list[dict]:
+    pls = _load_playlists(uid)
     return [{'id': p['id'], 'name': p['name'], 'created': p.get('created', 0),
              'song_count': len(p.get('songs') or [])} for p in pls]
 
 
-def get_playlist(pid: str) -> dict | None:
-    for p in _load_playlists():
+def get_playlist(pid: str, uid=None) -> dict | None:
+    for p in _load_playlists(uid):
         if p['id'] == pid:
             return p
     return None
 
 
-def create_playlist(name: str) -> dict:
+def create_playlist(name: str, uid=None) -> dict:
     name = str(name).strip()
     if not name:
         raise ValueError('歌单名不能为空')
     pid = uuid.uuid4().hex[:12]
-    pls = _load_playlists()
+    pls = _load_playlists(uid)
     pl = {'id': pid, 'name': name, 'created': int(time.time()), 'songs': []}
     pls.append(pl)
-    _save_playlists(pls)
+    _save_playlists(pls, uid)
     return pl
 
 
-def add_song(pid: str, song: dict) -> dict | None:
+def add_song(pid: str, song: dict, uid=None) -> dict | None:
     song = {'source': str(song.get('source') or ''),
             'id': str(song.get('id') or ''),
             'name': str(song.get('name') or ''),
             'artists': str(song.get('artists') or '')}
     if not song['source'] or not song['id']:
         raise ValueError('歌曲缺少 source / id')
-    pls = _load_playlists()
+    pls = _load_playlists(uid)
     for pl in pls:
         if pl['id'] != pid:
             continue
@@ -398,13 +404,13 @@ def add_song(pid: str, song: dict) -> dict | None:
             if s['source'] == song['source'] and s['id'] == song['id']:
                 return pl  # 已存在，幂等
         songs.append(song)
-        _save_playlists(pls)
+        _save_playlists(pls, uid)
         return pl
     return None
 
 
-def remove_song(pid: str, song_id: str) -> bool:
-    pls = _load_playlists()
+def remove_song(pid: str, song_id: str, uid=None) -> bool:
+    pls = _load_playlists(uid)
     for pl in pls:
         if pl['id'] != pid:
             continue
@@ -413,15 +419,15 @@ def remove_song(pid: str, song_id: str) -> bool:
         pl['songs'] = [s for s in songs if str(s.get('id')) != str(song_id)]
         if len(pl['songs']) == before:
             return False
-        _save_playlists(pls)
+        _save_playlists(pls, uid)
         return True
     return False
 
 
-def delete_playlist(pid: str) -> bool:
-    pls = _load_playlists()
+def delete_playlist(pid: str, uid=None) -> bool:
+    pls = _load_playlists(uid)
     new = [p for p in pls if p['id'] != pid]
     if len(new) == len(pls):
         return False
-    _save_playlists(new)
+    _save_playlists(new, uid)
     return True

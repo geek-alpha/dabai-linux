@@ -700,6 +700,19 @@ export interface AppKernel {
   MIN_ZOOM: number;
   MAX_ZOOM: number;
   camZoom: number;
+  /* ---------- 隐私护栏（非管理员相机限制，02_three_scene 初始化） ---------- */
+  IS_ADMIN: boolean;
+  USER_ORBIT_PITCH_LIMIT: number;
+  USER_MIN_CAM_DISTANCE: number;
+  USER_MIN_CAM_HORIZ: number;
+  USER_MIN_CAM_HEIGHT: number;
+  USER_MIN_VIEW_HEIGHT: number;
+  USER_FPV_MIN_HEIGHT: number;
+  USER_FPV_MIN_DISTANCE: number;
+  userMinZoom: () => number;
+  userMinCamDistance: () => number;
+  userMinCamHeight: () => number;
+  clampCameraForUser: (p: ThreeNS.Vector3) => void;
   camOffsetX: number;
   camOffsetY: number;
   camOffsetZ: number;
@@ -743,6 +756,9 @@ export interface AppKernel {
   setPerfTier: (tier: PerfTier) => void;
   cyclePerfTier: () => void;
   shouldRenderFrame: () => boolean;
+  /** 打字轻载（08_state_switch）：输入框聚焦时把帧率压到 20fps，不停帧 */
+  _typingLite: boolean;
+  setTypingLite: (on: boolean) => void;
   shouldVADFrame: () => boolean;
   _adaptiveDPR: boolean;
   _fpsAccum: number;
@@ -868,6 +884,7 @@ export interface AppKernel {
   loadCameraSettings: () => void;
   saveCameraSettings: () => void;
   resetAvatarToOrigin: () => void;
+  resetViewState: () => void;
   applySavedPositions: () => void;
   _bgCenterX: number;
   _bgCenterZ: number;
@@ -951,7 +968,7 @@ export interface AppKernel {
   wsConnTimeout: number | null;
   connectWS: () => void;
   handleWSMessage: (msg: ServerMessage) => void;
-  sendText: (text: string) => void;
+  sendText: (text: string, attachments?: any[]) => void;
   sendAudioBase64: (b64: string, mimeType?: string, wakeCheck?: boolean) => void;
 
   /* ---------- RL 统一调度 ---------- */
@@ -989,7 +1006,7 @@ export interface AppKernel {
 
   /* ---------- 聊天 UI（13_messages 挂载） ---------- */
   addSystemMsg: (text: string) => void;
-  addUserMsg: (text: string, isVoice?: boolean) => void;
+  addUserMsg: (text: string, isVoice?: boolean, attachments?: any[]) => void;
   addAIMsg: (text: string, isVoice?: boolean) => void;
   showToast: (msg: string) => void;
   showSubtitle: (text: string) => void;
@@ -1010,6 +1027,9 @@ export interface AppKernel {
   /* 长时间无响应看门狗：工具/思考期间无实时事件时的卡死提示 + 一键中断 */
   _lastTurnActivity: number;
   _toolRunningSince: number;
+  /* 本轮已进入工具执行（tool_call_start 置真，回合结束/被取消置假）：
+     语音在此状态下不打断本轮，只排队 */
+  _turnInTools: boolean;
   noteTurnActivity: () => void;
   clearStuckHint: () => void;
   maybeWarnStuck: () => void;
@@ -1023,7 +1043,7 @@ export interface AppKernel {
   notifyFullscreenChat: () => void;
   isFullscreen: boolean;
   extractMediaUrls: (text: string) => string[];
-  renderMsgMedia: (el: HTMLElement | null, text: string) => void;
+  renderMsgMedia: (el: HTMLElement | null, text: string, asUser?: boolean) => void;
   openMediaViewer: (url: string) => void;
   isNearBottom: () => boolean;
   _newMsgCount: number;
@@ -1051,6 +1071,7 @@ export interface AppKernel {
   chatQuiet: boolean;
   setQuiet: (on: boolean) => void;
   onQuiet: (fn: (on: boolean) => void) => void;
+  syncQuietLoop: () => void;
   quietSnapshot: () => { quiet: boolean; loopStopped: boolean; hooks: number };
 
   /* ---------- 语音 / VAD（11_voice_record + 12_vad_auto 挂载） ---------- */
@@ -1075,7 +1096,7 @@ export interface AppKernel {
   startVADRecording: () => void;
   stopVADRecording: () => void;
   _micStreamReleaseTimer: number | null;
-  triggerInterrupt: () => void;
+  triggerInterrupt: (force?: boolean) => void;
   setVoiceMode: (mode: VoiceMode) => void;
   lockMode: boolean;
   toggleLockMode: () => void;
@@ -1722,6 +1743,14 @@ export interface AppKernel {
   /* ---- js/ui/15_model_ui.js ---- */
 
   /* ---- js/ui/17_events.js ---- */
+
+  /* ---- js/ui/42_attach.js ---- */
+  attachPending: any[];
+  initAttach: () => void;
+  uploadFiles: (files: File[]) => Promise<void>;
+  renderAttachStrip: () => void;
+  takeAttachments: () => any[];
+  clearAttachments: () => void;
 
   /* ---- js/ui/23_name_settings.js ---- */
 

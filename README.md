@@ -85,7 +85,7 @@ dabai/
             ├── 小蛋糕.vrm
             ├── 水仙儿.vrm
             ├── 米尤.vrm
-            ├── 蔚蓝妖姬.vrm
+            ├── 白头凤.vrm
         ├── Ani_Grok.vrm
         ├── 可莉.vrm
         ├── 呆萌高中生.vrm
@@ -101,7 +101,7 @@ dabai/
         ├── 白女.vrm
         ├── 知性女.vrm
         ├── 米尤.vrm
-        ├── 蔚蓝妖姬.vrm
+        ├── 白头凤.vrm
         ├── 黑裙清冷高中生.vrm
     ├── swarm-game-engine/
         ├── _shared/
