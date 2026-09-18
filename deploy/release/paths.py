@@ -126,6 +126,16 @@ LOCAL_GLOBS: tuple[str, ...] = (
     ".archive/**",
 )
 
+# ── 受管资产：住在大资产目录里，但属于发布方受管、随包分发 ──────────────────
+# models/** 与 backgrounds/** 默认是 LOCAL（本机私有、换机器无意义），但这两个
+# 角色模型是前端加载的运行时资源：cards.example.json 的种子卡就指向它们，新机器
+# 缺了 3D 角色就是空的。所以逐个点名放行 —— 与 LOCAL 的「默认拒绝」相反，
+# 以后往 models/ 里丢新文件仍然默认受保护。
+PACKED_ASSETS: tuple[str, ...] = (
+    "models/白头凤.vrm",
+    "models/渡鸦将军.vrm",
+)
+
 # ── 保护地板：update.py 内嵌一份同样的最小集，与清单取并集 ──────────────────
 # 为什么要两份：MANIFEST 是「发布方说该写什么」，地板是「更新器自己说绝不能写什么」。
 # 发布方出 bug、包被投毒、清单被改坏时，地板是最后一道闸。
@@ -254,6 +264,8 @@ def _matches(path: str, globs: Sequence[str]) -> bool:
 def classify(path: str | Path) -> str:
     """返回 code / experience / local。前两档一律不许更新写入。"""
     p = _norm(path)
+    if _matches(p, PACKED_ASSETS):
+        return CODE
     if _matches(p, LOCAL_GLOBS):
         return LOCAL
     if _matches(p, EXPERIENCE_GLOBS):
@@ -272,7 +284,10 @@ def is_protected(path: str | Path) -> bool:
 
 def floor_violation(path: str | Path) -> bool:
     """只用地板判一次：与 classify 互相独立，用于交叉校验。"""
-    return _matches(_norm(path), FLOOR_GLOBS)
+    p = _norm(path)
+    if _matches(p, PACKED_ASSETS):
+        return False
+    return _matches(p, FLOOR_GLOBS)
 
 
 def tracked_files(root: str | Path) -> List[str]:
@@ -314,6 +329,10 @@ def _selftest() -> int:
         # 本机私有
         ("venv/bin/python", LOCAL),
         ("models/x.vrm", LOCAL),
+        ("models/白头凤.vrm", CODE),           # 受管资产：点名放行
+        ("models/渡鸦将军.vrm", CODE),
+        ("models/白头凤_draco3.vrm", LOCAL),   # 未点名 → 默认受保护
+        ("backgrounds/太空飞船走廊.glb", LOCAL),
         ("key.pem", LOCAL),
         ("deploy/tls/dabai-server.key", LOCAL),
         ("settings.json", LOCAL),

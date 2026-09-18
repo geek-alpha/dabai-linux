@@ -94,8 +94,13 @@ mmd_tools_new/
 # Python 虚拟环境（本地环境，跨机器无意义，625M）
 venv/
 .venv/
-# 角色模型 / 背景场景等外观资源（大体积二进制资产，378M+11M；磁盘保留、不入库）
-models/
+# 角色模型 / 背景场景等外观资源（大体积二进制资产；磁盘保留、不入库）
+# 白头凤与渡鸦将军两个角色模型例外：cards.example.json 的种子卡指向它们，
+# 新机器缺了 3D 角色就是空的。用 models/* 而不是 models/ —— 目录级忽略会让
+# 后面的 ! 例外失效（gitignore 的否定规则进不了已忽略目录内部）。
+models/*
+!models/白头凤.vrm
+!models/渡鸦将军.vrm
 backgrounds/
 # 烘焙动画片段与 Mixamo 原始 FBX（二进制大资产，可重建）
 # 只忽略动作片段目录，不忽略整个 web/anim/ —— animation-library.json 是手写配置，

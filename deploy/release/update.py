@@ -83,6 +83,13 @@ FLOOR_GLOBS: Tuple[str, ...] = (
     "skills/*/data", "skills/*/data/**",
 )
 
+# 受管资产白名单：住在大资产目录里、但属于发布方受管、随包分发、可被更新覆盖。
+# 与 paths.py 的 PACKED_ASSETS 同源，测试断言两者一致。
+PACKED_ASSETS: Tuple[str, ...] = (
+    "models/白头凤.vrm",
+    "models/渡鸦将军.vrm",
+)
+
 # 经历见证集：更新前后比对这些文件的哈希，用来证明「经历没被动过」。
 # 刻意不含 venv/models/backgrounds —— 那些是大资产，哈希它们只会拖慢更新，
 # 而它们本来就不可再生性低（删了能重建）。
@@ -129,6 +136,8 @@ for _g in FLOOR_GLOBS:
     if _g.endswith("/**"):
         _FLOOR_RX.append(_to_regex(_g[:-3]))
 
+_ASSET_RX: List["re.Pattern[str]"] = [_to_regex(_g) for _g in PACKED_ASSETS]
+
 
 def norm(path: str) -> str:
     p = str(path).replace("\\", "/").strip()
@@ -142,6 +151,8 @@ def is_forbidden(path: str) -> bool:
     p = norm(path)
     if not p:
         return True
+    if any(r.match(p) for r in _ASSET_RX):
+        return False
     if any(r.match(p) for r in _FLOOR_RX):
         return True
     parts = p.split("/")

@@ -149,6 +149,32 @@ def test_floor_matches_paths():
     )
 
 
+def test_packed_assets_match():
+    """受管资产白名单同样两份，必须不漂移。
+
+    放行面比禁写面更危险：一边放行、另一边照旧拒写，模型要么进不了包、
+    要么装不上，而且不会有任何报错 —— 装完只是 3D 角色空的。
+    """
+    only_update = sorted(set(update.PACKED_ASSETS) - set(paths.PACKED_ASSETS))
+    only_paths = sorted(set(paths.PACKED_ASSETS) - set(update.PACKED_ASSETS))
+    assert not only_update and not only_paths, (
+        f"受管资产漂移了：只在 update.py 里 {only_update}，只在 paths.py 里 {only_paths}"
+    )
+
+
+def test_packed_assets_pass_floor():
+    """点名放行的资产两边都放行；同类目录里没点名的仍被地板拦住。"""
+    for rel in paths.PACKED_ASSETS:
+        assert paths.classify(rel) == paths.CODE, rel
+        assert not paths.floor_violation(rel), rel
+        assert not update.is_forbidden(rel), rel
+    for rel in ("models/别的角色.vrm", "models/白头凤_draco3.vrm",
+                "backgrounds/太空飞船走廊.glb"):
+        assert paths.classify(rel) == paths.LOCAL, rel
+        assert paths.floor_violation(rel), rel
+        assert update.is_forbidden(rel), rel
+
+
 def test_validators_agree():
     """update.py 自带校验器与 manifest.py 的判定必须一致。
 
