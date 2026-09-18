@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="theme-color" content="#0f0f1e">
+<title>手机接入白头凤</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px 18px 56px;
+    font: 16px/1.7 -apple-system, "PingFang SC", "Noto Sans CJK SC", system-ui, sans-serif;
+    background: radial-gradient(120% 80% at 50% 0%, #241447 0%, #0b0a18 60%);
+    color: #e8e6f5; min-height: 100vh;
+  }
+  h1 { font-size: 22px; margin: 0 0 6px; letter-spacing: .5px; }
+  .sub { color: #9d97c4; font-size: 14px; margin-bottom: 22px; }
+  .card {
+    background: rgba(255,255,255,.05); border: 1px solid rgba(255,255,255,.1);
+    border-radius: 16px; padding: 18px; margin-bottom: 16px;
+    backdrop-filter: blur(8px);
+  }
+  .step { display: flex; gap: 12px; align-items: flex-start; }
+  .num {
+    flex: 0 0 26px; height: 26px; border-radius: 50%; margin-top: 3px;
+    background: linear-gradient(140deg, #8b5cf6, #ec4899);
+    font-size: 14px; font-weight: 700; line-height: 26px; text-align: center; color: #fff;
+  }
+  .step b { display: block; font-size: 16px; margin-bottom: 4px; }
+  .step p { margin: 0; color: #b6b0d8; font-size: 14px; }
+  .btn {
+    display: block; text-align: center; text-decoration: none;
+    padding: 14px; border-radius: 12px; font-weight: 600; font-size: 16px;
+    background: linear-gradient(140deg, #7c3aed, #db2777); color: #fff;
+    margin-top: 14px;
+  }
+  .btn.ghost { background: rgba(255,255,255,.08); border: 1px solid rgba(255,255,255,.16); color: #ded9f7; }
+  .qr { text-align: center; }
+  .qr img { width: 100%; max-width: 260px; border-radius: 12px; background: #fff; padding: 10px; }
+  code {
+    background: rgba(255,255,255,.1); padding: 2px 7px; border-radius: 6px;
+    font-size: 13px; word-break: break-all;
+  }
+  .warn { color: #fca5a5; font-size: 13px; }
+  .ok { color: #86efac; font-size: 13px; }
+  details { margin-top: 10px; }
+  summary { cursor: pointer; color: #a5b4fc; font-size: 14px; }
+  details p { color: #b6b0d8; font-size: 14px; margin: 8px 0 0; }
+  #probe { font-size: 13px; margin-top: 8px; }
+</style>
+</head>
+<body>
+  <h1>手机接入白头凤</h1>
+  <div class="sub">装一次证书，之后手机端就是桌面 App：秒开、可离线、不用再开浏览器找地址。</div>
+
+  <div class="card qr">
+    <img src="/setup-qr.png" alt="扫码打开白头凤"
+         onerror="this.style.display='none';document.getElementById('qrfallback').style.display='block'">
+    <div id="qrfallback" style="display:none;color:#b6b0d8;font-size:14px">
+      扫码图未生成，直接在手机浏览器输入：<br><code id="hosturl"></code>
+    </div>
+    <div style="color:#9d97c4;font-size:13px;margin-top:10px">手机相机扫这个码，打开白头凤</div>
+  </div>
+
+  <div class="card">
+    <div class="step">
+      <div class="num">1</div>
+      <div>
+        <b>装根证书（只需一次）</b>
+        <p>手机必须信任这张自签 CA，浏览器才允许注册离线缓存层。点下面按钮下载。</p>
+        <a class="btn" href="/dabai-ca.crt" download="dabai-ca.crt">下载根证书 dabai-ca.crt</a>
+        <details>
+          <summary>iPhone / iPad 安装步骤</summary>
+          <p>下载后打开「设置」→ 顶部会出现「已下载描述文件」→ 安装（要输锁屏密码）→ 再到「设置 → 通用 → 关于本机 → 证书信任设置」，把 <b>Dabai Local CA</b> 的开关打开。</p>
+        </details>
+        <details>
+          <summary>Android 安装步骤</summary>
+          <p>下载后打开「设置 → 安全 → 加密与凭据 → 安装证书 → CA 证书」，选择刚下载的 <code>dabai-ca.crt</code>。华为/小米等机型入口在「设置 → 安全 → 更多安全设置」里，认准「CA 证书」。</p>
+        </details>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="step">
+      <div class="num">2</div>
+      <div>
+        <b>回到白头凤，刷新一次</b>
+        <p>证书生效后地址栏不再报「不安全」，页面会自动把 3D 模型以外的资源缓存到手机本地，第二次打开基本瞬间进入。</p>
+        <a class="btn ghost" id="openurl" href="/">打开白头凤</a>
+        <div id="probe"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="step">
+      <div class="num">3</div>
+      <div>
+        <b>加到主屏幕</b>
+        <p>iPhone：Safari 分享按钮 → 「添加到主屏幕」。<br>Android Chrome：右上角 ⋮ → 「安装应用」/「添加到主屏幕」。之后从图标进，全屏、无浏览器地址栏。</p>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // 引导页可能从 HTTP 回源端口打开（装证书前唯一的无警告入口），
+    // 此时 location.origin 是 http://…:8001，跳过去等于跳到没有 SW 的站点。
+    // 主站地址固定按 https://<host>:8000 拼。
+    var secureOrigin = location.protocol === 'https:'
+      ? location.origin
+      : 'https://' + location.hostname + ':8000';
+    var url = secureOrigin + '/';
+    document.getElementById('hosturl').textContent = url;
+    document.getElementById('openurl').href = url;
+    var probe = document.getElementById('probe');
+    if (location.protocol !== 'https:') {
+      probe.innerHTML = '<span class="warn">你正从 HTTP 引导页访问。装完证书后点上面按钮走 HTTPS，离线缓存才会启用。</span>';
+    } else if (!window.isSecureContext) {
+      probe.innerHTML = '<span class="warn">当前不是安全上下文（HTTPS 未生效），离线缓存不会启用。</span>';
+    } else if (!('serviceWorker' in navigator)) {
+      probe.innerHTML = '<span class="warn">当前浏览器不支持 Service Worker。</span>';
+    } else {
+      navigator.serviceWorker.getRegistration('/').then(function (r) {
+        probe.innerHTML = r
+          ? '<span class="ok">离线缓存层已激活 ✓</span>'
+          : '<span class="warn">离线缓存层尚未激活——确认根证书已装好，然后刷新本页。</span>';
+      }).catch(function () {});
+    }
+  </script>
+</body>
+</html>

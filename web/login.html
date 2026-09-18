@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#04050a">
+<title>登录 · 白头凤</title>
+<style>
+  :root { --bg:#04050a; --card:rgba(12,17,34,.98); --line:rgba(90,120,255,.18);
+          --text:#e8ecff; --dim:#8892b8; --accent:#22d3ee; --accent2:#a855f7; --err:#f87171;
+          --mono:ui-monospace,"JetBrains Mono","SFMono-Regular",Menlo,Consolas,"Liberation Mono",monospace; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body { height:100%; margin:0; }
+  body { background:radial-gradient(1100px 520px at 50% -8%, rgba(34,211,238,.10) 0%, var(--bg) 62%);
+         color:var(--text); font:15px/1.6 var(--mono);
+         display:flex; align-items:center; justify-content:center; padding:24px; }
+  .card { width:100%; max-width:392px; border:1px solid var(--line); border-radius:18px;
+          padding:28px 23px 22px; box-shadow:0 30px 74px rgba(0,0,0,.62);
+          background:linear-gradient(160deg,rgba(12,17,34,.99),rgba(7,10,20,.99)); }
+  .brand { text-align:center; margin-bottom:22px; }
+  .brand h1 { margin:0; font-size:22px; letter-spacing:2px;
+              background:linear-gradient(90deg,var(--accent),var(--accent2));
+              -webkit-background-clip:text; background-clip:text; color:transparent; }
+  .brand p { margin:6px 0 0; color:var(--dim); font-size:12px; letter-spacing:1px; }
+  .tabs { display:flex; gap:5px; background:rgba(6,9,20,.9); border:1px solid var(--line);
+          border-radius:11px; padding:4px; margin-bottom:20px; }
+  .tabs button { flex:1; padding:9px 0; border:0; border-radius:8px; background:transparent;
+                 color:var(--dim); font:inherit; font-size:12px; font-weight:600; letter-spacing:.1em;
+                 cursor:pointer; transition:.16s; }
+  .tabs button.on { background:linear-gradient(135deg,var(--accent),var(--accent2)); color:#04050a; }
+  label { display:block; font-size:11px; letter-spacing:.08em; color:var(--dim); margin:0 0 6px 2px; }
+  input { width:100%; padding:11px 13px; margin-bottom:14px; border-radius:10px;
+          border:1px solid var(--line); background:rgba(6,9,20,.92); color:var(--text);
+          font:inherit; font-size:15px; outline:none; transition:border-color .18s; }
+  input:focus { border-color:color-mix(in srgb,var(--accent) 55%,transparent); }
+  .submit { width:100%; padding:12px; border:0; border-radius:999px; font:inherit;
+            font-size:13.5px; font-weight:700; letter-spacing:.08em; color:#04050a;
+            background:linear-gradient(135deg,var(--accent),var(--accent2));
+            cursor:pointer; margin-top:6px; }
+  .submit:disabled { opacity:.55; }
+  .or { display:flex; align-items:center; gap:10px; margin:16px 2px 12px;
+        color:var(--dim); font-size:11.5px; letter-spacing:1px; }
+  .or::before, .or::after { content:''; flex:1; height:1px; background:var(--line); }
+  .gh { width:100%; padding:11px 14px; border-radius:10px; border:1px solid rgba(255,255,255,.16);
+        background:#24292f; color:#fff; font:inherit; font-size:12.5px; letter-spacing:.06em;
+        font-weight:600; cursor:pointer; display:flex; align-items:center; justify-content:center; gap:9px; }
+  .gh:hover { background:#30363d; border-color:rgba(255,255,255,.26); }
+  .gh svg { width:17px; height:17px; fill:currentColor; }
+  .msg { min-height:20px; margin:12px 2px 0; font-size:13px; color:var(--err); text-align:center; }
+  .msg.ok { color:var(--accent); }
+  .hint { margin-top:16px; color:var(--dim); font-size:11.5px; text-align:center; line-height:1.7; }
+  .only-register { display:none; }
+  body.reg .only-register { display:block; }
+  body.reg .only-login { display:none; }
+  .note { margin:-6px 2px 14px; color:var(--dim); font-size:11.5px; line-height:1.6; }
+  .coderow { display:flex; gap:8px; }
+  .coderow input { flex:1; min-width:0; letter-spacing:2px; }
+  .coderow button { flex:0 0 106px; margin-bottom:14px; border-radius:10px; border:1px solid var(--line);
+                    background:transparent; color:var(--dim); font:inherit; font-size:12.5px; font-weight:600;
+                    cursor:pointer; }
+  .coderow button:hover { color:var(--accent); }
+  .coderow button:disabled { color:var(--dim); cursor:default; }
+  .warn { margin:-6px 0 18px; padding:10px 12px; border-radius:10px; text-align:center;
+          font-size:12px; line-height:1.6; color:#fca5a5;
+          background:rgba(248,113,113,.12); border:1px solid rgba(248,113,113,.4); }
+  .warn a { color:#fff; }
+</style>
+</head>
+<body>
+<div class="card">
+  <div id="insecure" class="warn" hidden>
+    当前是明文 HTTP，密码在裸奔<br><a id="to-https">改用 HTTPS 登录</a>
+  </div>
+
+  <div class="brand">
+    <h1>白头凤</h1>
+    <p>BATTLE PHOENIX</p>
+  </div>
+
+  <div class="tabs">
+    <button id="tab-login" class="on" type="button">登录</button>
+    <button id="tab-reg" type="button">注册</button>
+  </div>
+
+  <div id="nomail" class="warn" hidden>
+    服务器还没配置发信邮箱，邮箱注册暂时用不了<br>现在请用下面的 GitHub 注册
+  </div>
+
+  <form id="form" autocomplete="on">
+    <div class="only-login">
+      <label for="name">用户名 / 邮箱</label>
+      <input id="name" name="username" type="text" autocomplete="username"
+             placeholder="用户名，或邮箱 you@example.com" required>
+    </div>
+
+    <div class="only-register">
+      <label for="email">邮箱</label>
+      <input id="email" type="email" inputmode="email" autocomplete="email"
+             placeholder="you@example.com">
+
+      <label for="code">邮箱验证码</label>
+      <div class="coderow">
+        <input id="code" type="text" inputmode="numeric" autocomplete="one-time-code"
+               maxlength="6" placeholder="6 位数字">
+        <button id="send" type="button">获取验证码</button>
+      </div>
+      <p class="note">验证码发到这个邮箱，5 分钟内有效。邮箱必须先验证才能注册 ——
+        以后靠它找回密码时才不会是「谁填你的邮箱谁就能改密码」。</p>
+    </div>
+
+    <label for="pwd">密码</label>
+    <input id="pwd" name="password" type="password" autocomplete="current-password"
+           placeholder="至少 6 位" required>
+
+    <div class="only-register">
+      <label for="pwd2">确认密码</label>
+      <input id="pwd2" type="password" autocomplete="new-password" placeholder="再输一次">
+    </div>
+
+    <button id="submit" class="submit" type="submit">登录</button>
+    <div id="msg" class="msg"></div>
+  </form>
+
+  <div class="or">或</div>
+  <button id="gh" class="gh" type="button">
+    <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+    用 GitHub 登录
+  </button>
+
+  <div class="hint">每个账号拥有独立的对话记忆与模型设置<br>注册只有两条路：邮箱验证，或 GitHub<br>忘记密码请找服务器管理员重置</div>
+</div>
+
+<script>
+(function () {
+  var mode = 'login';
+  var emailReady = false;      /* /api/auth/status 说了算：没配发信就不给空表单 */
+  var timer = null;
+  var $ = function (id) { return document.getElementById(id); };
+  var msg = $('msg'), submit = $('submit');
+
+  function say(text, ok) {
+    msg.textContent = text;
+    msg.className = ok ? 'msg ok' : 'msg';
+  }
+
+  /* next 只认站内路径或本域绝对地址：登录页的开放重定向是经典钓鱼跳板。
+     主站（home./games.）注册完要跳回自己那边，所以放行白名单子域。 */
+  function safeNext(v) {
+    if (!v) return '/';
+    if (v.charAt(0) === '/' && v.charAt(1) !== '/') return v;
+    try {
+      var u = new URL(v);
+      if (u.protocol === 'https:' && /(^|\.)battlephoenix\.tech$/.test(u.hostname)) return u.href;
+    } catch (e) {}
+    return '/';
+  }
+
+  function setMode(m) {
+    if (m === 'register' && !emailReady) m = 'login';
+    mode = m;
+    var isReg = m === 'register';
+    document.body.classList.toggle('reg', isReg);
+    $('tab-login').classList.toggle('on', !isReg);
+    $('tab-reg').classList.toggle('on', isReg);
+    submit.textContent = isReg ? '注册并进入' : '登录';
+    $('pwd').setAttribute('autocomplete', isReg ? 'new-password' : 'current-password');
+    say('');
+  }
+
+  $('tab-login').onclick = function () { setMode('login'); };
+  $('tab-reg').onclick = function () { setMode('register'); };
+
+  /* ── 发验证码 ── */
+  function cooldown(sec) {
+    var left = sec;
+    var btn = $('send');
+    btn.disabled = true;
+    btn.textContent = left + 's';
+    clearInterval(timer);
+    timer = setInterval(function () {
+      left -= 1;
+      if (left <= 0) {
+        clearInterval(timer);
+        timer = null;
+        btn.disabled = false;
+        btn.textContent = '获取验证码';
+        return;
+      }
+      btn.textContent = left + 's';
+    }, 1000);
+  }
+
+  $('send').addEventListener('click', function () {
+    var email = $('email').value.trim();
+    if (!email || email.indexOf('@') < 1) { say('先填邮箱，示例：you@example.com'); return; }
+    var btn = $('send');
+    btn.disabled = true;
+    btn.textContent = '发送中…';
+    fetch('/api/auth/email/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: email })
+    }).then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (d) {
+        if (!r.ok) throw new Error(d.error || ('发送失败 ' + r.status));
+        return d;
+      });
+    }).then(function (d) {
+      say('验证码已发出，去邮箱看看（也可能在垃圾箱）', true);
+      $('code').focus();
+      cooldown(d.cooldown || 60);
+    }).catch(function (err) {
+      say(err.message || '网络异常，稍后再试');
+      btn.disabled = false;
+      btn.textContent = '获取验证码';
+    });
+  });
+
+  /* ── 提交 ── */
+  $('form').addEventListener('submit', function (e) {
+    e.preventDefault();
+    var isReg = mode === 'register';
+    var pwd = $('pwd').value;
+    var body;
+
+    if (isReg) {
+      var email = $('email').value.trim();
+      var code = $('code').value.trim();
+      if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        say('邮箱格式不对，示例：you@example.com'); return;
+      }
+      if (!/^\d{6}$/.test(code)) { say('先点「获取验证码」，再填收到的 6 位数字'); return; }
+      if (pwd.length < 6) { say('密码至少 6 位'); return; }
+      if (pwd !== $('pwd2').value) { say('两次密码不一致'); return; }
+      body = { name: email, pwd: pwd, email_code: code };
+    } else {
+      var name = $('name').value.trim();
+      if (!name || !pwd) { say('账号和密码都要填'); return; }
+      body = { name: name, pwd: pwd };
+    }
+
+    submit.disabled = true;
+    say(isReg ? '正在创建账号…' : '正在登录…', true);
+
+    fetch('/api/auth/' + (isReg ? 'register' : 'login'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    }).then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (d) {
+        if (!r.ok) throw new Error(d.error || ('请求失败 ' + r.status));
+        return d;
+      });
+    }).then(function (d) {
+      say('欢迎，' + (d.user && d.user.name ? d.user.name : ''), true);
+      var next = new URLSearchParams(location.search).get('next');
+      location.href = safeNext(next);
+    }).catch(function (err) {
+      say(err.message || '网络异常，稍后再试');
+      submit.disabled = false;
+    });
+  });
+
+  setMode(new URLSearchParams(location.search).get('mode') === 'register' ? 'register' : 'login');
+
+  /* 注册闸门：整站关闭时藏掉注册 tab（否则填完提交才报错）。全新部署（还没有任何
+     账号）默认落到注册 —— 第一个注册者就是管理员，这一步绕不开。 */
+  fetch('/api/auth/status').then(function (r) { return r.json(); }).then(function (d) {
+    if (!d) return;
+    emailReady = !!d.email_ready;
+    if (!d.registration_open) {
+      $('tab-reg').style.display = 'none';
+      setMode('login');
+      return;
+    }
+    if (!emailReady) {
+      /* 没配 SMTP：邮箱这条路的按钮全是死的，与其让用户白填一遍，不如直接说清楚 */
+      $('nomail').hidden = false;
+      $('tab-reg').style.display = 'none';
+      setMode('login');
+      return;
+    }
+    if (d.first_run) setMode('register');
+  }).catch(function () {});
+
+  /* 全站一把钥匙：GitHub 授权在主域走完，回来的 cookie 覆盖 .battlephoenix.tech，
+     大白这边直接认 —— 不用在这儿再输一次密码。注册和登录是同一条 OAuth 链路。 */
+  var OAUTH_START = 'https://battlephoenix.tech/api/oauth/github/start?next=/&from='
+                  + encodeURIComponent(location.hostname);
+  $('gh').onclick = function () { location.href = OAUTH_START; };
+
+  var OAUTH_MSG = { cancel:'你取消了 GitHub 授权', err:'GitHub 授权没成功，再试一次',
+                    state:'这次授权过期了，请重新点一次', busy:'请求太频繁，等一分钟再来',
+                    unconfigured:'服务器还没配置 GitHub 登录', ban:'这个账号已被停用' };
+  var om = /[?&]oauth=([a-z]+)/.exec(location.search);
+  if (om && OAUTH_MSG[om[1]]) say(OAUTH_MSG[om[1]]);
+
+  /* 明文 HTTP 下密码裸奔，而且服务端按客户端协议决定 cookie 的 Secure 标志，
+     浏览器会把带 Secure 的 cookie 丢掉 —— 直接把人送到 HTTPS，别让他卡在登录页。
+     局域网直连（私网地址）不提示：那里本来就没有 TLS，提示了也无处可跳。 */
+  (function () {
+    if (location.protocol !== 'http:') return;
+    var h = location.hostname;
+    if (/^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|169\.254\.)/.test(h) || /\.local$/.test(h)) return;
+    $('to-https').href = 'https://' + location.host + location.pathname + location.search;
+    $('insecure').hidden = false;
+  })();
+
+  $('name').focus();
+})();
+</script>
+</body>
+</html>

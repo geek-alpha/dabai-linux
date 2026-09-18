@@ -24,6 +24,7 @@ import gzip
 import io
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -136,6 +137,78 @@ def local_import_gaps(root: Path, pairs: List[Tuple[str, Path]]) -> List[str]:
     return sorted(set(gaps))
 
 
+_TS_REF = re.compile(r"""(?:from|import)\s*\(?\s*["'](\.[^"']*)["']""")
+# 站点绝对路径的字符串字面量。刻意不按 src=/href= 属性抓：importmap 是
+# {"three": "/static/vendor/three/build/three.module.js"}，service worker 是
+# navigator.serviceWorker.register('/sw.js')，两者都不是属性，用属性正则全漏。
+_SITE_PATH = re.compile(r"""["'](/[^"'\s]*)["']""")
+
+
+def _frontend_target(rel: str, ref: str) -> str:
+    """把前端引用解析成仓库内相对路径；解析不出（外链/锚点）返回空串。"""
+    ref = ref.split("?")[0].split("#")[0].strip()
+    if not ref or "://" in ref or ref.startswith(("//", "data:", "blob:", "#")):
+        return ""
+    if ref.startswith("/"):
+        # /static/x → web/x（server.py:950 挂载）；/sw.js、/manifest.webmanifest
+        # 直出根路径（server.py:1715/1723），同样落在 web/ 下。
+        rest = ref[len("/static/"):] if ref.startswith("/static/") else ref.lstrip("/")
+        return f"web/{rest}"
+    if not ref.startswith("."):
+        return ""
+    parts = [p for p in (rel.rsplit("/", 1)[0].split("/") + ref.split("/")) if p not in ("", ".")]
+    out: List[str] = []
+    for p in parts:
+        if p == "..":
+            if out:
+                out.pop()
+        else:
+            out.append(p)
+    return "/".join(out)
+
+
+def frontend_gap(root: Path, pairs: List[Tuple[str, Path]]) -> Tuple[List[str], List[str]]:
+    """包内前端文件引用的本地资源，有没有没进包的。
+
+    .py 的 import 有 local_import_gaps 兜着，前端没有 —— web/app.ts:54 直接
+    import ./js/ui/42_attach.ts，web/index.html:13/875 引 /manifest.webmanifest
+    与 /sw.js，这三个文件都长期在仓外：装上后前端 import 404、PWA 整体失效，
+    而打包器一声不响。同一个洞换个语言就再掉一次，所以按引用解析来查，不按后缀。
+
+    返回 (硬缺口, 软缺口)。软缺口 = 引用目标在 paths.py 里已被显式声明为本机私有
+    （web/vendor/** 这类第三方库），它本来就不该跨机器传播，只提示不拦；硬缺口
+    是没人声明过、纯属忘了 git add 的，直接拒绝打包。
+    """
+    packaged = {rel for rel, _ in pairs}
+    hard: List[str] = []
+    soft: List[str] = []
+    seen = set()
+    for rel, abs_path in pairs:
+        if rel.endswith(".ts"):
+            pats = (_TS_REF, _SITE_PATH)
+        elif rel.endswith((".html", ".js", ".webmanifest")):
+            pats = (_SITE_PATH,)
+        else:
+            continue
+        try:
+            text = abs_path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        for pat in pats:
+            for ref in pat.findall(text):
+                target = _frontend_target(rel, ref)
+                if not target or (rel, target) in seen:
+                    continue
+                seen.add((rel, target))
+                if target in packaged or not (root / target).is_file():
+                    continue
+                msg = f"{rel} → 引用 {ref}，但 {target} 不在包内"
+                if P.classify(target) == P.LOCAL:
+                    soft.append(msg + "（已在 paths.py 声明为本机私有，需另行同步）")
+                else:
+                    hard.append(msg + "（未入仓）")
+    return sorted(set(hard)), sorted(set(soft))
+
 def build_tar(pairs: List[Tuple[str, Path]], manifest: Dict, out: Path, epoch: int = 0) -> str:
     """可复现 tar.gz。返回包内容的 sha256。所有时间戳钉在 epoch（提交时间）上。"""
     raw = io.BytesIO()
@@ -222,15 +295,22 @@ def main() -> int:
         print("✘ 没有任何可打包的代码文件")
         return 1
 
-    gaps = local_import_gaps(root, pairs)
+    front_hard, front_soft = frontend_gap(root, pairs)
+    gaps = local_import_gaps(root, pairs) + front_hard
     if gaps:
-        print(f"✘ 有 {len(gaps)} 处 import 指向未入仓的本地模块（装上会起不来）：")
+        print(f"✘ 有 {len(gaps)} 处引用指向未入仓的本地文件（装上会起不来）：")
         for g in gaps[:20]:
             print("   ", g)
         if not args.list:
             print("   拒绝打包。先 git add 补进仓，或确认该模块本就该在仓外。")
             return 1
         print("   （--list 只列清单，故不拦截）")
+
+    if front_soft:
+        print(f"! {len(front_soft)} 处前端引用指向本机私有资源，包里不会有：")
+        for g in front_soft[:10]:
+            print("   ", g)
+        print("   （paths.py 已声明为本机私有，不拦打包；新机器需自行同步这些文件）")
 
     if args.list:
         print(f"版本 {version}：{len(pairs)} 个文件会进包")
@@ -240,6 +320,7 @@ def main() -> int:
         for rel in excluded[P.EXPERIENCE]:
             print(f"    [经历] {rel}")
         return 0
+
 
     sha, epoch = git_head_meta(root)
     man = M.build_manifest(

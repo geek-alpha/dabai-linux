@@ -225,3 +225,9 @@ nul
 web/*.png
 web/_swprobe.html
 web/icons/_preview*.png
+
+# ── 归档与构建中间产物 ────────────────────────────────────────────────
+# .archive 是「改坏了先留着」的旧版快照，godot-dabai/.project_build 是
+# project_build 技能的中间产物（spec.json 每次跑都重生成）。都不是运行时。
+/.archive/
+godot-dabai/.project_build/

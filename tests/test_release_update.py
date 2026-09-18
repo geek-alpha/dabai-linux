@@ -336,3 +336,87 @@ def test_real_repo_has_no_import_gaps():
     pairs, _missing, _excluded = build_mod.collect(REPO)
     gaps = build_mod.local_import_gaps(REPO, pairs)
     assert not gaps, "有模块被 import 但没入仓：\n" + "\n".join(gaps)
+
+
+# ── 前端引用完整性：包内前端引的本地资源必须在包里 ──────────────────────
+def test_frontend_gap_is_detected(tmp_path):
+    """TS import / HTML 与 manifest 引用指向仓外文件时必须报出来。
+
+    事故形态：web/app.ts:54 import ./js/ui/42_attach.ts，web/index.html:13/875
+    引 /manifest.webmanifest 与 /sw.js —— 三个文件都在仓外，包里的前端 import
+    直接 404、PWA 整体失效。同一个洞，Python 侧有 local_import_gaps 兜，前端
+    侧当时一个都没有。
+    """
+    (tmp_path / "web" / "js" / "ui").mkdir(parents=True)
+    (tmp_path / "web" / "app.ts").write_text(
+        "import init_42_attach from './js/ui/42_attach.ts';\n", encoding="utf-8")
+    (tmp_path / "web" / "js" / "ui" / "42_attach.ts").write_text("export default 1;\n", encoding="utf-8")
+    (tmp_path / "web" / "index.html").write_text(
+        '<link rel="manifest" href="/manifest.webmanifest">\n'
+        '<script src="/static/app.ts?v=173"></script>\n'
+        "<script>navigator.serviceWorker.register('/sw.js', { scope: '/' });</script>\n",
+        encoding="utf-8")
+    (tmp_path / "web" / "manifest.webmanifest").write_text(
+        '{"icons": [{"src": "/static/icons/icon-192.png", "sizes": "192x192"}]}\n', encoding="utf-8")
+    (tmp_path / "web" / "sw.js").write_text("self.addEventListener('fetch', () => {});\n", encoding="utf-8")
+    (tmp_path / "web" / "icons").mkdir()
+    (tmp_path / "web" / "icons" / "icon-192.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+
+    pairs = [
+        ("web/app.ts", tmp_path / "web" / "app.ts"),
+        ("web/index.html", tmp_path / "web" / "index.html"),
+    ]
+    gaps, soft = build_mod.frontend_gap(tmp_path, pairs)
+    assert any("42_attach.ts" in g for g in gaps), gaps
+    assert any("manifest.webmanifest" in g for g in gaps), gaps
+    assert any("/sw.js" in g for g in gaps), gaps
+    assert not soft, soft
+
+    # 补齐入仓后，同一批引用必须一条不剩（manifest 的 icons 也算引用）
+    for rel in ("web/js/ui/42_attach.ts", "web/manifest.webmanifest", "web/sw.js",
+                "web/icons/icon-192.png"):
+        pairs.append((rel, tmp_path / rel))
+    assert build_mod.frontend_gap(tmp_path, pairs) == ([], [])
+
+
+def test_frontend_manifest_icons_are_checked(tmp_path):
+    """manifest 的 icons[].src 也要查 —— 图标缺失时 PWA 是白框，不报错。"""
+    (tmp_path / "web" / "icons").mkdir(parents=True)
+    (tmp_path / "web" / "manifest.webmanifest").write_text(
+        '{"icons": [{"src": "/static/icons/icon-192.png", "sizes": "192x192"}]}\n', encoding="utf-8")
+    (tmp_path / "web" / "icons" / "icon-192.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+    pairs = [("web/manifest.webmanifest", tmp_path / "web" / "manifest.webmanifest")]
+    gaps, _soft = build_mod.frontend_gap(tmp_path, pairs)
+    assert gaps and "icon-192.png" in gaps[0], gaps
+
+
+def test_frontend_external_refs_are_not_flagged(tmp_path):
+    """外链、运行时端点、锚点不能误报 —— 它们本来就不在磁盘上。"""
+    (tmp_path / "web").mkdir()
+    (tmp_path / "web" / "index.html").write_text(
+        '<script src="https://cdn.example.com/three.js"></script>\n'
+        '<link href="//fonts.example.com/x.css" rel="stylesheet">\n'
+        '<a href="#top">顶</a>\n'
+        '<img src="/api/avatar/me">\n'
+        '<link href="/static/style.css">\n', encoding="utf-8")
+    pairs = [("web/index.html", tmp_path / "web" / "index.html")]
+    assert build_mod.frontend_gap(tmp_path, pairs) == ([], [])
+
+
+
+def test_real_repo_has_no_frontend_gaps():
+    """真仓库不许有前端缺口：以后新增 .ts 忘了 git add，这条测试会红。"""
+    pairs, _missing, _excluded = build_mod.collect(REPO)
+    gaps, _soft = build_mod.frontend_gap(REPO, pairs)
+    assert not gaps, "有前端资源被引用但没入仓：\n" + "\n".join(gaps)
+
+
+def test_vendor_is_soft_not_hard():
+    """web/vendor 是本机私有（paths.py:87 声明），只能提示、不能拦打包。
+
+    但必须提示：index.html:27-29 的 importmap 指向它，新机器上 3D 前端起不来。
+    """
+    pairs, _missing, _excluded = build_mod.collect(REPO)
+    _gaps, soft = build_mod.frontend_gap(REPO, pairs)
+    assert any("web/vendor" in s for s in soft), soft
+    assert all("web/vendor" not in g for g in _gaps), _gaps
