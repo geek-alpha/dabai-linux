@@ -24,6 +24,7 @@
     python update.py --apply                     # 真更新
     python update.py --apply --local-tarball X --local-manifest Y   # 离线/测试
     python update.py --rollback                  # 回滚到上一版
+    python update.py --apply --tag v1.0.0        # 切到指定版本（可降级）
 """
 
 from __future__ import annotations
@@ -265,6 +266,11 @@ def gh_request(url: str, token: str, timeout: int, raw: bool = False):
 
 def latest_release(repo: str, token: str, timeout: int) -> Dict[str, Any]:
     return gh_request(f"https://api.github.com/repos/{repo}/releases/latest", token, timeout)
+
+
+def release_by_tag(repo: str, tag: str, token: str, timeout: int) -> Dict[str, Any]:
+    """按 tag 取发行版 —— 版本切换走这个端点，不是拿 --force 硬拉最新版。"""
+    return gh_request(f"https://api.github.com/repos/{repo}/releases/tags/{tag}", token, timeout)
 
 
 def pick_assets(release: Dict[str, Any], version: str) -> Tuple[Optional[str], Optional[str]]:
@@ -716,9 +722,15 @@ def run(args) -> int:
             log_line(cfg, "✘ 没找到 GITHUB_TOKEN（环境变量 → /etc/dabai/secrets.env → ~/.config/dabai/secrets.env）")
             return 2
         try:
-            rel = latest_release(cfg["REPO"], token, int(cfg["HTTP_TIMEOUT"]))
+            if args.tag:
+                rel = release_by_tag(cfg["REPO"], args.tag, token, int(cfg["HTTP_TIMEOUT"]))
+            else:
+                rel = latest_release(cfg["REPO"], token, int(cfg["HTTP_TIMEOUT"]))
         except urllib.error.HTTPError as ex:
-            log_line(cfg, f"✘ 查最新发行版失败：HTTP {ex.code}")
+            what = f"发行版 {args.tag}" if args.tag else "最新发行版"
+            log_line(cfg, f"✘ 查{what}失败：HTTP {ex.code}")
+            if ex.code == 404 and args.tag:
+                log_line(cfg, "   该 tag 下没有发行版（tag 存在但没建 release 也是这个错）")
             return 1
         except Exception as ex:
             log_line(cfg, f"✘ 查最新发行版失败：{ex}")
@@ -785,7 +797,8 @@ def run(args) -> int:
     log_line(cfg, f"② 清单与逐文件 sha256 全对（{man['file_count']} 个文件）")
 
     # ── ④ 版本判定 ──────────────────────────────────────────────────────
-    if not args.force and vkey(ver) <= vkey(cur):
+    # 点名 --tag 就是要这个版本，降级也算数 —— 版本切换本来就是往旧版走
+    if not args.force and not args.tag and vkey(ver) <= vkey(cur):
         log_line(cfg, f"跳过：远端 v{ver} 不比本地 v{cur} 新（要强制就加 --force）")
         return 0
     if args.check:
@@ -910,6 +923,7 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true", help="全流程演练：不写盘、不重启")
     ap.add_argument("--apply", action="store_true", help="真更新")
     ap.add_argument("--rollback", action="store_true", help="回滚到上一版")
+    ap.add_argument("--tag", default="", help="切到指定版本（如 v1.0.0），默认取最新发行版")
     ap.add_argument("--local-tarball", default="", help="离线/测试：直接用本地包")
     ap.add_argument("--local-manifest", default="", help="离线/测试：配套清单（可选）")
     ap.add_argument("--force", action="store_true", help="同版本或降级也执行")

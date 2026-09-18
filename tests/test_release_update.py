@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import argparse
 import fnmatch
 import gzip
 import hashlib
@@ -23,6 +24,7 @@ import importlib.util
 import io
 import json
 import re
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -521,3 +523,40 @@ def test_workflow_artifact_covers_every_dist_file_it_reads():
         assert any(fnmatch.fnmatch(r, p) for p in pats), (
             f"{r} 被 workflow 引用，却不在 upload-artifact 的上传范围 {pats} 内 —— "
             "发布时会 FileNotFoundError")
+
+
+def test_update_switches_to_named_tag(tmp_path, monkeypatch):
+    """--tag 必须走 releases/tags 端点，且允许降级。
+
+    版本切换的用法就是「退回一个已知可用的旧版」，而版本判定默认只升不降 ——
+    不显式豁免，--tag v1.0.0 会被当成「不比本地新」直接跳过：命令返回 0、
+    什么都没做，看起来像成功了。
+    """
+    root = make_instance(tmp_path, version="2.0.0")
+    tar, _man, _d = make_package(tmp_path, {"server.py": "NEW SERVER\n"}, version="1.0.0")
+    sha_text = f"{hashlib.sha256(tar.read_bytes()).hexdigest()}  dabai-1.0.0.tar.gz\n"
+    seen = []
+
+    def fake_gh(url, token, timeout, raw=False):
+        seen.append(url)
+        if raw:
+            return sha_text.encode()
+        return {"tag_name": "v1.0.0", "assets": [
+            {"name": "dabai-1.0.0.tar.gz", "url": "https://api.github.com/asset/tar"},
+            {"name": "dabai-1.0.0.tar.gz.sha256", "url": "https://api.github.com/asset/sha"},
+        ]}
+
+    monkeypatch.setattr(update, "gh_request", fake_gh)
+    monkeypatch.setattr(update, "get_token", lambda: "fake")
+    monkeypatch.setattr(update, "download",
+                        lambda url, dest, token, timeout: shutil.copyfile(tar, dest))
+
+    args = argparse.Namespace(
+        root=str(root), state=str(tmp_path / "state"), repo="o/r", service="", port="",
+        check=False, dry_run=True, apply=False, rollback=False, tag="v1.0.0",
+        local_tarball="", local_manifest="", force=False, prune=False,
+        no_restart=True, ignore_active_turn=False, keep_backups=0)
+    rc = update.run(args)
+    assert rc == 0, rc
+    assert any("/releases/tags/v1.0.0" in u for u in seen), seen
+    assert not any(u.endswith("/releases/latest") for u in seen), seen
