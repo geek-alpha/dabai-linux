@@ -179,3 +179,11 @@ data/peer_cursor.json
 /skills/*/data/
 # 发行包产物
 /deploy/release/dist/
+
+# ── 私钥与证书中间产物 ────────────────────────────────────────────────
+# 原有规则只盖了 *.pem，而 deploy/tls 下的根 CA 私钥是 .key 后缀，一直漏在外面：
+# 实测 `git status -uall -- deploy/tls` 会列出 dabai-rootCA.key / dabai-server.key，
+# 一次 git add -A 就把根 CA 私钥推进了仓库。补上通用后缀堵住。
+*.key
+*.srl
+*.csr
