@@ -23,6 +23,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import pytest
 import re
 import shutil
 import subprocess
@@ -549,7 +550,7 @@ def test_update_switches_to_named_tag(tmp_path, monkeypatch):
     monkeypatch.setattr(update, "gh_request", fake_gh)
     monkeypatch.setattr(update, "get_token", lambda: "fake")
     monkeypatch.setattr(update, "download",
-                        lambda url, dest, token, timeout: shutil.copyfile(tar, dest))
+                        lambda url, dest, token, timeout, **kw: shutil.copyfile(tar, dest))
 
     args = argparse.Namespace(
         root=str(root), state=str(tmp_path / "state"), repo="o/r", service="", port="",
@@ -595,3 +596,78 @@ def test_stale_updater_copy_is_detected(tmp_path):
     # 仓库里那份不存在（更新器被单独部署）→ 无从比较，不误报
     packaged.unlink()
     assert update.updater_copy_stale(root, me=synced) is None
+
+
+def test_download_retries_after_bad_cdn_ip(tmp_path, monkeypatch):
+    """撞上无响应的 CDN 地址要重试，且单次尝试不许吃满 HTTP_TIMEOUT。
+
+    release-assets.githubusercontent.com 解析出 4 个 IP，其中 185.199.111.133
+    连 443 无响应。单次尝试撞上它就白等到 HTTP_TIMEOUT 见底（60s），
+    整轮更新失败 —— 而其余三个地址 0.1~1.2s 就通。
+    """
+    seen = []
+
+    def flaky(url, token, timeout, raw=False):
+        seen.append(timeout)
+        if len(seen) < 3:
+            raise TimeoutError("连接 release-assets 超时")
+        return b"tarball-bytes"
+
+    monkeypatch.setattr(update, "gh_request", flaky)
+    monkeypatch.setattr(update.time, "sleep", lambda s: None)
+    retried = []
+    dest = tmp_path / "dabai-1.0.2.tar.gz"
+    update.download("https://api.github.com/asset/tar", dest, "tok", 60,
+                    on_retry=lambda n, ex: retried.append(n))
+
+    assert dest.read_bytes() == b"tarball-bytes"
+    assert retried == [1, 2]
+    # 关键断言：单次尝试的超时被压到 ATTEMPT_TIMEOUT，而不是传进来的 60
+    assert seen == [update.DOWNLOAD_ATTEMPT_TIMEOUT] * 3
+    assert not list(tmp_path.glob("*.part"))
+
+
+def test_download_gives_up_loudly(tmp_path, monkeypatch):
+    """重试用尽要抛错，且不留半截文件 —— 半截文件会被下游当成完整包去校验。"""
+
+    def dead(url, token, timeout, raw=False):
+        raise TimeoutError("连接超时")
+
+    monkeypatch.setattr(update, "gh_request", dead)
+    monkeypatch.setattr(update.time, "sleep", lambda s: None)
+    dest = tmp_path / "dabai-1.0.2.tar.gz"
+    with pytest.raises(RuntimeError) as ei:
+        update.download("https://api.github.com/asset/tar", dest, "tok", 60)
+
+    assert "3 次" in str(ei.value)
+    assert not dest.exists()
+    assert not list(tmp_path.glob("*.part"))
+
+
+def test_download_failure_exits_cleanly(tmp_path, monkeypatch):
+    """下载彻底失败时 run() 返回 1 并写明原因，不是把栈扔给 systemd。"""
+    root = make_instance(tmp_path, version="1.0.0")
+    sha_text = f"{'a' * 64}  dabai-1.0.2.tar.gz\n"
+
+    def fake_gh(url, token, timeout, raw=False):
+        if raw:
+            return sha_text.encode()
+        return {"tag_name": "v1.0.2", "assets": [
+            {"name": "dabai-1.0.2.tar.gz", "url": "https://api.github.com/asset/tar"},
+            {"name": "dabai-1.0.2.tar.gz.sha256", "url": "https://api.github.com/asset/sha"},
+        ]}
+
+    monkeypatch.setattr(update, "gh_request", fake_gh)
+    monkeypatch.setattr(update, "get_token", lambda: "fake")
+
+    def dead(url, dest, token, timeout, **kw):
+        raise RuntimeError("下载失败（已尝试 3 次）：连接 release-assets 超时")
+
+    monkeypatch.setattr(update, "download", dead)
+    args = argparse.Namespace(
+        root=str(root), state=str(tmp_path / "state"), repo="o/r", service="", port="",
+        check=False, dry_run=True, apply=False, rollback=False, tag="",
+        local_tarball="", local_manifest="", force=True, prune=False,
+        no_restart=True, ignore_active_turn=False, keep_backups=0)
+    rc = update.run(args)
+    assert rc == 1, rc

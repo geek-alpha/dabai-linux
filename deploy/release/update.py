@@ -313,12 +313,32 @@ def pick_assets(release: Dict[str, Any], version: str) -> Tuple[Optional[str], O
     return tar_url, sha_url
 
 
-def download(url: str, dest: Path, token: str, timeout: int) -> None:
+# release-assets 会解析出多个 IP，其中个别地址连 443 无响应。urllib 单次尝试撞上
+# 就白等到 HTTP_TIMEOUT 见底（60s），所以单次尝试用短超时，失败再试 —— 每次
+# urlopen 都会重新解析地址表，重试不是重复同一次失败。
+DOWNLOAD_ATTEMPTS = 3
+DOWNLOAD_ATTEMPT_TIMEOUT = 15
+
+
+def download(url: str, dest: Path, token: str, timeout: int,
+             on_retry: Optional[Any] = None, attempts: int = DOWNLOAD_ATTEMPTS) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
-    data = gh_request(url, token, timeout, raw=True)
-    tmp = dest.with_suffix(dest.suffix + ".part")
-    tmp.write_bytes(data)
-    tmp.replace(dest)
+    last: Optional[Exception] = None
+    for i in range(1, attempts + 1):
+        try:
+            data = gh_request(url, token, min(timeout, DOWNLOAD_ATTEMPT_TIMEOUT), raw=True)
+        except Exception as ex:
+            last = ex
+            if i < attempts:
+                if on_retry:
+                    on_retry(i, ex)
+                time.sleep(2 * i)
+            continue
+        tmp = dest.with_suffix(dest.suffix + ".part")
+        tmp.write_bytes(data)
+        tmp.replace(dest)
+        return
+    raise RuntimeError(f"下载失败（已尝试 {attempts} 次）：{last}")
 
 
 def parse_sha256_file(text: str) -> str:
@@ -784,9 +804,14 @@ def run(args) -> int:
             return 1
         tar_path = stage / f"dabai-{remote_ver}.tar.gz"
         log_line(cfg, f"下载 v{remote_ver} …")
-        download(tar_url, tar_path, token, int(cfg["HTTP_TIMEOUT"]))
-        want = parse_sha256_file(
-            gh_request(sha_url, token, int(cfg["HTTP_TIMEOUT"]), raw=True).decode("utf-8", "replace"))
+        try:
+            download(tar_url, tar_path, token, int(cfg["HTTP_TIMEOUT"]),
+                     on_retry=lambda n, ex: log_line(cfg, f"   第 {n} 次下载没成（{ex}），重试 …"))
+            want = parse_sha256_file(
+                gh_request(sha_url, token, int(cfg["HTTP_TIMEOUT"]), raw=True).decode("utf-8", "replace"))
+        except Exception as ex:
+            log_line(cfg, f"✘ 下载失败：{ex}")
+            return 1
         if not want:
             log_line(cfg, "✘ .sha256 资产里读不出合法哈希")
             return 1
