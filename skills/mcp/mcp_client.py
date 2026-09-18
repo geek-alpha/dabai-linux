@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
-"""MCP stdio 客户端 —— 最小实现：JSON-RPC 2.0 over newline-delimited stdio。
+"""MCP 客户端 —— 最小实现：JSON-RPC 2.0。
+
+两条传输：stdio（本文件 MCPServer，子进程）与 Streamable HTTP（mcp_http.py，远程 url）。
 
 设计取向（第一性原理）：MCP 的价值是别人的现成 server，成本是 schema 全量灌上下文。
 所以这里只提供「连接 / 拉清单 / 调用 / 杀进程」四件事，进程按需存活、工具清单按需拉取。
@@ -17,6 +19,7 @@ import queue
 import shutil
 import signal
 import subprocess
+import sys
 import threading
 import time
 
@@ -31,9 +34,32 @@ _MEM_FLOOR_MB = 180
 _MAX_LIVE = 2
 _HEAVY_HINTS = ("chromium", "chrome", "firefox", "webkit", "playwright")
 
+# mcp_http 反向 import 本模块的常量，两边都要能独立被 import
+_SKILL_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SKILL_DIR not in sys.path:
+    sys.path.insert(0, _SKILL_DIR)
+
 
 class MCPError(Exception):
     """MCP 连接/协议/调用错误。"""
+
+
+def format_tool_result(result: dict) -> str:
+    """把 tools/call 的 result 拍平成文本（stdio 与 HTTP 两条传输共用）。"""
+    result = result or {}
+    parts = []
+    for item in result.get("content") or []:
+        if not isinstance(item, dict):
+            parts.append(str(item))
+            continue
+        if item.get("type") == "text":
+            parts.append(str(item.get("text", "")))
+        else:
+            parts.append(json.dumps(item, ensure_ascii=False))
+    text = "\n".join(p for p in parts if p)
+    if result.get("isError"):
+        return f"[工具报错] {text or '（无输出）'}"
+    return text or "（工具无输出）"
 
 
 class MCPServer:
@@ -191,19 +217,7 @@ class MCPServer:
         result = self._request("tools/call", {
             "name": tool, "arguments": arguments or {},
         }, timeout=timeout) or {}
-        parts = []
-        for item in result.get("content") or []:
-            if not isinstance(item, dict):
-                parts.append(str(item))
-                continue
-            if item.get("type") == "text":
-                parts.append(str(item.get("text", "")))
-            else:
-                parts.append(json.dumps(item, ensure_ascii=False))
-        text = "\n".join(p for p in parts if p)
-        if result.get("isError"):
-            return f"[工具报错] {text or '（无输出）'}"
-        return text or "（工具无输出）"
+        return format_tool_result(result)
 
     def _group_alive(self) -> bool:
         """进程组里还有活人吗（含被 npx fork 出去的孙进程）。"""
@@ -452,7 +466,7 @@ def resource_guard(action: str, name: str = "", spec: dict = None,
     if action == "connect":
         if st["live"] >= _MAX_LIVE:
             bad.append(f"已有 {st['live']} 个 server 在跑（上限 {_MAX_LIVE}），先 mcp_disconnect 一个")
-        cmdline = " ".join([str((spec or {}).get("command", ""))] +
+        cmdline = " ".join([str((spec or {}).get("command") or "")] +
                            [str(a) for a in ((spec or {}).get("args") or [])]).lower()
         hit = next((h for h in _HEAVY_HINTS if h in cmdline), None)
         if hit and not allow_heavy:
@@ -479,12 +493,17 @@ def connect(name: str, spec: dict = None, timeout: float = DEFAULT_TIMEOUT,
         if srv is not None:
             srv.stop()
         cfg = dict(spec or load_specs().get(name) or {})
+        url = str(cfg.get("url") or "").strip()
         command = cfg.get("command")
-        if not command:
-            raise MCPError(f"没有 '{name}' 的配置：请用 mcp_connect 传 command/args，"
-                           f"或写进 servers.json。")
+        if not url and not command:
+            raise MCPError(f"没有 '{name}' 的配置：请用 mcp_connect 传 url（远程 server）"
+                           f"或 command/args（本地子进程），或写进 servers.json。")
         resource_guard("connect", name, cfg, allow_heavy)
-        srv = MCPServer(name, command, cfg.get("args"), cfg.get("env"), cfg.get("cwd"))
+        if url:
+            from mcp_http import MCPHttpServer  # 延迟导入：mcp_http 反向依赖本模块
+            srv = MCPHttpServer(name, url, cfg.get("headers"), timeout=timeout)
+        else:
+            srv = MCPServer(name, command, cfg.get("args"), cfg.get("env"), cfg.get("cwd"))
         _SERVERS[name] = srv
         try:
             srv.start(timeout=timeout)

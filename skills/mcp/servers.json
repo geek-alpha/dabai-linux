@@ -1,5 +1,5 @@
 {
-  "_comment": "MCP server 配置：name -> {command, args, env, cwd}。mcp_connect 传 command 会自动写这里；下划线开头的键只是注释，不算 server。",
+  "_comment": "MCP server 配置：name -> {url, headers} 或 {command, args, env, cwd}。远程 server 写 url（Streamable HTTP），本地 server 写 command；mcp_connect 传过配置会自动写这里；下划线开头的键只是注释，不算 server。",
   "fs": {
     "command": "npx",
     "args": [
@@ -15,5 +15,6 @@
       "@modelcontextprotocol/server-github"
     ]
   },
+  "_url_example": "远程 server 这样写：{\"url\": \"https://host/mcp\", \"headers\": {\"Authorization\": \"Bearer xxx\"}}；不带 headers 就只写 url。",
   "_removed_playwright": "已撤：浏览器内核在 1GB 的 Pi 3 上会烧到硬关机（实测空载 63°C，chromium 一开直冲 85°C）。读网页用 read_web。真要临时用就现场传 command/args + allow_heavy=true，用完立刻 mcp_disconnect。"
 }

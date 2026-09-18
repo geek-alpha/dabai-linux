@@ -3,14 +3,16 @@
 接第三方 MCP server。**核心取舍**：server 的工具不占常驻工具表 —— 先 connect 拉清单，再 call。
 不用的 server 不占进程、不占上下文。
 
+两种连接：远程传 `url`（Streamable HTTP，不占本机资源）；本地传 `command`（拉子进程）。
+
 ## 工具
 
 | 工具 | 作用 |
 |---|---|
 | `mcp_servers` | 列已配置 server + 运行状态（零成本，不连接） |
-| `mcp_connect(server, command?, args?, env?, cwd?, allow_heavy?)` | 拉起子进程、initialize、返回工具清单；传 command 且**连接成功后**才存进 `servers.json` |
+| `mcp_connect(server, url?, headers?, command?, args?, env?, cwd?, allow_heavy?)` | 连接、initialize、返回工具清单。传 `url` 走 HTTP，传 `command` 拉子进程；**连接成功后**才存进 `servers.json` |
 | `mcp_call(server, tool, arguments)` | 调用工具；未连接会自动连接 |
-| `mcp_disconnect(server)` | 杀子进程；`server="all"` 杀全部 |
+| `mcp_disconnect(server)` | 断开（本地杀进程组、远程清会话）；`server="all"` 断全部 |
 
 ## 标准流程
 
@@ -21,6 +23,24 @@
 3. mcp_call(server="fs", tool="read_file", arguments={"path":"/tmp/a.txt"})
 4. mcp_disconnect(server="all")                  # 用完就杀
 ```
+
+## 远程 server（Streamable HTTP）
+
+公共托管的 MCP 基本都是 URL 端点，传 `url` 就能接，不占本机内存和温度：
+
+```
+1. mcp_connect(server="xxx", url="https://host/mcp",
+     headers={"Authorization":"Bearer <key>"})     # 不要鉴权的省略 headers
+2. mcp_call(server="xxx", tool="...", arguments={...})
+3. mcp_disconnect(server="xxx")
+```
+
+实现（`mcp_http.py`）照 MCP 2025-03-26 规范：单端点 POST、Accept 同时含
+`application/json` 与 `text/event-stream`、服务端回的 `Mcp-Session-Id` 后续请求原样带回；
+响应是 JSON 或 SSE 两种都支持。
+
+**旧版 HTTP+SSE（2024-11-05 的 `/sse` 长连接）不支持** —— 那种端点回 405/406，报错里会点明。
+key 一律放 headers，别写进 URL 查询串（会进日志）。
 
 ## 资源闸门（硬拦截）
 
@@ -56,7 +76,8 @@
 ```json
 {
   "fs": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]},
-  "fetch": {"command": "python3", "args": ["-m", "mcp_server_fetch"], "env": {"HTTP_PROXY": "http://127.0.0.1:7890"}}
+  "fetch": {"command": "python3", "args": ["-m", "mcp_server_fetch"], "env": {"HTTP_PROXY": "http://127.0.0.1:7890"}},
+  "remote": {"url": "https://host/mcp", "headers": {"Authorization": "Bearer xxx"}}
 }
 ```
 
@@ -67,6 +88,7 @@
 - 日志：`skills/mcp/logs/<server>.stderr.log`
 - 连不上先手工跑一遍启动命令（`npx -y ...`），确认包能下、命令本身没问题
 - 协议自测：`python3 tools/mcp_selftest.py`（项目根；夹具 server 跑通 initialize/list/call/杀进程）
+- HTTP 自测：`python3 skills/mcp/tools/mcp_http_test.py`（本地假 server，验 JSON/SSE 两条响应路径、session 回传、401 提示）
 - 闸门自测：`python3 skills/mcp/tools/mcp_guard_test.py`（不启任何 server，只验阀值）
 - 孤儿自测：`python3 skills/mcp/tools/mcp_orphan_test.py`（假 server 验 pid 对账）
 - **热重载会留孤儿**：改 `skills/mcp/*.py` 触发模块重载 → `_SERVERS` 字典清空，但子进程（独立
