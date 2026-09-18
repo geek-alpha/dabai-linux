@@ -44,21 +44,34 @@ classify("venv/bin/python")        -> local       永不写入
 
 ## 发布路径
 
-两道门，一道在脚本里，一道在 GitHub 上。
+推一个 `v*` tag 触发，打包与发布都在 GitHub 上跑完：
 
 ```
-build_release.py           打包：只取「跟踪 ∩ 代码」的文件
-   │                       可复现构建（时间戳钉在提交时间，同 commit 两次打包字节一致）
-   │                       产出 dabai-<ver>.tar.gz + .sha256 + MANIFEST.json
+git push origin v1.0.0     推 v* tag（或网页上手动 dispatch）
    ▼
-gitguard/safe-push.sh      八道既有闸门：干净树 → 三扫密钥 → git grep 独立复核
-   │                       → 硬雷文件未跟踪 → token → 建仓 → 推 → 推后自检
+.github/workflows/release.yml
+   ├─ build    paths.py --selftest → build_release.py --out dist
+   │           （含解包回验：sha256 全对、包内无受保护路径）
    ▼
-GitHub Actions             environment: release 的 required reviewers
-   │                       ★ 管理员必须在网页上点 Approve，作业才往下走
+   ├─ publish  environment: release 的 required reviewers
+   │           ★ 管理员必须在网页上点 Approve，作业才往下走
    ▼
-GitHub Release             tarball + sha256 成为节点可拉取的发行版
+   └─ gh release create        tarball + sha256 成为节点可拉取的发行版
+                               发布后自检：gh release view 核对资产名
 ```
+
+发一版：
+
+```bash
+# 1. 升版本号（改 VERSION，或 build_release.py --bump patch 自动升）
+# 2. 提交推送
+git add -A && git commit -m "..." && git push origin main
+# 3. 打 tag 推送 —— tag 名必须是 v<VERSION>
+git tag -a v1.0.0 -m "大白 v1.0.0" && git push origin v1.0.0
+```
+
+tag 名与清单版本不一致会被 CI 自己拦住（工作流里那条「确认 tag 与清单版本一致」），
+不用手工核对。产物由 CI 现场打包，本地 `dist/` 只是开发时的临时目录（已在 .gitignore）。
 
 **为什么最后一道闸放在 GitHub 上**：脚本闸门挡得住「推错东西」，挡不住「谁按下了推送」。
 而 `environment` 的 required reviewers 是 GitHub 自己强制的 —— 这是整套体系里唯一
@@ -67,6 +80,9 @@ GitHub Release             tarball + sha256 成为节点可拉取的发行版
 启用方式（一次性，仓库网页上做）：
 `Settings → Environments → New environment → 名字填 release → 勾 Required reviewers → 选自己`。
 没配这个 environment 时工作流照跑，只是没人拦 —— 所以配了才算数。
+
+**刻意不做本地直发脚本**：多一条能上传资产的本地路径，就等于在这道门旁边开了个洞，
+发布这件事只能有一个实现。本地要验包，跑 `build_release.py` 看回验输出即可。
 
 ## 更新路径
 
@@ -127,22 +143,31 @@ sudo bash deploy/release/install-update.sh
 
 ## 已验证的证据
 
-`tests/test_release_update.py`，12 条，全过。测的不是「正常能跑通」，是**坏情况能不能挡住**：
+`tests/test_release_update.py`，23 条，全过。测的不是「正常能跑通」，是**坏情况能不能挡住**：
 
 ```
 test_floor_matches_paths                     内嵌地板与 paths.py 不漂移
+test_packed_assets_match                     受管资产白名单两份不漂移
+test_packed_assets_pass_floor                点名的放行、没点名的仍拦住
 test_validators_agree                        两份清单校验器判定一致
-test_hidden_file_keeps_leading_dot           .gitattributes 不会被吃成 gitattributes
-test_forbidden_covers_ancestors_and_future_paths
 test_update_writes_code_and_spares_experience 代码更新了，5 个经历文件字节未变
-test_dry_run_writes_nothing
 test_refuses_package_declaring_protected_path 投毒包 → 整包作废，且无文件被改
-test_refuses_tampered_file                    包内被改 → 拒绝
-test_refuses_wrong_package_hash               包哈希不符 → 拒绝
-test_refuses_downgrade_without_force
+test_refuses_tampered_file                   包内被改 → 拒绝
+test_refuses_wrong_package_hash              包哈希不符 → 拒绝
 test_rollback_restores_previous_and_spares_experience
-test_real_repo_package_has_no_protected_path  真仓库打包：包内无受保护路径
+test_real_repo_package_has_no_protected_path 真仓库打包：包内无受保护路径
+test_real_repo_has_no_import_gaps            包内 import 的本地模块都进了包
+test_real_repo_has_no_frontend_gaps          前端引用的本地资源都进了包
+test_vendor_is_packaged                      web/vendor 必须在包里（否则 3D 前端 404）
+test_release_sha256_is_file_hash_and_updater_accepts_it
+                                             真产物喂真更新器：.sha256 语义两端对得上
 ```
+
+最后一条是补一个真实事故的：`build_release.py` 曾把 gzip 前的 tar 内容哈希写进 `.sha256`，
+而 `update.py` 下载后算的是文件哈希 —— 两个不同的对象，永远不可能相等。症状极隐蔽：
+打包成功、解包回验通过、测试套全绿，发布后每台机器都在第一步「包哈希不符」拒绝更新。
+原因是测试夹具自己用的就是文件哈希，全绿恰恰掩盖了生产端的错 —— 两端各自自洽，
+接口对不上。现在这条断言拿真产物喂真更新器，谁改回去它立刻红。
 
 打包器自身还有解包回验：解出来逐个核对 sha256，并断言包内不存在任何受保护路径。
 

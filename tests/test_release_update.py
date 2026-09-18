@@ -454,3 +454,44 @@ def test_vendor_is_packaged():
     hard, soft = build_mod.frontend_gap(REPO, pairs)
     assert not [g for g in hard + soft if "web/vendor" in g]
 
+
+
+
+def test_release_sha256_is_file_hash_and_updater_accepts_it(tmp_path):
+    """真产物喂真更新器：.sha256 语义两端必须对得上。
+
+    这条曾经真的错了：build_release 把 gzip 前的 tar 内容哈希写进 .sha256，
+    而 update.py 下载后算的是文件哈希 —— 两个不同的对象，永远不可能相等。
+    症状极隐蔽：打包成功、解包回验通过、测试套全绿，发布后每台机器都在第一步
+    「包哈希不符」拒绝更新。原因是测试夹具自己用的就是文件哈希，全绿恰恰掩盖了
+    生产端的错 —— 两端各自自洽，接口对不上。
+    """
+    out = tmp_path / "dist"
+    p = subprocess.run(
+        [sys.executable, str(REL / "build_release.py"), "--out", str(out)],
+        cwd=str(REPO), capture_output=True, text=True, timeout=900)
+    assert p.returncode == 0, p.stdout + p.stderr
+
+    version = build_mod.read_version(REPO)
+    tar = out / f"dabai-{version}.tar.gz"
+    sha_file = out / f"dabai-{version}.tar.gz.sha256"
+    assert tar.is_file() and sha_file.is_file(), sorted(x.name for x in out.iterdir())
+
+    want = update.parse_sha256_file(sha_file.read_text(encoding="utf-8"))
+    file_hash = hashlib.sha256(tar.read_bytes()).hexdigest()
+    assert want, ".sha256 里读不出合法哈希"
+    assert want == file_hash, (
+        f".sha256 里不是 .tar.gz 文件哈希：文件写 {want[:16]}…，"
+        f"更新器算的是 {file_hash[:16]}… —— 每台机器都会在第一步拒绝更新")
+
+    with gzip.open(tar, "rb") as gz:
+        content_hash = hashlib.sha256(gz.read()).hexdigest()
+    assert content_hash != file_hash, "夹具假设坏了：这两个哈希本该不同"
+    assert want != content_hash, "又写回 gzip 前的内容哈希了"
+
+    # 光靠上面的算术不够：让消费端自己说这包能过校验
+    root = make_instance(tmp_path, version="0.9.0")
+    rc, o = run_update(["--root", str(root), "--state", str(tmp_path / "state"),
+                        "--local-tarball", str(tar), "--dry-run"], timeout=600)
+    assert rc == 0, o
+    assert "包哈希校验通过" in o, o

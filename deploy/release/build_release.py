@@ -351,16 +351,19 @@ def main() -> int:
     out_dir = Path(args.out) if args.out else HERE / "dist"
     tar_path = out_dir / f"dabai-{version}.tar.gz"
     digest = build_tar(pairs, man, tar_path, epoch=epoch)
+    # 写 .tar.gz 文件本身的哈希，不是 gzip 前的 tar 内容哈希：更新器
+    # （update.py:754）下载后算的是文件哈希，写内容哈希会让每台机器都拒绝更新。
+    file_sha = M.sha256_file(tar_path)
     (out_dir / f"dabai-{version}.tar.gz.sha256").write_text(
-        f"{digest}  dabai-{version}.tar.gz\n", encoding="utf-8")
+        f"{file_sha}  dabai-{version}.tar.gz\n", encoding="utf-8")
     M.write_manifest(man, out_dir / f"dabai-{version}.MANIFEST.json")
     (out_dir / "MANIFEST.json").write_text(
         json.dumps(man, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
 
     size_mb = tar_path.stat().st_size / 1048576
     print(f"✔ 已打包 {tar_path.name}  {man['file_count']} 个文件  {size_mb:.2f} MB")
-    print(f"  内容 sha256（gzip 前）：{digest[:16]}…")
-    print(f"  包文件 sha256：{M.sha256_file(tar_path)[:16]}…")
+    print(f"  包文件 sha256：{file_sha[:16]}…（已写入 .sha256，更新器按此校验）")
+    print(f"  内容 sha256（gzip 前）：{digest[:16]}…（可复现性指标，不进 .sha256）")
     print(f"  排除（跟踪文件中的）：经历 {len(excluded[P.EXPERIENCE])} 个 / 本机私有 {len(excluded[P.LOCAL])} 个")
     print("  经历文件已不在跟踪面内，本就不在包的取材范围内 —— 这是结构性保证，不靠排除表")
     if missing:
