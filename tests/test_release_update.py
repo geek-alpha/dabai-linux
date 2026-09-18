@@ -41,6 +41,7 @@ def _load(name: str, path: Path):
 update = _load("dabai_update_mod", REL / "update.py")
 paths = _load("dabai_paths_mod", REL / "paths.py")
 manifest_mod = _load("dabai_manifest_mod", REL / "manifest.py")
+build_mod = _load("dabai_build_mod", REL / "build_release.py")
 
 
 # ── 测试夹具 ─────────────────────────────────────────────────────────────
@@ -302,3 +303,36 @@ def test_real_repo_package_has_no_protected_path(tmp_path):
         assert rel not in names, f"经历文件进了包：{rel}"
     bad = [n for n in names if paths.is_protected(n) and n != "MANIFEST.json"]
     assert not bad, f"包内出现受保护路径：{bad[:5]}"
+
+
+# ── import 完整性：包内代码 import 的本地模块必须在包里 ──────────────────
+def test_import_gap_is_detected(tmp_path):
+    """模块没进包时必须报出来。
+
+    这正是 auth_core / peer_mesh / turn_quota 那次事故的形态：server.py 逐个
+    import 它们，三个文件却从未入仓，打包器一声不响。
+    """
+    (tmp_path / "server.py").write_text("import auth_core\nimport json\n", encoding="utf-8")
+    (tmp_path / "auth_core.py").write_text("x = 1\n", encoding="utf-8")
+    pairs = [("server.py", tmp_path / "server.py")]
+    gaps = build_mod.local_import_gaps(tmp_path, pairs)
+    assert gaps, "缺模块竟然没报出来"
+    assert "auth_core" in gaps[0]
+
+    pairs.append(("auth_core.py", tmp_path / "auth_core.py"))
+    assert build_mod.local_import_gaps(tmp_path, pairs) == []
+
+
+def test_third_party_imports_are_not_flagged(tmp_path):
+    """第三方库不能被误报成缺口 —— 否则这条检查天天红，等于没有。"""
+    (tmp_path / "server.py").write_text(
+        "import os\nimport fastapi\nfrom pathlib import Path\n", encoding="utf-8")
+    pairs = [("server.py", tmp_path / "server.py")]
+    assert build_mod.local_import_gaps(tmp_path, pairs) == []
+
+
+def test_real_repo_has_no_import_gaps():
+    """真仓库不许有缺口：以后新增模块忘了 git add，这条测试会红。"""
+    pairs, _missing, _excluded = build_mod.collect(REPO)
+    gaps = build_mod.local_import_gaps(REPO, pairs)
+    assert not gaps, "有模块被 import 但没入仓：\n" + "\n".join(gaps)

@@ -104,6 +104,38 @@ def collect(root: Path) -> Tuple[List[Tuple[str, Path]], List[str], Dict[str, Li
     return include, missing, excluded
 
 
+def local_import_gaps(root: Path, pairs: List[Tuple[str, Path]]) -> List[str]:
+    """包内代码 import 的本地模块，有没有没进包的。
+
+    包 = git 跟踪的文件集。auth_core / peer_mesh / turn_quota 被 server.py:44/47/48
+    逐个 import，却从未入仓 —— 打包器一声不响，另两台装上直接起不来。
+    这个检查让缺口在打包时就炸，而不是在别人机器上。
+    """
+    import re
+    packaged = {rel for rel, _ in pairs}
+    gaps: List[str] = []
+    seen = set()
+    for rel, abs_path in pairs:
+        if not rel.endswith(".py"):
+            continue
+        try:
+            text = abs_path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        for mod in re.findall(r"^\s*(?:import|from)\s+([A-Za-z_]\w*)", text, re.M):
+            if (rel, mod) in seen:
+                continue
+            seen.add((rel, mod))
+            if f"{mod}.py" in packaged or f"{mod}/__init__.py" in packaged:
+                continue
+            # 磁盘上确实有这个名字的本地模块，但它不在包里 —— 缺口
+            if (root / f"{mod}.py").is_file():
+                gaps.append(f"{rel} → import {mod}，但 {mod}.py 不在包内（未入仓）")
+            elif (root / mod / "__init__.py").is_file():
+                gaps.append(f"{rel} → import {mod}，但 {mod}/ 不在包内（未入仓）")
+    return sorted(set(gaps))
+
+
 def build_tar(pairs: List[Tuple[str, Path]], manifest: Dict, out: Path, epoch: int = 0) -> str:
     """可复现 tar.gz。返回包内容的 sha256。所有时间戳钉在 epoch（提交时间）上。"""
     raw = io.BytesIO()
@@ -189,6 +221,16 @@ def main() -> int:
     if not pairs:
         print("✘ 没有任何可打包的代码文件")
         return 1
+
+    gaps = local_import_gaps(root, pairs)
+    if gaps:
+        print(f"✘ 有 {len(gaps)} 处 import 指向未入仓的本地模块（装上会起不来）：")
+        for g in gaps[:20]:
+            print("   ", g)
+        if not args.list:
+            print("   拒绝打包。先 git add 补进仓，或确认该模块本就该在仓外。")
+            return 1
+        print("   （--list 只列清单，故不拦截）")
 
     if args.list:
         print(f"版本 {version}：{len(pairs)} 个文件会进包")
