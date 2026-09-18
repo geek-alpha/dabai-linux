@@ -1,0 +1,28 @@
+{
+  "name": "hotmod",
+  "title": "服务内模块热重载（免重启）",
+  "version": "1.0.0",
+  "description": "把 tools/ 等非热重载目录的 Python 模块从服务进程 sys.modules 里逐出，改完源码即刻生效，不必重启 myservice（重启会掐断在途对话）。",
+  "author": "dabai",
+  "enabled": true,
+  "disclosure": "on_demand",
+  "prompt": "【技能 服务内热重载】改了 tools/ 下的模块源码，服务进程不会重新导入（根目录 *.py 与 harness/*.py 的改动才触发整进程重启，会掐断在途对话）。用 hotmod_reload 把 targets.json 列出的目录从 sys.modules 逐出，下一次 import 即读到新代码。",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "hotmod_reload",
+        "description": "把指定目录下的 Python 模块从服务进程 sys.modules 里逐出（并清 __pycache__），让下一次 import 读到磁盘上的新代码。免重启生效。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "dirs": {
+              "type": "string",
+              "description": "逗号分隔的目录（相对项目根，如 tools/longrun）；留空则用 targets.json 清单"
+            }
+          }
+        }
+      }
+    }
+  ]
+}

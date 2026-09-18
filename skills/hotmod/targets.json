@@ -1,0 +1,4 @@
+{
+  "dirs": ["tools/longrun"],
+  "why": "server.py 用函数内 import 读这些模块，sys.modules 命中即返回，改完源码不逐出就永远跑旧代码。实测 2026-09-13：tools/longrun/status_view.py 08:45 改完，09:00 /api/tasks 仍返回旧标题「第 9 轮 · biz-negotiate」，而同刻本地直接调 snapshot() 已是「第 10 轮进行中（已跑 1分12秒）」。"
+}

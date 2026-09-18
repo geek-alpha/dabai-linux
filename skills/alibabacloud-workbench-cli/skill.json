@@ -1,0 +1,10 @@
+{
+  "name": "alibabacloud-workbench-cli",
+  "title": "阿里云 Workbench CLI（ECS 远程运维）",
+  "version": "1.0.0",
+  "description": "管理无公网 IP 的阿里云 ECS：毫秒级远程命令执行（exec）、1GB 以内文件传输（upload/download，走 OSS 中转）、TCP 端口转发；支持 AK / StsToken / RamRoleArn / CredentialsCmd / CredentialsURI 五种认证，凭证存 ~/.workbench/config.json。",
+  "author": "aliyun",
+  "enabled": true,
+  "disclosure": "on_demand",
+  "prompt": "【技能 阿里云 Workbench CLI】用 workbench 命令行运维无公网 IP 的阿里云 ECS。核心：\n- exec：非交互毫秒级远程执行命令；upload/download：传文件（≤1GB，OSS 中转）；list：查实例列表；session/daemon：会话与守护进程管理。\n- 认证五模式：AK（默认）/ StsToken / RamRoleArn（STS 角色，自动刷新）/ CredentialsCmd（外部命令出凭证）/ CredentialsURI（HTTP 端点出凭证）；凭证直接写 ~/.workbench/config.json（chmod 600），非交互。\n- 会话生命周期 OPEN → RECONNECTING → BROKEN → CLOSED，空闲 30min 自动关闭。\n- 完整命令参考见 SKILL.md，需要时 skill_help(\"alibabacloud-workbench-cli\") 读全文。"
+}

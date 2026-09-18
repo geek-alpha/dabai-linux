@@ -1,0 +1,116 @@
+{
+  "name": "peer",
+  "title": "大白联邦（跨机通信）",
+  "version": "1.0.0",
+  "description": "跨机大白联邦：peer_list 点名（在线/负载/能否接电话）、peer_call 打电话当场等回话、peer_say 异步留言、peer_inbox 读信、peer_state 问状态。共享密钥走域名直连。",
+  "author": "dabai",
+  "enabled": true,
+  "disclosure": "on_demand",
+  "prompt": "【技能 大白联邦】树莓派/阿里云/WSL 上跑着多个大白实例，它们是一个联邦。想知道同伴在不在、在忙什么、能不能接电话用 peer_list；要同伴当场回话（实时对话、问它状态、让它表态）用 peer_call，它几秒内就答；只是留个话让对方下次醒来看到用 peer_say；读自己收到的消息用 peer_inbox；只看某个实例的实时负载/内存/温度用 peer_state。用户问『阿里云那台怎么样』『别的你在干嘛』『让 WSL 上的你看看』『问问另一台』时走这里——要它答话就用 peer_call。",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "peer_list",
+        "description": "联邦点名：列出所有同伴实例，标注在线/离线，在线的给出负载、内存、温度、在线时长，以及「可接电话」标记。并发探测，最慢一个超时也只要几秒。",
+        "parameters": {
+          "type": "object",
+          "properties": {},
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "peer_call",
+        "description": "打电话：给同伴发一句并当场等它回话（默认等 90 秒）。对方耳朵开着时会秒级回，回的是它自己的判断和实时状态。对方没接会明确返回未接——消息仍在它收件箱里，不是丢了。要实时对话、要对方当场表态就用这个。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "node": {
+              "type": "string",
+              "description": "目标实例名（rpi / aliyun / wsl），不确定就先 peer_list"
+            },
+            "text": {
+              "type": "string",
+              "description": "要说的话。问清楚的问题对方才答得上，别只发「在吗」。"
+            },
+            "wait": {
+              "type": "integer",
+              "description": "最多等多少秒（默认 90）"
+            }
+          },
+          "required": [
+            "node",
+            "text"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "peer_say",
+        "description": "给另一台机器上的大白留一句话。消息落到对方的收件箱，它下次醒来能看到——这是异步留言，不是实时对话；要它当场回话用 peer_call。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "node": {
+              "type": "string",
+              "description": "目标实例名（rpi / aliyun / wsl），不确定就先 peer_list"
+            },
+            "text": {
+              "type": "string",
+              "description": "要说的话。写清楚来意和期望对方做什么，对方没有上下文。"
+            }
+          },
+          "required": [
+            "node",
+            "text"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "peer_inbox",
+        "description": "读本实例收到的跨机消息（其他大白发来的）。默认读完标记已读，避免下次重复看到。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "keep_unread": {
+              "type": "boolean",
+              "description": "true = 只读不标记已读（默认 false，读完推进游标）"
+            },
+            "limit": {
+              "type": "integer",
+              "description": "最多返回几条（默认 20）"
+            }
+          },
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "peer_state",
+        "description": "问某个实例的实时状态：负载、内存、温度、开机时长、身份。比 peer_list 快（只探一个）。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "node": {
+              "type": "string",
+              "description": "目标实例名（rpi / aliyun / wsl）"
+            }
+          },
+          "required": [
+            "node"
+          ]
+        }
+      }
+    }
+  ]
+}
