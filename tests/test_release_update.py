@@ -16,11 +16,13 @@
 
 from __future__ import annotations
 
+import fnmatch
 import gzip
 import hashlib
 import importlib.util
 import io
 import json
+import re
 import subprocess
 import sys
 import tarfile
@@ -495,3 +497,27 @@ def test_release_sha256_is_file_hash_and_updater_accepts_it(tmp_path):
                         "--local-tarball", str(tar), "--dry-run"], timeout=600)
     assert rc == 0, o
     assert "包哈希校验通过" in o, o
+
+
+# ── workflow 自身的一致性：上传的产物要覆盖它后续要读的文件 ──────────────
+def test_workflow_artifact_covers_every_dist_file_it_reads():
+    """release.yml 上传的产物必须覆盖它后续要读的 dist 文件。
+
+    首次真实发布就是这么挂的：upload-artifact 只收 dist/dabai-*，而 publish 读
+    dist/MANIFEST.json（不带版本前缀，不匹配该模式）→ FileNotFoundError，
+    release 建不出来，而 build job 全绿、日志里一点征兆都没有。
+    这类「两个步骤各自都对、接口对不上」的洞本地跑不到，只能靠静态断言。
+    """
+    yml = (REPO / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    # 取 upload-artifact 块（name → if-no-files-found 之间），里面的 dist/... 就是上传范围
+    m = re.search(r"name:[ \t]*dabai-package(.*?)if-no-files-found", yml, re.S)
+    assert m, "读不出 upload-artifact 块"
+    pats = re.findall(r"dist/[A-Za-z0-9_.*-]+", m.group(1))
+    assert pats, "上传范围是空的"
+
+    refs = set(re.findall(r"dist/[A-Za-z0-9_.*-]+", yml))
+    assert refs, "workflow 里没引用任何 dist 文件？"
+    for r in sorted(refs):
+        assert any(fnmatch.fnmatch(r, p) for p in pats), (
+            f"{r} 被 workflow 引用，却不在 upload-artifact 的上传范围 {pats} 内 —— "
+            "发布时会 FileNotFoundError")

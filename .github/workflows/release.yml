@@ -51,7 +51,11 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: dabai-package
-          path: dist/dabai-*
+          # 必须覆盖 publish 步骤后续要读的每个文件：它读的是不带版本前缀的
+          # MANIFEST.json，而带通配的那个模式匹配不到这个名字（首次真实发布就挂在这里）。
+          path: |
+            dist/dabai-*
+            dist/MANIFEST.json
           if-no-files-found: error
           retention-days: 30
 
