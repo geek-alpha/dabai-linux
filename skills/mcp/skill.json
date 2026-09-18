@@ -1,18 +1,18 @@
 {
   "name": "mcp",
   "title": "MCP 接入（第三方 server，按需拉起）",
-  "version": "1.1.0",
-  "description": "接第三方 MCP server：按需拉起子进程、拉工具清单、调用、不用即杀。server 的工具不进常驻工具表，不付 schema 税。",
+  "version": "1.2.0",
+  "description": "接第三方 MCP server：远程传 url（Streamable HTTP）、本地传 command 拉子进程，拉工具清单、调用、不用即断。server 的工具不进常驻工具表，不付 schema 税。",
   "author": "dabai",
   "enabled": true,
   "disclosure": "on_demand",
-  "prompt": "【技能 MCP】接第三方 MCP server：mcp_servers 看清单/运行状态 → mcp_connect(server, command, args) 拉起并拿工具清单 → mcp_call(server, tool, arguments) 调用 → mcp_disconnect(server=\"all\") 杀进程。server 的工具不进常驻工具表，必须先 connect 看清单再 call。【资源闸门】连接与调用前会查温度和可用内存，超线直接拒（硬拦截，不是建议）；命令含浏览器内核（chromium/playwright 等）需显式 allow_heavy=true 才放行——这台是 1GB 的 Pi 3，浏览器会把它烧到硬关机。用完立即 mcp_disconnect，别常驻。",
+  "prompt": "【技能 MCP】接第三方 MCP server：mcp_servers 看清单/运行状态 → mcp_connect(server, url|command, args) 连接并拿工具清单 → mcp_call(server, tool, arguments) 调用 → mcp_disconnect(server=\"all\") 断开。远程 server 传 url（Streamable HTTP）+ 需要时 headers 带 key；本地 server 传 command/args 拉子进程。server 的工具不进常驻工具表，必须先 connect 看清单再 call。【资源闸门】连接与调用前会查温度和可用内存，超线直接拒（硬拦截，不是建议）；命令含浏览器内核（chromium/playwright 等）需显式 allow_heavy=true 才放行——这台是 1GB 的 Pi 3，浏览器会把它烧到硬关机。用完立即 mcp_disconnect，别常驻。",
   "tools": [
     {
       "type": "function",
       "function": {
         "name": "mcp_servers",
-        "description": "列出已配置的 MCP server 与运行状态（进程是否活着、工具数、启动命令）。不需要连接，零成本。",
+        "description": "列出已配置的 MCP server 与运行状态（是否活着、工具数、启动命令或 url）。不需要连接，零成本。",
         "parameters": {
           "type": "object",
           "properties": {}
@@ -23,13 +23,21 @@
       "type": "function",
       "function": {
         "name": "mcp_connect",
-        "description": "拉起（或复用）一个 MCP server 子进程并返回它的工具清单。传 command/args 会持久化到 servers.json，下次直接按名字连。",
+        "description": "连接（或复用）一个 MCP server 并返回它的工具清单。远程 server 传 url（Streamable HTTP 端点）；本地 server 传 command/args 拉子进程。传了的配置会持久化到 servers.json，下次直接按名字连。",
         "parameters": {
           "type": "object",
           "properties": {
             "server": {
               "type": "string",
               "description": "给这个 server 起的短名字，如 'fs'、'github'"
+            },
+            "url": {
+              "type": "string",
+              "description": "远程 MCP 端点（可选），如 https://host/mcp。与 command 二选一，传了就走 HTTP 不走子进程"
+            },
+            "headers": {
+              "type": "object",
+              "description": "HTTP 请求头（可选，仅 url 时用），如 {\"Authorization\":\"Bearer xxx\"}"
             },
             "command": {
               "type": "string",
@@ -101,7 +109,7 @@
       "type": "function",
       "function": {
         "name": "mcp_disconnect",
-        "description": "断开并杀掉 MCP server 子进程（server=\"all\" 杀全部）。用完就杀，不留常驻进程。",
+        "description": "断开 MCP server（server=\"all\" 断全部）。本地子进程会被杀，远程连接只清会话。用完就断，别常驻。",
         "parameters": {
           "type": "object",
           "properties": {

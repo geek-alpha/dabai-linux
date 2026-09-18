@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
-"""mcp 技能实现 —— 按需拉起 MCP server，不用即杀。
+"""mcp 技能实现 —— 按需连接 MCP server，不用即断。
+
+连接两种：远程 url（Streamable HTTP）或本地 command（子进程）。
 
 元工具只有 4 个（servers/connect/call/disconnect），server 自己的工具不占常驻 schema：
 先 connect 拿清单，再 call 调。这是「技能当闸门、MCP 当后端」的落地方式。
@@ -75,13 +77,16 @@ def do_servers(args: dict) -> str:
     specs = mc.load_specs()
     live = {s.name: s for s in mc.running()}
     if not specs and not live:
-        return ("没有已配置的 MCP server。用 mcp_connect 传 command/args 现场拉起一个，"
+        return ("没有已配置的 MCP server。用 mcp_connect 传 url 或 command 现场接一个，"
                 "例如：mcp_connect(server=\"fs\", command=\"npx\", "
-                "args=[\"-y\",\"@modelcontextprotocol/server-filesystem\",\"/tmp\"])")
+                "args=[\"-y\",\"@modelcontextprotocol/server-filesystem\",\"/tmp\"])；"
+                "远程的：mcp_connect(server=\"xxx\", url=\"https://host/mcp\", "
+                "headers={\"Authorization\":\"Bearer ...\"})")
     lines = []
     for name in sorted(set(specs) | set(live)):
         spec = specs.get(name) or {}
-        cmd = " ".join([str(spec.get("command", "?"))] + [str(a) for a in (spec.get("args") or [])])
+        cmd = (f"URL {spec['url']}" if spec.get("url") else
+               " ".join([str(spec.get("command", "?"))] + [str(a) for a in (spec.get("args") or [])]))
         if name in live:
             srv = live[name]
             n = len(srv.tools) if srv.tools else "未拉取"
@@ -105,7 +110,11 @@ def do_connect(args: dict) -> str:
     if not name:
         return "缺少 server 参数（给这个连接起个短名字，如 'fs'）。"
     spec = {}
-    if args.get("command"):
+    if args.get("url"):
+        spec = {"url": str(args["url"]).strip()}
+        if args.get("headers"):
+            spec["headers"] = _as_dict(args["headers"])
+    elif args.get("command"):
         spec = {
             "command": str(args["command"]).strip(),
             "args": _as_list(args.get("args")),
@@ -172,8 +181,9 @@ HANDLERS = {
 
 PROMPT = (
     "【技能 MCP】接第三方 MCP server：mcp_servers 看清单/运行状态 → "
-    "mcp_connect(server, command, args) 拉起并拿工具清单 → "
-    "mcp_call(server, tool, arguments) 调用 → mcp_disconnect(server=\"all\") 杀进程。"
+    "mcp_connect(server, url|command, args) 连接并拿工具清单 → "
+    "mcp_call(server, tool, arguments) 调用 → mcp_disconnect(server=\"all\") 断开。"
+    "远程 server 传 url（Streamable HTTP）+ 需要时 headers 带 key；本地 server 传 command/args 拉子进程。"
     "server 的工具不进常驻工具表，必须先 connect 看清单再 call。"
     "【资源闸门】连接与调用前会查温度和可用内存，超线直接拒绝（这是硬拦截，不是建议）；"
     "命令里带浏览器内核（chromium/playwright 等）需显式 allow_heavy=true 才放行——"
