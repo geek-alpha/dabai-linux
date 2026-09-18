@@ -19,7 +19,6 @@ FILES = [
     "codex_config.json",
     "stt_config.json",
     "tts_config.json",
-    "cards.json",
     "character_cards.json",
 ]
 

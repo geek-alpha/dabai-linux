@@ -314,7 +314,7 @@ def _selftest() -> int:
         ("harness/core.py", CODE),
         ("deploy/release/update.py", CODE),
         ("skills/peer/SKILL.md", CODE),
-        ("cards.example.json", CODE),          # 种子是基因组，属于代码
+        ("character_cards.example.json", CODE),  # 种子是基因组，属于代码
         # 经历
         ("conviction.json", EXPERIENCE),
         ("long_horizon.json", EXPERIENCE),
