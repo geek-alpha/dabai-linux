@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 
@@ -52,7 +53,8 @@ NOTICE_MAX_SHOWS = 2
 INSTRUCTIONS = (
     "【Plan Mode（只规划不动手）】\n"
     "你现在处于 Plan Mode，直到用户明确让你退出。用户在这期间说「去做/直接改」"
-    "只算「把执行也规划清楚」，不是开工信号。\n"
+    "只算「把执行也规划清楚」，不是开工信号；但系统提示里出现「闸门已解除」时不适用——"
+    "那是用户已批准执行，直接开工，不要再规划。\n"
     "三条硬约束（执行前闸门强制，绕不过去）：\n"
     "1. 只读探索，不做改动——写文件/改代码/跑有副作用的命令会被直接拒；\n"
     "2. 先探索再提问——能从代码/配置/系统里查到的事实绝不许拿去问用户；"
@@ -207,6 +209,86 @@ def status_text() -> str:
         "\n此模式下只读探索放行，改动型工具被拒；收尾用 <proposed_plan> 块交出方案，"
         "要动手先 plan_mode(action=\"exit\")。"
     )
+
+
+# ---- 用户措辞自动进出 ----
+# 「把能力写进提示词」已被证明没用（经验库），所以进出必须挂在流程上：
+# agent.chat_stream 拿到真实用户输入后调 auto_react。
+# 进入是限制性的——误触发会拦掉用户想要的改动，所以只认高置信度措辞（动词必填）；
+# 退出是解除限制，误触发代价小，判定可以宽松。两者都只在对应状态下才判。
+_ENTER_RE = re.compile(
+    # 动词必填，名词前允许少量修饰词（「先给我出个重构方案」）。修饰段里不许出现
+    # 观察类动词：否则「先给我看看方案文件」会经「给」+「我看看」回溯命中，误拦改动。
+    r"先(给我|帮我|你)?(出|写|做|给|来|拟)(一份|一个|个)?(?:(?!看|查|问|说|找|读)[^\s，,。.]){0,8}?(方案|计划|规划|设计|草案)"
+    r"|先别(动手|动|改|写代码)"
+    r"|(先|暂)不要(动手|动|改)"
+    r"|别(动手|改代码)"
+    r"|先想清楚|想清楚再(动手|改|做)"
+    r"|只(要|出|给)(方案|规划|计划)"
+    r"|先规划|先做规划|先设计"
+)
+_EXIT_RE = re.compile(
+    r"批准|同意(执行|方案|开工|动手)|可以(执行|开工|动手)"
+    r"|开始执行|执行方案"
+    r"|按(这个|该|上述)?(方案)?(来|做|执行|干|办)"
+    r"|开始(改|做|干|动手|写)|动手吧|开工|执行吧|干吧|去做吧|改吧"
+    r"|go ahead|proceed|execute it",
+    re.IGNORECASE,
+)
+# 自动进入的停留上限：用户走开时不该让改动型工具被拦两小时。
+AUTO_TTL_MINUTES = 45
+
+
+def detect_intent(text: str) -> str | None:
+    """从用户原话判定该自动进入还是退出；判不出返回 None。
+
+    只在对应状态下判：没进时「开始执行」不该触发任何动作，进了才当开工信号。
+    """
+    t = " ".join(str(text or "").split())
+    if not t:
+        return None
+    if is_active():
+        return "exit" if _EXIT_RE.search(t) else None
+    return "enter" if _ENTER_RE.search(t) else None
+
+
+def exit_by_user() -> str:
+    """用户明确要求开工：退出并留一次性提示。
+
+    与 leave() 的区别在提示：模型还在同一上下文里，不知道闸门已开就会继续按只读办事。
+    """
+    with _lock:
+        data = _load()
+        uid = _uid()
+        cur = data.get(uid) or {}
+        if not cur.get("active"):
+            return "当前本来就不在 Plan Mode。"
+        cur["active"] = False
+        cur["notice"] = (
+            "用户已批准/要求开工，Plan Mode 闸门已解除——改动型工具现在可用，按交出的方案执行。"
+        )
+        data[uid] = cur
+        _save(data)
+    return "已退出 Plan Mode。"
+
+
+def auto_react(text: str) -> str | None:
+    """按用户原话自动进出，返回给用户看的一句话（未触发返回 None）。
+
+    调用方负责把这句透出到对话流：静默改状态会让用户以为工具坏了。
+    """
+    act = detect_intent(text)
+    if act == "enter":
+        topic = " ".join(str(text or "").split())[:60]
+        enter(topic, AUTO_TTL_MINUTES)
+        return (
+            f"【已进入 Plan Mode】你要求先出方案，我先只做只读探索、不动任何东西"
+            f"（{AUTO_TTL_MINUTES} 分钟无操作自动退出）。想直接开工说一句「批准/开始执行」即可。"
+        )
+    if act == "exit":
+        exit_by_user()
+        return "【已退出 Plan Mode】开工，改动型工具恢复可用。"
+    return None
 
 
 def _read_only(tool_name: str) -> bool:

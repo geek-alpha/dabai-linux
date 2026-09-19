@@ -170,3 +170,71 @@ def test_tool_enter_bad_ttl_falls_back(pm):
     r = IMPL._do_plan_mode({'action': 'enter', 'topic': 'x', 'ttl_minutes': 'abc'})
     assert '已进入' in r
     assert '120 分钟' in r
+
+
+# ---- 用户措辞自动进出（挂流程，不靠模型自觉判断）----
+# 这一组是本次接线的核心：光有 enter/leave 两个工具不算接线，模型不调就等于没做。
+
+@pytest.mark.parametrize('text', [
+    '先给我出个方案',
+    '先别动手，我还没想好',
+    '先不要改代码',
+    '帮我先写个方案',
+    '先想清楚再动手',
+    '只要方案，别改',
+])
+def test_auto_enter_on_plan_wording(pm, text):
+    note = PM.auto_react(text)
+    assert note and '已进入 Plan Mode' in note
+    assert PM.is_active() is True
+    # 状态改了不算数：闸门必须真拦得住（否则等于只是换了个说法）
+    assert PM.check('code_edit') is not None
+
+
+@pytest.mark.parametrize('text', [
+    '先看看代码里怎么写的',
+    '这个方案在哪',
+    '先给我看看方案文件',
+    '你好',
+])
+def test_auto_enter_not_triggered_by_plain_chat(pm, text):
+    """误触发会拦掉用户想要的改动，所以普通聊天一律不动状态。"""
+    assert PM.auto_react(text) is None
+    assert PM.is_active() is False
+    assert PM.check('code_edit') is None
+
+
+@pytest.mark.parametrize('text', ['批准', '开始执行', '按这个方案做', '动手吧', 'go ahead'])
+def test_auto_exit_on_go_wording(pm, text):
+    PM.enter('t')
+    note = PM.auto_react(text)
+    assert note and '已退出' in note
+    assert PM.is_active() is False
+    assert PM.check('code_edit') is None
+    # 模型还在同一上下文里，不知道闸门已开就会继续按只读办事
+    assert '闸门已解除' in PM.prompt_block()
+
+
+def test_auto_exit_not_triggered_when_inactive(pm):
+    """没进 Plan Mode 时「开始执行」不该动任何状态。"""
+    assert PM.auto_react('开始执行') is None
+    assert PM.is_active() is False
+
+
+def test_auto_enter_records_user_wording(pm):
+    PM.auto_react('先给我出个重构方案')
+    assert '重构' in PM.status_text()
+
+
+def test_auto_enter_ttl_shorter_than_manual(pm):
+    """自动进入的停留上限必须比手动短：用户走开时不该被拦两小时。"""
+    assert PM.AUTO_TTL_MINUTES < PM.TTL_SECONDS / 60
+    PM.auto_react('先给我出个方案')
+    assert f'距自动退出约 {PM.AUTO_TTL_MINUTES} 分钟' in PM.status_text()
+
+
+def test_auto_enter_notice_reaches_user(pm):
+    """静默改状态会让用户以为工具坏了：文案必须明说进了什么模式。"""
+    note = PM.auto_react('先给我出个方案')
+    assert '只读探索' in note and '自动退出' in note
+    assert '批准' in note  # 给出退出办法，不然用户不知道怎么恢复动手

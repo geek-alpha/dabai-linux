@@ -3917,6 +3917,19 @@ class AIAgent:
         resume = ctx.resume
         record_history = ctx.record_history
         proactive = ctx.proactive
+        # 用户措辞自动进出 Plan Mode：挂流程，不靠模型自觉判断——“能力只写进提示词”
+        # 已被证明没用（经验库）。只在真实用户输入上判定：续跑、主动消息、环境消息
+        # 都不是用户意图，对它们动闸门会拦掉本该执行的工作。
+        if resume is None and not proactive and msg_source == "chat" and message:
+            try:
+                import plan_mode as _pm
+
+                _pm_note = _pm.auto_react(str(message))
+            except Exception:
+                _pm_note = None
+            if _pm_note:
+                # 静默改状态会让用户以为工具坏了：进入/退出都明说一句
+                yield TextDelta(_pm_note + "\n")
         agen = self._chat_stream_normal(
             message, history=history, enable_tools=enable_tools,
             current_model=current_model,

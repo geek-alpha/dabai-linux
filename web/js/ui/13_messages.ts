@@ -246,7 +246,14 @@ export default (function init(App: AppKernel) {
       imgMarks.push(App.toMediaUrl ? App.toMediaUrl(String(p)) : String(p));
       return '';
     }).trim();
-    if (!text && !imgMarks.length) { el.textContent = ''; return; }
+    // <proposed_plan> 块（Plan Mode 交出的方案）剥成独立卡片，带批准/拒绝按钮。
+    // 流式期间标签未闭合就不匹配，等闭合再渲染——不需要额外的流结束钩子。
+    const planMarks: string[] = [];
+    text = text.replace(/<proposed_plan>([\s\S]*?)<\/proposed_plan>/g, (_m, p) => {
+      planMarks.push(String(p).trim());
+      return '';
+    }).trim();
+    if (!text && !imgMarks.length && !planMarks.length) { el.textContent = ''; return; }
     const urls = App.extractMediaUrls(text);
     let html = mdToHtml(text);
     // 媒体链接：把渲染出的普通链接升级成内联 <img>/<video>
@@ -302,6 +309,38 @@ export default (function init(App: AppKernel) {
       });
       el.prepend(box);
     }
+    // 方案卡片：挂在正文之后（方案通常在回复末尾）。
+    planMarks.forEach((body) => {
+      const card = document.createElement('div');
+      card.className = 'proposed-plan';
+      const head = document.createElement('div');
+      head.className = 'pp-head';
+      head.textContent = '📋 方案 · 待你决定';
+      const bodyEl = document.createElement('div');
+      bodyEl.className = 'pp-body';
+      bodyEl.innerHTML = mdToHtml(body);
+      const acts = document.createElement('div');
+      acts.className = 'pp-actions';
+      const mkBtn = (label: string, cls: string, say: string) => {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'pp-btn ' + cls;
+        b.textContent = label;
+        b.addEventListener('click', () => {
+          if (!App.sendText) return;
+          App.sendText(say);
+          // 投递一次就锁住：重复点击会把同一条指令发进上下文
+          acts.querySelectorAll('button').forEach((x) => { x.disabled = true; });
+        });
+        return b;
+      };
+      acts.appendChild(mkBtn('批准，开始执行', 'pp-approve', '批准，按这个方案开始执行'));
+      acts.appendChild(mkBtn('先不执行', 'pp-reject', '先不执行，方案我再看看'));
+      card.appendChild(head);
+      card.appendChild(bodyEl);
+      card.appendChild(acts);
+      el.appendChild(card);
+    });
     // 视频起播：浏览器默认不自动播放（黑框），消息渲染完成后尝试自动播放。
     // 注意：renderMsgMedia 执行时 el 可能还未 append 到 DOM（addAIMsg 先渲染后挂载），
     // 此时 play() 会被拒绝、loadedmetadata 也可能提前触发被 once 消费，

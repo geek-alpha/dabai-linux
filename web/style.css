@@ -8073,3 +8073,59 @@ html.chat-quiet .gfx-ach-toast {
     }
     .chat-head-actions { gap: 8px; }
 }
+
+
+/* ============================================================
+ *  方案卡片（Plan Mode 交出的 <proposed_plan> 块）
+ *  与 .msg-attach 同属「消息里的结构化附件」：自带交互（批准/拒绝），
+ *  是正文之外的独立块，所以不套气泡/引用那套样式。
+ * ============================================================ */
+.proposed-plan {
+    margin-top: 10px;
+    border: 1px solid rgba(124, 92, 255, 0.45);
+    border-radius: 12px;
+    background: rgba(124, 92, 255, 0.07);
+    overflow: hidden;
+}
+.pp-head {
+    padding: 8px 12px;
+    font-size: 13px;
+    font-weight: 600;
+    color: #cbb8ff;
+    background: rgba(124, 92, 255, 0.16);
+    border-bottom: 1px solid rgba(124, 92, 255, 0.28);
+}
+.pp-body {
+    padding: 10px 12px;
+    font-size: 13px;
+    line-height: 1.65;
+    max-height: 420px;
+    overflow-y: auto;
+}
+.pp-body > :first-child { margin-top: 0; }
+.pp-body > :last-child { margin-bottom: 0; }
+.pp-actions {
+    display: flex;
+    gap: 8px;
+    padding: 10px 12px;
+    border-top: 1px solid rgba(124, 92, 255, 0.2);
+}
+.pp-btn {
+    flex: 1;
+    padding: 7px 12px;
+    border-radius: 8px;
+    font-size: 13px;
+    cursor: pointer;
+    border: 1px solid rgba(124, 92, 255, 0.5);
+    background: transparent;
+    color: #cbb8ff;
+    transition: background .15s, color .15s;
+}
+.pp-btn:hover:not(:disabled) { background: rgba(124, 92, 255, 0.22); }
+.pp-btn:disabled { opacity: .45; cursor: default; }
+.pp-approve {
+    background: rgba(124, 92, 255, 0.85);
+    color: #fff;
+    border-color: transparent;
+}
+.pp-approve:hover:not(:disabled) { background: rgba(124, 92, 255, 1); }
