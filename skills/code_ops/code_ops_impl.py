@@ -406,6 +406,151 @@ def _is_core(root: Path, fp: Path) -> bool:
 _MAX_QUERIES = 8
 
 
+
+
+# ---------- ripgrep 引擎（对标 VS Code / grep.app：Rust 原生扫描） ----------
+# 为什么换引擎：2000 文件 / 78 万行用纯 Python 逐行 re 匹配要 ~1s；rg 是 Rust
+# 多线程 SIMD 扫描，同量级快 10~50 倍。语法不支持（如 lookahead）或 rg 不可用时
+# 自动回退 Python 引擎——两种引擎产出结构一致、结果完全等价。
+
+def _rg_globs(exts, include_noise):
+    """扩展名过滤 + 噪音目录排除 → rg 的 -g 参数。"""
+    brace = "{" + ",".join(sorted(e.lstrip(".") for e in exts)) + "}"
+    globs = [f"*.{brace}"]
+    if not include_noise:
+        noise = ",".join(sorted(NOISE_DIRS))
+        globs += [f"!**/{{{noise}}}/**", f"!{{{noise}}}", "!**/.git/**"]
+    return globs
+
+
+def _rg_hits(root, exts, include_noise, paths, compiled, per_limit,
+             case_sensitive, regex_mode):
+    """每关键词一个 rg 进程并行扫描；返回 {q: {fp_str: set(行号)}}。
+
+    rg 对 Rust 正则语法不支持（lookahead 等）或超时抛 RuntimeError，
+    由调用方回退 Python 引擎——正确性优先，快是第二位的。
+    """
+    rg = shutil.which("rg")
+    if not rg:
+        raise RuntimeError("rg 不可用")
+    from concurrent.futures import ThreadPoolExecutor
+    globs = _rg_globs(exts, include_noise)
+    base = [rg, "--json", "--max-count", str(per_limit)]
+    if not case_sensitive:
+        base.append("-i")
+    # include_noise 时连 .gitignore 忽略的目录也搜（对齐 Python 引擎的最大包含语义）；
+    # 默认则尊重 .gitignore——VS Code 同款语义，data/ 等非代码目录自动被排除
+    if include_noise:
+        base += ["--no-ignore", "--hidden", "-g", "!**/.git/**"]
+    for g in globs:
+        base += ["-g", g]
+    starts = [str(s) for s in
+              ([_resolve(root, p) for p in _norm_paths(paths)] if paths
+               else [Path(root)]) if s.exists()]
+
+    def _one(q, pat):
+        # regex 模式用编译前的原始串（Rust 语法接近但不等价，出错即回退）；
+        # 字面量模式用原始 q + -F（不能用 re.escape 后的串，双转义会搜不到）。
+        pat_src = q if not regex_mode else pat.pattern
+        cmd = base + (["-F", "-e", pat_src] if not regex_mode else ["-e", pat_src])
+        cmd += starts
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+        if r.returncode not in (0, 1):
+            raise RuntimeError(f"rg 退出码 {r.returncode}: {r.stderr[:200]}")
+        hits = {}
+        for raw in r.stdout.splitlines():
+            try:
+                obj = json.loads(raw)
+            except ValueError:
+                continue
+            if obj.get("type") != "match":
+                continue
+            d = obj.get("data") or {}
+            fp_str = (d.get("path") or {}).get("text", "")
+            ln = d.get("line_number")
+            if fp_str and ln:
+                hits.setdefault(fp_str, set()).add(ln)
+        return q, hits
+
+    with ThreadPoolExecutor(max_workers=min(len(compiled), 8)) as ex:
+        futs = {ex.submit(_one, q, p): q for q, p in compiled}
+        return {futs[f]: f.result()[1] for f in futs}
+
+
+def _rg_candidate_files(root, exts, include_noise, paths, symbol):
+    """rg 粗筛：只返回可能含 symbol 的文件（-l 纯路径，极快）。
+
+    code_locate 用它先过滤再做 AST 精筛——1169 个 .py 全量 parse 是秒级，
+    而含某符号的文件通常只有个位数。返回 None 表示 rg 不可用（调用方全量兜底）。
+    """
+    rg = shutil.which("rg")
+    if not rg:
+        return None
+    globs = _rg_globs(exts, include_noise)
+    starts = [str(s) for s in
+              ([_resolve(root, p) for p in _norm_paths(paths)] if paths
+               else [Path(root)]) if s.exists()]
+    cmd = [rg, "-l", "-w", "-F", "-e", symbol]
+    if include_noise:
+        cmd += ["--no-ignore", "--hidden", "-g", "!**/.git/**"]
+    for g in globs:
+        cmd += ["-g", g]
+    cmd += starts
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if r.returncode not in (0, 1):
+        return None
+    return [l for l in r.stdout.splitlines() if l]
+
+
+def _git_visible_files(root: Path):
+    """git 仓库内应被搜索的文件集合（跟踪 + 未跟踪未忽略），返回绝对路径列表。
+
+    语义与 rg 主路径对齐（尊重 .gitignore）：data/ 等被整体忽略的业务工作区
+    不进结果。非 git 仓库返回 None → 调用方保持全量遍历兜底。
+    """
+    try:
+        top = subprocess.run(["git", "-C", str(root), "rev-parse", "--show-toplevel"],
+                             capture_output=True, text=True, timeout=10)
+        if top.returncode != 0:
+            return None
+        repo = Path(top.stdout.strip())
+        r = subprocess.run(
+            ["git", "-C", str(repo), "ls-files", "-z",
+             "--cached", "--others", "--exclude-standard"],
+            capture_output=True, timeout=20)
+        if r.returncode != 0:
+            return None
+        return [str((repo / p).resolve())
+                for p in r.stdout.decode("utf-8", "replace").split("\0") if p]
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def _search_hits_py(root, exts, include_noise, paths, compiled, per_limit):
+    """Python 引擎（rg 不可用/语法不支持时的回退）：一次遍历、多模式匹配。"""
+    hits = {q: {} for q, _ in compiled}
+    totals = {q: 0 for q, _ in compiled}
+    for fp in _iter_files(root, exts, include_noise, paths=paths):
+        if all(totals[q] >= per_limit for q, _ in compiled):
+            break
+        try:
+            text, _ = _read_text(fp)
+        except OSError:
+            continue
+        lines = text.splitlines()
+        for i, line in enumerate(lines, 1):
+            for q, pat in compiled:
+                if totals[q] >= per_limit:
+                    continue
+                if pat.search(line):
+                    hits[q].setdefault(str(fp), (lines, set()))[1].add(i)
+                    totals[q] += 1
+    return hits, totals
+
+
 def _parse_queries(args: dict) -> list:
     """解析检索关键词：queries 数组 / 换行或逗号分隔字符串 / 单个 query。
 
@@ -465,23 +610,37 @@ def code_search(args: dict) -> str:
     # 一次遍历、多模式匹配：N 个关键词的磁盘 IO 只做一遍。
     # 这是批量检索的真收益——若只是「合并成一个调用但内部循环 N 遍」，
     # 省下的只是往返时间，磁盘成本反而翻 N 倍。
+    # 引擎选择：rg（Rust 多线程扫描）快 10~50 倍；语法不支持/出错回退 Python。
+    # 两引擎产出相同的 hits/totals 结构，下面的格式化完全共用。
     hits: dict = {q: {} for q, _ in compiled}
     totals: dict = {q: 0 for q, _ in compiled}
-    for fp in _iter_files(root, exts, include_noise, paths=paths):
-        if all(totals[q] >= per_limit for q, _ in compiled):
-            break
+    if shutil.which("rg"):
         try:
-            text, _ = _read_text(fp)
-        except OSError:
-            continue
-        lines = text.splitlines()
-        for i, line in enumerate(lines, 1):
-            for q, pat in compiled:
-                if totals[q] >= per_limit:
-                    continue
-                if pat.search(line):
-                    hits[q].setdefault(str(fp), (lines, set()))[1].add(i)
-                    totals[q] += 1
+            for q, fp_hits in _rg_hits(
+                    root, exts, include_noise, paths,
+                    [(q, p) for q, p in compiled], per_limit,
+                    bool(args.get("case_sensitive")),
+                    args.get("regex") is not False).items():
+                n = 0
+                for fp_str, lns in fp_hits.items():
+                    if n >= per_limit:
+                        break
+                    take = sorted(lns)[:per_limit - n]
+                    if not take:
+                        continue
+                    n += len(take)
+                    try:
+                        text, _ = _read_text(Path(fp_str))
+                    except OSError:
+                        continue
+                    hits[q][fp_str] = (text.splitlines(), set(take))
+                totals[q] = n
+        except (RuntimeError, subprocess.TimeoutExpired, OSError):
+            hits, totals = _search_hits_py(root, exts, include_noise, paths,
+                                           compiled, per_limit)
+    else:
+        hits, totals = _search_hits_py(root, exts, include_noise, paths,
+                                       compiled, per_limit)
 
     grand = sum(totals.values())
     if grand == 0 and not multi:
@@ -669,13 +828,37 @@ def code_locate(args: dict) -> str:
     paths = args.get("paths")
     word = r"\b" + re.escape(symbol) + r"\b"
     defs, refs = [], []
-    for fp in _iter_files(root, exts, False, paths=paths):
+    # rg 粗筛候选文件（-l 秒级）→ 只对命中文件 AST 精筛；rg 不可用则全量兜底
+    cand = _rg_candidate_files(root, exts, False, paths, symbol)
+    if cand is not None and not paths:
+        # rg 的 -g include 是 whitelist 语义：会把被 gitignore 排除的根级文件
+        # 强制包含进来（如 gene_stats.json），与兜底路径的候选集合不一致。
+        # 用 git 白名单求交集，保证 rg/兜底两条路径结果完全等价。
+        seen = _git_visible_files(root)
+        if seen is not None:
+            seen_set = set(seen)
+            cand = [c for c in cand if str(Path(c).resolve()) in seen_set]
+    if cand is not None:
+        iter_files = [Path(c) for c in dict.fromkeys(cand)]
+    elif paths:
+        # 显式限定子目录（可能点名搜 data/ 等被忽略目录）：尊重意图，全量遍历
+        iter_files = _iter_files(root, exts, False, paths=paths)
+    else:
+        # rg 不可用 + 全仓：git 白名单剪枝（与 rg 主路径同语义，跳过被忽略的业务工作区）
+        seen = _git_visible_files(root)
+        iter_files = ([Path(p) for p in seen if not _is_binary(Path(p))]
+                      if seen is not None
+                      else _iter_files(root, exts, False, paths=paths))
+    for fp in iter_files:
         try:
             text, _ = _read_text(fp)
         except OSError:
             continue
         suffix = fp.suffix.lower()
         if suffix == ".py":
+            # 正则粗筛：文件里没有该符号就直接跳过，省掉 AST parse（命中率极低）
+            if not re.search(word, text):
+                continue
             # AST 结构感知：真实定义/引用，排除注释与字符串里的同名假命中
             ast_defs = _py_ast_defs(text)
             if ast_defs is not None:
@@ -698,6 +881,8 @@ def code_locate(args: dict) -> str:
                     is_def = True
                     break
             (defs if is_def else refs).append((fp, i, line.strip()))
+    defs.sort(key=lambda x: (str(x[0]), x[1]))
+    refs.sort(key=lambda x: (str(x[0]), x[1]))
     def_lines = {(fp, i) for fp, i, _ in defs}
     refs_only = [(fp, i, t) for fp, i, t in refs if (fp, i) not in def_lines]
     out = [f"符号 {symbol} 的定位结果："]
@@ -2292,7 +2477,45 @@ def code_verify(args: dict) -> str:
     return _trim("\n\n".join(results))
 
 
+def code_undo_turn(args: dict) -> str:
+    """把某一轮工具改过的文件还原成轮前状态（轮级快照，见 harness/turn_snapshot.py）。
+
+    为什么按「轮」而不是按文件：一次重构会散着改好几个文件，方向错了要退回时，
+    逐个去找 .bak-<时间戳> 既慢又容易漏；新建的文件连 .bak 都没有。轮级快照把
+    「这一轮动过哪些文件」变成一条清单，一次全退。undo 幂等：还原过的再调一次
+    只会报「本来就一致」，不会又写一遍。
+
+    list_only=true 只看有哪些轮、不还原；paths 只退指定文件（改对了的留着）。
+    """
+    import datetime
+
+    from harness import turn_snapshot as ts
+
+    if args.get("list_only"):
+        try:
+            limit = max(1, min(int(args.get("limit") or 10), 50))
+        except (TypeError, ValueError):
+            limit = 10
+        turns = ts.list_turns(limit=limit)
+        if not turns:
+            return "没有轮快照（data/turn_snapshots 为空，或本轮还没改过文件）。"
+        lines = ["可还原的轮快照（新→旧）："]
+        for t in turns:
+            when = datetime.datetime.fromtimestamp(t["mtime"]).strftime("%m-%d %H:%M:%S")
+            extra = f"，{t['skipped']} 个未纳入快照" if t["skipped"] else ""
+            blind = f"，另有 {'/'.join(t['blind'])} 动过磁盘但未追踪" if t["blind"] else ""
+            lines.append(f"  {t['turn_id']}  {when}  {t['files']} 个文件{extra}{blind}")
+        lines.append("传 turn_id 还原某一轮；不传 = 最近一轮。")
+        return "\n".join(lines)
+
+    paths = args.get("paths")
+    if isinstance(paths, str):
+        paths = [p.strip() for p in paths.replace("\n", ",").split(",") if p.strip()]
+    return ts.undo(str(args.get("turn_id") or ""), paths or None)
+
+
 HANDLERS = {
+    "code_undo_turn": code_undo_turn,
     "code_search": code_search,
     "code_list_files": code_list_files,
     "code_read": code_read,
