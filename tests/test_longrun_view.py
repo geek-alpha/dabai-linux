@@ -25,6 +25,22 @@ from tools.longrun import status_view as sv  # noqa: E402
 
 # ---------- 合成视图：契约与只读性 ----------
 
+@pytest.fixture(autouse=True)
+def _isolate_dismissed(tmp_path, monkeypatch):
+    """把「用户清除过哪一轮」的标记挪出真实运行目录。
+
+    DISMISSED 是模块级常量（指向真实 data/longrun/dismissed.json），只 patch
+    RUN_DIR 挪不动它 —— 本机点过一次「清除已完成」，这整套视图测试就集体变红：
+    引擎已停 + 清除轮次 == 当前轮次 → snapshot 按契约返回 None。
+    """
+    import importlib
+    global sv
+    live = importlib.import_module("tools.longrun.status_view")
+    if live is not sv:
+        sv = live
+    monkeypatch.setattr(sv, "DISMISSED", tmp_path / "dismissed.json")
+
+
 def test_snapshot_has_fields_frontend_needs():
     s = sv.snapshot(full=False)
     for k in ("id", "kind", "channel", "title", "status", "steps",
