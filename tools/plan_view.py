@@ -17,6 +17,20 @@ import time
 
 TASK_ID = "task-agent-plan"
 
+# 清单绑在「当前这件事」上：干完了就该 done，没干完而被搁置就该如实说「已中断」。
+# 不这么判，没跑完的清单会永远挂在 running —— 实测踩过：工作全做完并入了仓，
+# 任务中心却一直显示「2/5 进行中」，用户以为还在跑。
+# 阈值不能短：一轮里跑长任务几十分钟不更新是常态，误报「中断」比不报更糟。
+STALE_AFTER = 1800.0
+
+
+def _stale_after() -> float:
+    """阈值可用 DABAI_PLAN_STALE_SEC 覆盖（测试要造陈旧清单，不能真等半小时）。"""
+    try:
+        return float(os.environ.get("DABAI_PLAN_STALE_SEC") or STALE_AFTER)
+    except ValueError:
+        return STALE_AFTER
+
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _TASKS_DIR = os.path.join(_ROOT, "skills", "tasks")
 
@@ -56,12 +70,23 @@ def _snapshot(full: bool):
     running = [s for s in plan if s.get('status') == 'in_progress']
     total = len(plan)
 
+    updated_at = data.get('updated_at') or 0
+    idle_sec = max(0, int(time.time() - updated_at)) if updated_at else 0
+    # 只给「有活没干完」的陈旧清单扣中断帽子：全部完成的清单不该被标中断。
+    stale = bool(done < total and updated_at and idle_sec > _stale_after())
+
     if done == total:
         status = "done"
+    elif stale:
+        status = "stalled"
     else:
         status = "running"
 
-    if running:
+    left = total - done
+    if stale:
+        title = (f"工作清单 · {done}/{total} · ⏸ 已中断"
+                 f"（{idle_sec // 60} 分钟没动，{left} 步未收尾）")
+    elif running:
         title = f"工作清单 · {done}/{total} · 进行中：{running[0]['step'][:40]}"
     elif done == total:
         title = f"工作清单 · {total}/{total} 全部完成"
@@ -76,7 +101,6 @@ def _snapshot(full: bool):
     finished = [s for s in plan if s.get('status') == 'completed']
     if finished:
         steps.append(f"● 刚完成：{finished[-1]['step']}")
-    left = total - done
     if left:
         steps.append(f"○ 还剩 {left} 步")
     if data.get('explanation'):
@@ -92,6 +116,8 @@ def _snapshot(full: bool):
             "updates": data.get('updates') or 0,
             "done": done,
             "total": total,
+            "stale": stale,
+            "idle_sec": idle_sec,
         },
     }
 

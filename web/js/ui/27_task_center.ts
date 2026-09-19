@@ -13,7 +13,10 @@ export default (function init(App: AppKernel) {
     running:    { label: '执行中', cls: 'running',    icon: '🔄' },
     done:       { label: '已完成', cls: 'done',       icon: '✅' },
     error:      { label: '失败',   cls: 'error',      icon: '❌' },
-    cancelled:  { label: '已取消', cls: 'cancelled',  icon: '🛑' }
+    cancelled:  { label: '已取消', cls: 'cancelled',  icon: '🛑' },
+    // 清单有活没干完却被搁置：实测踩过——活全干完并入了仓，卡片还显示「进行中」，
+    // 用户以为还在跑。中断 ≠ 完成，done 数照旧不补。
+    stalled:    { label: '已中断', cls: 'cancelled',  icon: '⏸' }
   };
   // 智能体目录（与后端 task_orchestrator.AGENTS 一致）：谁是谁、长什么样、干什么的
   const AGENT_DB: Record<string, AgentInfo> = {
@@ -467,16 +470,19 @@ export default (function init(App: AppKernel) {
     if (!steps.length) return;
     const done = Number(p.done || 0);
     const total = Number(p.total || steps.length);
+    const stale = !!p.stale;
+    const idleMin = Math.floor(Number(p.idle_sec || 0) / 60);
     const box = el('div', 'task-steps');
     box.appendChild(el('div', 'task-section-label',
       '工作清单 · ' + done + '/' + total + ' 完成' +
+      (stale ? ' · ⏸ 已中断（' + idleMin + ' 分钟没动）' : '') +
       (p.updates ? ' · 第 ' + p.updates + ' 次提交' : '')));
 
     // 进度条：一眼看出做到哪儿了（清单越长越有用）
     const bar = el('div', 'task-plan-bar');
     bar.style.cssText = 'height:6px;border-radius:3px;background:rgba(255,255,255,.12);overflow:hidden;margin:6px 0 10px;';
     const fill = el('div', 'task-plan-fill');
-    fill.style.cssText = 'height:100%;background:#4ade80;width:' +
+    fill.style.cssText = 'height:100%;background:' + (stale ? '#f59e0b' : '#4ade80') + ';width:' +
       (total ? Math.round(done * 100 / total) : 0) + '%;';
     bar.appendChild(fill);
     box.appendChild(bar);
@@ -506,7 +512,8 @@ export default (function init(App: AppKernel) {
     }
     if (p.updated_at) {
       const meta = el('div', 'task-section-label',
-        '最后更新 ' + new Date(p.updated_at * 1000).toLocaleTimeString('zh-CN', { hour12: false }));
+        '最后更新 ' + new Date(p.updated_at * 1000).toLocaleTimeString('zh-CN', { hour12: false }) +
+        (stale ? ' · 没跑完的步骤不会被自动算完成，继续做或让它 plan_clear' : ''));
       meta.style.opacity = '0.6';
       box.appendChild(meta);
     }

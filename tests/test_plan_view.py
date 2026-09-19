@@ -112,3 +112,51 @@ def test_updates_counter_grows(pl):
     n1 = snap()['extra']['plan']['updates']
     upd([{'step': 'A', 'status': 'completed'}])
     assert snap()['extra']['plan']['updates'] > n1
+
+
+# --- 僵尸进度：没跑完就被搁置的清单，不许永远挂 running -------------------------
+
+def _age_plan(path, sec):
+    """把 updated_at 往前拨 sec 秒，造出「搁置很久」的清单（不用真等半小时）。"""
+    import json
+    d = json.loads(path.read_text(encoding='utf-8'))
+    d['updated_at'] = d['updated_at'] - sec
+    path.write_text(json.dumps(d, ensure_ascii=False), encoding='utf-8')
+
+
+def test_stale_unfinished_plan_is_not_running(pl, monkeypatch):
+    """实测踩过：工作全做完并入了仓，任务中心却一直显示「2/5 进行中」，用户以为还在跑。"""
+    monkeypatch.setenv('DABAI_PLAN_STALE_SEC', '1')
+    upd([{'step': 'A', 'status': 'completed'}, {'step': 'B', 'status': 'in_progress'}])
+    _age_plan(pl, 60)
+    s = snap()
+    assert s['status'] == 'stalled'
+    assert s['extra']['plan']['stale'] is True
+    assert '已中断' in s['title']
+
+
+def test_fresh_plan_stays_running(pl, monkeypatch):
+    """阈值内的清单不能误报中断：一轮里跑长任务几十分钟不更新是常态。"""
+    monkeypatch.setenv('DABAI_PLAN_STALE_SEC', '1800')
+    upd([{'step': 'A', 'status': 'in_progress'}])
+    assert snap()['status'] == 'running'
+
+
+def test_stale_does_not_fake_completion(pl, monkeypatch):
+    """中断 ≠ 完成：绝不自动补 completed，done 数必须保持真实。"""
+    monkeypatch.setenv('DABAI_PLAN_STALE_SEC', '1')
+    upd([{'step': 'A', 'status': 'completed'}, {'step': 'B', 'status': 'in_progress'}])
+    _age_plan(pl, 60)
+    p = snap()['extra']['plan']
+    assert (p['done'], p['total']) == (1, 2)
+    assert [x['status'] for x in p['steps']] == ['completed', 'in_progress']
+
+
+def test_completed_plan_never_marked_stalled(pl, monkeypatch):
+    """全完成的清单放再久也不该被扣「中断」帽子。"""
+    monkeypatch.setenv('DABAI_PLAN_STALE_SEC', '1')
+    upd([{'step': 'A', 'status': 'completed'}])
+    _age_plan(pl, 60)
+    s = snap()
+    assert s['status'] == 'done'
+    assert s['extra']['plan']['stale'] is False
