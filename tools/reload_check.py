@@ -8,6 +8,7 @@
 用法：
   python tools/reload_check.py          # 列出未生效的核心改动
   python tools/reload_check.py --json   # 机器可读
+  python tools/reload_check.py -q       # 只出结论行（PID/开关/判据那三行常量头不打印）
 
 注：输出一律用 ASCII 标记（[OK]/[!]）—— Windows 控制台默认 GBK，
     打印 ✅/⚠ 这类符号会直接 UnicodeEncodeError 把脚本搞崩。
@@ -169,7 +170,7 @@ def _restart_check_report() -> str:
     return text[-2000:] if len(text) > 2000 else text
 
 
-def main(as_json=False):
+def main(as_json=False, quiet=False):
     pid, started = _proc_start()
     auto = _autorestart_enabled()
     files = _scan_core()
@@ -229,15 +230,18 @@ def main(as_json=False):
     if as_json:
         print(json.dumps(res, ensure_ascii=False, indent=2))
         return 0
-    print("运行中进程 PID %s，启动于 %s" % (res["pid"], res["started_at"]))
-    print("自动重启（harness.core_autorestart）：%s"
-          % ("开启" if auto else "关闭 ← 核心改动不会自动生效"))
-    if res["judge"] == "loaded_state":
-        print("判据：已加载快照（%s，落盘于 %s）"
-              % (LOADED_STATE.name, res.get("state_at") or "未知"))
-    else:
-        print("判据：进程启动时间 —— 已加载快照缺失（守护未重启或未开启热重载）；"
-              "该判据在自动重启后会误报")
+    # quiet 只砍这三行常量头（PID/开关/判据）：它们不随结论变，脚本里读是纯噪音。
+    # 结论行、探测失败告警、未生效清单一律照打——省的是噪音，不是证据。
+    if not quiet:
+        print("运行中进程 PID %s，启动于 %s" % (res["pid"], res["started_at"]))
+        print("自动重启（harness.core_autorestart）：%s"
+              % ("开启" if auto else "关闭 ← 核心改动不会自动生效"))
+        if res["judge"] == "loaded_state":
+            print("判据：已加载快照（%s，落盘于 %s）"
+                  % (LOADED_STATE.name, res.get("state_at") or "未知"))
+        else:
+            print("判据：进程启动时间 —— 已加载快照缺失（守护未重启或未开启热重载）；"
+                  "该判据在自动重启后会误报")
     if not started and res["judge"] != "loaded_state":
         # 关键：探测失败 ≠ 已生效。旧版在这里静默放过，永远打印 [OK]，
         # 把“探测不到”伪装成“没问题”（实测踩过：agent.py 改完未生效却报 OK）。
@@ -260,10 +264,17 @@ def main(as_json=False):
         print("\n原因：core_autorestart=false —— 需要手动重启 server.py 才会生效。")
     diag = res.get("restart_check")
     if diag:
-        print("\n--- 重启体检（%s）---" % (BASE / "data" / "restart_check_report.txt"))
-        print(diag)
+        rep = BASE / "data" / "restart_check_report.txt"
+        if quiet:
+            # -q 的语义是「只出结论」：体检报告本来就已经落盘，脚本里再抄一遍
+            # journal 尾巴只是把噪声搬个地方。指路就够，要点自己去看文件。
+            print("重启体检 %d 行已落盘：%s" % (len(diag.splitlines()), rep))
+        else:
+            print("\n--- 重启体检（%s）---" % rep)
+            print(diag)
     return 1
 
 
 if __name__ == "__main__":
-    sys.exit(main("--json" in sys.argv[1:]))
+    _args = sys.argv[1:]
+    sys.exit(main(as_json="--json" in _args, quiet=("--quiet" in _args or "-q" in _args)))

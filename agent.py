@@ -4238,9 +4238,11 @@ class AIAgent:
         #
         # 附带教训（2026-09-11）：改完这里后连续 3 轮「验证数据毫无变化」——
         # 因为 settings.json 的 harness.core_autorestart 是 false，核心代码改动
-        # 只记日志不重启，**改完了 ≠ 改生效了**。现在已置 true，并加了
-        # tools/reload_check.py（对比进程启动时间与核心文件 mtime，列出未生效改动），
-        # 验证前先跑它，别再拿旧进程的数据下结论。
+        # 只记日志不重启，**改完了 ≠ 改生效了**。该开关至今仍是 false（2026-09-20
+        # 核实 settings.json；置 true 会腰斩执行中的对话轮，是有意留着的），所以
+        # 核心文件改完必须手动重启。验证前先跑 tools/reload_check.py，它的判据是
+        # 守护落盘的已加载快照 data/hot_reload_state.json（不是进程启动时间——
+        # 自动重启走 os.execv 自替换，PID 与 starttime 都冻结在创建时刻）。
         try:
             harness_extras = get_harness_prompt_extras(self._activated_skills)
         except Exception:
