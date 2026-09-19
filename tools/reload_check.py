@@ -9,6 +9,10 @@
   python tools/reload_check.py          # 列出未生效的核心改动
   python tools/reload_check.py --json   # 机器可读
   python tools/reload_check.py -q       # 只出结论行（PID/开关/判据那三行常量头不打印）
+  python tools/reload_check.py --diag   # 未生效时追加跑一次重启体检（默认不跑，见下）
+
+体检为什么默认关掉：它内部要起 restart_server.sh --check（timeout 60），在服务重启
+窗口里能把一次普通自检拖成几十秒。判据本身只要 0.08s，不该被体检绑架。
 
 注：输出一律用 ASCII 标记（[OK]/[!]）—— Windows 控制台默认 GBK，
     打印 ✅/⚠ 这类符号会直接 UnicodeEncodeError 把脚本搞崩。
@@ -170,7 +174,7 @@ def _restart_check_report() -> str:
     return text[-2000:] if len(text) > 2000 else text
 
 
-def main(as_json=False, quiet=False):
+def main(as_json=False, quiet=False, diag=False):
     pid, started = _proc_start()
     auto = _autorestart_enabled()
     files = _scan_core()
@@ -225,8 +229,8 @@ def main(as_json=False, quiet=False):
                 })
     res["stale"].sort(key=lambda x: -x["ahead_sec"])
     res["stale_count"] = len(res["stale"])
-    # 改动没生效时顺手体检：谁发现没生效，谁留下证据（报告落盘）
-    res["restart_check"] = _restart_check_report() if res["stale"] else ""
+    # 体检只在显式 --diag 时跑：默认路径必须保持秒级（判据 0.08s）
+    res["restart_check"] = _restart_check_report() if (res["stale"] and diag) else ""
     if as_json:
         print(json.dumps(res, ensure_ascii=False, indent=2))
         return 0
@@ -262,19 +266,22 @@ def main(as_json=False, quiet=False):
               % (it["file"], it["mtime"], _ref, it["ahead_sec"]))
     if not auto:
         print("\n原因：core_autorestart=false —— 需要手动重启 server.py 才会生效。")
-    diag = res.get("restart_check")
-    if diag:
+    diag_text = res.get("restart_check")
+    if diag_text:
         rep = BASE / "data" / "restart_check_report.txt"
         if quiet:
             # -q 的语义是「只出结论」：体检报告本来就已经落盘，脚本里再抄一遍
             # journal 尾巴只是把噪声搬个地方。指路就够，要点自己去看文件。
-            print("重启体检 %d 行已落盘：%s" % (len(diag.splitlines()), rep))
+            print("重启体检 %d 行已落盘：%s" % (len(diag_text.splitlines()), rep))
         else:
             print("\n--- 重启体检（%s）---" % rep)
-            print(diag)
+            print(diag_text)
+    else:
+        print("    要看为什么没生效，加 --diag 跑一次重启体检。")
     return 1
 
 
 if __name__ == "__main__":
     _args = sys.argv[1:]
-    sys.exit(main(as_json="--json" in _args, quiet=("--quiet" in _args or "-q" in _args)))
+    sys.exit(main(as_json="--json" in _args, quiet=("--quiet" in _args or "-q" in _args),
+                  diag=("--diag" in _args)))

@@ -2586,7 +2586,9 @@ async def task_center_list():
     try:
         from tools.longrun.status_view import snapshot as _longrun_snap, TASK_ID as _LONGRUN_ID
         tasks = [t for t in tasks if str(t.get("id") or "") != _LONGRUN_ID]
-        tasks.append(_longrun_snap(full=False))
+        _lr = _longrun_snap(full=False)
+        if _lr:  # 引擎已停且用户清除过 → None，不留一条清不掉的条目
+            tasks.append(_lr)
     except Exception as e:
         logger.warning(f"[TaskCenter] 合并长跑引擎失败: {e}")
     # 合并 agent 工作清单（plan_*）：同样是合成条目 —— 它不注册进 orchestrator，
@@ -2614,7 +2616,9 @@ async def task_center_get(task_id: str):
     try:
         from tools.longrun.status_view import snapshot as _longrun_snap, TASK_ID as _LONGRUN_TID
         if task_id == _LONGRUN_TID:
-            return {"ok": True, "task": _longrun_snap(full=True)}
+            _lr = _longrun_snap(full=True)
+            if _lr:
+                return {"ok": True, "task": _lr}
     except Exception as e:
         logger.warning(f"[TaskCenter] 长跑任务详情失败: {e}")
     # agent 工作清单（合成条目，同上）
@@ -2777,6 +2781,15 @@ async def task_center_clear():
             n += 1
     except Exception as e:
         logger.warning(f"[TaskCenter] 清除工作清单失败: {e}")
+    # 长跑引擎同样是合成条目（server.py:2589 只读合成），clear_finished() 一样够不着它 ——
+    # 引擎停了但条目永远挂着，用户看到的就是「已停止却清除不了」。引擎还在跑时
+    # dismiss() 会拒绝，不清除运行数据，只记「这一轮我看过了」。
+    try:
+        from tools.longrun.status_view import dismiss as _longrun_dismiss
+        if _longrun_dismiss():
+            n += 1
+    except Exception as e:
+        logger.warning(f"[TaskCenter] 清除长跑条目失败: {e}")
     return {"ok": True, "cleared": n}
 
 
