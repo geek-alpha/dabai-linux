@@ -73,6 +73,17 @@ git tag -a v1.0.0 -m "大白 v1.0.0" && git push origin v1.0.0
 tag 名与清单版本不一致会被 CI 自己拦住（工作流里那条「确认 tag 与清单版本一致」），
 不用手工核对。产物由 CI 现场打包，本地 `dist/` 只是开发时的临时目录（已在 .gitignore）。
 
+**盯落地（推荐）**：push tag 后跑 `watch_release.py`，它轮询 Actions 直到 release
+落地（tar.gz + sha256 资产齐全）才返回 0，失败/超时给明确退出码，不用人肉刷新网页：
+
+```bash
+# 盯到 release 落地再继续（publish 需管理员在网页点 Approve，脚本会提示等待）
+python deploy/release/watch_release.py v1.0.0
+```
+
+只读观察者，不产生任何发布能力——建 release 的仍是 CI 的 publish 步骤，不违背
+「发布只能有一个实现」。
+
 **为什么最后一道闸放在 GitHub 上**：脚本闸门挡得住「推错东西」，挡不住「谁按下了推送」。
 而 `environment` 的 required reviewers 是 GitHub 自己强制的 —— 这是整套体系里唯一
 一个连大白自己都绕不过去的门。
