@@ -459,6 +459,60 @@ export default (function init(App: AppKernel) {
     wrap.appendChild(box);
   }
 
+  // agent 工作清单（plan_*）：带状态的清单 —— 与 append 式「进展」里程碑不同，
+  // 同一步骤是原地改状态，所以结构化数据在 extra.plan，由这里专门渲染。
+  function renderPlanPanel(wrap: HTMLElement, t: any) {
+    const p = (t.extra && t.extra.plan) || null;
+    const steps = (p && p.steps) || [];
+    if (!steps.length) return;
+    const done = Number(p.done || 0);
+    const total = Number(p.total || steps.length);
+    const box = el('div', 'task-steps');
+    box.appendChild(el('div', 'task-section-label',
+      '工作清单 · ' + done + '/' + total + ' 完成' +
+      (p.updates ? ' · 第 ' + p.updates + ' 次提交' : '')));
+
+    // 进度条：一眼看出做到哪儿了（清单越长越有用）
+    const bar = el('div', 'task-plan-bar');
+    bar.style.cssText = 'height:6px;border-radius:3px;background:rgba(255,255,255,.12);overflow:hidden;margin:6px 0 10px;';
+    const fill = el('div', 'task-plan-fill');
+    fill.style.cssText = 'height:100%;background:#4ade80;width:' +
+      (total ? Math.round(done * 100 / total) : 0) + '%;';
+    bar.appendChild(fill);
+    box.appendChild(bar);
+
+    const COLOR: Record<string, string> = { completed: '#4ade80', in_progress: '#f59e0b', pending: '#8c8ca0' };
+    const MARK: Record<string, string> = { completed: '●', in_progress: '◐', pending: '○' };
+    const CN: Record<string, string> = { completed: '已完成', in_progress: '进行中', pending: '待办' };
+    steps.forEach((s: any, i: number) => {
+      const st = String(s.status || 'pending');
+      const row = el('div', 'task-step');
+      row.innerHTML = '<span class="task-step-dot"></span><span></span>';
+      const dot = row.firstElementChild as HTMLElement;
+      if (dot) dot.style.background = COLOR[st] || '#8c8ca0';
+      if (st === 'in_progress') row.style.fontWeight = '600';
+      else if (st === 'pending') row.style.opacity = '0.6';
+      const txt = row.lastElementChild as HTMLElement;
+      if (txt) {
+        txt.textContent = (i + 1) + '. ' + (MARK[st] || '?') + ' ' +
+          String(s.step || '') + '（' + (CN[st] || st) + '）';
+      }
+      box.appendChild(row);
+    });
+    if (p.explanation) {
+      const ex = el('div', 'task-section-label', '调整说明：' + String(p.explanation));
+      ex.style.opacity = '0.75';
+      box.appendChild(ex);
+    }
+    if (p.updated_at) {
+      const meta = el('div', 'task-section-label',
+        '最后更新 ' + new Date(p.updated_at * 1000).toLocaleTimeString('zh-CN', { hour12: false }));
+      meta.style.opacity = '0.6';
+      box.appendChild(meta);
+    }
+    wrap.appendChild(box);
+  }
+
   function renderDetail(taskId: string) {
     const wrap = document.getElementById('task-center-detail');
     if (!wrap) return;
@@ -518,6 +572,8 @@ export default (function init(App: AppKernel) {
 
     // 长跑引擎：轮次可下钻（每轮一个 trace 文件）
     if (t.kind === 'longrun') renderLongrunRounds(wrap, t);
+    // agent 工作清单：带状态的清单（只读，跟着 plan_update 走）
+    if (t.kind === 'plan') renderPlanPanel(wrap, t);
 
     if (t.logs && t.logs.length) {
       // 过程性日志默认折叠：摘要行露出最新一条，点开看全文
@@ -580,7 +636,7 @@ export default (function init(App: AppKernel) {
       approveBtn.addEventListener('click', () => act(taskId, true));
       actions.appendChild(rejectBtn);
       actions.appendChild(approveBtn);
-    } else if (t.status === 'running' || t.status === 'queued') {
+    } else if ((t.status === 'running' || t.status === 'queued') && t.kind !== 'plan') {
       const killBtn = el('button', 'task-btn-act task-btn-ghost', '中断');
       killBtn.addEventListener('click', () => kill(taskId));
       actions.appendChild(killBtn);

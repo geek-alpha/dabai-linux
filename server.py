@@ -2589,6 +2589,17 @@ async def task_center_list():
         tasks.append(_longrun_snap(full=False))
     except Exception as e:
         logger.warning(f"[TaskCenter] 合并长跑引擎失败: {e}")
+    # 合并 agent 工作清单（plan_*）：同样是合成条目 —— 它不注册进 orchestrator，
+    # 因为 Task.steps 是 append 式字符串，承载不了「同一步骤原地改状态」。
+    # 清单为空时 snapshot 返回 None：不留一条空条目在列表里刷屏。
+    try:
+        from tools.plan_view import snapshot as _plan_snap, TASK_ID as _PLAN_ID
+        _pv = _plan_snap(full=False)
+        if _pv:
+            tasks = [t for t in tasks if str(t.get("id") or "") != _PLAN_ID]
+            tasks.append(_pv)
+    except Exception as e:
+        logger.warning(f"[TaskCenter] 合并工作清单失败: {e}")
     tasks.sort(key=lambda x: -(x.get("created_at") or 0))
     return {"ok": True, "tasks": tasks[:50]}
 
@@ -2606,6 +2617,15 @@ async def task_center_get(task_id: str):
             return {"ok": True, "task": _longrun_snap(full=True)}
     except Exception as e:
         logger.warning(f"[TaskCenter] 长跑任务详情失败: {e}")
+    # agent 工作清单（合成条目，同上）
+    try:
+        from tools.plan_view import snapshot as _plan_snap, TASK_ID as _PLAN_TID
+        if task_id == _PLAN_TID:
+            _pv = _plan_snap(full=True)
+            if _pv:
+                return {"ok": True, "task": _pv}
+    except Exception as e:
+        logger.warning(f"[TaskCenter] 工作清单详情失败: {e}")
     # 回退：Harness TaskSystem 的 flow/batch 任务（详情含步骤/条目状态）
     try:
         ht = _harness().tasks.status(task_id)
@@ -2680,6 +2700,14 @@ async def task_center_kill(task_id: str):
     orch = get_orchestrator()
     task = orch.get(task_id)
     if task is None:
+        # agent 工作清单（合成条目）：只读，没什么可中断的 —— 给一句人话而不是 404
+        try:
+            from tools.plan_view import TASK_ID as _PLAN_TID
+            if task_id == _PLAN_TID:
+                return {"ok": True, "task_id": task_id, "status": "running",
+                        "message": "工作清单是只读条目：它跟着白头凤的 plan_update 走，不需要中断。"}
+        except Exception:
+            pass
         # 长跑引擎（合成条目）：中断 = 停 systemd 服务，watchdog 一并停 ——
         # 只停服务不停 watchdog，它按心跳判活会立刻把它拉起来。
         try:

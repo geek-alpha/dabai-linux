@@ -171,6 +171,26 @@ def _do_update(args) -> str:
     return _render(steps, explanation, title='工作清单已更新')
 
 
+def read_plan() -> dict:
+    """当前清单快照（供任务中心合成条目 / 外部只读消费）。
+
+    created_at 取**首次提交时间**而不是 updated_at：任务中心按 created_at 倒序，
+    用 updated_at 会让清单每步都跳到列表顶部（用户没提交也一直闪），
+    用首次时间则位置稳定，只有它自己会随时间往下沉。
+    """
+    data = _load(_plan_path())
+    plan = data.get('plan') or []
+    hist = data.get('history') or []
+    first_at = (hist[0].get('at') if hist else 0) or data.get('updated_at') or 0
+    return {
+        'plan': plan,
+        'updated_at': data.get('updated_at') or 0,
+        'created_at': first_at,
+        'explanation': data.get('explanation'),
+        'updates': len(hist) + (1 if plan else 0),
+    }
+
+
 def _do_show(args) -> str:
     path = _plan_path()
     data = _load(path)
