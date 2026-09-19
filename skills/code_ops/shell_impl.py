@@ -32,6 +32,53 @@ def _executor():
     return EXECUTOR
 
 
+def _decode(b: bytes) -> str:
+    for enc in ("utf-8", "gbk"):
+        try:
+            return b.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return b.decode("utf-8", errors="replace")
+
+
+def _run_shell_cmd(cmd: str, timeout: int, argv, cwd) -> str:
+    """执行命令：自成进程组，超时杀整棵树并带回超时前的部分输出。
+
+    与 codex_runner.Executor.run_sync 的改进保持同一行为（那边服务网页 /cmd）。
+    为什么杀整棵树：shell=True 时直接子进程只是 /bin/sh，curl/编译等孙进程若只杀
+    shell 会变孤儿继续占网络与资源——「命令超时了机器还一直慢」的来源。
+    """
+    kw = pc.spawn_kwargs(new_group=True)
+    try:
+        if argv:
+            p = subprocess.Popen(argv, cwd=cwd, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, **kw)
+        else:
+            p = subprocess.Popen(cmd, shell=True, cwd=cwd,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kw)
+    except Exception as e:
+        return f'$ {cmd}\n[异常] {e}'
+    try:
+        out_b, err_b = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _, note = pc.terminate_tree(p.pid, timeout=15)
+        try:
+            out_b, err_b = p.communicate(timeout=5)
+        except Exception:
+            out_b, err_b = b'', b''
+        got = (_decode(out_b or b'').strip() + '\n'
+               + _decode(err_b or b'').strip()).strip()
+        snippet = f'\n[超时前输出] …{got[-500:]}' if got else ''
+        return (f'$ {cmd}\n[超时：超过{timeout}秒，已终止整棵进程树（{note}）]'
+                f'{snippet}')
+    text = _decode(out_b)
+    err = _decode(err_b)
+    if err.strip():
+        text += '\n[stderr]\n' + err
+    text = text.strip() or '(无输出)'
+    return f'$ {cmd}\n[exit={p.returncode}]\n{text}'
+
+
 async def shell_run(args: dict) -> str:
     cmd = str(args.get("command") or "").strip()
     if not cmd:
@@ -51,14 +98,12 @@ async def shell_run(args: dict) -> str:
     except Exception as e:  # noqa: BLE001
         return f"沙箱拒绝：{e}"
     try:
-        exe = _executor()
         out = await asyncio.wait_for(
-            asyncio.to_thread(exe.run_sync, cmd, timeout, argv, cwd), timeout=timeout + 10)
+            asyncio.to_thread(_run_shell_cmd, cmd, timeout, argv, cwd), timeout=timeout + 10)
     except TimeoutError:
         return f"命令超时（>{timeout}s），已终止：{cmd}"
     except Exception as e:
         return f"执行失败：{e.__class__.__name__}: {e}"
-    # run_sync 输出末尾带 [exit=N] 标记
     ok = "[exit=0]" in out
     if len(out) > 4000:
         out = out[:3997] + "..."

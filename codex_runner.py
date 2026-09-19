@@ -958,23 +958,37 @@ class Executor:
         """
         timeout = timeout or AGENT_CFG.get('sync_timeout_sec', 120)
         work = cwd or self.cwd
+        # 自成进程组：超时要杀整棵进程树，否则 shell 只是直接子进程，curl/编译等
+        # 孙进程变孤儿继续占网络与资源——「命令超时了机器还一直慢」的来源。
+        kw = pc.spawn_kwargs(new_group=True)
         try:
             if argv:
-                p = subprocess.run(argv, cwd=work, capture_output=True, timeout=timeout)
+                p = subprocess.Popen(argv, cwd=work, stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE, **kw)
             else:
-                p = subprocess.run(
-                    cmd, shell=True, cwd=work, capture_output=True, timeout=timeout
-                )
-            text = decode_bytes(p.stdout)
-            err = decode_bytes(p.stderr)
-            if err.strip():
-                text += '\n[stderr]\n' + err
-            text = text.strip() or '(无输出)'
-            return f'$ {cmd}\n[exit={p.returncode}]\n{text}'
-        except subprocess.TimeoutExpired:
-            return f'$ {cmd}\n[超时：超过{timeout}秒被终止]'
+                p = subprocess.Popen(cmd, shell=True, cwd=work,
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kw)
         except Exception as e:
             return f'$ {cmd}\n[异常] {e}'
+        try:
+            out_b, err_b = p.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            ok, note = pc.terminate_tree(p.pid, timeout=15)
+            try:
+                out_b, err_b = p.communicate(timeout=5)
+            except Exception:
+                out_b, err_b = b'', b''
+            got = (decode_bytes(out_b or b'').strip() + '\n'
+                   + decode_bytes(err_b or b'').strip()).strip()
+            snippet = f'\n[超时前输出] …{got[-500:]}' if got else ''
+            return (f'$ {cmd}\n[超时：超过{timeout}秒，已终止整棵进程树（{note}）]'
+                    f'{snippet}')
+        text = decode_bytes(out_b)
+        err = decode_bytes(err_b)
+        if err.strip():
+            text += '\n[stderr]\n' + err
+        text = text.strip() or '(无输出)'
+        return f'$ {cmd}\n[exit={p.returncode}]\n{text}'
 
     def start_bg(self, cmd: str) -> str:
         tid = uuid.uuid4().hex[:6]
