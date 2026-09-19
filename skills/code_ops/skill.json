@@ -672,6 +672,35 @@
     {
       "type": "function",
       "function": {
+        "name": "code_undo_turn",
+        "description": "把某一轮工具改过的文件还原成轮前状态（轮级快照）。一轮里改了多个文件、发现方向错了要整体退回时用它——比逐个去找 .bak-<时间戳> 快且不会漏，新建的文件也能删掉。list_only=true 先看有哪些轮可退。只覆盖参数里带得出路径的写工具（code_edit/code_append/code_create_file/code_patch）；shell_run 这类命令改的东西不在还原范围，报告里会点名，别以为整轮都退干净了。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "turn_id": {
+              "type": "string",
+              "description": "要还原的轮 id；省略 = 最近一轮。list_only 时不需要"
+            },
+            "paths": {
+              "type": "string",
+              "description": "可选：只还原这几个文件，逗号/换行分隔（这一轮里改对了的留着别退）"
+            },
+            "list_only": {
+              "type": "boolean",
+              "description": "true=只列出可还原的轮，不执行还原"
+            },
+            "limit": {
+              "type": "integer",
+              "description": "list_only 时最多列几条（默认 10，最大 50）"
+            }
+          },
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
         "name": "shell_run",
         "description": "执行一条本机 shell 命令并返回输出（Windows 走 cmd，Linux/macOS 走 sh）。适合快速本机操作：打开程序/文件、列目录、看进程、读小文件等。引用用户文件时必须使用真实存在的完整路径，不确定先用 find_file 查找。大型编码/项目任务不要用本工具，改用 delegate_agent_task 委派。",
         "parameters": {

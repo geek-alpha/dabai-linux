@@ -3796,6 +3796,13 @@ class AIAgent:
         断点续跑完成时连源槽位一并清理，避免同一任务被重复续跑。
         """
         turn_id = uuid.uuid4().hex
+        # 轮级文件快照：本轮工具改过的文件都归到这个 id，可以整轮退回
+        try:
+            from harness import turn_snapshot as _turn_snap
+
+            _turn_snap.set_turn(turn_id)
+        except Exception:
+            pass
         user_id = self.user_id or "default"
         # 工具集每轮都重建，含续跑轮：断点里不存 tools，续跑时若跳过重建，
         # 模型拿到的就是「重启后的空技能集」——技能工具调不出，tools 段还

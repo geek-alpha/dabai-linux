@@ -430,6 +430,13 @@ class Harness:
             arguments = _sb.prepare_args(actor, tool_name, arguments)
         except _sb.SandboxError as e:
             return f"沙箱拒绝：{e}", kind
+        # 轮级文件快照：执行前存下原内容，本轮可以整轮退回（capture 内部绝不抛异常）
+        try:
+            from harness import turn_snapshot as _snap
+
+            _snap.capture(tool_name, arguments)
+        except Exception:
+            pass
         try:
             if kind == "skill":
                 return await self.skills.execute_tool(owner_name, tool_name, arguments)

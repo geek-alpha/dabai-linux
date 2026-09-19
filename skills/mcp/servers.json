@@ -5,7 +5,8 @@
     "args": [
       "-y",
       "@modelcontextprotocol/server-filesystem",
-      "/home/wxf/dabai/skills/mcp"
+      "/home/wxf/dabai/skills/code_ops",
+      "/home/wxf/dabai"
     ]
   },
   "github": {

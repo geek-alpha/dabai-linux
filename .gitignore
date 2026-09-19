@@ -245,3 +245,6 @@ web/icons/_preview*.png
 # project_build 技能的中间产物（spec.json 每次跑都重生成）。都不是运行时。
 /.archive/
 godot-dabai/.project_build/
+.pytest_libs/
+# mcp fs server 的运行时 pid 文件，每次启动都会生成
+skills/mcp/run/
