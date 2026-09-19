@@ -66,6 +66,8 @@ jobs:
     environment: release        # ← 管理员批准闸门在这里
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/download-artifact@v4
         with:
@@ -90,12 +92,34 @@ jobs:
       - name: 生成发行说明
         run: |
           python - <<'PY' > notes.md
-          import json
+          import json, re, subprocess
           m = json.load(open("dist/MANIFEST.json"))
-          print(f"## 大白 v{m['version']}\n")
+          tag = m["version"]
+          print(f"## 大白 v{tag}\n")
           print(f"- 文件 {m['file_count']} 个，{m['total_bytes']/1048576:.2f} MB")
           print(f"- commit `{m['commit'][:12]}`")
           print(f"- 打包于 {m['built_on']} {m['built_at']}")
+
+          def run(*a):
+              r = subprocess.run(a, capture_output=True, text=True)
+              return r.stdout.strip() if r.returncode == 0 else ""
+
+          print("\n### 本次更新\n")
+          prev = run("git", "describe", "--tags", "--abbrev=0", "HEAD~1")
+          if prev:
+              logs = run("git", "log", "--oneline", "--no-merges", f"{prev}..HEAD").splitlines()
+              if not logs:
+                  logs = run("git", "log", "--oneline", "--no-merges", "-10", "HEAD").splitlines()
+          else:
+              logs = run("git", "log", "--oneline", "--no-merges", "HEAD").splitlines()
+          if not logs:
+              print("（本次无独立提交）")
+          for line in logs:
+              msg = re.sub(r"^[0-9a-f]{7,}\s+", "", line).strip()
+              msg = re.sub(r"（v?[\d.]+）$", "", msg).strip()
+              if msg:
+                  print(f"- {msg}")
+
           print("\n### 安装\n")
           print("节点侧自动更新会拉这个发行版。手动装：")
           print("```\nsudo /usr/local/lib/dabai-update/update.py --apply\n```")
