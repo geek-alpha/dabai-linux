@@ -1,12 +1,12 @@
 {
   "name": "tasks",
   "title": "任务与执行（长任务/批量/TODO/定时）",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "长任务/批量任务（harness 任务系统）+ TODO 任务清单 + 定时任务：多步骤长任务后台执行、断点续跑、任务分解与提醒、按固定间隔自动执行。",
   "author": "dabai",
   "enabled": true,
   "disclosure": "on_demand",
-  "prompt": "【技能 任务与执行】多步骤长任务用 harness_flow_plan 规划（autostart=true 直接开跑）或 harness_flow_submit 提交后台执行（断点续跑）；批量并行用 harness_batch_submit；进度用 harness_task_status/list 查询，危险步骤用 harness_task_confirm 批准。TODO 清单用 todo_create/plan/list/get/update/subtask/remind/delete；定时任务用 sched_add/list/run_now/toggle/remove。",
+  "prompt": "【技能 任务与执行】多步骤长任务用 harness_flow_plan 规划（autostart=true 直接开跑）或 harness_flow_submit 提交后台执行（断点续跑）；批量并行用 harness_batch_submit；进度用 harness_task_status/list 查询，危险步骤用 harness_task_confirm 批准。TODO 清单（**用户**的待办）用 todo_create/plan/list/get/update/subtask/remind/delete；**你自己干活**的步骤清单用 plan_update（整份提交，工具层强制：同时只 1 个 in_progress、不许 pending 跳 completed）/ plan_show / plan_clear / plan_history；要「先想清楚再动手」时用 plan_mode（action=enter）进入只规划模式：改动型工具被闸门拒绝、只读探索放行，收尾交 <proposed_plan>，exit 才恢复可执行（默认 2 小时超时自动退出，不会永久只读）；中途范围变了（拆分/合并/重排）要先 plan_update 再继续干活，别让清单过期，也不许事后一次性批量补完；定时任务用 sched_add/list/run_now/toggle/remove。",
   "tools": [
     {
       "type": "function",
@@ -655,6 +655,121 @@
           "required": [
             "job_id",
             "confirm"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "plan_update",
+        "description": "提交/更新**你自己**的工作步骤清单（整份提交，非增量）。多步任务开工前先建清单；每推进一步重新提交一次。工具层强制：同时只允许 1 个 in_progress；不许从 pending 直接跳到 completed（必须先经过 in_progress）。注意：这不是用户的待办清单（用户待办用 todo_*）。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "plan": {
+              "type": "array",
+              "description": "完整步骤清单，最多 20 条，按执行顺序",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "step": {
+                    "type": "string",
+                    "description": "这一步做什么（具体、可验证，别写『处理一下』这类空话）"
+                  },
+                  "status": {
+                    "type": "string",
+                    "enum": [
+                      "pending",
+                      "in_progress",
+                      "completed"
+                    ],
+                    "description": "pending=待办 / in_progress=进行中 / completed=已完成"
+                  }
+                },
+                "required": [
+                  "step",
+                  "status"
+                ]
+              }
+            },
+            "explanation": {
+              "type": "string",
+              "description": "仅当改动计划本身（拆分/合并/重排/放弃某步）时填，一句话说明为什么改"
+            }
+          },
+          "required": [
+            "plan"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "plan_show",
+        "description": "查看当前工作清单与进度（含最后更新时间和剩余未完成项）。",
+        "parameters": {
+          "type": "object",
+          "properties": {}
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "plan_clear",
+        "description": "清空工作清单（任务收尾或整件事放弃时用；会提示有多少步没完成就被清掉了）。",
+        "parameters": {
+          "type": "object",
+          "properties": {}
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "plan_history",
+        "description": "查看工作清单的历史快照（每次提交都留痕，可事后核对有没有『事后批量补完』）。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "n": {
+              "type": "integer",
+              "description": "看最近几次快照，默认 5"
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "plan_mode",
+        "description": "Plan Mode 开关：只规划不动手。进入后改动型工具（写文件/改代码/shell 等）在执行前被闸门拒绝，只读探索放行；流程三阶段——先只读探索消掉能查到的事实，再问偏好取舍，最后交出 decision complete 的 <proposed_plan>。触发：用户说「先想清楚再动手/先出方案/先别动手」时主动 enter；方案定了、用户让动手时 exit。默认 2 小时超时自动退出，不会永久只读。注意：这不是工作清单（那是 plan_update）。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "enum": [
+                "enter",
+                "exit",
+                "status"
+              ],
+              "description": "enter=进入 Plan Mode（只规划不动手）/ exit=退出恢复可执行 / status=查看当前状态"
+            },
+            "topic": {
+              "type": "string",
+              "description": "可选：这次要规划的主题（enter 时填，便于 status 回看）"
+            },
+            "ttl_minutes": {
+              "type": "number",
+              "description": "可选：超时自动退出的分钟数（默认 120；传 0 表示不超时）"
+            }
+          },
+          "required": [
+            "action"
           ]
         }
       }

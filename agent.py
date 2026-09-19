@@ -2320,6 +2320,19 @@ def _harness_conviction_block(cap: int = 4) -> str:
 
 
 
+def _harness_plan_mode_block() -> str:
+    """Plan Mode 激活时注入三阶段指令；未激活返回空串。
+
+    放易变尾巴：模式一进一出就变，留在静态前缀会连带作废其后整段历史缓存。
+    """
+    try:
+        import plan_mode as _pm
+
+        return _pm.prompt_block()
+    except Exception:
+        return ""
+
+
 def _harness_peer_block(preview: int = 2) -> str:
     """联邦收件箱未读：别的机器上的大白留的话。没有未读返回空串。
 
@@ -2445,6 +2458,17 @@ async def execute_local_tool(tool_name: str, arguments: dict) -> str:
     Returns:
         工具执行结果字符串。屏幕控制类工具返回带 __screen_command__ 前缀的 JSON。
     """
+    # Plan Mode 闸门：只规划不动手（对标 codex collaboration mode: plan）
+    # 挂在这里是因为所有工具（本地 + harness 技能/插件）都经本函数出去。
+    try:
+        import plan_mode as _pm
+
+        _pm_deny = _pm.check(tool_name)
+        if _pm_deny:
+            return _pm_deny
+    except Exception:
+        pass
+
     # ============ 原内置工具已迁移为「渐进式披露技能」（skills/ 与 plugins/，经 harness 路由） ============
     # 屏幕控制（换装/换场景/换声/模式/Toast/BGM/游戏）、智能体委派（dsh/codex/opencode）、
     # 任务查询等全部由 skills/{appearance,voice,music,interface,agent_ops} 提供，
@@ -4233,8 +4257,10 @@ class AIAgent:
                 "委派前先查任务中心，失败过的任务不原样重发；"
                 "收到子任务/编程助手汇报后，用一句话复盘成功/失败原因/下次改进；"
                 "完成汇报附验证证据；"
-                "多步任务（≥3 步或跨轮）开工前先用 todo_plan 建清单、每完成一步 todo_update，"
-                "同一时刻只留一个进行中项，不许跳过中间状态直接标完成"
+                "多步任务（≥3 步或跨轮）开工前先用 plan_update 提交整份工作清单（这是你自己干活的步骤，"
+                "不是用户待办——用户待办才用 todo_*）、每推进一步重新提交一次，"
+                "同一时刻只留一个进行中项，不许跳过中间状态直接标完成（工具会拒绝跳级），"
+                "轮末 plan_show 确认没有遗留未完成项"
                 "（tasks 技能未激活时先 skill_help 加载）。\n"
             )
 
@@ -4457,6 +4483,9 @@ class AIAgent:
             _peer_block = _harness_peer_block()
             if _peer_block:
                 messages.append({"role": "system", "content": _peer_block})
+            _plan_mode_block = _harness_plan_mode_block()
+            if _plan_mode_block:
+                messages.append({"role": "system", "content": _plan_mode_block})
             if mode_msg:
                 messages.append(mode_msg)
             if dynamic_status:
@@ -4528,6 +4557,9 @@ class AIAgent:
             _peer_block = _harness_peer_block()
             if _peer_block:
                 messages.append({"role": "system", "content": _peer_block})
+            _plan_mode_block = _harness_plan_mode_block()
+            if _plan_mode_block:
+                messages.append({"role": "system", "content": _plan_mode_block})
             if mode_msg:
                 messages.append(mode_msg)
             if dynamic_status:

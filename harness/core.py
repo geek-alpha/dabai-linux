@@ -426,6 +426,15 @@ class Harness:
         deny = _sb.check_tool(actor, tool_name)
         if deny:
             return deny, kind
+        # Plan Mode 闸门：只规划不动手（对标 codex collaboration mode: plan）
+        try:
+            import plan_mode as _pm
+
+            _pm_deny = _pm.check(tool_name)
+            if _pm_deny:
+                return _pm_deny, kind
+        except Exception:
+            pass
         try:
             arguments = _sb.prepare_args(actor, tool_name, arguments)
         except _sb.SandboxError as e:

@@ -29,6 +29,8 @@ if _SKILL_DIR not in sys.path:
     sys.path.insert(0, _SKILL_DIR)
 import todo_impl  # noqa: E402
 import sched_impl  # noqa: E402
+import plan_impl  # noqa: E402
+import plan_mode_impl  # noqa: E402
 
 
 def on_load(ctx):
@@ -332,6 +334,12 @@ HANDLERS = {
     "todo_subtask": todo_impl._do_subtask,
     "todo_remind": todo_impl._do_remind,
     "todo_delete": todo_impl._do_delete,
+    # ---- Agent 自用工作清单（对标 codex update_plan，非用户待办）----
+    "plan_update": plan_impl._do_update,
+    "plan_show": plan_impl._do_show,
+    "plan_clear": plan_impl._do_clear,
+    "plan_history": plan_impl._do_history,
+    "plan_mode": plan_mode_impl._do_plan_mode,
     # ---- 合并自原 scheduler 技能（5 个定时任务工具）----
     "sched_add": sched_impl.sched_add,
     "sched_list": sched_impl.sched_list,

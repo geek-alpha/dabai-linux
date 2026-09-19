@@ -13,6 +13,17 @@
 - `todo_create/plan/list/get/update/subtask/remind/delete` 任务清单全流程
 - `sched_add/list/run_now/toggle/remove` 定时任务
 
+## 规划与进度（plan_* / plan_mode）
+- `plan_update` 提交/更新**你自己**的工作步骤清单（整份提交，非增量）——多步任务开工前先建，每推进一步重新提交一次
+  - 工具层硬约束（不是靠自觉）：同时只允许 1 个 in_progress；不许 pending 直接跳 completed（必须先经过 in_progress）；最多 20 步
+- `plan_show` 看当前清单与进度 / `plan_history` 看历史快照（事后核对有没有「事后批量补完」）/ `plan_clear` 收尾清空
+- `plan_mode` Plan Mode 开关：`enter` 进入 / `exit` 退出 / `status` 查看
+  - 进入后改动型工具（写文件/改代码/shell 等）在执行前被闸门拒绝，只读探索放行
+  - 三阶段：先只读探索消掉能查到的事实 → 再问偏好取舍 → 最后交 `<proposed_plan>`（decision complete）
+  - 触发：用户说「先想清楚再动手 / 先出方案 / 先别动手」时主动 enter；方案定了、用户让动手时 exit
+  - 默认 2 小时超时自动退出（`ttl_minutes` 可调，0=不超时），不会永久只读
+- 分工：plan_* 是我自己的干活步骤，todo_* 是用户的任务清单
+
 ## 策略复盘（execution_* / strategy_*）
 - `execution_record` 登记执行日志（尤其失败时务必登记卡点）
 - `execution_review` 复盘：把失败/卡点聚类提炼成可复用策略，写入策略库
