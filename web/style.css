@@ -5210,7 +5210,7 @@ body.locked #task-btn { display: none; }
     white-space: nowrap;
 }
 
-/* 搜索页：视频源选择 chips（全部/B站/AcFun/XVideos） */
+/* 搜索页：视频源选择 chips（全部/B站/AcFun/YouTube） */
 /* 观看历史：头部（徽标 + 提示 + 清空） */
 /* 视频源管理：头部 + 内置平台开关 + 自定义源列表 */
 .video-src-head {

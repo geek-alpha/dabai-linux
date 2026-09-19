@@ -122,8 +122,6 @@ PLATFORMS = [
      "hint": "关键词搜索 + 点播（含知识区/公开课/纪录片等教育内容）"},
     {"id": "acfun", "name": "AcFun", "searchable": True,
      "hint": "关键词搜索 + 点播"},
-    {"id": "xvideos", "name": "XVideos", "searchable": True,
-     "hint": "外网学习网站，需 fq 代理"},
     {"id": "youtube", "name": "YouTube", "searchable": True,
      "hint": "全球最大视频站，需 fq 代理"},
 ]
@@ -135,7 +133,7 @@ def _enabled_platform_ids() -> list:
         import video_sources_lib
         return video_sources_lib.enabled_ids()
     except Exception:
-        return ["bilibili", "acfun", "xvideos", "youtube"]
+        return ["bilibili", "acfun", "youtube"]
 
 
 def _platform_enabled(pid: str) -> bool:
@@ -469,8 +467,6 @@ def resolve(url, need_stream=True, force=False):
         if hit and now - hit["ts"] < CACHE_TTL and (not need_stream or hit["entry"].get("stream")):
             return hit["entry"]
 
-    if re.search(r"(?:^|\.)xvideos\.com", url):
-        return _resolve_xvideos(url, need_stream)
     opts = dict(BASE_OPTS, skip_download=True)
     is_yt = bool(re.search(r"(?:^|\.)youtube\.com|youtu\.be", url))
     if is_yt:
@@ -711,7 +707,7 @@ def _merge_results(groups, sort, limit):
 
     各平台在搜索阶段已按所请求的排序（综合/热门/最新）返回各自排好的
     列表，聚合时交错混排保持平台多样性；热门/最新不再按 view_count
-    全局重排（XVideos 搜索结果无播放量，全局排序会把它压到底部）。"""
+    全局重排（部分平台结果无播放量，全局排序会把它压到底部）。"""
     merged = []
     for i in range(max((len(g) for g in groups), default=0)):
         for g in groups:
@@ -843,7 +839,7 @@ def search_videos(query, platform="all", limit=12, sort="relevance", page=1):
     sort=relevance 综合 / hot 最热门 / new 最新发布（各平台按官方
     排序接口返回，聚合交错混排）。
 
-    page>=1 全平台按页加载：B 站 REST 真分页；XVideos 按 ?p= 翻页；
+    page>=1 全平台按页加载：B 站 REST 真分页；
     AcFun 接口固定返回前 30 条，用缓存切片模拟分页（切完为空，
     聚合后由前端按 webpage_url 去重自然"加载完毕"）。"""
     sort = sort if sort in ("hot", "new") else "relevance"
@@ -858,8 +854,6 @@ def search_videos(query, platform="all", limit=12, sort="relevance", page=1):
             jobs.append(("bilibili", lambda: _bilibili_search(query, limit, page, bili_order)))
         if "acfun" in enabled:
             jobs.append(("acfun", lambda: acfun_search(query, 30, page, sort)))
-        if "xvideos" in enabled:
-            jobs.append(("xvideos", lambda: xvideos_search(query, 30, page, sort)))
         if "youtube" in enabled:
             jobs.append(("youtube", lambda: youtube_search(query, 30, page, sort)))
         merged = None
@@ -877,15 +871,13 @@ def search_videos(query, platform="all", limit=12, sort="relevance", page=1):
                 merged = _merge_results(groups, sort, limit)
         if not merged:
             raise RuntimeError("all platform searches failed")
-    elif platform in ("bilibili", "acfun", "xvideos", "youtube"):
+    elif platform in ("bilibili", "acfun", "youtube"):
         if not _platform_enabled(platform):
             raise ValueError(f"platform '{platform}' 已被禁用，请在视频源设置里启用后再搜索")
         if platform == "bilibili":
             merged = _merge_results([_bilibili_search(query, limit, page, bili_order)], sort, limit)
         elif platform == "acfun":
             merged = _merge_results([acfun_search(query, limit, page, sort)], sort, limit)
-        elif platform == "xvideos":
-            merged = _merge_results([xvideos_search(query, limit, page, sort)], sort, limit)
         else:
             merged = _merge_results([youtube_search(query, limit, page, sort)], sort, limit)
     elif platform.startswith("custom_"):
@@ -899,7 +891,7 @@ def search_videos(query, platform="all", limit=12, sort="relevance", page=1):
             raise ValueError(f"自定义源 '{platform}' 不存在或已被禁用")
         merged = _custom_search(src, query, limit, page)
     else:
-        raise ValueError(f"unknown platform '{platform}'; use all / bilibili / acfun / xvideos / youtube / custom_*")
+        raise ValueError(f"unknown platform '{platform}'; use all / bilibili / acfun / youtube / custom_*")
     schedule_prewarm(merged)
     return merged
 
@@ -1222,98 +1214,20 @@ def start_relay(key, transcode=False, ss=None):
     return proc, item.get("mime") or "video/mp4"
 
 
-# XVideos support (fq proxy)
-_XV_PROXY="http://127.0.0.1:7890"
-_XV_UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+# fq 代理（YouTube 等外网站点）
+_FQ_PROXY="http://127.0.0.1:7890"
+_FQ_UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
 # ---------------------------------------------------------------------------
-# fq 代理自动拉起：YouTube/XVideos 走本地代理（127.0.0.1:7890）。
+# fq 代理自动拉起：YouTube 走本地代理（127.0.0.1:7890）。
 # 代理未启动时自动拉起 Clash（fq.cmd start clash），避免"点在线视频看不了
 # YouTube"——之前代理硬编码但从不检查端口，Clash 没开时请求全部失败。
 # 实现与 LLM/TTS 等云端出口共用 proxy_utils（共享"已尝试拉起"标记）。
 # ---------------------------------------------------------------------------
 from proxy_utils import ensure_fq_proxy as _ensure_fq_proxy  # noqa: E402
 
-def _xv_get(url,timeout=20):
-    return requests.get(url,headers={"User-Agent":_XV_UA},proxies={"http":_XV_PROXY,"https":_XV_PROXY},timeout=timeout)
-
-def _xv_parse_page(h, limit):
-    """解析 XVideos 页面（搜索 / 首页通用）为视频条目列表。"""
-    # 缩略图：thumb 链接块里 <a href="/video..."><img ... data-src="https://thumb-cdn77...">
-    thumbs = {}
-    for href, src in re.findall(r'<a\s+href="(/video(?:\.[a-z0-9]+|\d+)/[^"]+)"[^>]*>\s*<img[^>]*?data-src="([^"]+)"', h):
-        thumbs.setdefault(href, src)
-    # 只匹配真实视频页（/video.<id>/<slug> 或旧版 /video<digits>/<slug>），
-    # 排除 /videos-i-like 等导航链接；优先块级解析拿标题和时长
-    blocks = re.findall(
-        r'<a\s+href="(/video(?:\.[a-z0-9]+|\d+)/[^"]+)"[^>]*?title="([^"]*)"[^>]*>.*?<span class="duration">([^<]*)</span>',
-        h, re.S)
-    seen = {}
-    for href, title, dur in blocks:
-        seen.setdefault(href, (title, dur))
-    for href in re.findall(r'href="(/video(?:\.[a-z0-9]+|\d+)/[^"]+)"', h):
-        seen.setdefault(href, ("", ""))
-    out = []
-    for href, (title, dur) in seen.items():
-        vid = href.split("/")[1].replace("video.", "")
-        t = html.unescape(title).strip() or href.split("/")[-1].replace("_", " ").title()
-        secs = 0
-        mh = re.search(r"(\d+)\s*h", dur); mm = re.search(r"(\d+)\s*min", dur)
-        if mh: secs += int(mh.group(1)) * 3600
-        if mm: secs += int(mm.group(1)) * 60
-        out.append({"title": t, "webpage_url": "https://www.xvideos.com" + href,
-                    "platform": "xvideos", "view_count": 0,
-                    "duration": secs or None, "uploader": "", "id": vid,
-                    "thumbnail": thumbs.get(href, "")})
-        if len(out) >= limit:
-            break
-    return out
-
-
-def xvideos_search(query,limit=12,page=1,sort="relevance"):
-    import urllib.parse
-    x=urllib.parse.quote(query)
-    page=max(1,int(page or 1))
-    # sort 实测映射：""=综合 / views=最多播放 / uploaddate=最新发布
-    # （nv/mv/tr 等旧短码已被站点忽略，等于综合）
-    sv={"hot":"views","new":"uploaddate"}.get(sort,"")
-    u=f"https://www.xvideos.com/?k={x}"
-    if sv: u+=f"&sort={sv}"
-    if page>1: u+=f"&p={page}"
-    r=_xv_get(u)
-    if r.status_code!=200: raise RuntimeError(f"xv search http {r.status_code}")
-    out = _xv_parse_page(r.text, limit)
-    if not out:
-        # 第 1 页就没结果=关键词无匹配；翻页翻空=到底了，返回空列表让前端停止加载
-        if page<=1: raise RuntimeError("xv search no results")
-        return []
-    return out
-
-def _resolve_xvideos(url, need_stream=True):
-    r = _xv_get(url)
-    if r.status_code != 200:
-        raise RuntimeError(f"xv resolve http {r.status_code}")
-    h = r.text
-    m = re.search("setVideoUrl\\\\(" + chr(39) + "([^" + chr(39) + "]+)" + chr(39) + "\\\\)", h)
-    if not m:
-        m = re.search("html5player\\.setVideoUrl\\\\(" + chr(39) + "([^" + chr(39) + "]+)" + chr(39) + "\\\\)", h)
-    if not m:
-        m = re.search(chr(34) + "videoUrl" + chr(34) + ":" + chr(34) + "([^" + chr(34) + "]+)" + chr(34), h)
-    if not m:
-        m = re.search(chr(34) + "url" + chr(34) + ":" + chr(34) + "(https?:\\\\/\\\\/[" + chr(34) + "]+?)" + chr(34), h)
-    if not m:
-        m = re.search(chr(34) + "(https://mp4-cdn[^" + chr(34) + chr(39) + " ]+?video_" + chr(92) + "d+p" + chr(92) + ".mp4" + chr(92) + "?secure=[^" + chr(92) + chr(34) + chr(39) + " ]+)" + chr(34), h)
-    if not m:
-        raise RuntimeError("xv no direct url found")
-    direct = m.group(1)
-    if chr(92) in direct:
-        direct = direct.encode().decode("unicode_escape")
-    entry = {"id": url.rstrip("/").split("/")[-1].split("-")[-1], "title": url.rstrip("/").split("/")[-1].replace("-", " ").title(), "uploader": "", "duration": None, "thumbnail": "", "view_count": 0, "webpage_url": url, "platform": "xvideos"}
-    if need_stream:
-        key = _register_stream({"kind": "direct", "url": direct, "headers": {"User-Agent": _XV_UA, "Referer": url}})
-        entry["stream"] = {"mode": "direct", "key": key, "mime": "video/mp4", "height": 720}
-    return entry
-
+def _fq_get(url,timeout=20):
+    return requests.get(url,headers={"User-Agent":_FQ_UA},proxies={"http":_FQ_PROXY,"https":_FQ_PROXY},timeout=timeout)
 
 # ---------------------------------------------------------------------------
 # YouTube support (fq proxy)：yt-dlp ytsearch 搜索 + 直链解析
@@ -1374,8 +1288,8 @@ def youtube_search(query, limit=12, page=1, sort="relevance"):
 
 
 # ---------------------------------------------------------------------------
-# 热门 / 推荐：B站官方热门榜 + AcFun 全站日榜 + YouTube trending（fq 代理）
-# + XVideos 首页（fq 代理）。platform=all 并行抓取后复用 _merge_results 交错合并。
+# 热门 / 推荐：B站官方热门榜 + AcFun 全站日榜 + YouTube trending（fq 代理）。
+# platform=all 并行抓取后复用 _merge_results 交错合并。
 # ---------------------------------------------------------------------------
 _HOT_CACHE = {}          # (platform, limit, page) -> (ts, [entry])
 _HOT_CACHE_TTL = 300     # 5 分钟缓存，避免每次打开弹窗都打外网
@@ -1607,19 +1521,6 @@ def youtube_hot(limit=12, page=1):
     return out[start:start + limit]
 
 
-def xvideos_hot(limit=12, page=1):
-    """XVideos 首页热门（走 fq 代理；首页无翻页，第 1 页之后返回空）。"""
-    page = max(1, int(page or 1))
-    limit = max(1, int(limit or 12))
-    r = _xv_get("https://www.xvideos.com/")
-    if r.status_code != 200:
-        raise RuntimeError(f"xv home http {r.status_code}")
-    out = _xv_parse_page(r.text, limit)
-    if page <= 1:
-        return out
-    return out[(page - 1) * limit: page * limit]
-
-
 def hot_videos(platform="all", limit=12, page=1):
     """热门 / 推荐聚合：按平台返回官网热门列表，字段与搜索结果一致。
 
@@ -1628,8 +1529,8 @@ def hot_videos(platform="all", limit=12, page=1):
     """
     limit = max(1, min(int(limit or 12), 24))
     page = max(1, int(page or 1))
-    if platform not in ("all", "bilibili", "acfun", "xvideos", "youtube"):
-        raise ValueError(f"unknown platform '{platform}'; use all / bilibili / acfun / xvideos / youtube")
+    if platform not in ("all", "bilibili", "acfun", "youtube"):
+        raise ValueError(f"unknown platform '{platform}'; use all / bilibili / acfun / youtube")
     if platform != "all" and not _platform_enabled(platform):
         raise ValueError(f"platform '{platform}' 已被禁用，请在视频源设置里启用后再看热门")
     # 缓存 key 含「启用的平台集合」：关闭/开启视频源后自动失效，避免聚合热门仍带已禁用平台
@@ -1647,8 +1548,6 @@ def hot_videos(platform="all", limit=12, page=1):
             jobs.append(("bilibili", lambda: _bilibili_hot(limit, page)))
         if "acfun" in enabled:
             jobs.append(("acfun", lambda: acfun_hot(limit, page)))
-        if "xvideos" in enabled:
-            jobs.append(("xvideos", lambda: xvideos_hot(limit, page)))
         if "youtube" in enabled:
             jobs.append(("youtube", lambda: youtube_hot(limit, page)))
         merged = None
@@ -1670,8 +1569,6 @@ def hot_videos(platform="all", limit=12, page=1):
         merged = _merge_results([_bilibili_hot(limit, page)], "hot", limit)
     elif platform == "acfun":
         merged = _merge_results([acfun_hot(limit, page)], "hot", limit)
-    elif platform == "xvideos":
-        merged = _merge_results([xvideos_hot(limit, page)], "hot", limit)
     else:
         merged = _merge_results([youtube_hot(limit, page)], "hot", limit)
     with _HOT_CACHE_LOCK:

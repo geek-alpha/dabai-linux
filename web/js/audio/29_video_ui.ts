@@ -20,7 +20,6 @@ export interface VideoItem {
 const PLATFORM_LABEL: Record<string, string> = {
   bilibili: 'B站',
   acfun: 'AcFun',
-  xvideos: 'XVideos',
   youtube: 'YouTube',
 };
 
@@ -209,7 +208,7 @@ export default function init_29_video_ui(App: AppKernel) {
     }
   };
 
-  /* ---------- 缩略图：走后端代理（B站图床防盗链/XVideos 图床需代理，浏览器直连会挂） ---------- */
+  /* ---------- 缩略图：走后端代理（B站图床防盗链/YouTube 图床需代理，浏览器直连会挂） ---------- */
   function thumbUrl(v: VideoItem): string {
     return v.thumbnail ? '/api/video_hub/thumb?u=' + encodeURIComponent(v.thumbnail) : '';
   }

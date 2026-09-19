@@ -26,10 +26,9 @@
                 "all",
                 "bilibili",
                 "acfun",
-                "xvideos",
                 "youtube"
               ],
-              "description": "平台，默认 all 聚合搜索（B站/AcFun/xvideos/YouTube）；教育/课程内容 bilibili 最全。"
+              "description": "平台，默认 all 聚合搜索（B站/AcFun/YouTube）；教育/课程内容 bilibili 最全。"
             },
             "sort": {
               "type": "string",

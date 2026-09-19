@@ -3,7 +3,7 @@
 在线影音 + 汉化流水线 + 小游戏 + AI 画图，四合一。触发：搜视频/放视频/搜歌/放歌/歌单/歌词/榜单/汉化视频/翻译配音/下载油管/发布B站/烧字幕/垫BGM/玩游戏/画图/生成图片/壁纸/立绘/头像/插画/海报。
 
 ## 视频（video_*）
-- `video_search(keyword, platform?, sort?, limit?)` 聚合搜索（B站/AcFun/xvideos/YouTube）
+- `video_search(keyword, platform?, sort?, limit?)` 聚合搜索（B站/AcFun/YouTube）
 - `video_play(index|query|url, watch?)` 大屏播放；watch=true 派子智能体盯梢，播完自动汇报
 - `video_queue(index|query|url)` 加入连播队列
 - `video_control(action, value?)` 控制：pause/resume/seek/volume/mute/stop/next

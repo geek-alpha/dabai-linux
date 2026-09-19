@@ -7359,10 +7359,9 @@ async def vh_hot(platform: str = "all", limit: int = 12, page: int = 1):
             "has_more": len(results) >= limit, "results": results}
 
 
-# ---------- 缩略图代理：B站图床有 Referer 防盗链、XVideos 图床需走代理，
+# ---------- 缩略图代理：B站图床有 Referer 防盗链、YouTube 图床需走代理，
 # 浏览器直连外链都会失败，统一由后端按平台策略拉取转发（域名白名单防 SSRF） ----------
 _VH_THUMB_HOSTS = ("hdslb.com", "bilibili.com", "acfun.cn", "aixifan.com",
-                   "xvideos-cdn.com", "xvideos.com", "xnxx-cdn.com",
                    "ytimg.com", "youtube.com", "googlevideo.com")
 
 
@@ -7375,10 +7374,8 @@ def _vh_thumb_fetch(url: str):
     if not any(host == a or host.endswith("." + a) for a in _VH_THUMB_HOSTS):
         raise PermissionError("host not allowed")
     lib = _video_lib()
-    if "xvideos" in host or "xnxx" in host:
-        return lib._xv_get(url, timeout=10)  # 走 fq 代理
     if "ytimg" in host or "youtube" in host or "googlevideo" in host:
-        return lib._xv_get(url, timeout=10)  # YouTube 图床走 fq 代理
+        return lib._fq_get(url, timeout=10)  # YouTube 图床走 fq 代理
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                              "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"}
     if "hdslb" in host or "bilibili" in host:

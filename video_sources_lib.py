@@ -7,7 +7,7 @@
 
 数据结构：
   {
-    "builtin": {"bilibili": true, "acfun": true, "xvideos": true, "youtube": true},
+    "builtin": {"bilibili": true, "acfun": true, "youtube": true},
     "custom": [{"id", "name", "search_url", "enabled", "created"}]
   }
 
@@ -36,7 +36,6 @@ _save_lock = threading.RLock()
 BUILTIN_PLATFORMS = [
     {"id": "bilibili", "name": "哔哩哔哩", "hint": "关键词搜索 + 点播（含知识区/公开课/纪录片等）"},
     {"id": "acfun", "name": "AcFun", "hint": "关键词搜索 + 点播"},
-    {"id": "xvideos", "name": "XVideos", "hint": "外网学习网站，需 fq 代理"},
     {"id": "youtube", "name": "YouTube", "hint": "全球最大视频站，需 fq 代理"},
 ]
 
