@@ -1844,7 +1844,7 @@ export default (function init(App: AppKernel) {
   App.fpvLookLastY = 0;
   App.vrmBones = {};
   App.gltfLoader = new GLTFLoader();
-  // 注册 Draco 解码器：支持 KHR_draco_mesh_compression 压缩模型（如白头凤_draco3.vrm）
+  // 注册 Draco 解码器：支持 KHR_draco_mesh_compression 压缩过的模型
   const dracoLoader = new DRACOLoader();
   // 必须是绝对静态路径：/static 挂载 web/ 根 → /static/vendor/three/... 命中解码器
   // 不要写成相对的，页面在根 URL '/' 时 resolve 成顶级 /vendor → 404，压缩模型直接加载失败

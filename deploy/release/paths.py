@@ -331,7 +331,7 @@ def _selftest() -> int:
         ("models/x.vrm", LOCAL),
         ("models/白头凤.vrm", CODE),           # 受管资产：点名放行
         ("models/渡鸦将军.vrm", CODE),
-        ("models/白头凤_draco3.vrm", LOCAL),   # 未点名 → 默认受保护
+        ("models/未点名角色.vrm", LOCAL),   # 未点名 → 默认受保护
         ("backgrounds/太空飞船走廊.glb", LOCAL),
         ("key.pem", LOCAL),
         ("deploy/tls/dabai-server.key", LOCAL),

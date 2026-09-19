@@ -173,7 +173,7 @@ def test_packed_assets_pass_floor():
         assert paths.classify(rel) == paths.CODE, rel
         assert not paths.floor_violation(rel), rel
         assert not update.is_forbidden(rel), rel
-    for rel in ("models/别的角色.vrm", "models/白头凤_draco3.vrm",
+    for rel in ("models/别的角色.vrm", "models/未点名角色.vrm",
                 "backgrounds/太空飞船走廊.glb"):
         assert paths.classify(rel) == paths.LOCAL, rel
         assert paths.floor_violation(rel), rel
