@@ -8,8 +8,8 @@
 heartbeat / runner.lock + systemd 单元状态）合成一条与 orchestrator 同形状的
 任务快照，由 /api/tasks 合并进列表。
 
-只读契约：本模块不写任何文件、不启停任何进程；启停走 service_action()，
-由显式 API 触发。
+只读契约：本模块只读运行数据、不启停任何进程；启停走 service_action()、
+清除走 dismiss()，两者都由显式 API 触发。
 """
 from __future__ import annotations
 
@@ -27,6 +27,7 @@ HEARTBEAT = RUN_DIR / "heartbeat"
 STOP = RUN_DIR / "STOP"
 LOCK = RUN_DIR / "runner.lock"
 TRACES = RUN_DIR / "traces"
+DISMISSED = RUN_DIR / "dismissed.json"
 
 LEDGER = BASE / "long_horizon.json"
 TASK_ID = "longrun-engine"
@@ -288,16 +289,77 @@ def service_action(action: str) -> tuple:
     return False, f"未知动作：{action}（可用 start/stop/restart/status）"
 
 
-def snapshot(full: bool = False) -> dict:
-    """合成任务中心里的一条长跑任务。任何异常都不该拖垮任务中心列表。"""
+def read_dismissed() -> dict:
+    """用户清除过哪一轮（cycle=None 表示从没清除过）。
+
+    用 None 而不是 0 当哨兵：引擎一次都没跑过时 state.cycle 也是 0，
+    用 0 会让「没清除过」和「清除过第 0 轮」撞车，条目永久消失。
+    """
+    d = _read_json(DISMISSED, None)
+    if not isinstance(d, dict):
+        return {"cycle": None}
     try:
-        return _snapshot(full)
+        d["cycle"] = int(d["cycle"])
+    except Exception:
+        d["cycle"] = None
+    return d
+
+
+def engine_running() -> bool:
+    """引擎是否在跑：runner 进程活着，或单元处于 active/启动中。
+
+    单元状态取不到时按「可能在跑」处理 —— 判据自己坏掉必须算「未检查」，不能
+    静默降级成「没在跑」（实测本机 systemctl --user 报 bus 错误，那时会把正在跑
+    的引擎当成已停，一清就从列表里藏掉了）。宁可让用户多点一次清除。
+    """
+    if _proc_alive(engine_pid()):
+        return True
+    st = unit_state()
+    if st in ("active", "activating", "reloading"):
+        return True
+    if st in ("inactive", "failed", "deactivating", "dead"):
+        return False
+    return True
+
+
+def dismiss() -> bool:
+    """把「已停止」的长跑条目从任务中心移除（用户点「清除已完成」时触发）。
+
+    只写一个 cycle 标记，不删任何运行数据（state/journal/traces 全留着）；
+    引擎下次跑出新 cycle，条目自动回来。引擎还在跑时拒绝 —— 把正在跑的东西
+    从列表里藏掉是骗人，不是清除。
+    """
+    if engine_running():
+        return False
+    cycle = int(read_state().get("cycle") or 0)
+    try:
+        RUN_DIR.mkdir(parents=True, exist_ok=True)
+        DISMISSED.write_text(json.dumps({"cycle": cycle, "at": time.time()},
+                                        ensure_ascii=False), encoding="utf-8")
+        return True
+    except Exception:
+        return False
+
+
+def snapshot(full: bool = False):
+    """合成任务中心里的一条长跑任务。任何异常都不该拖垮任务中心列表。
+
+    返回 None 的唯一种情况：引擎已停 + 用户清除过当前这一轮。条目从列表消失，
+    运行数据一份没动；引擎跑出新轮次后自动回来。
+    """
+    try:
+        snap = _snapshot(full)
     except Exception as e:
         return {"id": TASK_ID, "kind": "longrun", "channel": "longrun",
                 "title": "长跑引擎（状态读取失败）", "status": "error",
                 "steps": [], "logs": [], "result": "", "error": f"{type(e).__name__}: {e}",
                 "confirm": False, "extra": {"longrun": True}, "dsh_session_id": "",
                 "agent": _agent_meta(), "created_at": 0, "updated_at": 0}
+    if snap.get("status") != "running":
+        dm = read_dismissed()["cycle"]
+        if dm is not None and dm == int((snap.get("extra") or {}).get("cycle") or 0):
+            return None
+    return snap
 
 
 def _agent_meta() -> dict:
