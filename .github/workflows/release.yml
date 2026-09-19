@@ -117,8 +117,9 @@ jobs:
           for line in logs:
               msg = re.sub(r"^[0-9a-f]{7,}\s+", "", line).strip()
               msg = re.sub(r"（v?[\d.]+）$", "", msg).strip()
-              if msg:
-                  print(f"- {msg}")
+              if not msg or msg.startswith("release:"):
+                  continue
+              print(f"- {msg}")
 
           print("\n### 安装\n")
           print("节点侧自动更新会拉这个发行版。手动装：")
