@@ -2768,6 +2768,15 @@ async def task_center_clear():
         n += h.tasks.clear_finished()
     except Exception as e:
         logger.warning(f"[TaskCenter] 清除 Harness 任务失败: {e}")
+    # 合成条目（工作清单）不在上面两个注册表里，批量清除够不着它 —— 不按终态清数据源的话，
+    # UI 上消失一秒、下一轮轮询又原样回来，用户看到的就是「已完成却清除不了」。
+    # 只清「全部完成」的清单：没完成的清单一律留着，那是用户正在看的进度。
+    try:
+        from tools.plan_view import clear_done as _plan_clear_done
+        if _plan_clear_done():
+            n += 1
+    except Exception as e:
+        logger.warning(f"[TaskCenter] 清除工作清单失败: {e}")
     return {"ok": True, "cleared": n}
 
 

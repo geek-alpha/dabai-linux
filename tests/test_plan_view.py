@@ -160,3 +160,41 @@ def test_completed_plan_never_marked_stalled(pl, monkeypatch):
     s = snap()
     assert s['status'] == 'done'
     assert s['extra']['plan']['stale'] is False
+
+
+# ---------- 清除已完成：合成条目清不掉 = 用户眼里的「卡住」 ----------
+
+def test_clear_done_removes_finished_plan(pl):
+    """全完成的清单必须能被「清除已完成」清掉，否则条目永久占着任务中心。"""
+    upd([{'step': 'A', 'status': 'completed'}])
+    assert V.clear_done() is True
+    assert snap() is None
+
+
+def test_clear_done_keeps_unfinished_plan(pl):
+    """没完成的清单绝不能清：那是用户正在看的进度，清掉等于把他的进度删了。"""
+    upd([{'step': 'A', 'status': 'completed'}, {'step': 'B', 'status': 'pending'}])
+    assert V.clear_done() is False
+    s = snap()
+    assert s is not None and s['status'] == 'running'
+
+
+def test_clear_done_on_empty_plan_is_false(pl):
+    """空清单返回 False：清除按钮的计数不该为不存在的东西 +1。"""
+    assert V.clear_done() is False
+
+
+def test_clear_done_archives_to_history(pl):
+    """清空走 _do_clear 同一路径：旧清单进 history，不是无声丢掉。"""
+    import json
+    upd([{'step': 'A', 'status': 'completed'}])
+    V.clear_done()
+    d = json.loads(pl.read_text(encoding='utf-8'))
+    assert d['plan'] == []
+    assert d['history'] and d['history'][-1]['plan'][0]['step'] == 'A'
+
+
+def test_clear_done_survives_broken_plan_file(pl):
+    """坏文件不能让「清除已完成」整个 500 —— 清除失败就当没清，别炸任务中心。"""
+    pl.write_text('{ not json', encoding='utf-8')
+    assert V.clear_done() is False

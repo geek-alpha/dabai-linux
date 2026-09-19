@@ -229,6 +229,22 @@ def _do_clear(args) -> str:
     return '工作清单已清空（全部步骤都已完成）。'
 
 
+def clear_finished() -> bool:
+    """清单已全部完成时清空，返回是否清了。任务中心「清除已完成」用。
+
+    合成条目不在 orchestrator / Harness 注册表里，批量清除够不着它 —— 所以这里
+    补一个「按终态清数据源」的入口。没完成的清单一律不动：那是用户正在看的进度。
+    走 _do_clear 同一把锁、同一份 history 归档，不另开写路径。
+    """
+    path = _plan_path()
+    data = _load(path)
+    plan = data.get('plan') or []
+    if not plan or any(s.get('status') != 'completed' for s in plan):
+        return False
+    _do_clear(None)
+    return True
+
+
 def _do_history(args) -> str:
     path = _plan_path()
     data = _load(path)

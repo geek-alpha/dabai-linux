@@ -6,7 +6,8 @@
 longrun 已经给出正确先例（tools/longrun/status_view.py）：不注册进 orchestrator，
 在 /api/tasks 里只读合成一条，结构化数据放 extra 由前端专门渲染。
 
-数据源是 data/agent_plan.json（plan_impl 写），本模块只读不写。
+数据源由 plan_impl._plan_path() 决定（按用户分目录，回退 skills/tasks/data/agent_plan.json）。
+本模块只读，唯一例外是 clear_done()：它转调 plan_impl 的清空，自己不碰文件。
 清单为空时返回 None —— 任务中心不该常驻一条空条目刷屏。
 """
 from __future__ import annotations
@@ -50,6 +51,19 @@ def _agent_meta() -> dict:
         "desc": "白头凤当前这件事的工作步骤（plan_update 维护）。只读：改状态请直接说，"
                 "或让它自己 plan_update。",
     }
+
+
+def clear_done() -> bool:
+    """清单已全部完成时清空数据源，返回是否清了（任务中心「清除已完成」调用）。
+
+    实测踩过：合成条目不在 orchestrator / Harness 注册表里，/api/tasks/clear 够不着它，
+    用户按「清除已完成」看到条目消失一秒、下一轮轮询又原样回来 —— 像是卡住了。
+    没完成的清单一律不动。
+    """
+    try:
+        return bool(_impl().clear_finished())
+    except Exception:
+        return False
 
 
 def snapshot(full: bool = False):
