@@ -54,7 +54,7 @@ MANIFEST_NAME = "MANIFEST.json"
 DEFAULTS = {
     "ROOT": "/home/wxf/dabai",
     "STATE": "/var/lib/dabai-update",
-    "REPO": "wangxingfen/dabai-linux",
+    "REPO": "geek-alpha/dabai-linux",
     "SERVICE": "myservice",
     "PORT": "8000",
     "ENTRY": "server.py",

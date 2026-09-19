@@ -6,10 +6,10 @@
 # 本脚本是那条路径的替代品：先验证、再推送；token 只在运行时注入，不落盘。
 #
 # 用法：
-#   bash deploy/gitguard/safe-push.sh wangxingfen/dabai-linux            # 默认 private
-#   bash deploy/gitguard/safe-push.sh wangxingfen/dabai-linux --public
-#   bash deploy/gitguard/safe-push.sh wangxingfen/dabai-linux --dry-run  # 只预检
-#   bash deploy/gitguard/safe-push.sh wangxingfen/dabai-linux --proxy http://127.0.0.1:7890
+#   bash deploy/gitguard/safe-push.sh geek-alpha/dabai-linux            # 默认 private
+#   bash deploy/gitguard/safe-push.sh geek-alpha/dabai-linux --public
+#   bash deploy/gitguard/safe-push.sh geek-alpha/dabai-linux --dry-run  # 只预检
+#   bash deploy/gitguard/safe-push.sh geek-alpha/dabai-linux --proxy http://127.0.0.1:7890
 #
 # token 来源（按优先级）：
 #   1) 环境变量 GITHUB_TOKEN
@@ -90,7 +90,7 @@ ok "10 类硬雷文件均未被跟踪"
 
 echo
 if [ -z "$TARGET" ]; then
-  die "未指定目标仓库，例：bash deploy/gitguard/safe-push.sh wangxingfen/dabai-linux"
+  die "未指定目标仓库，例：bash deploy/gitguard/safe-push.sh geek-alpha/dabai-linux"
 fi
 echo "④ 目标：$TARGET（$VIS）"
 

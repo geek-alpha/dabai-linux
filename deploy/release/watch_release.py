@@ -3,7 +3,7 @@
 
 用法：
   python deploy/release/watch_release.py v1.0.6
-       [--repo wangxingfen/dabai-linux] [--root /home/wxf/dabai]
+       [--repo geek-alpha/dabai-linux] [--root /home/wxf/dabai]
        [--timeout 1800] [--interval 30]
 
 退出码：
@@ -118,7 +118,7 @@ def failed_steps(repo: str, run_id: int, token: str) -> str:
 def main() -> int:
     ap = argparse.ArgumentParser(description="盯发行版 workflow 直到 release 落地")
     ap.add_argument("tag", help="要盯的 tag，如 v1.0.6")
-    ap.add_argument("--repo", default="wangxingfen/dabai-linux")
+    ap.add_argument("--repo", default="geek-alpha/dabai-linux")
     ap.add_argument("--root", default="/home/wxf/dabai")
     ap.add_argument("--timeout", type=int, default=1800, help="总超时秒数，默认 1800")
     ap.add_argument("--interval", type=int, default=30, help="轮询间隔秒数，默认 30")
