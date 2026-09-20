@@ -47,6 +47,7 @@ POLL_INTERVAL = 0.4
 MAX_REPLIES_PER_MIN = 3     # 同一个同伴一分钟最多回几次：对方程序出错时不能变成无限对话
 REPLY_CHAR_CAP = 400
 LLM_TIMEOUT = 60.0
+FLUSH_EVERY = 20.0          # 重投发件箱的间隔（秒）：0.4 秒一轮，不能每轮都去敲离线节点
 
 _SYSTEM = """你是大白（白头凤）—— 跑在「{label}」这台机器上的那一个。
 同伴「{peer}」打电话过来了，你要当场回一句。
@@ -254,6 +255,25 @@ def _reply(frm: str, text: str, entry: Dict[str, Any]) -> None:
         log(f"↳ 回话没送到 {frm}：{r.get('error')}")
 
 
+_FLUSH_RUNNING = threading.Event()
+
+
+def _flush_bg() -> None:
+    """重投排队消息丢到线程里跑：对面离线时一次 6 秒超时，堵在主循环会让心跳断掉，
+    同伴就会把「正在补投」误判成「这台接不了电话」。"""
+    if _FLUSH_RUNNING.is_set():
+        return
+    _FLUSH_RUNNING.set()
+    try:
+        r = peer_mesh.flush_outbox()
+        if r.get("sent") or r.get("dropped"):
+            log(f"发件箱重投：送出 {r['sent']}，过期丢弃 {r['dropped']}，还剩 {r['pending']}")
+    except Exception as e:
+        log(f"发件箱重投异常（已吞）：{type(e).__name__}: {e}")
+    finally:
+        _FLUSH_RUNNING.clear()
+
+
 def _prime_cursor() -> None:
     """首启动不回灌历史：游标文件不存在时先把游标推到末尾。
     否则第一次开耳朵会把积压的旧留言全当成新来电，挨个回话刷屏。"""
@@ -279,6 +299,7 @@ def main(argv: List[str] | None = None) -> int:
         f"通知={'关' if a.no_notify else '开'}")
 
     budget: Dict[str, List[float]] = {}
+    last_flush = 0.0
     while True:
         beat()
         try:
@@ -286,6 +307,9 @@ def main(argv: List[str] | None = None) -> int:
                 handle(entry, not a.no_reply, not a.no_notify, budget)
         except Exception as e:
             log(f"循环异常（已吞，继续跑）：{type(e).__name__}: {e}")
+        if time.time() - last_flush >= FLUSH_EVERY:
+            last_flush = time.time()
+            threading.Thread(target=_flush_bg, daemon=True).start()
         if a.once:
             return 0
         time.sleep(max(0.05, a.interval))

@@ -30,6 +30,7 @@ import os
 import re
 import secrets
 import socket
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -47,6 +48,7 @@ CURSOR_FILE = DATA_DIR / "peer_cursor.json"
 WATCH_CURSOR_FILE = DATA_DIR / "peer_watch_cursor.json"
 TASK_LOG_FILE = DATA_DIR / "peer_tasks.jsonl"
 TASK_QUOTA_FILE = DATA_DIR / "peer_task_quota.json"
+OUTBOX_FILE = DATA_DIR / "peer_outbox.jsonl"
 
 TS_WINDOW = 300          # 签名时间窗（秒）：足够容忍时钟漂移，又不足以让抓包重放
 PROBE_TIMEOUT = 6.0      # 单实例探测超时
@@ -59,9 +61,14 @@ router = APIRouter(prefix="/api/peer", tags=["peer"])
 # ---------- 存储层 ----------
 
 def _atomic_write(path: Path, text: str, mode: int = 0o600) -> None:
-    """tmp + rename 原子写：树莓派断电频繁，写一半的密钥文件会让整个集群失联。"""
+    """tmp + rename 原子写：树莓派断电频繁，写一半的密钥文件会让整个集群失联。
+
+    tmp 名带 pid+线程 id：survey() 是并发探测，全新机器上三个线程会同时发现
+    「key 不存在」并同时生成 —— 共用一个 tmp 名时，先落盘的那个把 tmp 移走，
+    剩下的 chmod 打在空气上（FileNotFoundError），首启动直接崩。
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     tmp.write_text(text, encoding="utf-8")
     os.chmod(tmp, mode)
     os.replace(tmp, path)
@@ -78,8 +85,28 @@ def cluster_key(create: bool = True) -> bytes:
     if not create:
         return b""
     key = secrets.token_urlsafe(32)
-    _atomic_write(KEY_FILE, key + "\n")
-    return key.encode("utf-8")
+    KEY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = KEY_FILE.with_name(f"{KEY_FILE.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    tmp.write_text(key + "\n", encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    try:
+        # link 是原子的：目标已存在就抛 FileExistsError，并发自举只有一个赢家。
+        # 「生成→原子写→重读」不够：两个线程都可能在对方落盘前完成生成，各拿一把，
+        # 落选那把去发请求全变 403。
+        os.link(tmp, KEY_FILE)
+    except FileExistsError:
+        pass
+    except OSError:
+        _atomic_write(KEY_FILE, key + "\n")
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+    try:
+        return KEY_FILE.read_text(encoding="utf-8").strip().encode("utf-8")
+    except OSError:
+        return key.encode("utf-8")
 
 
 def node_info(create: bool = True) -> Dict[str, str]:
@@ -121,6 +148,98 @@ def set_peer(node_id: str, url: str, label: str = "") -> Dict[str, Any]:
     d.setdefault("nodes", {})[node_id] = {"url": url.rstrip("/"), "label": label or node_id}
     _atomic_write(PEERS_FILE, json.dumps(d, ensure_ascii=False, indent=2))
     return d["nodes"][node_id]
+
+
+# ---------- 离线投递（发件箱）----------
+# 一次 POST 失败就丢消息，等于「对方不在线 = 这件事没发生过」。排队重投把投递
+# 变成至少一次：对方上线（或密钥对齐）后自动补送，不用人记得重发。
+# 代价是可能重复送达 —— 发送方在收到响应前断线时，消息已到、回执没回。
+OUTBOX_TTL = 7 * 86400              # 排队消息的保质期：过期不再投，避免陈旧指令诈尸
+OUTBOX_MAX = 500                    # 队列上限：超了丢最老的，新的更要紧
+OUTBOX_BACKOFF = (30, 60, 120, 300, 600, 900, 1800)
+
+
+def outbox_items() -> List[Dict[str, Any]]:
+    try:
+        lines = OUTBOX_FILE.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    out: List[Dict[str, Any]] = []
+    for ln in lines:
+        try:
+            d = json.loads(ln)
+        except ValueError:
+            continue
+        if isinstance(d, dict) and d.get("node_id") and d.get("text"):
+            out.append(d)
+    return out
+
+
+def _outbox_write(items: List[Dict[str, Any]]) -> None:
+    if not items:
+        try:
+            OUTBOX_FILE.unlink()
+        except OSError:
+            pass
+        return
+    _atomic_write(OUTBOX_FILE,
+                  "".join(json.dumps(i, ensure_ascii=False) + "\n" for i in items))
+
+
+def queue_outbox(node_id: str, text: str, kind: str = "say", cid: str = "",
+                 re_ts: int = 0, error: str = "") -> Dict[str, Any]:
+    """把一条送不到的消息排队。同节点同内容已在队里就不重复排 —— 发布脚本重跑
+    不该把同一条通知堆成 N 份。"""
+    items = outbox_items()
+    for it in items:
+        if (it.get("node_id") == node_id and it.get("text") == text
+                and it.get("kind") == kind):
+            return {"queued": False, "reason": "duplicate", "pending": len(items)}
+    now = time.time()
+    items.append({"node_id": node_id, "text": text, "kind": kind, "cid": cid,
+                  "re": int(re_ts or 0), "queued_at": now, "attempts": 0,
+                  "next_try_at": now, "last_error": error})
+    dropped = 0
+    if len(items) > OUTBOX_MAX:
+        dropped = len(items) - OUTBOX_MAX
+        items = items[dropped:]
+    _outbox_write(items)
+    return {"queued": True, "pending": len(items), "dropped_oldest": dropped}
+
+
+def flush_outbox(limit: int = 5, now: Optional[float] = None) -> Dict[str, Any]:
+    """把到点的排队消息重投一遍：成功出队，失败按指数退避改下次时间。
+
+    重投走 say() 会重新签名 —— 签名绑 ts 且有 5 分钟时间窗，原样重发旧消息对面
+    一律拒收。重签不影响「是谁在说」：签的还是同一把集群密钥。
+    """
+    items = outbox_items()
+    if not items:
+        return {"sent": 0, "kept": 0, "dropped": 0, "pending": 0}
+    t = time.time() if now is None else now
+    kept: List[Dict[str, Any]] = []
+    sent = dropped = tried = 0
+    for it in items:
+        if tried >= limit or float(it.get("next_try_at") or 0) > t:
+            kept.append(it)
+            continue
+        if t - float(it.get("queued_at") or t) > OUTBOX_TTL:
+            dropped += 1
+            continue
+        tried += 1
+        r = say(str(it["node_id"]), str(it["text"]), kind=str(it.get("kind") or "say"),
+                cid=str(it.get("cid") or ""), re_ts=int(it.get("re") or 0),
+                queue_on_fail=False)
+        if r.get("ok"):
+            sent += 1
+            continue
+        it["attempts"] = int(it.get("attempts") or 0) + 1
+        it["next_try_at"] = t + OUTBOX_BACKOFF[
+            min(it["attempts"] - 1, len(OUTBOX_BACKOFF) - 1)]
+        it["last_error"] = str(r.get("error") or "")
+        kept.append(it)
+    _outbox_write(kept)
+    return {"sent": sent, "kept": len(kept), "dropped": dropped, "pending": len(kept)}
 
 
 # ---------- 签名 ----------
@@ -573,7 +692,8 @@ def whoami(node_id: str, timeout: float = PROBE_TIMEOUT) -> Dict[str, Any]:
 
 
 def say(node_id: str, text: str, kind: str = "say",
-        timeout: float = PROBE_TIMEOUT, cid: str = "", re_ts: int = 0) -> Dict[str, Any]:
+        timeout: float = PROBE_TIMEOUT, cid: str = "", re_ts: int = 0,
+        queue_on_fail: bool = True) -> Dict[str, Any]:
     """对某个实例说一句话。签名绑住 from+ts+text，对方据此确认「是谁在说」。
 
     cid/re 是「这是哪通电话 / 在回哪条消息」的标记，不进签名域：加进去会让新旧
@@ -588,7 +708,12 @@ def say(node_id: str, text: str, kind: str = "say",
         payload["cid"] = cid
     if re_ts:
         payload["re"] = int(re_ts)
-    return call(node_id, "/api/peer/say", payload, timeout)
+    r = call(node_id, "/api/peer/say", payload, timeout)
+    if queue_on_fail and not r.get("ok") and "known" not in r:
+        # 地址簿里没有的节点不排队：重投一万次也还是不知道往哪发。
+        q = queue_outbox(node_id, text, kind, cid, re_ts, str(r.get("error") or ""))
+        r = {**r, "queued": bool(q.get("queued")), "pending": q.get("pending")}
+    return r
 
 
 def state(node_id: str, timeout: float = PROBE_TIMEOUT) -> Dict[str, Any]:
@@ -611,7 +736,12 @@ def call_peer(node_id: str, text: str, wait: float = 90.0) -> Dict[str, Any]:
     cid = f"{me}-{sent_ts}-{secrets.token_hex(3)}"
     r = say(node_id, text, kind="call", cid=cid)
     if not r.get("ok"):
-        return {"ok": False, "error": r.get("error", "send failed"), "known": r.get("known")}
+        out: Dict[str, Any] = {"ok": False, "error": r.get("error", "send failed"),
+                              "known": r.get("known")}
+        if r.get("queued"):
+            out["queued"] = True
+            out["pending"] = r.get("pending")
+        return out
     deadline = time.time() + max(0.0, wait)
     while True:
         for m in _tail(50):
@@ -642,7 +772,15 @@ def survey(timeout: float = PROBE_TIMEOUT) -> List[Dict[str, Any]]:
     def probe(n: str) -> Dict[str, Any]:
         r = whoami(n, timeout)
         if not r.get("ok"):
-            return {"node_id": n, "online": False, "error": r.get("error", "unreachable")}
+            # 403 是对方进程自己回的 —— 它活着、网络通、服务在跑，只是不认这把密钥。
+            # 把它和「连不上」归成一类，面板上就只剩一个查不出原因的离线。
+            reachable = str(r.get("code") or "") == "forbidden"
+            row: Dict[str, Any] = {"node_id": n, "online": False,
+                                   "reachable": reachable,
+                                   "error": r.get("error", "unreachable")}
+            if reachable:
+                row["hint"] = "服务在跑，但对方不认这把 cluster.key（密钥没对齐）"
+            return row
         st = state(n, timeout)
         st.pop("ok", None)
         return {"node_id": n, "online": True, "label": r.get("label", n), **st}
@@ -702,6 +840,9 @@ def _cli(argv: List[str]) -> int:
                 if "uptime_s" in r:
                     bits.append(f"在线 {r['uptime_s'] // 3600}h")
                 print(f"  ● {r['node_id']:<10} {r.get('label', ''):<8} {'  '.join(bits)}")
+            elif r.get("reachable"):
+                print(f"  ◐ {r['node_id']:<10} 在线但密钥不符（{r.get('error', '')}）"
+                      f" —— 服务在跑，是 cluster.key 没对齐")
             else:
                 print(f"  ○ {r['node_id']:<10} 离线（{r.get('error', '')}）")
         return 0
@@ -744,6 +885,22 @@ def _cli(argv: List[str]) -> int:
             print(r.get("note"))
         return 0
 
+    if cmd == "outbox":
+        if "--flush" in rest:
+            print(json.dumps(flush_outbox(), ensure_ascii=False))
+            return 0
+        items = outbox_items()
+        if not items:
+            print("发件箱空")
+        for it in items:
+            when = time.strftime("%m-%d %H:%M", time.localtime(it.get("queued_at", 0)))
+            nxt = time.strftime("%H:%M:%S", time.localtime(it.get("next_try_at", 0)))
+            print(f"[{when}] → {it.get('node_id')} ({it.get('kind')}) "
+                  f"试{it.get('attempts', 0)}次 下次{nxt}  {str(it.get('text', ''))[:60]}")
+            if it.get("last_error"):
+                print(f"           上次失败：{it['last_error']}")
+        return 0
+
     if cmd == "inbox":
         msgs = my_inbox(mark_read="--read" in rest)
         if not msgs:
@@ -759,7 +916,7 @@ def _cli(argv: List[str]) -> int:
         return 0
 
     print(__doc__.strip().splitlines()[0])
-    print("命令: init | key | add-peer | status | say | call | inbox | state")
+    print("命令: init | key | add-peer | status | say | call | inbox | outbox | state")
     return 2
 
 
