@@ -37,6 +37,7 @@ _DECISION_LABEL = {
     "allow": "✅ 允许一次",
     "always": "✓✓ 总是允许（已进永久白名单）",
     "deny": "⛔ 拒绝",
+    "expired": "⌛ 已失效（重启后卡片作废，未执行）",
 }
 
 
@@ -108,6 +109,26 @@ def mark(rid: str, decision: str, perm_key: str = "") -> bool:
                 _save()
                 return True
     return False
+
+
+def expire_stale() -> int:
+    """进程启动时清账：上一轮留下的 pending 卡点不动了。
+
+    闸门状态在内存里，重启即丢——/api/bridge/confirm 对这些 rid 只会返回 404。
+    审计继续显示「等你决定」是假状态：让用户等一个永远不会到来的决定。
+    """
+    with _LOCK:
+        _load()
+        now = time.time()
+        n = 0
+        for e in _ENTRIES:
+            if e.get("decision") == "pending":
+                e["decision"] = "expired"
+                e["ts_done"] = now
+                n += 1
+        if n:
+            _save()
+        return n
 
 
 def _desc(e: Dict[str, Any]) -> str:

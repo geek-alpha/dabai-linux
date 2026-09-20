@@ -225,6 +225,15 @@ async def lifespan(app: FastAPI):
         logger.info("[Scheduler] 定时任务调度器已启动")
     except Exception as e:
         logger.warning(f"[Scheduler] 定时任务调度器启动失败: {e}")
+    # 确认卡审计清账：上一轮进程留下的未决卡，内存状态已丢、点不动（confirm 会 404），
+    # 审计里不能继续显示「等你决定」——那是让用户等一个不会到来的决定。
+    try:
+        import gate_audit
+        stale = gate_audit.expire_stale()
+        if stale:
+            logger.info("[GateAudit] 上一轮 %s 条未决确认卡已标为失效", stale)
+    except Exception as e:
+        logger.warning(f"[GateAudit] 未决确认卡清账失败: {e}")
     # 工作清单搁置提醒：清单卡在 in_progress 没人管时，主动往对话里推一条
     try:
         asyncio.ensure_future(_plan_stall_watch())
@@ -2980,10 +2989,10 @@ async def harness_bridge_confirm(payload: dict):
             raise HTTPException(status_code=404, detail="提问卡不存在或已过期")
         return {"ok": True, "request_id": request_id, "status": "answered"}
     if request_id.startswith("tool_gate:"):
-        # 工具级确认：写进 agent 闸门状态（白名单/黑名单/永久白名单）并广播收尾卡片
-        from agent import get_agent as _ga
-        agent = await _ga()
-        if not agent.resolve_gate(request_id, approve, always=always):
+        # 工具级确认：写进 agent 闸门状态（白名单/黑名单/永久白名单）并广播收尾卡片。
+        # 卡片挂在会话实例上，这里必须按 rid 反查持卡实例——用 get_agent() 会落到另一个实例，永远 404。
+        from agent import resolve_gate_anywhere as _resolve_gate
+        if not _resolve_gate(request_id, approve, always=always):
             raise HTTPException(status_code=404, detail="确认请求不存在或已过期")
         # 允许 → running（已放行，模型下轮重试即执行）；拒绝 → cancelled（未执行）
         status = "running" if approve else "cancelled"

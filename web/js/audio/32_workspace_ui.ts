@@ -128,7 +128,8 @@ export default function init_32_workspace_ui(App: AppKernel) {
         row.className = 'ws-saved-item';
         const when = it.ts ? new Date(it.ts * 1000).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '';
         // 拒绝用红、未决用灰、放行用绿——扫一眼就能找到手滑放过的那条
-        const color = it.decision === 'deny' ? '#ff8888' : (it.decision === 'pending' ? '#8888aa' : '#88ddaa');
+        const color = it.decision === 'deny' ? '#ff8888'
+          : (it.decision === 'pending' ? '#8888aa' : (it.decision === 'expired' ? '#aa9966' : '#88ddaa'));
         row.innerHTML =
           '<span class="ws-saved-mark">·</span>'
           + '<span class="ws-saved-path" style="white-space:normal;line-height:1.5">'

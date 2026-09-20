@@ -245,3 +245,52 @@ def test_端点返回审计清单(_isolate):
     assert data["ok"] is True
     assert len(data["items"]) == 1
     assert data["items"][0]["perm_key"] == "tool:todo_delete"
+
+
+# ---------- 重启清账：点不动的 pending 卡不能继续显示「等你决定」 ----------
+
+def test_清账_未决卡标为失效(_isolate):
+    gate_audit.record("tool_gate:a", "shell_run", {"command": "rm -rf /x"}, "不可逆操作")
+    assert gate_audit.expire_stale() == 1
+    it = gate_audit.list_audit()[0]
+    assert it["decision"] == "expired"
+    assert it["ts_done"] > 0
+    assert "失效" in it["desc"] and "shell_run" in it["desc"]
+
+
+def test_清账_已决定的记录不动(_isolate):
+    gate_audit.record("tool_gate:allow1", "todo_delete", {"task_id": "t1"}, "不可逆")
+    gate_audit.record("tool_gate:deny1", "todo_delete", {"task_id": "t2"}, "不可逆")
+    gate_audit.record("tool_gate:pend1", "shell_run", {"command": "git push -f"}, "强制推送")
+    gate_audit.mark("tool_gate:allow1", "allow")
+    gate_audit.mark("tool_gate:deny1", "deny")
+    assert gate_audit.expire_stale() == 1
+    got = {e["id"]: e["decision"] for e in gate_audit.list_audit()}
+    assert got == {"tool_gate:allow1": "allow", "tool_gate:deny1": "deny", "tool_gate:pend1": "expired"}
+
+
+def test_清账_无未决返回0(_isolate):
+    gate_audit.record("tool_gate:a", "shell_run", {}, "x")
+    gate_audit.mark("tool_gate:a", "deny")
+    assert gate_audit.expire_stale() == 0
+    assert gate_audit.expire_stale() == 0
+
+
+def test_清账_落盘且重启后仍是失效(_isolate):
+    """清账必须落盘：否则下次启动读回旧文件，又是「等你决定」。"""
+    gate_audit.record("tool_gate:a", "shell_run", {"command": "rm -rf /x"}, "不可逆")
+    gate_audit.expire_stale()
+    raw = json.loads(_isolate.read_text(encoding="utf-8"))
+    assert raw[0]["decision"] == "expired"
+    gate_audit._ENTRIES = []
+    gate_audit._LOADED = False
+    assert gate_audit.list_audit()[0]["decision"] == "expired"
+
+
+def test_清账_不影响后续新卡(_isolate):
+    """清账只扫历史，新弹的卡照旧是 pending——否则刚弹就被误标失效。"""
+    gate_audit.record("tool_gate:old", "shell_run", {}, "x")
+    gate_audit.expire_stale()
+    gate_audit.record("tool_gate:new", "shell_run", {}, "x")
+    got = {e["id"]: e["decision"] for e in gate_audit.list_audit()}
+    assert got["tool_gate:old"] == "expired" and got["tool_gate:new"] == "pending"
