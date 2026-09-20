@@ -35,6 +35,10 @@ BASE_DIR = Path(__file__).parent.resolve()
 # 工具调用最大轮数（防止无限循环）；0 / 负数表示不限制，
 # 可由 settings.json -> agent.max_tool_rounds 覆盖（见 _max_tool_rounds）
 MAX_TOOL_ROUNDS = 0
+# max_tokens 截断续补上限：finish_reason=length 时自动续补完整回复的最大次数。
+# 续补要额外发一次 LLM 请求；设上限防止 provider 永远返回 length 时死循环烧钱
+# （默认 3，可由 settings.json -> agent.resume_tail_limit 覆盖，见 _resume_tail_limit）
+MAX_RESUME_TAILS = 3
 # 死循环防护：连续 N 轮调用「完全相同工具+参数」才停止（默认 50，容错更高，
 # 避免模型多轮重试同一工具时被误杀）；可由 settings.json -> agent.repeat_guard_rounds 覆盖
 REPEAT_GUARD_LIMIT = 50
@@ -891,6 +895,31 @@ def _tool_max_tokens() -> int:
     except Exception:
         base = 512
     return max(base, 4096)
+
+
+def _resume_tail_limit() -> int:
+    """max_tokens 截断自动续补的上限（settings.json -> agent.resume_tail_limit，默认 3）。"""
+    try:
+        v = int(load_config().get("agent", {}).get("resume_tail_limit", MAX_RESUME_TAILS) or 0)
+    except Exception:
+        v = MAX_RESUME_TAILS
+    return max(v, 1)
+
+
+def _should_resume_tail(finish_reason, has_tool_calls, text_tool_call, resume_count) -> bool:
+    """max_tokens 用尽（finish_reason=length）且本轮是纯文本回复时，应自动续补尾巴。
+
+    对齐 Anthropic SDK 的 stop_reason 语义（max_tokens → resume）：被截断的回复
+    不该当正常结束交付给用户，长回复/长代码写到一半被掐断是真实场景。
+
+    有工具调用的轮不续补：工具参数截断由 parse_partial_json 的 partial 通道兜底
+    （截断的 code_edit 绝不能执行），把工具轮续成文本轮反而语义混乱。
+    """
+    if finish_reason != "length":
+        return False
+    if has_tool_calls or text_tool_call:
+        return False
+    return resume_count < _resume_tail_limit()
 
 
 def _stream_retry_count() -> int:
@@ -4896,8 +4925,10 @@ class AIAgent:
             # 断点续跑：先保证被中断的那一轮能执行完，再谈轮数上限
             max_tool_rounds = max(max_tool_rounds, ckpt_round)
         loop_break = False  # 死循环保护触发标记（连续 N 轮相同工具调用）
+        resume_tail_count = 0  # max_tokens 截断续补计数（防死循环烧钱）
         while max_tool_rounds <= 0 or tool_round < max_tool_rounds:
             tool_round += 1
+            finish_reason = None  # 本轮 LLM 输出的结束原因（length=被 max_tokens 截断）
             # 轮内工具历史压缩：总量超预算时把旧轮结果压成片段，
             # 防止几十轮工具后上下文无限膨胀导致模型逐轮变慢/超窗口（"卡死"）
             try:
@@ -4955,6 +4986,7 @@ class AIAgent:
                         _tool_kwargs["extra_body"] = _reason_extra
                     resp = await self._retry_create(**_tool_kwargs)
                     assistant_content = (resp.choices[0].message.content or "").strip()
+                    finish_reason = getattr(resp.choices[0], "finish_reason", None)
                     # 真实思维链（非流式）：一次性推给思考段（展示 + 语音）
                     try:
                         rc = getattr(resp.choices[0].message, "reasoning_content", None)
@@ -5051,6 +5083,11 @@ class AIAgent:
                                 # 需在迭代中手动捕获最后一个带 usage 的 chunk
                                 if getattr(chunk, "usage", None) is not None:
                                     last_usage = chunk.usage
+                                # 结束原因：流式最后一个 chunk 带 finish_reason（delta 常为空），
+                                # 必须在「无 choices 跳过」之前捕获，否则 length 截断无从感知
+                                if (chunk.choices
+                                        and getattr(chunk.choices[0], "finish_reason", None)):
+                                    finish_reason = chunk.choices[0].finish_reason
                                 if not chunk.choices:
                                     continue
                                 delta = chunk.choices[0].delta
@@ -5190,6 +5227,23 @@ class AIAgent:
                                 }
                         except (json.JSONDecodeError, TypeError) as e:
                             logger.warning(f"文本工具调用解析失败: {assistant_content[:200]} ({e})")
+
+            # ---- max_tokens 截断续补（对齐 Anthropic stop_reason=length → resume）----
+            # 长回复/长代码写到一半被 max_tokens 掐断时，把已生成部分作为 assistant 消息
+            # 追加，下一轮继续补完——不再把半截回复当正常结束交付给用户。
+            # 有工具调用的轮不续补：参数截断走 parse_partial_json 的 partial 通道。
+            if _should_resume_tail(finish_reason, has_tool_calls, text_tool_call,
+                                   resume_tail_count):
+                resume_tail_count += 1
+                _tail = _strip_think_markers(assistant_content.strip())
+                if _tail:
+                    messages.append({"role": "assistant", "content": _tail})
+                    yield TurnStatus(f"回复较长，正在继续（{resume_tail_count} 次）……")
+                    continue
+                # 空尾巴（只有思考/空白）：无内容可续，落正常结束
+            elif finish_reason == "length" and not has_tool_calls and not text_tool_call:
+                # 已到续补上限：交付半截并明示，不假装说完
+                yield TurnStatus("回复较长但已到续补上限，内容可能不完整")
 
             # 如果没有工具调用，对话结束
             if not has_tool_calls and not text_tool_call:
