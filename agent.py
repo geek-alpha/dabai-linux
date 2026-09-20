@@ -499,6 +499,18 @@ _IMG_JPEG_Q = 70
 # 360x640→201、720x1280→592、1280x1280→995，官方「每图封顶 384」在本渠道不成立。
 # 原值 400 偏低 33%~60%，上下文预算会被悄悄超支；1024 覆盖 _IMG_MAX_SIDE=1280 的实测上限。
 _IMG_TOKEN_EST = 1024
+# 单次工具结果最多注入几张图。MCP 侧 _MCP_IMG_MAX_COUNT 已限 4，但这条通道面向所有
+# 产出方（android 批量截图、技能脚本拼接 log），一个结果塞 20 个标记就是 20×1024 token
+# 直接灌进上下文。4 让「一个工具结果最多 4 张图」成为全链路一致的契约。
+_IMG_MAX_PER_RESULT = 4
+# 用户主动上传放宽到 8：对齐 server.UPLOAD_MAX_FILES。那是明确意图，截断用户自己
+# 发来的图比截断工具批量产出更糟；8 张 = 8192 token，预算扛得住。
+_IMG_MAX_USER_UPLOAD = 8
+# 超出上限必须留一句说明：静默丢弃会让模型以为「这次只产出了 4 张图」，
+# 拿着残缺信息下结论比不看图更坏。
+_IMG_CAP_NOTE = ("【图片注入上限】本次共 {total} 张图，只注入了 {done} 张"
+                 "（单次上限 {cap} 张，防上下文超支）；其余 {left} 张未注入，"
+                 "需要看哪张就用工具单独读取它的路径。")
 
 
 def _img_marks(text) -> list:
@@ -580,23 +592,34 @@ def _img_injectable() -> bool:
         return True
 
 
-def _append_img_messages(messages: list, marks: list, tool_name: str, img_ok: bool) -> int:
+def _append_img_messages(messages: list, marks: list, tool_name: str, img_ok: bool,
+                         limit: int = None) -> int:
     """[[IMG:]] 标记 → 多模态消息；返回追加的字符当量（供预算累计）。
 
     看不见图时只留 _IMG_NO_EYES 提示、绝不注入 image_url：提示说「未注入」
     就必须真的没注入，否则非视觉模型会撞提供方 400。
+
+    超出 limit 的标记不注入、但留一句说明；编码失败的标记不占名额。
     """
     if not marks:
         return 0
     if not img_ok:
         messages.append({"role": "system", "content": _IMG_NO_EYES})
         return 0
-    added = 0
-    for _ip in marks:
-        _im = _img_message(_ip, tool_name)
+    cap = _IMG_MAX_PER_RESULT if limit is None else max(1, int(limit))
+    added, done, i = 0, 0, 0
+    while i < len(marks) and done < cap:
+        _im = _img_message(marks[i], tool_name)
         if _im:
             messages.append(_im)
+            done += 1
             added += _IMG_TOKEN_EST * 4
+        i += 1
+    left = len(marks) - i
+    if left > 0:
+        note = _IMG_CAP_NOTE.format(total=len(marks), done=done, cap=cap, left=left)
+        messages.append({"role": "system", "content": note})
+        added += len(note)
     return added
 
 
@@ -3656,6 +3679,7 @@ class AIAgent:
                     f"你允许后我会继续执行，拒绝则不会。")
         rid = f"tool_gate:{uuid.uuid4().hex[:10]}"
         self._gate_pending[sig] = rid
+        _register_gate_owner(rid, self)   # 端点只拿得到 rid，必须能反查持卡实例
         # 缓存弹卡时的工具/参数/原因：用户点『总是允许』时按 perm_key 落盘用
         self._gate_card_args[sig] = (tool_name, arguments, reason)
         await self._emit_gate_card(rid, tool_name, arguments, reason)
@@ -3692,6 +3716,7 @@ class AIAgent:
         for sig, rid in list(self._gate_pending.items()):
             if rid == request_id:
                 self._gate_pending.pop(sig, None)
+                _GATE_OWNERS.pop(request_id, None)
                 # 审计要在清缓存之前取参数：perm_key 得从弹卡时的工具/参数算
                 self._gate_audit_mark(
                     rid, "always" if always else ("allow" if approve else "deny"),
@@ -4853,7 +4878,8 @@ class AIAgent:
             messages.append({"role": "user", "content": message})
             # 用户上传的图片复用同一条 [[IMG:]] 通道：紧跟一条多模态 user 消息，
             # 模型直接看像素（附件路径由 server 侧合成进 message 文本）
-            _append_img_messages(messages, _img_marks(message), "用户上传", _img_injectable())
+            _append_img_messages(messages, _img_marks(message), "用户上传",
+                                 _img_injectable(), _IMG_MAX_USER_UPLOAD)
             # 保存用户消息到记忆（环境交互标记为 auto，由记忆系统处理）
             await self.memory.add_message("user", message, source=msg_source)
 
@@ -6237,6 +6263,37 @@ class AIAgent:
 
 
 # ==================== 全局 Agent 实例（单例模式） ====================
+
+# 确认卡持有者登记表：卡片挂在会话级实例上（server 按 user_id 分实例），
+# 而 /api/bridge/confirm 只知道 rid —— 不按 rid 反查持卡实例就会误判「卡片不存在」。
+_GATE_OWNERS: dict = {}
+_GATE_OWNERS_MAX = 200
+
+
+def _register_gate_owner(rid: str, owner: "AIAgent") -> None:
+    """登记「这张确认卡挂在哪个实例上」。正常路径解决即注销，堆积只可能是陈旧条目。"""
+    if len(_GATE_OWNERS) >= _GATE_OWNERS_MAX:
+        _GATE_OWNERS.clear()
+    _GATE_OWNERS[rid] = owner
+
+
+def resolve_gate_anywhere(request_id: str, approve: bool, always: bool = False) -> bool:
+    """按 rid 找到持卡的 Agent 实例并落定决定，返回是否命中。
+
+    跨实例是常态：卡片由会话实例弹出，确认请求由 HTTP 端点处理，两者不是同一个对象。
+    """
+    owner = _GATE_OWNERS.get(request_id)
+    if owner is None:
+        return False
+    try:
+        ok = bool(owner.resolve_gate(request_id, approve, always=always))
+    except Exception as e:
+        logger.warning(f"确认卡落定失败 {request_id}: {e}")
+        ok = False
+    if not ok:
+        _GATE_OWNERS.pop(request_id, None)   # 实例已重置/卡片已失效，不留残渣
+    return ok
+
 
 _global_agent: Optional[AIAgent] = None
 _agent_lock = asyncio.Lock()
