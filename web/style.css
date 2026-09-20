@@ -4572,6 +4572,83 @@ body.locked #task-btn { display: none; }
 /* ============================================================
  *  DSH 智能体 · 聊天框直播卡（进度/结果一眼可判，紫色主题）
  * ============================================================ */
+/* 提问卡：模型中途问一句，答完在聊天框留痕（关掉弹窗也翻得到） */
+.msg.ask-card {
+    align-self: stretch;
+    max-width: 94%;
+    background: linear-gradient(150deg, rgba(30,24,64,0.92), rgba(14,16,42,0.94));
+    border: 1px solid rgba(124,92,255,0.4);
+    border-radius: 14px;
+    padding: 12px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    font-size: 13px;
+    line-height: 1.5;
+    position: relative;
+    overflow: hidden;
+    animation: dsh-in 0.3s ease;
+}
+.msg.ask-card::before {
+    content: '';
+    position: absolute;
+    left: 0; top: 0; bottom: 0;
+    width: 4px;
+    background: linear-gradient(180deg, #7c5cff, #ff8ae2);
+}
+.msg.ask-card .ask-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.msg.ask-card .ask-icon { font-size: 16px; }
+.msg.ask-card .ask-title { font-weight: 700; color: #e8e3ff; flex: 1; min-width: 0; }
+.msg.ask-card .ask-status {
+    padding: 2px 10px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 700;
+    background: rgba(124,92,255,0.18);
+    color: #b4a6ff;
+    border: 1px solid rgba(124,92,255,0.45);
+}
+.msg.ask-card .ask-status.answered { background: rgba(74,222,128,0.14); color: #4ade80; border-color: rgba(74,222,128,0.4); }
+.msg.ask-card .ask-status.skipped  { background: rgba(179,157,219,0.14); color: #b39ddb; border-color: rgba(179,157,219,0.35); }
+.msg.ask-card .ask-status.timeout,
+.msg.ask-card .ask-status.expired  { background: rgba(255,213,79,0.14); color: #ffd54f; border-color: rgba(255,213,79,0.35); }
+.msg.ask-card .ask-question {
+    color: var(--text);
+    white-space: pre-wrap;
+    word-break: break-word;
+    user-select: text;
+    -webkit-user-select: text;
+}
+.msg.ask-card .ask-options { display: flex; flex-direction: column; gap: 8px; }
+.msg.ask-card .ask-opt-btn {
+    width: 100%;
+    text-align: left;
+    padding: 9px 12px;
+    border-radius: 10px;
+    border: 1px solid rgba(124,92,255,0.35);
+    background: rgba(124,92,255,0.10);
+    color: var(--text);
+    font-size: 13px;
+    line-height: 1.5;
+    cursor: pointer;
+    transition: all 0.15s;
+    word-break: break-word;
+}
+.msg.ask-card .ask-opt-btn:hover:not(:disabled) { background: rgba(124,92,255,0.22); border-color: rgba(124,92,255,0.6); }
+.msg.ask-card .ask-opt-btn:disabled { opacity: 0.5; cursor: default; }
+.msg.ask-card .ask-opt-btn.chosen {
+    opacity: 1;
+    background: rgba(74,222,128,0.16);
+    border-color: rgba(74,222,128,0.7);
+    color: #d7ffe4;
+}
+.msg.ask-card .ask-answer {
+    color: var(--text-dim);
+    font-size: 12px;
+    user-select: text;
+    -webkit-user-select: text;
+}
+
 .dsh-card {
     align-self: stretch;
     max-width: 94%;

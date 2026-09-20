@@ -13,9 +13,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import threading
+import time
 import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("ask_user")
@@ -32,6 +36,12 @@ _LOCK = threading.Lock()
 _PENDING: Dict[str, Tuple[Any, Any]] = {}
 _BROADCAST = None
 
+# 提问卡留痕：问过什么、答了什么，刷新页面还能翻回来（modal 关掉就没了）
+HISTORY_FILE = Path(__file__).resolve().parent / "data" / "ask_history.json"
+MAX_HISTORY = 50
+_HISTORY: List[Dict[str, Any]] = []
+_HISTORY_LOADED = False
+
 
 def set_broadcast(fn) -> None:
     """注入推送函数（server.py 复用确认卡通道）。返回在线前端数则用于判断送达。"""
@@ -43,6 +53,71 @@ def pending_count() -> int:
     """当前挂起等待回答的提问数（诊断用）。"""
     with _LOCK:
         return len(_PENDING)
+
+
+def _load_history() -> None:
+    global _HISTORY_LOADED
+    if _HISTORY_LOADED:
+        return
+    _HISTORY_LOADED = True
+    try:
+        if HISTORY_FILE.exists():
+            data = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                _HISTORY.extend([d for d in data if isinstance(d, dict)][-MAX_HISTORY:])
+    except Exception as e:
+        logger.warning("提问历史读取失败: %s", e)
+
+
+def _save_history() -> None:
+    try:
+        HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = str(HISTORY_FILE) + ".tmp"
+        Path(tmp).write_text(json.dumps(_HISTORY, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, HISTORY_FILE)
+    except Exception as e:
+        logger.warning("提问历史落盘失败: %s", e)
+
+
+def record(rid: str, question: str, options: List[str], status: str = "pending",
+           answer: str = "") -> Dict[str, Any]:
+    """登记一条提问（提问卡弹出时调用），超出上限丢最旧的。"""
+    entry: Dict[str, Any] = {
+        "id": rid, "q": question, "options": list(options or []),
+        "status": status, "answer": answer, "ts": time.time(),
+    }
+    with _LOCK:
+        _load_history()
+        _HISTORY.append(entry)
+        del _HISTORY[:-MAX_HISTORY]
+        _save_history()
+    return entry
+
+
+def mark(rid: str, status: str, answer: str = "") -> bool:
+    """更新已登记提问的状态（answered/skipped/timeout）。未知 id 返回 False。"""
+    with _LOCK:
+        _load_history()
+        for e in reversed(_HISTORY):
+            if e.get("id") == rid:
+                e["status"] = status
+                e["answer"] = answer
+                e["ts_done"] = time.time()
+                _save_history()
+                return True
+    return False
+
+
+def list_history(limit: int = 20) -> List[Dict[str, Any]]:
+    """最近的提问卡（新的在前），供前端刷新后补回聊天框。"""
+    with _LOCK:
+        _load_history()
+        try:
+            n = int(limit)
+        except (TypeError, ValueError):
+            n = 20
+        n = max(1, min(n, MAX_HISTORY))
+        return [dict(e) for e in _HISTORY[-n:]][::-1]
 
 
 def clean_options(options: Any) -> List[str]:
@@ -95,6 +170,7 @@ def resolve(request_id: str, value: str) -> bool:
     except Exception as e:  # 事件循环已关闭等
         logger.warning("提问答案投递失败 %s: %s", rid, e)
         return False
+    mark(rid, "skipped" if not text else "answered", text)
     return True
 
 
@@ -118,6 +194,19 @@ async def _emit(rid: str, question: str, options: List[str]) -> Optional[int]:
     except Exception as e:
         logger.warning("提问卡推送失败: %s", e)
         return 0
+
+
+async def _broadcast_status(rid: str, status: str) -> None:
+    """把提问卡状态推给前端（超时 = expired），让聊天框里的卡片同步置灰。"""
+    fn = _BROADCAST
+    if not fn:
+        return
+    try:
+        res = fn({"type": "bridge_status", "request_id": rid, "task": "", "status": status})
+        if asyncio.iscoroutine(res):
+            await res
+    except Exception as e:
+        logger.warning("提问卡状态广播失败 %s: %s", rid, e)
 
 
 _SKIP_HINT = ("按你判断的合理默认继续，并在回复里说明你选了哪个默认——"
@@ -147,9 +236,12 @@ async def ask(question: str, options: Any = None, timeout: Any = None) -> str:
         if sent == 0:
             return ("⚠️ 提问没送达：当前没有在线的前端页面。"
                     "直接在回复里把问题写出来，别调用本工具。")
+        record(rid, q, opts)
         try:
             answer = await asyncio.wait_for(fut, timeout=secs)
         except asyncio.TimeoutError:
+            mark(rid, "timeout")
+            await _broadcast_status(rid, "expired")
             return f"⏰ 等了 {int(secs)} 秒用户没回答。别重复提问——{_SKIP_HINT}"
     finally:
         with _LOCK:

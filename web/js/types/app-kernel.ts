@@ -1321,6 +1321,9 @@ export interface AppKernel {
   updateHarnessStatus: (msg: BridgeStatusMessage) => void;
   harnessApprove: (approve: boolean, always?: boolean) => void;
   harnessAnswer: (value: string) => void;
+  submitAskAnswer: (requestId: string, value: string) => void;
+  updateAskCard: (requestId: string, answer: string, status: string) => void;
+  syncAskCards: () => void;
   harnessClose: () => void;
   onBridgeSay: (text: string) => void;
   dshCardExists: (requestId: string) => boolean;

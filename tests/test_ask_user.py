@@ -23,11 +23,19 @@ import plan_mode as PM  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
-def _clean():
-    """每个用例前后都清空挂起表与广播钩子——全局单例，别互相污染。"""
+def _clean(tmp_path, monkeypatch):
+    """每个用例前后清空挂起表/留痕/广播钩子——全局单例，别互相污染。
+
+    留痕落盘指向 tmp_path：否则单测会写进线上 data/ask_history.json。
+    """
     ask_user._PENDING.clear()
+    monkeypatch.setattr(ask_user, "HISTORY_FILE", tmp_path / "ask_history.json")
+    ask_user._HISTORY.clear()
+    ask_user._HISTORY_LOADED = False
     yield
     ask_user._PENDING.clear()
+    ask_user._HISTORY.clear()
+    ask_user._HISTORY_LOADED = False
     ask_user.set_broadcast(None)
 
 
@@ -242,3 +250,88 @@ def test_广播函数返回在线数():
 
     n = asyncio.run(server._gate_broadcast_safe({"type": "bridge_confirm"}))
     assert isinstance(n, int) and n >= 0
+
+
+# ---------- 提问卡留痕：刷新/翻记录还能看到问过什么、答了什么 ----------
+
+def test_提问与答案落进留痕():
+    ask_user.set_broadcast(_broadcast(answer="毫秒 int"))
+    asyncio.run(ask_user.ask("时间戳存哪种？", options=["毫秒 int", "ISO 串"]))
+    items = ask_user.list_history()
+    assert len(items) == 1
+    it = items[0]
+    assert it["id"].startswith(ask_user.PREFIX)
+    assert it["q"] == "时间戳存哪种？"
+    assert it["options"] == ["毫秒 int", "ISO 串"]
+    assert it["status"] == "answered" and it["answer"] == "毫秒 int"
+
+
+def test_跳过记skipped_超时记timeout():
+    ask_user.set_broadcast(_broadcast(answer=""))          # 空串 = 跳过
+    asyncio.run(ask_user.ask("选？"))
+    ask_user.set_broadcast(_broadcast(clients=1))          # 在线但一直不答
+    asyncio.run(ask_user.ask("另一个问题？", timeout=0.5))
+    items = ask_user.list_history()                        # 新的在前
+    assert items[0]["status"] == "timeout"
+    assert items[1]["status"] == "skipped"
+
+
+def test_超时广播expired让卡片置灰():
+    sent = []
+    ask_user.set_broadcast(_broadcast(clients=1, sink=sent))
+    asyncio.run(ask_user.ask("选？", timeout=0.5))
+    statuses = [e for e in sent if e.get("type") == "bridge_status"]
+    assert statuses, "超时必须广播状态，否则聊天框里的卡片一直显示『等你回答』"
+    assert statuses[-1]["status"] == "expired"
+    assert statuses[-1]["request_id"].startswith(ask_user.PREFIX)
+
+
+def test_没送达不落留痕():
+    ask_user.set_broadcast(_broadcast(clients=0))
+    asyncio.run(ask_user.ask("选？"))
+    assert ask_user.list_history() == []
+
+
+def test_留痕上限封顶且新的在前():
+    for i in range(ask_user.MAX_HISTORY + 5):
+        ask_user.record(f"{ask_user.PREFIX}{i}", f"q{i}", [])
+    items = ask_user.list_history(100)
+    assert len(items) == ask_user.MAX_HISTORY
+    assert items[0]["q"] == f"q{ask_user.MAX_HISTORY + 4}"
+    assert all(it["q"] != "q0" for it in items)            # 最旧的被丢掉
+
+
+def test_留痕落盘可重载():
+    ask_user.record("ask_user:r1", "问题", ["A"])
+    ask_user.mark("ask_user:r1", "answered", "A")
+    # 模拟进程重启：丢掉内存态，从磁盘重新加载
+    ask_user._HISTORY.clear()
+    ask_user._HISTORY_LOADED = False
+    items = ask_user.list_history()
+    assert items and items[0]["id"] == "ask_user:r1"
+    assert items[0]["status"] == "answered" and items[0]["answer"] == "A"
+
+
+def test_mark未知id返回False():
+    assert ask_user.mark("ask_user:nope", "answered", "x") is False
+
+
+def test_端点返回提问留痕():
+    import server
+
+    ask_user.record("ask_user:e1", "端点问题", ["A", "B"])
+    data = asyncio.run(server.ask_history(limit=5))
+    assert data["ok"] is True
+    assert any(it["id"] == "ask_user:e1" for it in data["items"])
+
+
+def test_前端提问卡接线齐全():
+    """聊天框留痕靠前端四处接线，删任何一处都会静默失效。"""
+    path = os.path.join(_ROOT, "web", "js", "network", "09_websocket.ts")
+    with open(path, encoding="utf-8") as f:
+        src = f.read()
+    assert "App.syncAskCards = function" in src
+    assert "ensureAskCard(rid, task || '', options, 'pending', '')" in src
+    assert "App.submitAskAnswer(rid, String(value || ''))" in src
+    assert "msg.status === 'expired' && App.updateAskCard" in src
+    assert "if (App.syncAskCards) App.syncAskCards();" in src

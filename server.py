@@ -2903,6 +2903,13 @@ async def gate_allow_delete(key: str):
     return {"ok": True, "removed": key}
 
 
+@app.get("/api/bridge/ask-history")
+async def ask_history(limit: int = 20):
+    """提问卡留痕：最近问过什么、答了什么（刷新页面后聊天框补回这些卡片）。"""
+    import ask_user as _ask_user
+    return {"ok": True, "items": _ask_user.list_history(limit)}
+
+
 @app.post("/api/bridge/confirm")
 async def harness_bridge_confirm(payload: dict):
     request_id = str(payload.get("request_id") or "")
