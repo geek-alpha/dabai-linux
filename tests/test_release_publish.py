@@ -223,3 +223,47 @@ def test_no_tags_yet_is_allowed(monkeypatch, tmp_path):
     _wire(monkeypatch, tmp_path, _table(**{"tag --sort=-v:refname --list v*": _cp("")}))
     info = publish.preflight(_args(), "tok")
     assert info["latest_tag"] == ""
+
+
+# --- watch_release：push 完立刻查 run 会查不到 ---
+#
+# v1.0.10 首发就栽在这：publish.py 推完 tag 马上调 watch_release，GitHub 还没把
+# 这条 run 登记进 actions/runs，脚本报「可能 workflow 没触发」退出码 2 —— 假失败，
+# 重跑同一条命令立刻成功。所以「查不到」必须重试到窗口结束才算数。
+
+watch = _load("dabai_watch", "deploy/release/watch_release.py")
+
+
+def test_wait_run_retries_before_giving_up(monkeypatch):
+    """前两次查不到（还没登记）、第三次命中 —— 不能第一次就判死。"""
+    calls = []
+
+    def fake_find(repo, sha, token):
+        calls.append(sha)
+        if len(calls) < 3:
+            return None, "还没登记"
+        return {"id": 42}, None
+
+    monkeypatch.setattr(watch, "find_run", fake_find)
+    run, err = watch.wait_run("o/r", "abc", "tok", window=5, interval=0.01)
+    assert run == {"id": 42}
+    assert err is None
+    assert len(calls) == 3
+
+
+def test_wait_run_reports_last_error_after_window(monkeypatch):
+    """窗口耗尽后返回的是「最后一次的原因」，不是空错误 —— 报错文案要能定位。"""
+    monkeypatch.setattr(watch, "find_run", lambda *a: (None, "push 事件里没找到该 commit"))
+    run, err = watch.wait_run("o/r", "abc", "tok", window=0.05, interval=0.01)
+    assert run is None
+    assert "没找到该 commit" in err
+
+
+def test_wait_run_returns_immediately_on_hit(monkeypatch):
+    """命中时不空转：只查一次，窗口再长也不等。"""
+    calls = []
+    monkeypatch.setattr(watch, "find_run",
+                        lambda *a: (calls.append(1), {"id": 7}, None)[1:])
+    run, err = watch.wait_run("o/r", "abc", "tok", window=30, interval=5)
+    assert run == {"id": 7}
+    assert len(calls) == 1

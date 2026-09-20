@@ -86,6 +86,24 @@ def find_run(repo: str, sha: str, token: str):
     return None, "push 事件里没找到该 commit 对应的 workflow run（可能 workflow 没触发）"
 
 
+def wait_run(repo: str, sha: str, token: str, window: int = 90, interval: int = 5):
+    """窗口内轮询 find_run。
+
+    为什么不能只查一次：push 完立刻查 actions/runs，GitHub 往往还没把这条 run
+    登记进去，单次查询会把「还没登记」误报成「workflow 没触发」——v1.0.10 首发
+    就这么假失败了一次（重跑同一命令即成功）。
+    """
+    deadline = time.time() + window
+    err = ""
+    while True:
+        run, err = find_run(repo, sha, token)
+        if run:
+            return run, None
+        if time.time() >= deadline:
+            return None, err
+        time.sleep(interval)
+
+
 def pending_approvals(repo: str, run_id: int, token: str) -> list:
     url = f"https://api.github.com/repos/{repo}/actions/runs/{run_id}/pending_deployments"
     st, d = api_get(url, token)
@@ -135,7 +153,7 @@ def main() -> int:
         return 2
     print(f"盯 {args.tag}（commit {sha[:8]}）@ {args.repo} …")
 
-    run, err = find_run(args.repo, sha, token)
+    run, err = wait_run(args.repo, sha, token)
     if not run:
         print(f"✘ {err}")
         return 2
