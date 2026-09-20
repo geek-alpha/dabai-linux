@@ -550,7 +550,7 @@ def test_update_switches_to_named_tag(tmp_path, monkeypatch):
     monkeypatch.setattr(update, "gh_request", fake_gh)
     monkeypatch.setattr(update, "get_token", lambda: "fake")
     monkeypatch.setattr(update, "download",
-                        lambda url, dest, token, timeout, **kw: shutil.copyfile(tar, dest))
+                        lambda url, dest, token, **kw: shutil.copyfile(tar, dest))
 
     args = argparse.Namespace(
         root=str(root), state=str(tmp_path / "state"), repo="o/r", service="", port="",
@@ -599,49 +599,91 @@ def test_stale_updater_copy_is_detected(tmp_path):
 
 
 def test_download_retries_after_bad_cdn_ip(tmp_path, monkeypatch):
-    """撞上无响应的 CDN 地址要重试，且单次尝试不许吃满 HTTP_TIMEOUT。
+    """撞上无响应的 CDN 地址要重试，且单次尝试不许吃满整个超时。
 
     release-assets.githubusercontent.com 解析出 4 个 IP，其中 185.199.111.133
-    连 443 无响应。单次尝试撞上它就白等到 HTTP_TIMEOUT 见底（60s），
-    整轮更新失败 —— 而其余三个地址 0.1~1.2s 就通。
+    连 443 无响应。首块撞上它就白等到超时见底，整轮更新失败 ——
+    而其余三个地址 0.1~1.2s 就通。
     """
+    payload = b"tarball-bytes" * 8
     seen = []
 
-    def flaky(url, token, timeout, raw=False):
+    def flaky(url, token, start, size, timeout):
         seen.append(timeout)
         if len(seen) < 3:
             raise TimeoutError("连接 release-assets 超时")
-        return b"tarball-bytes"
+        return payload[start:start + size], 206, len(payload)
 
-    monkeypatch.setattr(update, "gh_request", flaky)
+    monkeypatch.setattr(update, "_range_get", flaky)
     monkeypatch.setattr(update.time, "sleep", lambda s: None)
     retried = []
     dest = tmp_path / "dabai-1.0.2.tar.gz"
-    update.download("https://api.github.com/asset/tar", dest, "tok", 60,
+    update.download("https://api.github.com/asset/tar", dest, "tok",
                     on_retry=lambda n, ex: retried.append(n))
 
-    assert dest.read_bytes() == b"tarball-bytes"
+    assert dest.read_bytes() == payload
     assert retried == [1, 2]
-    # 关键断言：单次尝试的超时被压到 ATTEMPT_TIMEOUT，而不是传进来的 60
-    assert seen == [update.DOWNLOAD_ATTEMPT_TIMEOUT] * 3
+    # 关键断言：首块超时被压到 ATTEMPT_TIMEOUT —— 建连阶段不许慢慢耗
+    assert seen[0] == update.DOWNLOAD_ATTEMPT_TIMEOUT
     assert not list(tmp_path.glob("*.part"))
 
 
 def test_download_gives_up_loudly(tmp_path, monkeypatch):
     """重试用尽要抛错，且不留半截文件 —— 半截文件会被下游当成完整包去校验。"""
 
-    def dead(url, token, timeout, raw=False):
+    def dead(url, token, start, size, timeout):
         raise TimeoutError("连接超时")
 
-    monkeypatch.setattr(update, "gh_request", dead)
+    monkeypatch.setattr(update, "_range_get", dead)
     monkeypatch.setattr(update.time, "sleep", lambda s: None)
     dest = tmp_path / "dabai-1.0.2.tar.gz"
     with pytest.raises(RuntimeError) as ei:
-        update.download("https://api.github.com/asset/tar", dest, "tok", 60)
+        update.download("https://api.github.com/asset/tar", dest, "tok")
 
     assert "3 次" in str(ei.value)
     assert not dest.exists()
     assert not list(tmp_path.glob("*.part"))
+
+
+def test_download_streams_in_chunks(tmp_path, monkeypatch):
+    """慢网络分块拉：首块小、后续块大，已落盘的部分不重来。
+
+    树莓派直连约 60KB/s，26MB 整包一次读完必撞超时（09-20 连试三次全挂）。
+    分块后 socket 超时是空闲超时 —— 数据在流动就不算失败。
+    """
+    payload = bytes(range(256)) * 600        # 153600 字节，跨多块
+    calls = []
+
+    def chunked(url, token, start, size, timeout):
+        calls.append((start, size, timeout))
+        return payload[start:start + size], 206, len(payload)
+
+    monkeypatch.setattr(update, "_range_get", chunked)
+    dest = tmp_path / "pkg.tar.gz"
+    update.download("https://api.github.com/asset/tar", dest, "tok")
+
+    assert dest.read_bytes() == payload
+    assert calls[0] == (0, update.DOWNLOAD_FIRST_CHUNK, update.DOWNLOAD_ATTEMPT_TIMEOUT)
+    assert calls[1][1] == update.DOWNLOAD_CHUNK
+    assert all(c[2] == update.DOWNLOAD_IDLE_TIMEOUT for c in calls[1:])
+    assert not list(tmp_path.glob("*.part"))
+
+
+def test_download_handles_server_ignoring_range(tmp_path, monkeypatch):
+    """服务器忽略 Range（返回 200 整包）时写一次就收，不能把整包拼成双份。"""
+    payload = b"x" * 5000
+    calls = []
+
+    def ignores_range(url, token, start, size, timeout):
+        calls.append(start)
+        return payload, 200, None
+
+    monkeypatch.setattr(update, "_range_get", ignores_range)
+    dest = tmp_path / "pkg.tar.gz"
+    update.download("https://api.github.com/asset/tar", dest, "tok")
+
+    assert dest.read_bytes() == payload
+    assert calls == [0]
 
 
 def test_download_failure_exits_cleanly(tmp_path, monkeypatch):
@@ -660,7 +702,7 @@ def test_download_failure_exits_cleanly(tmp_path, monkeypatch):
     monkeypatch.setattr(update, "gh_request", fake_gh)
     monkeypatch.setattr(update, "get_token", lambda: "fake")
 
-    def dead(url, dest, token, timeout, **kw):
+    def dead(url, dest, token, **kw):
         raise RuntimeError("下载失败（已尝试 3 次）：连接 release-assets 超时")
 
     monkeypatch.setattr(update, "download", dead)

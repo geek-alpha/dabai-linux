@@ -353,19 +353,85 @@ def pick_assets(release: Dict[str, Any], version: str) -> Tuple[Optional[str], O
 
 
 # release-assets 会解析出多个 IP，其中个别地址连 443 无响应。urllib 单次尝试撞上
-# 就白等到 HTTP_TIMEOUT 见底（60s），所以单次尝试用短超时，失败再试 —— 每次
-# urlopen 都会重新解析地址表，重试不是重复同一次失败。
+# 就白等到 HTTP_TIMEOUT 见底（60s），所以建连用短超时，失败再试 —— 每次 urlopen
+# 都会重新解析地址表，重试不是重复同一次失败。
+#
+# 短超时治得了建连，治不了慢速下载：树莓派直连 GitHub 约 60KB/s，26MB 要 6 分钟
+# 以上，整包一次读完必然撞超时（09-20 那次连试三次全挂就是它）。所以整包改成分块
+# Range 请求：
+#   · socket 超时是「空闲超时」不是总时长 —— 数据在流动就不会触发，慢不等于失败；
+#   · 首块故意取小（建连慢/坏 IP 15 秒内暴露），后续块给足 120 秒空闲；
+#   · 块断了只重下这一块，已落盘的部分不重来；
+#   · 流式追加写盘，不再把整个包读进内存。
 DOWNLOAD_ATTEMPTS = 3
-DOWNLOAD_ATTEMPT_TIMEOUT = 15
+DOWNLOAD_ATTEMPT_TIMEOUT = 15          # 建连 + 首块：坏 IP 快速跳过
+DOWNLOAD_IDLE_TIMEOUT = 120            # 数据：多久没有新字节才算死链
+DOWNLOAD_FIRST_CHUNK = 64 * 1024       # 首块 64KB
+DOWNLOAD_CHUNK = 8 * 1024 * 1024       # 后续每块 8MB（块越小握手次数越多，实测 2MB 拖慢 4 倍）
 
 
-def download(url: str, dest: Path, token: str, timeout: int,
+def _range_get(url: str, token: str, start: int, size: int, timeout: int):
+    """取 [start, start+size) 一段。返回 (数据, 状态码, 文件总大小或 None)。"""
+    headers = {
+        "Accept": "application/octet-stream",
+        "User-Agent": "dabai-update",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "Range": f"bytes={start}-{start + size - 1}",
+    }
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    req = urllib.request.Request(url, headers=headers)
+    with _opener().open(req, timeout=timeout) as r:
+        total = None
+        cr = r.headers.get("Content-Range") or ""
+        if "/" in cr:
+            try:
+                total = int(cr.rsplit("/", 1)[1])
+            except ValueError:
+                total = None
+        elif r.status == 200:
+            cl = (r.headers.get("Content-Length") or "").strip()
+            total = int(cl) if cl.isdigit() else None
+        return r.read(), r.status, total
+
+
+def _fetch_whole(url: str, token: str, tmp: Path) -> None:
+    """分块把整个文件落到 tmp。"""
+    tmp.parent.mkdir(parents=True, exist_ok=True)
+    pos = 0
+    total = None
+    while total is None or pos < total:
+        first = pos == 0
+        size = DOWNLOAD_FIRST_CHUNK if first else DOWNLOAD_CHUNK
+        data, status, seen_total = _range_get(
+            url, token, pos, size,
+            DOWNLOAD_ATTEMPT_TIMEOUT if first else DOWNLOAD_IDLE_TIMEOUT)
+        if status == 200:
+            # 服务器忽略 Range（镜像/代理会这样）：一次返回的就是整包，写完即止 ——
+            # 再请求只会拿到同一个整包，循环里拼就是无限重复
+            tmp.write_bytes(data)
+            return
+        if seen_total is not None:
+            total = seen_total
+        if not data:
+            break
+        with tmp.open("wb" if pos == 0 else "ab") as f:
+            f.write(data)
+        pos += len(data)
+    if total is not None and pos != total:
+        raise RuntimeError(f"下载不完整：{pos}/{total} 字节")
+
+
+def download(url: str, dest: Path, token: str,
              on_retry: Optional[Any] = None, attempts: int = DOWNLOAD_ATTEMPTS) -> None:
+    tmp = dest.with_suffix(dest.suffix + ".part")
     dest.parent.mkdir(parents=True, exist_ok=True)
     last: Optional[Exception] = None
     for i in range(1, attempts + 1):
+        if tmp.exists():
+            tmp.unlink()      # 上一轮残片不拼进这一轮：脏字节别产生，别指望 sha256 兜底
         try:
-            data = gh_request(url, token, min(timeout, DOWNLOAD_ATTEMPT_TIMEOUT), raw=True)
+            _fetch_whole(url, token, tmp)
         except Exception as ex:
             last = ex
             if i < attempts:
@@ -373,10 +439,9 @@ def download(url: str, dest: Path, token: str, timeout: int,
                     on_retry(i, ex)
                 time.sleep(2 * i)
             continue
-        tmp = dest.with_suffix(dest.suffix + ".part")
-        tmp.write_bytes(data)
         tmp.replace(dest)
         return
+    tmp.unlink(missing_ok=True)
     raise RuntimeError(f"下载失败（已尝试 {attempts} 次）：{last}")
 
 
@@ -921,7 +986,7 @@ def run(args) -> int:
         tar_path = stage / f"dabai-{remote_ver}.tar.gz"
         log_line(cfg, f"下载 v{remote_ver} …")
         try:
-            download(tar_url, tar_path, token, int(cfg["HTTP_TIMEOUT"]),
+            download(tar_url, tar_path, token,
                      on_retry=lambda n, ex: log_line(cfg, f"   第 {n} 次下载没成（{ex}），重试 …"))
             want = parse_sha256_file(
                 gh_request(sha_url, token, int(cfg["HTTP_TIMEOUT"]), raw=True).decode("utf-8", "replace"))
