@@ -4,14 +4,17 @@
 
 实现的 MCP 子集：initialize / notifications/initialized / tools/list / tools/call。
 工具：echo(text)、add(a,b)、boom（返回 isError）、hang(seconds)（测超时）、
-structured（只给 structuredContent）、both（两种都给，测优先级）。
+structured（只给 structuredContent）、both（两种都给，测优先级）、shot（返回真实 PNG 的 image content，测图片回灌）。
 """
 from __future__ import annotations
 
+import base64
 import json
+import struct
 import subprocess
 import sys
 import time
+import zlib
 
 TOOLS = [
     {
@@ -47,6 +50,12 @@ TOOLS = [
         "description": "content 与 structuredContent 都有（测优先级）",
         "inputSchema": {"type": "object", "properties": {}},
     },
+    {
+        "name": "shot",
+        "description": "返回一张真实 PNG（image content），测图片回灌",
+        "inputSchema": {"type": "object",
+                        "properties": {"w": {"type": "number"}, "h": {"type": "number"}}},
+    },
 ]
 
 
@@ -57,6 +66,20 @@ def _send(obj: dict):
 
 def _text(s: str, is_error: bool = False) -> dict:
     return {"content": [{"type": "text", "text": s}], "isError": is_error}
+
+
+def _png(w: int = 800, h: int = 600) -> bytes:
+    """零依赖生成一张真 PNG（渐变彩条）：夹具不该为造图引入第三方包。"""
+    row = b"\x00" + bytes([(i * 255) // max(1, w - 1) for i in range(w) for _ in range(3)])
+    raw = row * h
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
 
 
 def handle(msg: dict):
@@ -93,6 +116,13 @@ def handle(msg: dict):
             return {"jsonrpc": "2.0", "id": mid,
                     "result": {"content": [{"type": "text", "text": "给人看的一句话"}],
                                "structuredContent": {"temperature": 22.5}}}
+        if name == "shot":
+            raw = _png(int(a.get("w") or 800), int(a.get("h") or 600))
+            return {"jsonrpc": "2.0", "id": mid, "result": {"content": [
+                {"type": "text", "text": f"已截图 {len(raw)} 字节"},
+                {"type": "image", "data": base64.b64encode(raw).decode(),
+                 "mimeType": "image/png"},
+            ]}}
         return {"jsonrpc": "2.0", "id": mid,
                 "error": {"code": -32602, "message": f"未知工具 {name}"}}
     if mid is None:

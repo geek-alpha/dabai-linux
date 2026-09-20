@@ -68,6 +68,17 @@ def main():
     check("只有 structuredContent 时不丢数据", "22.5" in r and "Partly cloudy" in r, r)
     r = sk.do_call({"server": NAME, "tool": "both"})
     check("两者并存时优先给人看的文本", r == "给人看的一句话", r)
+
+    # 5c. 图片回灌：MCP image content 落盘成文件 + [[IMG:]] 标记，base64 不进上下文
+    r = sk.do_call({"server": NAME, "tool": "shot"})
+    check("图片结果带 [[IMG:]] 标记", "[[IMG:" in r, r[:90])
+    check("base64 没灌进上下文", len(r) < 500, f"{len(r)} 字符")
+    _p = r.split("[[IMG:")[1].split("]]")[0] if "[[IMG:" in r else ""
+    check("落盘文件真实存在", bool(_p) and os.path.isfile(_p), _p)
+    if _p and os.path.isfile(_p):
+        _n = len(open(_p, "rb").read())
+        check("落盘的是完整 PNG（不是截断的半张）", _n > 500, f"{_n} 字节")
+        os.remove(_p)  # 自测不留副作用
     # 6. 未知工具 → 协议 error
     r = sk.do_call({"server": NAME, "tool": "not_exist"})
     check("未知工具返回协议错误", "未知工具" in r, r[:80])

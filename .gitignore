@@ -134,6 +134,7 @@ data/task_resume_states.json.tmp
 .playwright-mcp/
 # Android 技能运行时数据：标注截图、ADB 日志、采集 JSON、pid/lock
 data/android/
+data/mcp_images/
 # Android 技能 UI dump 临时目录（每次 viewtree 都会重写）
 skills/android/tmp/
 # 诊断打包与一次性基线

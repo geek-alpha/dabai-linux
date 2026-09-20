@@ -44,25 +44,124 @@ class MCPError(Exception):
     """MCP 连接/协议/调用错误。"""
 
 
+# ---------- 图片回灌：MCP image content → 本地文件 → [[IMG:]] 标记 ----------
+# 第一性原理：MCP 图片值钱的是像素，base64 文本进上下文是纯亏——一张 1.7MB 截图
+# 编码后 230 万字符，模型读不出画面，上下文先被撑爆。落盘 + 标记由 agent 的多模态
+# 通道喂像素（agent.py:490 已验证的那条路）。
+_MCP_IMG_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(_SKILL_DIR)), "data", "mcp_images")
+_MCP_IMG_MAX_BYTES = 8 * 1024 * 1024
+_MCP_IMG_MAX_COUNT = 4
+_MCP_IMG_EXTS = {"image/jpeg": ".jpg", "image/jpg": ".jpg", "image/png": ".png",
+                 "image/gif": ".gif", "image/webp": ".webp", "image/bmp": ".bmp"}
+# 目录上限：内容寻址对「同一张图重复调用」收敛，但截图每次都不同，不清理就会撑满盘。
+_MCP_IMG_KEEP = 200
+
+
+def _prune_images():
+    """超过 _MCP_IMG_KEEP 张时按 mtime 删最旧的到一半；清理失败不影响本次落盘。"""
+    try:
+        files = [os.path.join(_MCP_IMG_DIR, f) for f in os.listdir(_MCP_IMG_DIR)]
+        files = [f for f in files if os.path.isfile(f)]
+        if len(files) <= _MCP_IMG_KEEP:
+            return
+        files.sort(key=lambda p: os.path.getmtime(p))
+        for p in files[:len(files) - _MCP_IMG_KEEP // 2]:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+    except Exception:
+        pass
+
+
+def _take_image(data_b64: str, mime: str, taken: int) -> tuple:
+    """image content → data/mcp_images/<sha1_16>.<ext>；返回 (路径, 失败原因)。
+
+    内容寻址：同一张图重复调用不重复写盘。落盘失败一律降级成一句说明，
+    绝不抛异常打断工具调用——图看不见是遗憾，工具调不动是事故。
+    """
+    if taken >= _MCP_IMG_MAX_COUNT:
+        return "", f"图 {taken + 1} 未注入（单次上限 {_MCP_IMG_MAX_COUNT} 张，防上下文超支）"
+    try:
+        import base64
+        import hashlib
+        raw = base64.b64decode(data_b64)
+    except Exception as e:
+        return "", f"一张图未能注入（base64 解码失败：{e.__class__.__name__}）"
+    if not raw:
+        return "", "一张图未能注入（数据为空）"
+    if len(raw) > _MCP_IMG_MAX_BYTES:
+        return "", (f"一张图未能注入（{len(raw) / 1048576:.1f}MB 超过单图上限 "
+                    f"{_MCP_IMG_MAX_BYTES // 1048576}MB）")
+    ext = _MCP_IMG_EXTS.get(str(mime or "").split(";")[0].strip().lower(), ".png")
+    try:
+        os.makedirs(_MCP_IMG_DIR, exist_ok=True)
+        path = os.path.join(_MCP_IMG_DIR, hashlib.sha1(raw).hexdigest()[:16] + ext)
+        if not os.path.exists(path):
+            tmp = f"{path}.tmp{os.getpid()}"
+            with open(tmp, "wb") as f:
+                f.write(raw)
+            os.replace(tmp, path)
+            _prune_images()
+        return path, ""
+    except Exception as e:
+        return "", f"一张图未能注入（落盘失败：{e.__class__.__name__}）"
+
+
 def format_tool_result(result: dict) -> str:
-    """把 tools/call 的 result 拍平成文本（stdio 与 HTTP 两条传输共用）。"""
+    """把 tools/call 的 result 拍平成文本（stdio 与 HTTP 两条传输共用）。
+
+    图片落盘成文件、在输出**开头**给 [[IMG:路径]] 标记（agent 按标记注入像素，
+    放开头是因为结果会被截断，标记在末尾等于没有）；其余二进制只报体量。
+    """
     result = result or {}
-    parts = []
+    parts, marks, skipped = [], [], []
     for item in result.get("content") or []:
         if not isinstance(item, dict):
             parts.append(str(item))
             continue
-        if item.get("type") == "text":
+        kind = item.get("type")
+        if kind == "text":
             parts.append(str(item.get("text", "")))
-        else:
+            continue
+        if kind == "image" and item.get("data"):
+            path, why = _take_image(str(item["data"]), str(item.get("mimeType") or ""), len(marks))
+            if path:
+                marks.append(path)
+            else:
+                skipped.append(why)
+            continue
+        if kind == "resource" and isinstance(item.get("resource"), dict):
+            res = item["resource"]
+            blob, mime = res.get("blob"), str(res.get("mimeType") or "")
+            if blob and mime.startswith("image/"):
+                path, why = _take_image(str(blob), mime, len(marks))
+                if path:
+                    marks.append(path)
+                else:
+                    skipped.append(why)
+                continue
+            if blob:
+                skipped.append(f"{mime or '二进制'} 资源约 {len(str(blob)) * 3 // 4} 字节未注入")
+                continue
             parts.append(json.dumps(item, ensure_ascii=False))
+            continue
+        blob = item.get("data")
+        if isinstance(blob, str) and len(blob) > 512:
+            skipped.append(f"{kind or '二进制'} 约 {len(blob) * 3 // 4} 字节未注入")
+            continue
+        parts.append(json.dumps(item, ensure_ascii=False))
     text = "\n".join(p for p in parts if p)
     if not text and result.get("structuredContent") is not None:
         # MCP 2025-06-18 起，server 可以只给 structuredContent（规范只是 SHOULD 同时给 text）
         text = json.dumps(result["structuredContent"], ensure_ascii=False)
+    if skipped:
+        text = (text + "\n" if text else "") + "；".join(skipped)
+    head = "".join(f"[[IMG:{p}]]\n" for p in marks)
     if result.get("isError"):
-        return f"[工具报错] {text or '（无输出）'}"
-    return text or "（工具无输出）"
+        return f"[工具报错] {head}{text or '（无输出）'}"
+    return head + (text or ("（工具无输出）" if not marks else ""))
 
 
 class MCPServer:
