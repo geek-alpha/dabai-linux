@@ -988,7 +988,8 @@ class TaskSystem:
 
     async def _leaf_failed(self, t: Task, msg: str) -> None:
         if t.attempts < t.max_attempts:
-            delay = float(self._cfg["backoff"]) * (2 ** (t.attempts - 1))
+            from harness.core import backoff_delay
+            delay = backoff_delay(t.attempts, base=float(self._cfg["backoff"]))
             t._set_state(PENDING, msg)
             t.status_text = f"第 {t.attempts} 次失败，{delay:.0f}s 后重试"
             self._emit("task", f"任务 {t.id}（{t.name}）{msg}，{delay:.0f}s 后重试"

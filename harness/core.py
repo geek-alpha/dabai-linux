@@ -124,6 +124,29 @@ def _retry_after_of(e: BaseException) -> Optional[float]:
         return None
 
 
+def backoff_delay(
+    attempt: int,
+    *,
+    base: float = DEFAULT_BACKOFF,
+    cap: float = DEFAULT_BACKOFF_CAP,
+    max_exp: int = 10,
+    jitter: bool = True,
+    retry_after: Optional[float] = None,
+) -> float:
+    """指数退避 + 抖动（纯函数，attempt 从 1 起）。
+
+    - 抖动乘在封顶之前：min(cap, base*2^n*jitter)，否则 1.2 倍能顶穿 cap
+      （实测 attempts=12/backoff=10 时 35.1s > 30s 封顶）。
+    - 服务端给了 retry_after 就听它的（同样封顶，不叠抖动）。
+    """
+    if retry_after is not None:
+        return max(0.0, min(retry_after, cap))
+    delay = base * (2 ** min(attempt - 1, max_exp))
+    if jitter:
+        delay *= random.uniform(0.8, 1.2)
+    return min(cap, delay)
+
+
 async def retry_async(coro_factory: Callable[[], Awaitable[Any]],
                       attempts: int = DEFAULT_MAX_ATTEMPTS,
                       backoff: float = DEFAULT_BACKOFF,
@@ -144,13 +167,11 @@ async def retry_async(coro_factory: Callable[[], Awaitable[Any]],
             last_exc = e
             if attempt >= attempts or not is_transient_error(e):
                 raise
-            hint = _retry_after_of(e)
-            if hint is not None:
-                delay = hint
-            else:
-                # 抖动乘在封顶之前，否则 1.2 倍能把 delay 顶穿 cap（实测 35.1s > 30s）
-                delay = min(DEFAULT_BACKOFF_CAP,
-                            backoff * (2 ** (attempt - 1)) * random.uniform(0.8, 1.2))
+            delay = backoff_delay(
+                attempt,
+                base=backoff,
+                retry_after=_retry_after_of(e),
+            )
             if on_retry:
                 try:
                     on_retry(attempt, e)

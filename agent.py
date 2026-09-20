@@ -3435,7 +3435,11 @@ class AIAgent:
                 if time.monotonic() - started > _llm_retry_window_sec():
                     logger.warning("[LLM] 瞬时错误持续超过重连窗口，放弃: %s", e)
                     raise
-                delay = min(2.0 * (2 ** min(attempt - 1, 4)), 20.0)
+                from harness.core import _retry_after_of, backoff_delay
+                delay = backoff_delay(
+                    attempt, base=2.0, cap=20.0, max_exp=4,
+                    retry_after=_retry_after_of(e),
+                )
                 logger.warning(
                     "[LLM] 网络波动（%s），%.0fs 后自动重连（第 %d 次，任务不会被打断）",
                     e, delay, attempt)
