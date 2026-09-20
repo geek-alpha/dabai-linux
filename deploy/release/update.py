@@ -839,8 +839,10 @@ def run(args) -> int:
     else:
         token = get_token()
         if not token:
-            log_line(cfg, "✘ 没找到 GITHUB_TOKEN（环境变量 → /etc/dabai/secrets.env → ~/.config/dabai/secrets.env）")
-            return 2
+            # 公开仓匿名可拉：没凭据不再是失败，只是拿不到私有仓而已。
+            # 私有仓匿名访问返回 404（不是 401），下面按这个事实给提示。
+            log_line(cfg, "  没找到 GITHUB_TOKEN，按公开仓匿名访问")
+
         try:
             if args.tag:
                 rel = release_by_tag(cfg["REPO"], args.tag, token, int(cfg["HTTP_TIMEOUT"]))
@@ -849,7 +851,10 @@ def run(args) -> int:
         except urllib.error.HTTPError as ex:
             what = f"发行版 {args.tag}" if args.tag else "最新发行版"
             log_line(cfg, f"✘ 查{what}失败：HTTP {ex.code}")
-            if ex.code == 404 and args.tag:
+            if ex.code == 404 and not token:
+                log_line(cfg, "   匿名访问得到 404：仓库是私有的，或确实没有发行版")
+                log_line(cfg, "   私有仓需要凭据：环境变量 → /etc/dabai/secrets.env → ~/.config/dabai/secrets.env")
+            elif ex.code == 404 and args.tag:
                 log_line(cfg, "   该 tag 下没有发行版（tag 存在但没建 release 也是这个错）")
             return 1
         except Exception as ex:
