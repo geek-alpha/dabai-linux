@@ -19,6 +19,11 @@ sys.path.insert(0, BASE)
 
 import agent as A   # noqa: E402
 import memory as M  # noqa: E402
+import turn_metrics as TM  # noqa: E402
+
+# 命中价系数必须与真实计费同源：这里曾写死 0.1（旧假设 1/10），比实测的 1/50 贵 5 倍。
+# 系数一变，「多带体积（命中价）换少重建（全价）」的账就反过来，故直接引用单一来源。
+HIT_PRICE_RATIO = TM.HIT_PRICE_RATIO
 
 
 def _cfg():
@@ -58,9 +63,10 @@ def _raw(conn, sid):
 def replay(rounds, cfg, newest_keep, newest_per):
     """逐轮重放，返回每轮 token / 追加重建数 / 缓存计价成本指数。
 
-    成本指数 = Σ(命中前缀 × 0.1 + 新增部分 × 1.0)：命中部分按缓存读价（约 1/10），
-    新增部分全价。只看「每轮均 token」会把「重发一遍全价前缀」算成一次普通增量，
-    这就是前一轮估出「每轮只多 3.5k」却实测重建翻 6 倍的原因。
+    成本指数 = Σ(命中前缀 × HIT_PRICE_RATIO + 其余 × 1.0)：命中部分按缓存读价（1/50），
+    其余全价（本轮新增 + 重建后作废的旧消息）。只看「每轮均 token」会把
+    「重发一遍全价前缀」算成一次普通增量，这就是前一轮估出「每轮只多 3.5k」
+    却实测重建翻 6 倍的原因。
     """
     fake = types.SimpleNamespace(memory=types.SimpleNamespace(session_id="cost-%s-%s" % (newest_keep, newest_per)))
     prev = None
@@ -93,7 +99,7 @@ def replay(rounds, cfg, newest_keep, newest_per):
                 if key is None or not any(A._hist_msg_key(m) == key for m in packed):
                     stats["anchor_lost"] += 1
             hit_tok = A._hist_view_tokens(view[:n])
-            stats["index"] += hit_tok * 0.1 + (t - hit_tok)
+            stats["index"] += hit_tok * HIT_PRICE_RATIO + (t - hit_tok)
         else:
             stats["index"] += t
         prev = view
@@ -163,7 +169,7 @@ def main():
                sum(last) / max(1, len(last)), app, reb, lost, idx,
                100.0 * (idx - base) / base))
     print("\n「追加」= 上一轮视图是这一轮的前缀（命中缓存）；「重建」= 前缀作废（全价重发）。")
-    print("成本指数 = Σ(命中前缀×0.1 + 新增×1.0)，第一行为基准。")
+    print("成本指数 = Σ(命中前缀×%.2f + 其余×1.0)，第一行为基准。" % HIT_PRICE_RATIO)
 
 
 if __name__ == "__main__":

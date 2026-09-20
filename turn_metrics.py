@@ -85,6 +85,30 @@ def record_err(err_names, call_names=None, goal: str = "") -> None:
         logger.debug("工具报错流水记录跳过: %s", e)
 
 
+COMPACT_TRACE_PATH = os.path.join(BASE_DIR, "data", "compact_trace.jsonl")
+
+
+def record_compact(entry: dict) -> None:
+    """轮内压缩的净账流水——**不滚动**，与 turn_metrics 的 300 行窗口分开存。
+
+    为什么不能只记「省了多少 token」：压缩省下的是体积 × 命中价（1/50），
+    代价却是被改消息之后的整段前缀从命中价升回全价重发。两笔钱不同量级，
+    只看省下的量会把亏的记成赚的。所以必须同时记 min_k / pos_from_end /
+    invalidated_chars——前缀作废范围就是「最早被改的那条到末尾」，
+    没有这几个数，事后算不出代价，这笔账就白记。
+
+    只在真改了内容时写一行（实测多数轮次不触发）。异常照旧吞掉。
+    """
+    try:
+        row = {"ts": time.time()}
+        row.update(entry or {})
+        os.makedirs(os.path.dirname(COMPACT_TRACE_PATH), exist_ok=True)
+        with open(COMPACT_TRACE_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception as e:
+        logger.debug("压缩流水记录跳过: %s", e)
+
+
 def load(limit: int = 0) -> list:
     """读回指标（默认全部）。损坏的行直接跳过，不抛异常。"""
     rows = []

@@ -756,6 +756,7 @@ def _compact_tool_history(messages: list, budget: int = None,
     total = sum(_est(m) for m in messages)
     total0 = total          # 原始总量：压缩有没有真跑、省了多少，必须能事后验证
     over_budget = total > budget
+    edits = []              # 本次真改动的消息：(下标, role, 前字符, 后字符, 触发线)
     single_cap = _single_result_max_tokens()
 
     def _is_result_msg(m):
@@ -763,7 +764,7 @@ def _compact_tool_history(messages: list, budget: int = None,
                 or (m.get("role") == "system"
                     and str(m.get("content") or "").startswith("【工具")))
 
-    def _shrink(m, cap, suffix):
+    def _shrink(m, k, cap, suffix, reason):
         """把一条消息压到 cap 字符，并把省下的 token 从 total 里扣掉。
 
         增量维护是必须的：原来每压完一个旧轮都要把**全部**消息重算一遍 token
@@ -777,6 +778,7 @@ def _compact_tool_history(messages: list, budget: int = None,
         new_c = c[:cap] + suffix
         total -= _est(m) - estimate_tokens(new_c)
         m["content"] = new_c
+        edits.append((k, m.get("role"), len(c), len(new_c), reason))
 
     def _oversize(m):
         """旧轮里的超大单条结果。
@@ -815,9 +817,10 @@ def _compact_tool_history(messages: list, budget: int = None,
                 # 两条触发线：总量超预算（按序截断到预算内），或旧轮里存在
                 # 超大单条结果（压缩比 > 1/h 即划算，见 _single_result_max_tokens）
                 if over_budget or _oversize(m):
-                    _shrink(m, retro_cap, "…【已压缩】")
+                    _shrink(m, k, retro_cap, "…【已压缩】",
+                            "budget" if over_budget else "oversize")
             elif m.get("role") == "assistant" and over_budget:
-                _shrink(m, ASSISTANT_RETRO_CAP, "…")
+                _shrink(m, k, ASSISTANT_RETRO_CAP, "…", "budget")
         if over_budget and total <= budget:
             break
 
@@ -831,6 +834,7 @@ def _compact_tool_history(messages: list, budget: int = None,
             tok_before = _est(m)
             if _downgrade_img(m):
                 total -= tok_before - _est(m)
+                edits.append((k, "user", tok_before * 4, _est(m) * 4, "img"))
             if total <= budget:
                 break
 
@@ -846,7 +850,7 @@ def _compact_tool_history(messages: list, budget: int = None,
             for k in range(start, end):
                 m = messages[k]
                 if _is_result_msg(m):
-                    _shrink(m, cap, "…【已压缩】")
+                    _shrink(m, k, cap, "…【已压缩】", "tail")
             if total <= budget:
                 break
     if total < total0:
@@ -855,7 +859,45 @@ def _compact_tool_history(messages: list, budget: int = None,
             budget, total0, total, total0 - total,
             100.0 * (total0 - total) / max(1, total0),
             "" if over_budget else "｜触发：旧轮超大单条 > %d token" % single_cap)
+        _compact_trace(edits, messages, budget, total0, total)
     return messages
+
+
+def _compact_trace(edits: list, messages: list, budget: int,
+                   total0: int, total: int) -> None:
+    """把本次压缩的净账写进流水（观测失败静默——绝不能拖挂主路径）。
+
+    只记「省了多少」会把亏的记成赚的：压缩改的是历史中间的消息，从最早被改的
+    那条到末尾，整段前缀缓存作废、要从 1/50 价升回全价重发。所以必须同时记
+    min_k 与 invalidated_chars——那才是这次改动的代价面。
+    """
+    try:
+        from turn_metrics import record_compact
+        n = len(messages)
+        min_k = min(e[0] for e in edits)
+
+        def _chars(m):
+            c = m.get("content")
+            if isinstance(c, list):
+                return _IMG_TOKEN_EST * 4    # 与 estimate_tokens 的 4 字符/token 同口径
+            return len(str(c or ""))
+
+        record_compact({
+            "reasons": sorted({e[4] for e in edits}),
+            "budget": budget,
+            "total_before": total0,
+            "total_after": total,
+            "saved_tokens": total0 - total,
+            "n_msgs": n,
+            "min_k": min_k,
+            "pos_from_end": n - 1 - min_k,
+            "invalidated_chars": sum(_chars(m) for m in messages[min_k:]),
+            "edit_count": len(edits),
+            "edits": [{"pos": e[0], "role": e[1], "before": e[2],
+                       "after": e[3], "reason": e[4]} for e in edits[:20]],
+        })
+    except Exception:
+        pass
 
 
 def _normalize_tool_rounds(messages: list) -> list:
