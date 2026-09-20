@@ -4011,6 +4011,10 @@ def _normalize_card_llm(payload_llm: dict) -> dict:
         "model": (payload_llm.get("model") or "").strip(),
         "temperature": temperature,
         "vision": _norm_vision(payload_llm.get("vision")),
+        # 侧任务（摘要/记忆提取）可选独立模型，同样只存「供应商 id + 模型名」，
+        # 地址密钥取自全局注册表。留空 = 用全局 memory.aux_*（那份也空 = 跟随主模型）。
+        "aux_provider_id": (payload_llm.get("aux_provider_id") or "").strip(),
+        "aux_model": (payload_llm.get("aux_model") or "").strip(),
     }
     # 卡片一旦声明了供应商（provider_id），就不再携带自己的 base_url/api_key，
     # 应用时统一从全局供应商注册表取地址/密钥；否则旧卡遗留的迁移字段会被一直带下去，

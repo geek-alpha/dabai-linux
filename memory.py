@@ -42,6 +42,13 @@ RECALL_MAX_CHARS = 800
 # 相关回忆注入的最大估算 token（与 recall_max_chars 取更小者）
 RECALL_MAX_TOKENS = 200
 
+# 侧任务（摘要生成 / 记忆提取）可选独立链路：空 = 跟随主模型（默认，行为与旧版一致）。
+# 摘要每 10 条消息一次、记忆提取每轮一次，都是高频低价值调用，允许走更便宜的模型；
+# 主对话链路不受影响。实际生效值由 agent 从 settings.json 的 memory 段读取后注入。
+AUX_MODEL = ""
+AUX_BASE_URL = ""
+AUX_API_KEY = ""
+
 # 上下文打包（token 预算）默认参数；可在 settings.json 的 memory 段覆盖
 # 提示词预算 = context_window * token_budget_ratio（max_prompt_tokens > 0 时优先用固定值）
 CONTEXT_TOKEN_BUDGET_RATIO = 0.5
@@ -111,6 +118,21 @@ SHORT_TERM_MAX_CHARS_PER_TOOL = 500
 # 对应三处修正：统计含 tool_calls；参数也截断；单轮只留最近 N 次工具交互（成对保留）。
 SHORT_TERM_MAX_CHARS_PER_TOOL_CALL = 300  # 单条工具调用参数（arguments）最大字符
 SHORT_TERM_KEEP_LAST_TOOLS = 3           # 单轮保留最近 N 次工具交互（其余成对丢弃）
+# 2026-09-20 实测（tools/compaction_recall.py + tools/hist_view_cost.py）：上面这条上限对
+# 「最新一轮」同样生效，而最新一轮恰恰是下一轮唯一必读的上下文。实测每轮工具交互
+# 中位 17 次、p90 52 次、87% 的轮超过 3 次 —— 最新一轮只剩 10.0% 的 token、11.1% 的
+# 事实实体（文件:行号、命令、数字全在被砍掉的那段里），于是下一轮看不见自己刚读过
+# 什么，只能重读（相邻轮重复操作同一文件占 18.0%）。
+#
+# 只放宽「条数」不放宽「单条字符」：放宽到 16 条 / 1500 字符后实体保留 31.1%，
+# 但窗口更快顶到 HIST_VIEW_MAX_TOKENS → 裁剪重建从 8 次涨到 51 次（前缀作废、
+# 缓存全失效），按缓存计价成本 +128%。实测扫描（3/500 为基准）：
+#   6/500 → 实体 15.6%  成本 +40%     10/500 → 实体 22.1%  成本 +74%
+#   16/500 → 实体 23.1% 成本 +128%    10/1200 → 成本 +130%（换不到多少实体）
+# 拐点在 10 条：再往上只多 1pp 实体却多 54% 成本。历史轮不放开：越旧越该丢。
+SHORT_TERM_KEEP_LAST_TOOLS_NEWEST = 10
+# 0 = 继承 SHORT_TERM_MAX_CHARS_PER_TOOL（实测单独放宽它是负收益，见上）
+SHORT_TERM_MAX_CHARS_PER_TOOL_NEWEST = 0
 SUMMARY_MAX_TOKENS = 800                 # 长期摘要块预算（累计式摘要自包含，最新一条优先全量）
 SUMMARY_MAX_CHARS_PER_ITEM = 600         # 单条摘要最大字符（与累计摘要 600 字上限一致）
 LONG_TERM_MAX_TOKENS = 300               # 常驻长期记忆块预算
@@ -357,13 +379,17 @@ def _pack_history_records(records: list, budget_tokens: int,
                           min_rounds: int = 0,
                           max_chars_per_tool: int = 0,
                           max_chars_per_tool_call: int = 0,
-                          keep_last_tools: int = 0) -> list:
+                          keep_last_tools: int = 0,
+                          max_chars_per_tool_newest: int = 0,
+                          keep_last_tools_newest: int = 0) -> list:
     """按「轮」打包短期窗口历史（新→旧挑选，输出恢复旧→新）。
 
     records: 旧→新的消息列表 [{"role","content", tool_calls?, tool_results?}...]。
     先按轮分组（user 与其后的 assistant/tool 消息归为一轮，不拆散问答对）：
     - 最新一轮整体保留：不受单轮字符上限截断，超 token 预算时才按预算硬截断，
-      保证「刚发生的事」完整进入下一轮上下文（修复长工具轮把上一轮挤掉的问题）；
+      保证「刚发生的事」完整进入下一轮上下文（修复长工具轮把上一轮挤掉的问题）。
+      例外：工具交互条数与单条工具结果另有上限，最新一轮走 *_newest 那组参数
+      （默认比历史轮宽松，理由见 SHORT_TERM_KEEP_LAST_TOOLS_NEWEST 处的实测）；
     - min_rounds>0：最近 N 个「用户轮」保底保留（只受字符上限约束，不因预算丢整轮），
       保证最近几轮对话绝不被工具长文挤掉（修复"前两轮就忘"）；
     - 更旧轮按剩余预算由新到旧挑选，放不下的整轮跳过。
@@ -382,12 +408,16 @@ def _pack_history_records(records: list, budget_tokens: int,
         guaranteed = min_rounds > 0 and user_rounds_kept < min_rounds
         # 最新一轮不截字符（超预算才硬截断）；旧轮仍按单轮上限截断
         cap = 0 if is_newest else max_chars_per_round
+        per_tool = ((max_chars_per_tool_newest or max_chars_per_tool)
+                    if is_newest else max_chars_per_tool)
+        keep_tools = ((keep_last_tools_newest or keep_last_tools)
+                      if is_newest else keep_last_tools)
         packed, rnd_tokens = _pack_one_round(
             rnd, cap, budget_tokens, is_newest,
-            max_chars_per_tool=max_chars_per_tool,
+            max_chars_per_tool=per_tool,
             ignore_budget=guaranteed,
             max_chars_per_tool_call=max_chars_per_tool_call,
-            keep_last_tools=keep_last_tools)
+            keep_last_tools=keep_tools)
         packed = _drop_dangling_tail(packed)
         if not packed:
             continue
@@ -853,23 +883,43 @@ class ChatMemory:
         self._summary_lock = None  # 懒创建：串行化普通/强制摘要，避免重复覆盖同一区间
         self._llm_client = None  # 可选：用于 LLM 驱动的摘要生成和记忆提取
         self._llm_model = None
+        # 侧任务独立链路（None = 跟随主链路，默认）
+        self._aux_client = None
+        self._aux_model = None
+        # aux 失败过一次就就地停用：否则模型名写错会每轮白付一次失败调用
+        self._aux_broken = False
 
     # ==================== 会话管理 ====================
 
-    def set_llm_client(self, client, model_name: str):
+    def set_llm_client(self, client, model_name: str, aux: dict = None):
         """设置 LLM 客户端，用于生成高质量摘要和提取长期记忆。
 
         Args:
             client: OpenAI AsyncOpenAI 客户端实例
             model_name: 模型名称
+            aux: 侧任务独立链路 {"client": obj, "model": str}；None 或字段缺失 =
+                 跟随主链路（默认）。摘要/记忆提取走更便宜的模型，主对话不受影响。
         """
         self._llm_client = client
         self._llm_model = model_name
+        a = aux if isinstance(aux, dict) else {}
+        a_model = str(a.get("model") or "").strip()
+        a_client = a.get("client")
+        # 缺一不启用：半个配置会把摘要静默降级成关键词拼接，比不配更坏
+        if a_model and a_client is not None:
+            self._aux_client = a_client
+            self._aux_model = a_model
+        else:
+            self._aux_client = None
+            self._aux_model = None
+        self._aux_broken = False
 
     async def _supervised_create(self, **kwargs):
         """经 harness 监督运行时执行 LLM 调用（重试/超时/熔断/计量，渠道=memory）。
 
         harness 不可用时退化为直接调用，原有降级逻辑（关键词摘要/提取）不受影响。
+        配了侧任务链路（aux）时改走 aux；aux 失败回退主链路一次并就地停用——
+        模型名写错不该让摘要从此永久塌成关键词拼接。
         """
         # 兜底：保证 role=tool 消息带 tool_call_id（与主智能体同一规范函数），
         # 否则发给 OpenAI 兼容提供方会被 400（missing field tool_call_id）
@@ -886,10 +936,29 @@ class ChatMemory:
             runtime = get_harness().runtime
         except Exception:
             runtime = None
-        if runtime is not None:
-            return await runtime.supervise_llm(
-                "memory", lambda: self._llm_client.chat.completions.create(**kwargs))
-        return await self._llm_client.chat.completions.create(**kwargs)
+        use_aux = bool(self._aux_client is not None and self._aux_model
+                       and not self._aux_broken)
+        if use_aux:
+            kwargs = dict(kwargs)
+            kwargs["model"] = self._aux_model
+        client = self._aux_client if use_aux else self._llm_client
+
+        async def _call(c):
+            if runtime is not None:
+                return await runtime.supervise_llm(
+                    "memory", lambda: c.chat.completions.create(**kwargs))
+            return await c.chat.completions.create(**kwargs)
+
+        try:
+            return await _call(client)
+        except Exception as e:
+            if not use_aux:
+                raise
+            self._aux_broken = True
+            logger.warning(f"侧任务链路（{self._aux_model}）调用失败，停用并回退主模型: {e}")
+            kwargs = dict(kwargs)
+            kwargs["model"] = self._llm_model
+            return await _call(self._llm_client)
 
     async def get_or_create_session(self, title: str = "") -> str:
         """获取或创建当前用户的活动会话。
@@ -2077,6 +2146,8 @@ class ChatMemory:
             'short_term_max_chars_per_tool': SHORT_TERM_MAX_CHARS_PER_TOOL,
             'short_term_max_chars_per_tool_call': SHORT_TERM_MAX_CHARS_PER_TOOL_CALL,
             'short_term_keep_last_tools': SHORT_TERM_KEEP_LAST_TOOLS,
+            'short_term_keep_last_tools_newest': SHORT_TERM_KEEP_LAST_TOOLS_NEWEST,
+            'short_term_max_chars_per_tool_newest': SHORT_TERM_MAX_CHARS_PER_TOOL_NEWEST,
             'summary_max_tokens': SUMMARY_MAX_TOKENS,
             'summary_max_chars_per_item': SUMMARY_MAX_CHARS_PER_ITEM,
             'long_term_max_tokens': LONG_TERM_MAX_TOKENS,
@@ -2465,7 +2536,13 @@ class ChatMemory:
                     'short_term_max_chars_per_tool_call',
                     SHORT_TERM_MAX_CHARS_PER_TOOL_CALL),
                 keep_last_tools=hcfg.get('short_term_keep_last_tools',
-                                         SHORT_TERM_KEEP_LAST_TOOLS))
+                                         SHORT_TERM_KEEP_LAST_TOOLS),
+                max_chars_per_tool_newest=hcfg.get(
+                    'short_term_max_chars_per_tool_newest',
+                    SHORT_TERM_MAX_CHARS_PER_TOOL_NEWEST),
+                keep_last_tools_newest=hcfg.get(
+                    'short_term_keep_last_tools_newest',
+                    SHORT_TERM_KEEP_LAST_TOOLS_NEWEST))
         else:
             history = raw_records
         n_rounds = sum(1 for m in history if m.get("role") == "user")

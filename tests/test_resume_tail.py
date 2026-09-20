@@ -91,3 +91,42 @@ def test_上限_配置0_落到下限1(monkeypatch):
 def test_上限_配置异常_回落默认(monkeypatch):
     monkeypatch.setattr(agent, "load_config", lambda: (_ for _ in ()).throw(RuntimeError))
     assert agent._resume_tail_limit() == 3
+
+
+# ---------- 契约 4：渠道大写 finish_reason 归一后才能续补 ----------
+# 部分 OpenAI 兼容网关转的是 Gemini 原生大写原因（STOP / MAX_TOKENS）。
+# 不归一的话 _should_resume_tail 判 "length" 永远为假，截断续补静默失效——
+# 半截回复被当正常结束交付，既不报错也不重试，是最难发现的一类回归。
+
+@pytest.mark.parametrize("raw,expect", [
+    ("MAX_TOKENS", "length"),        # Gemini 原生大写
+    ("max_tokens", "length"),        # Anthropic 风格
+    ("Length", "length"),            # 大小写混合
+    ("STOP", "stop"),
+    ("end", "stop"),
+    ("FUNCTION_CALL", "tool_calls"),
+    ("stop", "stop"),                # 契约值字节不变
+    ("length", "length"),
+    ("tool_calls", "tool_calls"),
+    ("content_filter", "content_filter"),   # 未知值原样，不硬塞
+    ("", ""),                        # 空值原样（调用方保留自己的 or "stop" 默认）
+    (None, None),
+    (2, 2),                          # 非字符串原样（有网关回 int 原因）
+])
+def test_finish_reason_归一(raw, expect):
+    assert agent._normalize_finish_reason(raw) == expect
+
+
+def test_大写MAX_TOKENS经归一后触发续补():
+    assert agent._should_resume_tail(
+        agent._normalize_finish_reason("MAX_TOKENS"), False, None, 0) is True
+
+
+def test_大写STOP经归一后不续补():
+    assert agent._should_resume_tail(
+        agent._normalize_finish_reason("STOP"), False, None, 0) is False
+
+
+def test_不归一就会漏掉截断():
+    """变异检验：不归一的大写原因让续补判据失效（回归的根因）。"""
+    assert agent._should_resume_tail("MAX_TOKENS", False, None, 0) is False

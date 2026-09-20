@@ -85,6 +85,11 @@ App.rcRoleName = App.$('rc-role-name') as HTMLInputElement | null;
   App.rcLlmTempVal = App.$('rc-llm-temp-val') as HTMLSpanElement | null;
   App.rcLlmVision = App.$('rc-llm-vision') as HTMLSelectElement | null;
   App.rcLlmVisionTip = App.$('rc-llm-vision-tip') as HTMLDivElement | null;
+  // 角色卡片内的侧任务模型（摘要 / 记忆提取）
+  App.rcAuxProviderSelect = App.$('rc-aux-provider-select') as HTMLSelectElement | null;
+  App.rcAuxModel = App.$('rc-aux-model') as HTMLSelectElement | null;
+  App.rcAuxRefreshBtn = App.$('rc-aux-refresh-btn') as HTMLButtonElement | null;
+  App.rcAuxTip = App.$('rc-aux-tip') as HTMLDivElement | null;
   App.rcTtsTabs = App.$('rc-tts-tabs') as HTMLDivElement | null;
   App.rcTtsEdgePanel = App.$('rc-tts-edge-panel') as HTMLDivElement | null;
   App.rcTtsGsoPanel = App.$('rc-tts-gso-panel') as HTMLDivElement | null;

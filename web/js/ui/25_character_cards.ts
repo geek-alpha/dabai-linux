@@ -68,6 +68,11 @@ export default (function init(App: AppKernel) {
     // 读图能力：卡片绑的模型跟供应商默认模型常常不是同一个，改动即重判
     App.rcLlmVision?.addEventListener('change', () => App.refreshRcLlmVisionTip?.());
     App.rcLlmModel?.addEventListener('change', () => App.refreshRcLlmVisionTip?.());
+    // 侧任务模型（摘要 / 记忆提取）：供应商留空 = 跟随全局当前供应商，模型留空 = 跟随主模型
+    App.rcAuxProviderSelect?.addEventListener('change', () => {
+      App.switchRcAuxProvider(App.rcAuxProviderSelect?.value || '');
+    });
+    App.rcAuxRefreshBtn?.addEventListener('click', () => App.loadRcAuxModels());
     // 缓存全局默认温度（卡片未单独设定时沿用）
     App.rcLlmDefaultTemp = 0.2;
     fetch('/api/llm/config').then(r => r.json()).then(cfg => {
@@ -141,6 +146,7 @@ export default (function init(App: AppKernel) {
           ? `大模型：${llmProviderName}${llmCfg.model ? ' · ' + llmCfg.model : ''}`
           : (llmCfg.model ? `大模型：${llmCfg.model}` : '');
       }
+      const auxLabel = (llmCfg.aux_model || '') ? `侧任务：${llmCfg.aux_model}` : '';
       card.innerHTML = `
                 <div class="role-card-avatar">${App.escapeHtml((c.name || '?').slice(0, 1))}</div>
                 <div class="role-card-info">
@@ -153,6 +159,7 @@ export default (function init(App: AppKernel) {
                         ${toolsLabel ? `<span class="role-card-tag">${App.escapeHtml(toolsLabel)}</span>` : ''}
                         ${animLabel ? `<span class="role-card-tag">${App.escapeHtml(animLabel)}</span>` : ''}
                         ${llmLabel ? `<span class="role-card-tag">${App.escapeHtml(llmLabel)}</span>` : ''}
+                        ${auxLabel ? `<span class="role-card-tag">${App.escapeHtml(auxLabel)}</span>` : ''}
                         <span class="role-card-tag">${App.escapeHtml(promptBrief)}</span>
                     </div>
                 </div>
@@ -345,6 +352,12 @@ export default (function init(App: AppKernel) {
     // 严格从所选供应商加载模型列表（未选供应商则只提示，绝不串用其它提供方）
     await App.loadRcLlmModels();
     App.refreshRcLlmVisionTip?.();
+    // 侧任务模型：供应商留空 = 跟随全局当前供应商，模型留空 = 跟随主模型
+    App.rcAuxProviderId = (llm.aux_provider_id || '').trim();
+    App._rcAuxPresetModel = (llm.aux_model || '').trim();
+    App.renderRcAuxProviderOptions();
+    if (App.rcAuxProviderSelect) App.rcAuxProviderSelect.value = App.rcAuxProviderId;
+    await App.loadRcAuxModels();
     // TTS
     App.switchRcTTSEngine(tts.engine || 'edge_tts');
     const rate = parseInt(tts.edge_rate) || 0;
@@ -590,6 +603,90 @@ export default (function init(App: AppKernel) {
     }
   };
 
+  /* ---------- 侧任务模型（摘要 / 记忆提取）：卡片声明，留空跟随主模型 ---------- */
+  /** 用缓存供应商列表填充侧任务「供应商」下拉框 */
+  App.renderRcAuxProviderOptions = function renderRcAuxProviderOptions() {
+    const sel = App.rcAuxProviderSelect;
+    if (!sel) return;
+    const cur = sel.value || App.rcAuxProviderId || '';
+    sel.innerHTML = '<option value="">（跟随全局当前供应商）</option>';
+    const g = App.llmGlobalConfig;
+    for (const p of ((g && g.providers) || [])) {
+      const opt = document.createElement('option');
+      opt.value = p.id;
+      opt.textContent = p.name + (p._active ? '（当前）' : '');
+      sel.appendChild(opt);
+    }
+    sel.value = cur;
+  };
+
+  /** 切换侧任务供应商：模型列表必须来自所选供应商，所以清掉旧选择 */
+  App.switchRcAuxProvider = async function switchRcAuxProvider(providerId) {
+    App.rcAuxProviderId = providerId || '';
+    App._rcAuxPresetModel = '';
+    if (App.rcAuxModel) App.rcAuxModel.value = '';
+    await App.loadRcAuxModels();
+  };
+
+  /** 从所选供应商加载侧任务可用模型；留空 = 跟随主模型（不启用侧任务链路） */
+  App.loadRcAuxModels = async function loadRcAuxModels() {
+    const sel = App.rcAuxModel;
+    if (!sel) return;
+    const pid = App.rcAuxProviderId || '';
+    const tipEl = App.rcAuxTip;
+    // 打开卡片编辑后什么都没改就保存，不能把已存的侧任务模型弄丢
+    const prevValue = sel.value || App._rcAuxPresetModel || '';
+    sel.innerHTML = '<option value="">（跟随主模型，不省这份钱）</option>';
+    if (!pid) {
+      if (prevValue) {
+        const opt = document.createElement('option');
+        opt.value = prevValue;
+        opt.textContent = prevValue;
+        sel.appendChild(opt);
+        sel.value = prevValue;
+      }
+      if (tipEl) tipEl.textContent = '未指定供应商 = 跟随全局当前供应商；模型留空 = 跟随主模型。';
+      return;
+    }
+    try {
+      const params = new URLSearchParams();
+      params.set('provider', pid);
+      const res = await fetch('/api/llm/models?' + params.toString());
+      const data = await res.json();
+      const list = data.models || [];
+      for (const m of list) {
+        const opt = document.createElement('option');
+        opt.value = m;
+        opt.textContent = m;
+        sel.appendChild(opt);
+      }
+      if (prevValue && list.includes(prevValue)) {
+        sel.value = prevValue;
+      } else if (prevValue) {
+        // 已存模型不在当前可对话列表：保留原值，绝不静默换成列表第一个
+        const opt = document.createElement('option');
+        opt.value = prevValue;
+        opt.textContent = `${prevValue}（不在当前可对话列表，保存将保留原值）`;
+        sel.appendChild(opt);
+        sel.value = prevValue;
+      }
+      if (tipEl) {
+        tipEl.textContent = data.error
+          ? `模型列表加载失败：${data.error}`
+          : `已加载 ${list.length} 个可对话模型；留空 = 跟随主模型。`;
+      }
+    } catch (e) {
+      if (prevValue) {
+        const opt = document.createElement('option');
+        opt.value = prevValue;
+        opt.textContent = prevValue;
+        sel.appendChild(opt);
+        sel.value = prevValue;
+      }
+      if (tipEl) tipEl.textContent = '模型列表加载失败（已保留当前值）';
+    }
+  };
+
   /* ---------- 语音识别（STT）独立设置 ---------- */
   /** 拉取全局 STT 配置并缓存 */
   App.loadRcSttConfig = async function loadRcSttConfig(force) {
@@ -819,7 +916,9 @@ export default (function init(App: AppKernel) {
         model: App.rcLlmModel?.value.trim() || '',
         temperature: App.rcLlmTemperature ? Number(App.rcLlmTemperature.value) : null,
         vision: App.rcLlmVision?.value === 'true' ? true
-          : (App.rcLlmVision?.value === 'false' ? false : null)
+          : (App.rcLlmVision?.value === 'false' ? false : null),
+        aux_provider_id: App.rcAuxProviderId || '',
+        aux_model: App.rcAuxModel?.value.trim() || ''
       }
     };
   };

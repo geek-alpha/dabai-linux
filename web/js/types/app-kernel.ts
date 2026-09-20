@@ -463,6 +463,11 @@ export interface AppKernel {
   rcLlmTempVal: HTMLSpanElement | null;
   rcLlmVision: HTMLSelectElement | null;
   rcLlmVisionTip: HTMLDivElement | null;
+  // 角色卡片内：侧任务模型（摘要 / 记忆提取）
+  rcAuxProviderSelect: HTMLSelectElement | null;
+  rcAuxModel: HTMLSelectElement | null;
+  rcAuxRefreshBtn: HTMLButtonElement | null;
+  rcAuxTip: HTMLDivElement | null;
   rcTtsTabs: HTMLDivElement | null;
   rcTtsEdgePanel: HTMLDivElement | null;
   rcTtsGsoPanel: HTMLDivElement | null;
@@ -1810,6 +1815,8 @@ export interface AppKernel {
   rcLlmDefaultTemp?: any;
   rcLlmProviderId?: any;
   _rcPresetModel?: string;
+  rcAuxProviderId?: any;
+  _rcAuxPresetModel?: string;
   rcSttLoaded?: any;
   rcToolsLoaded?: any;
   rcVoicesLoaded?: any;

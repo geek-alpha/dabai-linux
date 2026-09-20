@@ -22,6 +22,9 @@ BASE = Path(__file__).resolve().parent.parent
 AGENT = BASE / "agent.py"
 LESSONS = BASE / "harness_task_memory.json"
 HORIZON = BASE / "long_horizon.json"
+DRAFTS = BASE / "data" / "learn_drafts.json"
+LESSON_STATE = BASE / "data" / "lesson_state.json"
+LESSON_ARCHIVE = BASE / "harness_task_memory.archive.json"
 
 RULE_START = "【工作准则（任何模式下"
 RULE_END = "shell 输出不许用"
@@ -64,6 +67,24 @@ def lessons():
     return got if isinstance(got, list) else []
 
 
+def draft_count():
+    """待审复盘草稿数（tools/learn_nudge.py 写入）：学习机有没有真的通电，看这个数。"""
+    ds = _load_json(DRAFTS, [])
+    if not isinstance(ds, list):
+        return 0
+    return sum(1 for d in ds if isinstance(d, dict) and d.get("status") == "pending")
+
+
+def lifecycle():
+    """生命周期计数（tools/lesson_curator.py 写入）：stale 只是标记，archived 是已移出主库。"""
+    st = _load_json(LESSON_STATE, {})
+    stale = sum(1 for v in (st.values() if isinstance(st, dict) else [])
+                if isinstance(v, dict) and v.get("state") == "stale")
+    arch = _load_json(LESSON_ARCHIVE, {})
+    archived = len(arch.get("lessons") or []) if isinstance(arch, dict) else 0
+    return stale, archived
+
+
 def projects():
     data = _load_json(HORIZON, {})
     if not isinstance(data, dict):
@@ -82,6 +103,9 @@ def collect():
         "projects": len(proj_list),
         "active": len(active),
         "questions": len(q_list),
+        "drafts": draft_count(),
+        "stale": lifecycle()[0],
+        "archived": lifecycle()[1],
         "progress": [
             {"id": p.get("id"), "pct": p.get("progress", 0), "next": p.get("next", "")}
             for p in active
@@ -104,6 +128,10 @@ def cmd_report(as_json=False):
     for p in d["progress"]:
         print(f"            - {p['id']} {p['pct']}% → {str(p['next'])[:40]}")
     print(f"  未解问题  {d['questions']} 条")
+    if d["drafts"]:
+        print(f"  待审复盘  {d['drafts']} 条 → `venv/bin/python tools/learn_nudge.py show`")
+    if d["stale"] or d["archived"]:
+        print(f"  生命周期  stale {d['stale']} 条 / 归档 {d['archived']} 条")
     if d["last_lesson"]:
         print(f"  最新教训  {d['last_lesson'][:46]}")
     if not r["anchored"]:

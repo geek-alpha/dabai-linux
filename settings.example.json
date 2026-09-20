@@ -62,7 +62,10 @@
     "long_term_max_tokens": 300,
     "long_term_top_k": 4,
     "recall_max_tokens": 400,
-    "record_stats": true
+    "record_stats": true,
+    "aux_model": "",
+    "aux_base_url": "",
+    "aux_api_key": ""
   },
   "agent": {
     "max_tool_rounds": 0,

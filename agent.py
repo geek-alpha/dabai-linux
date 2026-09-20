@@ -1031,6 +1031,29 @@ def _resume_tail_limit() -> int:
     return max(v, 1)
 
 
+# finish_reason 线上写法归一：部分 OpenAI 兼容网关转的是 Gemini 原生大写原因
+# （STOP / MAX_TOKENS），而下游比较全用小写 OpenAI 字面量——大写原因会静默跳过
+# 截断续补（_should_resume_tail 判 "length"），半截回复被当正常结束交付给用户。
+# 单点归一，比较处不再各自 lower（对齐 Hermes message_sanitization.py:275-298）。
+_FINISH_REASON_ALIASES = {
+    "max_tokens": "length",          # Gemini 原生 / Anthropic 风格的上限原因
+    "end": "stop",                   # 部分网关的干净结束写法
+    "function_call": "tool_calls",   # OpenAI 旧版 pre-tools 写法
+}
+
+
+def _normalize_finish_reason(raw):
+    """把渠道回传的 finish_reason 折成小写 OpenAI 字面量。
+
+    非字符串/空值原样返回（调用方保留自己的 ``or "stop"`` 默认），
+    契约值（"stop"/"length"/"tool_calls"）原样返回、字节不变。
+    """
+    if not isinstance(raw, str) or not raw:
+        return raw
+    lowered = raw.lower()
+    return _FINISH_REASON_ALIASES.get(lowered, lowered)
+
+
 def _should_resume_tail(finish_reason, has_tool_calls, text_tool_call, resume_count) -> bool:
     """max_tokens 用尽（finish_reason=length）且本轮是纯文本回复时，应自动续补尾巴。
 
@@ -1090,6 +1113,78 @@ def _is_retryable_llm_error(e: BaseException) -> bool:
         return True
     msg = (str(e) or "").lower()
     return any(k in msg for k in ("熔断", "rate limit", "too many requests", "timeout", "connection"))
+
+
+# ---- 输出上限修复：请求本身有病时修请求，而不是重发请求 ----
+# 对齐 Hermes turn_recovery 的 recovery-chain 语义（agent/turn_recovery.py:3-7）：
+# 「max_tokens 超过渠道上限」这类 400 不可重试（同一个参数重发一万次还是 400），
+# 但请求可以修——本地 tool_max_tokens 允许配到 16384，渠道上限可能只有 8192，
+# 于是每一轮都在同一个参数上撞死，用户看到的是「AI 坏了」。
+# 判据抄 Hermes model_metadata.py:1395-1451：必须先分清「输出上限」和「输入超长」——
+# 两者修法相反（改小 max_tokens vs 压缩上下文），混淆会让重试在同一处死循环。
+_INPUT_OVERFLOW_SIGNALS = (
+    "prompt is too long", "prompt too long", "input is too long", "input token",
+    "prompt length", "prompt contains", "reduce the length",
+)
+_OUTPUT_CAP_SIGNALS = (
+    ("range of max_tokens should be",), ("available_tokens",), ("available tokens",),
+    ("in the output", "maximum context length"), ("requested", "output tokens"),
+    ("exceeds model", "maximum output tokens"), ("output limit",),
+    ("maximum allowed number of output tokens",),
+    ("max_tokens is too large", "supports at most"), ("limited to",),
+)
+# 只认能提取出数字的措辞（Hermes 的 parseable 组，比可判定组更窄）
+_PARSEABLE_OUTPUT_CAP_SIGNALS = (
+    ("max_tokens", "available_tokens"), ("max_tokens", "available tokens"),
+    ("range of max_tokens should be",), ("exceeds model", "maximum output tokens"),
+    ("output limit",), ("max_tokens", "maximum allowed number of output tokens"),
+    ("max_tokens is too large", "supports at most"), ("limited to",),
+)
+_OUTPUT_CAP_PATTERNS = (
+    r"exceeds model(?:'s)? maximum output tokens\s*\(?\s*(\d+)\s*\)?",
+    r"max_tokens\s*:\s*\d+\s*>\s*(\d+)\s*,?\s*which is the maximum allowed number of output tokens",
+    r"range of max_tokens should be\s*\[\s*\d+\s*,\s*(\d+)\s*\]",
+    r"available_tokens[:\s]+(\d+)",
+    r"available\s+tokens[:\s]+(\d+)",
+    r"output limit (?:of|is)\s*(\d+)",
+    r"supports at most\s*(\d+)\s*(?:completion\s+)?tokens",
+    r"(?:max_tokens|max_completion_tokens) is limited to\s*(\d+)",
+    r"=\s*(\d+)\s*$",
+)
+
+
+def _parse_output_cap(err_text: str) -> Optional[int]:
+    """从「max_tokens 超渠道上限」类错误文本里解析渠道允许的输出上限，解析不出返回 None。"""
+    text = (err_text or "").lower()
+    if not any(all(p in text for p in g) for g in _PARSEABLE_OUTPUT_CAP_SIGNALS):
+        return None
+    for pattern in _OUTPUT_CAP_PATTERNS:
+        m = re.search(pattern, text)
+        if m and int(m.group(1)) >= 1:
+            return int(m.group(1))
+    return None
+
+
+def _is_output_cap_error(err_text: str) -> bool:
+    """是「输出上限」而不是「输入超长」——两者的修法相反，判错就是死循环。"""
+    text = (err_text or "").lower()
+    if not any(p in text for p in ("max_tokens", "max_output_tokens",
+                                   "max_completion_tokens", "tokens for the completion")):
+        return False
+    if not any(all(p in text for p in g) for g in _OUTPUT_CAP_SIGNALS):
+        return False
+    return not any(p in text for p in _INPUT_OVERFLOW_SIGNALS)
+
+
+def _clamp_output_tokens(kwargs: dict, cap: int) -> bool:
+    """把 kwargs 里的输出上限参数压到 cap 以内（只改已有的键，不新增参数）。"""
+    changed = False
+    for key in ("max_tokens", "max_completion_tokens"):
+        cur = kwargs.get(key)
+        if isinstance(cur, int) and cur > cap:
+            kwargs[key] = cap
+            changed = True
+    return changed
 
 
 def _is_transient_stream_error(e: Exception) -> bool:
@@ -1345,6 +1440,25 @@ def load_config_for(user_id: str) -> dict:
         cfg["temperature"] = llm["temperature"]
     if "vision" in llm:
         cfg["llm_vision"] = bool(llm["vision"])
+    # 侧任务（摘要生成 / 记忆提取）可选独立模型：卡片声明 aux_model 即覆盖全局
+    # memory.aux_*；留空则用全局那份，全局也空 = 跟随主模型（旧行为）。
+    # 端点必须与所选模型同源，所以未指定 aux 供应商时用本卡主模型端点——
+    # 沿用全局 aux_base_url 可能跟卡片选的模型不是同一家，调用会报「模型不存在」。
+    aux_model = (llm.get("aux_model") or "").strip()
+    if aux_model:
+        aux_pid = (llm.get("aux_provider_id") or "").strip()
+        aux_prov = None
+        if aux_pid and isinstance(providers, list):
+            aux_prov = next((p for p in providers
+                             if isinstance(p, dict) and str(p.get("id") or "") == aux_pid), None)
+        mem = cfg.setdefault("memory", {})
+        mem["aux_model"] = aux_model
+        if aux_prov and str(aux_prov.get("base_url") or "").strip():
+            mem["aux_base_url"] = str(aux_prov["base_url"]).strip()
+            mem["aux_api_key"] = str(aux_prov.get("api_key") or "")
+        else:
+            mem["aux_base_url"] = str(cfg.get("base_url") or "").strip()
+            mem["aux_api_key"] = str(cfg.get("api_key") or "")
     tools = card.get("tools")
     if isinstance(tools, dict):
         cfg.setdefault("agent", {})
@@ -2349,6 +2463,36 @@ def _gene_flush_exposure(metrics: dict | None = None) -> int:
     return n
 
 
+def _learn_mod():
+    """加载 tools/learn_nudge.py：复盘计数器与草稿的唯一真源。失败返回 None。"""
+    try:
+        import importlib.util as _ilu
+        f = _harness_base() / "tools" / "learn_nudge.py"
+        spec = _ilu.spec_from_file_location("learn_nudge", f)
+        mod = _ilu.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception:
+        return None
+
+
+def _learn_tick(tool_rounds, tool_calls, tool_errors, err_names, user_msg, reply="") -> None:
+    """回合结束的复盘触发：到点且有信号就落一条待审草稿（tools/learn_nudge.py）。
+
+    挂在 _record_turn_metrics 里——那是「本轮结束」的必经点，且排在 tool_round
+    判断之前，一次工具都没调的轮次照样计入轮数计数器。全程静默：学习机制坏了，
+    对话照常交付（hermes turn_finalizer.py:653 的 suppress(Exception) 同款取舍）。
+    """
+    try:
+        mod = _learn_mod()
+        if mod is None:
+            return
+        mod.tick(tool_rounds=tool_rounds, tool_calls=tool_calls, tool_errors=tool_errors,
+                 err_names=err_names, user_msg=user_msg, reply=reply)
+    except Exception:
+        pass
+
+
 def _gene_pick(items: list, cap: int, fresh: int = 2) -> list:
     """注入窗口选取：前 fresh 条保新近性（刚踩的坑立刻能用），其余按曝光升序补足。
 
@@ -2915,6 +3059,31 @@ def _build_llm_client(base_url: str, api_key: str, proxy: str | None = None) -> 
     )
 
 
+def _build_aux_llm(cfg: dict):
+    """侧任务（摘要生成 / 记忆提取）的独立链路：settings.json -> memory.aux_*。
+
+    返回 (client, model)；未配置或不完整返回 None（= 跟随主模型，旧行为）。
+    base_url 与 model 都要给：只给 model 会在主端点上报「模型不存在」，
+    只给 base_url 无从判断调哪个模型。api_key 留空时沿用主链路密钥。
+    """
+    mem = cfg.get("memory") or {}
+    model = str(mem.get("aux_model") or "").strip()
+    base = str(mem.get("aux_base_url") or "").strip()
+    if not (model and base):
+        return None
+    key = (str(mem.get("aux_api_key") or "").strip()
+           or str(cfg.get("api_key") or "").strip())
+    if not key:
+        logger.warning("memory.aux_* 已配置但无可用密钥，侧任务改用主模型")
+        return None
+    proxy = None if is_local_url(base) else resolve_llm_proxy(cfg)
+    try:
+        return _build_llm_client(base, key, proxy), model
+    except Exception as e:
+        logger.warning(f"侧任务链路构建失败，改用主模型: {e}")
+        return None
+
+
 def _resolve_client_proxy(cfg: dict) -> str | None:
     """按 settings.json 解析 LLM 客户端代理；本地地址（Ollama 等）永远直连。"""
     if is_local_url(str(cfg.get("base_url") or "").strip()):
@@ -2943,6 +3112,9 @@ class AIAgent:
         self._ns_override = namespace.strip()
         self.memory: Optional[ChatMemory] = None
         self._client: Optional[AsyncOpenAI] = None
+        # 侧任务链路缓存（settings.json -> memory.aux_*）：按配置指纹复用，避免 reload 重建连接池
+        self._aux_sig = None
+        self._aux_cache = None
         self._config: dict = {}
         self._all_tools: list = []
         self._base_tools: list = []  # 静态基础工具缓存（本地 + full 披露技能 + skill_help）
@@ -2954,6 +3126,7 @@ class AIAgent:
         self._initialized = False
         self._text_tool_mode = False  # 当前模型不支持原生工具调用时置 True，改用文本协议
         self._reasoning_echo_required = False  # thinking 渠道要求回传 reasoning_content：踩过一次后每轮前置补齐
+        self._output_cap = 0  # 渠道输出上限（从 400 里解析出来后每轮前置压住，避免重复撞墙）
         self._usage_enabled = True  # LLM 用量统计开关（运行时提供方不支持时可降级为 False）
         self._last_round_fps: list = []  # 死循环防护：最近几轮工具调用指纹
         self._last_round_sigs: list = []  # 死循环防护（强判据）：对应轮次的结果指纹
@@ -2986,6 +3159,18 @@ class AIAgent:
         except Exception:
             self._gate_permanent: dict = {}
 
+    def _aux_llm(self):
+        """侧任务（摘要/记忆提取）的 aux 参数；未配置返回 None（= 走主链路）。"""
+        mem = (self._config or {}).get("memory") or {}
+        sig = (str(mem.get("aux_model") or ""), str(mem.get("aux_base_url") or ""),
+               str(mem.get("aux_api_key") or ""))
+        if sig == self._aux_sig and self._aux_cache:
+            return self._aux_cache
+        got = _build_aux_llm(self._config or {})
+        self._aux_sig = sig
+        self._aux_cache = {"client": got[0], "model": got[1]} if got else None
+        return self._aux_cache
+
     async def initialize(self):
         """初始化 Agent：加载配置、加载技能工具、初始化记忆。"""
         if self._initialized:
@@ -3013,7 +3198,8 @@ class AIAgent:
 
         # 初始化记忆（绑定当前活动角色卡片对应的独立记忆命名空间）
         self.memory = ChatMemory(user_id=self.user_id, namespace=self._active_memory_namespace())
-        self.memory.set_llm_client(self._client, self._config["model"])
+        self.memory.set_llm_client(self._client, self._config["model"],
+                                   aux=self._aux_llm())
         await self.memory.get_or_create_session()
 
         # 注册进 harness 监督运行时（此后全部 LLM/工具调用受监督）
@@ -3070,7 +3256,8 @@ class AIAgent:
             # 提供方切换后重新探测：云端模型（支持原生工具）不再走文本协议
             self._text_tool_mode = False
             if self.memory:
-                self.memory.set_llm_client(self._client, self._config.get("model", ""))
+                self.memory.set_llm_client(self._client, self._config.get("model", ""),
+                                           aux=self._aux_llm())
             # 同步更新监督运行时里的注册信息（模型/提供方已变）
             runtime = _get_runtime()
             if runtime is not None:
@@ -3664,8 +3851,13 @@ class AIAgent:
                     kwargs["messages"] = _ensure_reasoning_echo(kwargs["messages"])
         except Exception:
             pass
+        # 已撞过渠道输出上限：每轮先压住再发，避免每轮都先失败一次、白付一整轮全价 prompt
+        # （同 _reasoning_echo_required 的教训）
+        if getattr(self, "_output_cap", 0):
+            _clamp_output_tokens(kwargs, self._output_cap)
         runtime = _get_runtime()
         attempt = 0
+        _cap_repaired = False  # 输出上限修复：每次调用最多修一次
         started = time.monotonic()
         while True:
             try:
@@ -3683,6 +3875,25 @@ class AIAgent:
             except asyncio.CancelledError:
                 raise  # 用户打断：立即让位，不吞取消信号
             except Exception as e:
+                # 一次性修复：请求本身有病（max_tokens 超渠道上限）时改参数原地重发，
+                # 不消耗重试次数、不计入熔断（对齐 Hermes turn_recovery 的 recovery 链）。
+                # 每次调用最多修一次：解析出明确数字才记进 _output_cap（后续轮出口前置压住）；
+                # 「认得出但抠不出数字」的减半探路只影响这一次请求——判据万一误伤
+                # （把上下文超长看成输出上限），错误的上限不会被记下来污染后续所有轮。
+                if not _cap_repaired:
+                    _err = str(e)
+                    _cap = _parse_output_cap(_err)
+                    _remember = bool(_cap)
+                    if _cap is None and _is_output_cap_error(_err):
+                        _cap = max(512, int(kwargs.get("max_tokens") or 4096) // 2)
+                    if _cap and _clamp_output_tokens(kwargs, _cap):
+                        _cap_repaired = True
+                        if _remember:
+                            self._output_cap = _cap
+                        logger.warning(
+                            "[LLM] 输出上限超渠道限制，已自动调低 max_tokens 至 %d 并原地重发（不消耗重试）%s",
+                            _cap, "" if _remember else "｜无明确上限数字，仅本次生效")
+                        continue
                 if not _is_retryable_llm_error(e):
                     raise  # 鉴权/参数等非瞬时错误：重试无意义，快速失败
                 attempt += 1
@@ -5214,6 +5425,15 @@ class AIAgent:
                 "re_reads": eff_re_reads,
                 "duration_ms": duration_ms,
             })
+            _reply = ""
+            try:
+                for _m in reversed(messages):
+                    if isinstance(_m, dict) and _m.get("role") == "assistant":
+                        _reply = str(_m.get("content") or "")
+                        break
+            except Exception:
+                pass
+            _learn_tick(tool_round, eff_tool_calls, eff_tool_errors, eff_err_names, message, _reply)
             if tool_round <= 0:
                 return
             try:
@@ -5366,7 +5586,8 @@ class AIAgent:
                         _tool_kwargs["extra_body"] = _reason_extra
                     resp = await self._retry_create(**_tool_kwargs)
                     assistant_content = (resp.choices[0].message.content or "").strip()
-                    finish_reason = getattr(resp.choices[0], "finish_reason", None)
+                    finish_reason = _normalize_finish_reason(
+                        getattr(resp.choices[0], "finish_reason", None))
                     # 真实思维链（非流式）：一次性推给思考段（展示 + 语音）
                     try:
                         rc = getattr(resp.choices[0].message, "reasoning_content", None)
@@ -5473,7 +5694,8 @@ class AIAgent:
                                 # 必须在「无 choices 跳过」之前捕获，否则 length 截断无从感知
                                 if (chunk.choices
                                         and getattr(chunk.choices[0], "finish_reason", None)):
-                                    finish_reason = chunk.choices[0].finish_reason
+                                    finish_reason = _normalize_finish_reason(
+                                        chunk.choices[0].finish_reason)
                                 if not chunk.choices:
                                     continue
                                 delta = chunk.choices[0].delta
