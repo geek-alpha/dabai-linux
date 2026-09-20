@@ -19,6 +19,9 @@ import random
 import re
 import time
 from collections import deque
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from math import isnan
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
@@ -108,8 +111,26 @@ def is_transient_error(e: BaseException) -> bool:
     return any(p.search(msg) for p in _STATUS_HINTS)
 
 
+def _parse_http_date(txt: str) -> Optional[datetime]:
+    """解析 HTTP-date（RFC 7231 允许的三种格式：IMF-fixdate / RFC 850 / asctime）。"""
+    try:
+        dt = parsedate_to_datetime(txt)
+    except (TypeError, ValueError):
+        return None
+    if dt is None:
+        return None
+    if dt.tzinfo is None:  # HTTP-date 恒为 GMT，无时区的按 UTC 算
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
 def _retry_after_of(e: BaseException) -> Optional[float]:
-    """服务端给了 Retry-After 就听它的（只认秒数形式，封顶）。"""
+    """服务端给了 Retry-After 就听它的（秒数或 HTTP-date，封顶）。
+
+    两种形式都得认：delta-seconds（"30"）与 HTTP-date（"Wed, 21 Oct 2015 07:28:00 GMT"）。
+    只认秒数时，带日期的响应会静默退回指数退避（~1s）——服务端要求等 30s、我们 1s
+    后重撞，等于把限流又加重一次。
+    """
     resp = getattr(e, "response", None)
     hdrs = getattr(resp, "headers", None)
     if hdrs is None:
@@ -118,10 +139,19 @@ def _retry_after_of(e: BaseException) -> Optional[float]:
         raw = hdrs.get("retry-after") or hdrs.get("Retry-After")
     except Exception:
         return None
-    try:
-        return max(0.0, min(float(str(raw).strip()), DEFAULT_BACKOFF_CAP))
-    except (TypeError, ValueError):
+    if raw is None:
         return None
+    txt = str(raw).strip()
+    try:
+        secs = float(txt)
+    except (TypeError, ValueError):
+        dt = _parse_http_date(txt)
+        if dt is None:
+            return None
+        secs = (dt - datetime.now(timezone.utc)).total_seconds()
+    if isnan(secs):  # 非法数值：退回指数退避，别当成 0 秒打热循环
+        return None
+    return max(0.0, min(secs, DEFAULT_BACKOFF_CAP))
 
 
 def backoff_delay(

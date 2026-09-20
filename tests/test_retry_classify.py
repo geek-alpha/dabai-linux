@@ -215,3 +215,40 @@ def test_RetryAfter也封顶(monkeypatch):
 
     _run(retry_async(factory, attempts=3, backoff=1.0))
     assert delays == [DEFAULT_BACKOFF_CAP]
+
+
+def test_尊重RetryAfter的HTTPdate形式(monkeypatch):
+    """429 用 HTTP-date 写等待时间（RFC 7231 的另一种合法形式）也要听。
+
+    只认秒数时这里会退回 1s 指数退避——服务端要求等 20s 而我们 1s 后重撞。
+    """
+    from datetime import datetime, timedelta, timezone
+    from email.utils import format_datetime
+
+    delays = []
+
+    async def fake_sleep(d):
+        delays.append(d)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    hdr = format_datetime(datetime.now(timezone.utc) + timedelta(seconds=20), usegmt=True)
+
+    class _Resp:
+        headers = {"retry-after": hdr}
+
+    class _RateLimited(Exception):
+        status_code = 429
+        response = _Resp()
+
+    calls = {"n": 0}
+
+    async def factory():
+        calls["n"] += 1
+        if calls["n"] < 2:
+            raise _RateLimited()
+        return "ok"
+
+    assert _run(retry_async(factory, attempts=3, backoff=1.0)) == "ok"
+    assert delays, "应该重试过一次"
+    assert 17.0 <= delays[0] <= 20.0, (hdr, delays)

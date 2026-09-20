@@ -79,3 +79,82 @@ def test_deterministic_without_jitter():
     """jitter=False 时同一输入恒等输出（可测试、可预测）。"""
     assert backoff_delay(4, base=2.0, max_exp=3, jitter=False) == \
         backoff_delay(4, base=2.0, max_exp=3, jitter=False) == 16.0
+
+
+# ---------- Retry-After 的两种合法形式（RFC 7231）----------
+# 只认秒数时，带 HTTP-date 的响应会静默退回 ~1s 指数退避：
+# 服务端要求等 30s、我们 1s 后重撞，等于把限流又加重一次。
+
+def _exc_with_retry_after(value):
+    class _Resp:
+        headers = {"retry-after": value}
+
+    class _Err(Exception):
+        response = _Resp()
+
+    return _Err()
+
+
+def test_retry_after_http_date_也被认():
+    """IMF-fixdate：最标准的 HTTP-date 写法。"""
+    from datetime import datetime, timedelta, timezone
+    from email.utils import format_datetime
+
+    from harness.core import _retry_after_of
+
+    hdr = format_datetime(datetime.now(timezone.utc) + timedelta(seconds=25), usegmt=True)
+    ra = _retry_after_of(_exc_with_retry_after(hdr))
+    assert ra is not None, f"HTTP-date 没被解析：{hdr}"
+    assert 22.0 <= ra <= 25.0, (hdr, ra)
+
+
+@pytest.mark.parametrize("fmt", [
+    "%A, %d-%b-%y %H:%M:%S GMT",   # RFC 850：老网关会发
+    "%a %b %d %H:%M:%S %Y",        # asctime：不带时区，必须按 UTC 补
+])
+def test_retry_after_老格式也能认(fmt):
+    """asctime 解析出来是 naive datetime——不补 UTC 会在减法处 TypeError 崩掉。"""
+    from datetime import datetime, timedelta, timezone
+
+    from harness.core import _retry_after_of
+
+    hdr = (datetime.now(timezone.utc) + timedelta(seconds=25)).strftime(fmt)
+    ra = _retry_after_of(_exc_with_retry_after(hdr))
+    assert ra is not None, f"没被解析：{hdr}"
+    assert 22.0 <= ra <= 25.0, (hdr, ra)
+
+
+def test_retry_after_http_date_过去时间归零():
+    """服务端给的时间已经过去 → 立即重试，不返回负数。"""
+    from datetime import datetime, timedelta, timezone
+    from email.utils import format_datetime
+
+    from harness.core import _retry_after_of
+
+    hdr = format_datetime(datetime.now(timezone.utc) - timedelta(seconds=60), usegmt=True)
+    assert _retry_after_of(_exc_with_retry_after(hdr)) == 0.0
+
+
+def test_retry_after_http_date_超大也封顶():
+    from datetime import datetime, timedelta, timezone
+    from email.utils import format_datetime
+
+    from harness.core import _retry_after_of
+
+    hdr = format_datetime(datetime.now(timezone.utc) + timedelta(days=1), usegmt=True)
+    assert _retry_after_of(_exc_with_retry_after(hdr)) == 30.0
+
+
+@pytest.mark.parametrize("bad", ["", "abc", "nan", "12.5.3", "None"])
+def test_retry_after_非法值退回指数退避(bad):
+    """坏值必须退回指数退避，不能当成 0 秒打热循环。"""
+    from harness.core import _retry_after_of
+
+    assert _retry_after_of(_exc_with_retry_after(bad)) is None
+
+
+def test_retry_after_无穷大封顶而非归零():
+    """1e999 解析成 inf：封顶到 30s（与 99999 同待遇），不是 None 也不是 0。"""
+    from harness.core import _retry_after_of
+
+    assert _retry_after_of(_exc_with_retry_after("1e999")) == 30.0
