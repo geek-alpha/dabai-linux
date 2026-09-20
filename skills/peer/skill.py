@@ -58,6 +58,9 @@ def peer_say(args: dict) -> str:
     r = peer_mesh.say(node, text)
     if r.get("ok"):
         return f"已送达 {node}。它下次醒来会看到这句话（要它当场回话用 peer_call）。"
+    if r.get("queued"):
+        return (f"{node} 现在不在线，话已排队（第 {r.get('pending')} 条）—— "
+                f"它一上线耳朵就自动补送，不用你重发。")
     known = r.get("known")
     hint = f"（可用：{', '.join(known)}）" if known else ""
     return f"没能送到 {node}：{r.get('error', '未知错误')}{hint}"
@@ -72,6 +75,9 @@ def peer_call(args: dict) -> str:
     if not r.get("ok"):
         known = r.get("known")
         hint = f"（可用：{', '.join(known)}）" if known else ""
+        if r.get("queued"):
+            return (f"{node} 现在不在线，这通电话排进发件箱了（第 {r.get('pending')} 条）—— "
+                    f"它一上线耳朵会替它接，回话进你收件箱。")
         return f"打不通 {node}：{r.get('error', '未知错误')}{hint}"
     if r.get("answered"):
         return f"[{r.get('latency_s')}s] {node}：{r.get('reply')}"
@@ -114,6 +120,9 @@ def peer_task(args: dict) -> str:
     if not r.get("ok"):
         known = r.get("known")
         hint = f"（可用：{', '.join(known)}）" if known else ""
+        if r.get("queued"):
+            return (f"{node} 现在不在线，活已排队（第 {r.get('pending')} 条）—— "
+                    f"它一上线耳朵就自动补送，不用你重发。")
         return f"没能派给 {node}：{r.get('error', '未知错误')}{hint}"
     t = r.get("task") or {}
     if t.get("ok"):
