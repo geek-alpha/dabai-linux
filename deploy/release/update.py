@@ -49,6 +49,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 SCHEMA_VERSION = 1
 MANIFEST_NAME = "MANIFEST.json"
+# 交给独立 unit 时打的标记：调用方（peer_autoupdate）靠它区分「已移交」和「已装好」
+DETACH_MARK = "[detached]"
 
 # ── 配置默认值（可被 /etc/dabai/update.conf 或命令行覆盖）──────────────────
 DEFAULTS = {
@@ -630,6 +632,73 @@ def restore(journal: Dict[str, Any]) -> List[str]:
     return problems
 
 
+def _in_service_cgroup(service: str, cgroup_text: Optional[str] = None) -> bool:
+    """自己是不是跑在目标服务的 cgroup 里。
+
+    是的话 systemctl stop 的 KillMode=control-group 会把更新器一起杀掉 ——
+    文件没换、服务停着起不来，日志里只剩一行「⑤ 停机」。
+    """
+    if not service:
+        return False
+    names = {service, service if service.endswith(".service") else service + ".service"}
+    if cgroup_text is None:
+        try:
+            cgroup_text = Path("/proc/self/cgroup").read_text(encoding="utf-8")
+        except OSError:
+            return False
+    for line in cgroup_text.splitlines():
+        leaf = line.rsplit(":", 1)[-1].strip().rsplit("/", 1)[-1]
+        if leaf in names:
+            return True
+    return False
+
+
+def _token_in_file() -> bool:
+    """token 能不能只靠文件拿到。能就别从 argv 接 —— argv 同机任何用户可读。"""
+    for p in SECRET_FILES:
+        try:
+            if p.is_file() and "GITHUB_TOKEN=" in p.read_text(encoding="utf-8", errors="replace"):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def detach_self(cfg: Dict[str, str], argv: Sequence[str]) -> int:
+    """把自己交给 systemd-run 起的独立 unit，本进程立即退出。
+
+    新 unit 与目标服务平级、cgroup 互不相干，stop 目标服务不会再杀掉更新器。
+    日志照旧双写 state_dir/update.log，脱离终端不影响取证。
+    """
+    unit = f"dabai-updater-{int(time.time())}"
+    cmd = ["systemd-run", "--unit", unit, "--collect", "--quiet",
+           "--property=Type=oneshot",
+           f"--property=WorkingDirectory={os.getcwd()}"]
+    tok = os.environ.get("GITHUB_TOKEN", "").strip()
+    if tok and not _token_in_file():
+        # 文件里没有才靠环境变量带过去。代价：systemd-run 的 argv 会短暂暴露这个值。
+        # 接受它是因为另一种结局更差 —— 新 unit 找不到 token，更新直接失败。
+        cmd.append(f"--setenv=GITHUB_TOKEN={tok}")
+    cmd += ["--", sys.executable, str(Path(__file__).resolve()), *argv, "--detached"]
+    if os.geteuid() != 0:
+        cmd = ["sudo", "-n"] + cmd
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except FileNotFoundError:
+        log_line(cfg, "! 没有 systemd-run，无法脱离服务 cgroup —— 本次不更新"
+                      "（原地跑会在 ⑤ 停机那步把自己杀掉，服务起不来）")
+        return 1
+    except subprocess.TimeoutExpired:
+        log_line(cfg, "! systemd-run 超时 —— 本次不更新")
+        return 1
+    if p.returncode != 0:
+        detail = (p.stdout + p.stderr).strip() or "无输出"
+        log_line(cfg, f"! 脱离 cgroup 失败（rc={p.returncode}）：{detail} —— 本次不更新")
+        return 1
+    log_line(cfg, f"{DETACH_MARK} 已交给独立 unit {unit} 继续更新（本进程退出，结果见 update.log）")
+    return 0
+
+
 # ── 服务控制与健康检查 ───────────────────────────────────────────────────
 def svc(action: str, service: str, timeout: int = 120) -> Tuple[int, str]:
     """控制 systemd 服务。非 root 时走 sudo -n，要求已配窄口径免密规则。"""
@@ -715,6 +784,9 @@ def do_rollback(cfg: Dict[str, str], args) -> int:
     if args.dry_run:
         log_line(cfg, "（演练模式，未动盘）")
         return 0
+    # 回滚是救命路径，更不能死在停机上：更新失败 + 服务停死 + 回滚没做完是最坏结局
+    if not args.no_restart and not args.detached and _in_service_cgroup(cfg["SERVICE"]):
+        return detach_self(cfg, sys.argv[1:])
     if not args.no_restart:
         rc, out = svc("stop", cfg["SERVICE"])
         log_line(cfg, f"  停机 rc={rc} {out}")
@@ -881,6 +953,10 @@ def run(args) -> int:
         log_line(cfg, "（演练模式：未停机、未写盘、未重启）")
         return 0
 
+    # 自己就跑在目标服务里时，⑤ 停机会连自己一起杀 —— 先挪进独立 cgroup 再动手
+    if not args.no_restart and not args.detached and _in_service_cgroup(cfg["SERVICE"]):
+        return detach_self(cfg, sys.argv[1:])
+
     if not args.no_restart and not args.ignore_active_turn:
         at = active_turn(root)
         if at:
@@ -990,6 +1066,8 @@ def main() -> int:
     ap.add_argument("--prune", action="store_true", help="删除新包里已不存在的旧代码文件")
     ap.add_argument("--no-restart", action="store_true", help="不碰服务（测试用）")
     ap.add_argument("--ignore-active-turn", action="store_true", help="有对话轮在跑也照更")
+    ap.add_argument("--detached", action="store_true",
+                    help="内部用：已脱离服务 cgroup，不再二次脱离")
     ap.add_argument("--keep-backups", type=int, default=0)
     return run(ap.parse_args())
 

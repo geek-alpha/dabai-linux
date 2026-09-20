@@ -167,8 +167,30 @@ def _report(frm: str, text: str) -> None:
                 "error": f"{type(e).__name__}: {e}"})
 
 
+DETACH_MARK = "[detached]"        # update.py 把自己交给独立 unit 时打的标记
+DETACH_WAIT = 180                 # 等移交出去的那个进程真正生效的上限
+
+
 def _updater_cmd(flag: str) -> List[str]:
-    return [sys.executable, str(UPDATER), flag]
+    # --root 必须显式给：update.py 的默认 ROOT 是开发机路径，装在别处的机器会直接失败
+    return [sys.executable, str(UPDATER), "--root", str(BASE_DIR), flag]
+
+
+def _installed_version() -> str:
+    try:
+        return (BASE_DIR / "VERSION").read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _wait_installed(ver: str) -> bool:
+    """等移交出去的更新真正落盘：VERSION 变成目标版本才算数。"""
+    end = time.time() + DETACH_WAIT
+    while time.time() < end:
+        if parse_version(_installed_version()) == ver:
+            return True
+        time.sleep(5)
+    return parse_version(_installed_version()) == ver
 
 
 def run_once(entry: Dict[str, Any]) -> Dict[str, Any]:
@@ -229,6 +251,23 @@ def _run_locked(entry: Dict[str, Any]) -> Dict[str, Any]:
         return {"ok": False, "reason": "更新超时"}
 
     ok = ap.returncode == 0
+    out = (ap.stdout or "") + (ap.stderr or "")
+    if ok and DETACH_MARK in out:
+        # update.py 跑在服务 cgroup 里时会先把自己交给独立 unit 再动手，然后立刻返回 0 ——
+        # 那个 0 是「已移交」，不是「已装好」。当成成功就是把假成功写进账本。
+        if _wait_installed(ver):
+            st["installed"] = ver
+            st["attempts"] = {}
+            _save_state(st)
+            _audit({"ts": int(time.time()), "phase": "apply", "result": "ok-after-detach"})
+            _report(frm, f"v{ver} 已自动更新完成（更新器脱离服务 cgroup 执行）。")
+            return {"ok": True, "detached": True, "reason": "已更新"}
+        _save_state(st)          # 已经记了冷却：对着一个不明结果反复重试是刷屏
+        _audit({"ts": int(time.time()), "phase": "apply",
+                "result": "detached-unconfirmed", "tail": _tail(ap)})
+        _report(frm, f"v{ver} 的更新已交给独立进程，{DETACH_WAIT}s 内没等到 VERSION 变化，"
+                     f"结果未确认，见 update.log。")
+        return {"ok": True, "detached": True, "reason": "已移交，结果未确认"}
     if ok:
         st["installed"] = ver or st.get("installed", "")
         st["attempts"] = {}

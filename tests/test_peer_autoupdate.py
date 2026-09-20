@@ -173,3 +173,49 @@ def test_parse_version_from_publish_text():
     assert pa.parse_version("v1.1.0 已发布：dabai-1.1.0.tar.gz") == "1.1.0"
     assert pa.parse_version("v12.3.45 可以拉") == "12.3.45"
     assert pa.parse_version("随便一句话") == ""
+
+
+# ── 更新器契约：--root 必须钉死；「已移交」不等于「已装好」 ────────────────
+def _detached_runner(pa, monkeypatch, codes):
+    """假更新器：apply 那一步吐 detach 标记（模拟 update.py 把自己交给独立 unit 后返回 0）。"""
+    calls = []
+    seq = list(codes)
+
+    def fake(cmd, timeout):
+        calls.append(cmd)
+        rc = seq.pop(0) if seq else 0
+        out = ("[detached] 已交给独立 unit dabai-updater-1 继续更新"
+               if cmd[-1] == "--apply" else "update.py: 一行日志")
+        return _P(rc, out)
+
+    monkeypatch.setattr(pa, "_run", fake)
+    return calls
+
+
+def test_updater_cmd_always_pins_root(tmp_path, monkeypatch):
+    pa = _load(tmp_path, ON, monkeypatch)
+    cmd = pa._updater_cmd("--check")
+    assert "--root" in cmd and str(tmp_path) in cmd, \
+        "不给 --root，update.py 会用开发机默认路径，装在别处的机器必然失败"
+
+
+def test_detached_apply_is_confirmed_by_version(tmp_path, monkeypatch):
+    pa = _load(tmp_path, ON, monkeypatch)
+    pa.DETACH_WAIT = 0          # 不真等，直接看最终判定
+    (tmp_path / "VERSION").write_text("1.1.0\n", encoding="utf-8")
+    _detached_runner(pa, monkeypatch, [10, 0])
+    r = pa.run_once(_entry())
+    assert r["ok"] is True and r.get("detached") is True
+    assert _state(pa)["installed"] == "1.1.0"
+
+
+def test_detached_apply_without_version_change_is_not_success(tmp_path, monkeypatch):
+    pa = _load(tmp_path, ON, monkeypatch)
+    pa.DETACH_WAIT = 0
+    (tmp_path / "VERSION").write_text("1.0.3\n", encoding="utf-8")
+    _detached_runner(pa, monkeypatch, [10, 0])
+    r = pa.run_once(_entry())
+    assert r.get("detached") is True
+    assert "未确认" in r["reason"], "把『已移交』当成『已装好』就是假成功"
+    assert "installed" not in _state(pa), "结果未确认却记了成功"
+    assert time.time() - float(_state(pa)["last_ts"]) < 60, "结果未确认也该吃冷却，别反复重试"
