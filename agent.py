@@ -431,6 +431,18 @@ def _fit_tool_result(result: str, tool_name: str) -> str:
     return result[:head_len] + notice + result[-tail_len:]
 
 
+# ---------- 工具级确认闸门：确认卡广播钩子（server 启动时 set_gate_broadcast 注入） ----------
+
+
+_gate_broadcast = None
+
+
+def set_gate_broadcast(fn):
+    """注册确认卡广播函数（async callable，接收 bridge_confirm 事件 dict）。"""
+    global _gate_broadcast
+    _gate_broadcast = fn
+
+
 def _mid_turn_max_tokens() -> int:
     """轮内上下文预算：默认取配置窗口的 1/4（1M 窗口 → 256K），
     也可用 settings.json -> agent.mid_turn_max_tokens 显式覆盖。"""
@@ -2816,6 +2828,10 @@ class AIAgent:
         # （真实样本里同一 sid 反复 reset_sid，只有这个能证伪）。
         self._inst_tag = f"{os.getpid()}-{id(self) & 0xFFFF:04x}"
         _trace_hist_view("", 0, 0, -1, "instance_new", 0, self._inst_tag)
+        # 工具级确认闸门状态（会话级：重启即清空 → 重新求授权，fail-closed 方向安全）
+        self._gate_allowed: dict = {}   # 签名 -> 1（用户允许过的动作，重调直接放行）
+        self._gate_denied: dict = {}    # 签名 -> 1（用户拒绝过的动作，重调直接拒）
+        self._gate_pending: dict = {}   # 签名 -> 确认卡 request_id（未决确认，重调不重复弹卡）
 
     async def initialize(self):
         """初始化 Agent：加载配置、加载技能工具、初始化记忆。"""
@@ -3590,6 +3606,10 @@ class AIAgent:
             _sb.pop(_token)
 
     async def _execute_tool_inner(self, tool_name: str, arguments: dict) -> str:
+        # 工具级确认闸门：ask/deny 在这里拦截并回填说明（不执行工具）
+        gate = await self._gate_request(tool_name, arguments)
+        if gate:
+            return gate
         # 记录技能最近使用时间（轮内工具上限的 LRU 淘汰依据）
         try:
             from harness import get_harness
@@ -3602,6 +3622,65 @@ class AIAgent:
             return await execute_local_tool(tool_name, arguments)
         else:
             return f"未知工具: {tool_name}"
+
+    async def _gate_request(self, tool_name: str, arguments: dict) -> Optional[str]:
+        """工具级确认闸门：ask/deny 时拦截并回填说明；返回 None = 放行。
+
+        判级在 tool_gate.evaluate（纯函数）——只读零确认、高危按签名挂确认卡、
+        被拒过的签名直接拒绝（不骚扰）；评估器故障放行（闸门绝不能成为故障源）。"""
+        try:
+            from tool_gate import evaluate
+            verdict, reason, sig = evaluate(
+                tool_name, arguments,
+                self._gate_allowed, self._gate_denied, self._gate_pending)
+        except Exception as e:
+            logger.warning(f"工具闸门评估失败，放行 {tool_name}: {e}")
+            return None
+        if verdict == "allow":
+            return None
+        if verdict == "deny":
+            return f"⛔ 已拒绝执行 {tool_name}：{reason}。我不会再发起这个操作。"
+        # ask：同签名已在挂起 → 只回填等待文案（不重复弹卡、不覆盖 rid）
+        rid = self._gate_pending.get(sig)
+        if rid is not None:
+            return (f"⏳ 仍在等待你确认：{tool_name}（确认卡编号 {rid}）。"
+                    f"你允许后我会继续执行，拒绝则不会。")
+        rid = f"tool_gate:{uuid.uuid4().hex[:10]}"
+        self._gate_pending[sig] = rid
+        await self._emit_gate_card(rid, tool_name, arguments, reason)
+        return (f"⏳ 操作需你确认：{tool_name}——{reason}。"
+                f"确认卡片已弹出（编号 {rid}），你允许后我会继续执行，拒绝则不会。")
+
+    async def _emit_gate_card(self, rid: str, tool_name: str,
+                              arguments: dict, reason: str) -> None:
+        """推送工具确认卡：复用前端 harness-modal（bridge_confirm 事件），零前端改动。"""
+        try:
+            args_preview = json.dumps(arguments, ensure_ascii=False, default=str)[:120]
+            fn = _gate_broadcast
+            if fn:
+                await fn({
+                    "type": "bridge_confirm",
+                    "request_id": rid,
+                    "task": f"工具「{tool_name}」{reason}\n参数：{args_preview}",
+                    "require_confirm": True,
+                    "task_id": rid,
+                })
+        except Exception:
+            pass
+
+    def resolve_gate(self, request_id: str, approve: bool) -> bool:
+        """用户对确认卡做出决定：allow → 签名进白名单（同动作重调即放行）；
+        deny → 签名进黑名单（同动作直接拒绝）。返回是否命中待决确认卡。"""
+        for sig, rid in list(self._gate_pending.items()):
+            if rid == request_id:
+                self._gate_pending.pop(sig, None)
+                if approve:
+                    self._gate_allowed[sig] = 1
+                else:
+                    self._gate_denied[sig] = 1
+                logger.info(f"工具闸门: 用户{'允许' if approve else '拒绝'} 签名 {sig}")
+                return True
+        return False
 
     def _tool_exec_config(self, tool_name: str = "") -> dict:
         """读取工具执行的超时与心跳配置（settings.json -> agent 段），失败用默认值。

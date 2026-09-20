@@ -2854,10 +2854,44 @@ async def harness_bridge_info():
     }
 
 
+# ---------- 工具级确认闸门：确认卡广播 + 回传分流 ----------
+# agent 侧闸门（tool_gate）要弹确认卡 → 这里广播给所有前端；
+# 用户在确认卡点击 → /api/bridge/confirm，request_id 带 tool_gate: 前缀走工具确认。
+# 函数体内 manager 是延迟解析：运行时已定义（4744 行），定义顺序无碍。
+
+
+async def _gate_broadcast_safe(ev: dict) -> None:
+    """工具确认卡广播到所有已连接前端（复用 harness-modal 确认卡 UI）。"""
+    for ws in list(manager.active):
+        await safe_send_json(ws, ev)
+
+
+try:
+    from agent import set_gate_broadcast
+    set_gate_broadcast(_gate_broadcast_safe)
+except Exception:
+    pass
+
+
 @app.post("/api/bridge/confirm")
 async def harness_bridge_confirm(payload: dict):
     request_id = str(payload.get("request_id") or "")
     approve = bool(payload.get("approve"))
+    if request_id.startswith("tool_gate:"):
+        # 工具级确认：写进 agent 闸门状态（白名单/黑名单）并广播收尾卡片
+        from agent import get_agent as _ga
+        agent = await _ga()
+        if not agent.resolve_gate(request_id, approve):
+            raise HTTPException(status_code=404, detail="确认请求不存在或已过期")
+        # 允许 → running（已放行，模型下轮重试即执行）；拒绝 → cancelled（未执行）
+        status = "running" if approve else "cancelled"
+        await _gate_broadcast_safe({
+            "type": "bridge_status",
+            "request_id": request_id,
+            "task": "",
+            "status": status,
+        })
+        return {"ok": True, "request_id": request_id, "status": status}
     orch = get_orchestrator()
     task = await orch.confirm(request_id, approve)
     if task is None or task.id != request_id:
@@ -2880,6 +2914,10 @@ async def harness_bridge_confirm(payload: dict):
 
 @app.get("/api/bridge/status")
 async def harness_bridge_status(request_id: str):
+    if request_id.startswith("tool_gate:"):
+        # 工具确认卡的轮询终态：卡片常驻 running，用户手动关闭即收尾
+        return {"ok": True, "request_id": request_id, "status": "running",
+                "task": "", "reply": "", "error": ""}
     orch = get_orchestrator()
     task = orch.get(request_id)
     if task is None:
