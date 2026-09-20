@@ -280,6 +280,43 @@ def stale_updater_note(stale: Optional[Tuple[Path, Path]]) -> List[str]:
     ]
 
 
+# ── 代理探测（内嵌副本，理由同文件头：更新器不依赖仓库内文件）────────────
+# 直连 GitHub 常见 60KB/s 量级（26MB 要 6 分钟，还常中途超时断掉）；本机跑着
+# sing-box / clash 时同一个包 7 秒下完。代理开着、链路不知道它存在 —— 这就是慢
+# 的全部原因。不猜只探：环境变量 → 本机常用端口 → 都没有就直连（没代理的机器
+# 行为完全不变）。deploy/release/netproxy.py 是同一份逻辑，改这里时那边也要改。
+PROXY_PORTS = (7890, 7891, 10809, 1080, 10808, 20171)
+_proxy_cache: Optional[str] = None
+_proxy_probed = False
+
+
+def detect_proxy() -> Optional[str]:
+    global _proxy_cache, _proxy_probed
+    if _proxy_probed:
+        return _proxy_cache
+    _proxy_probed = True
+    for var in ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"):
+        val = os.environ.get(var, "").strip()
+        if val:
+            _proxy_cache = val
+            return _proxy_cache
+    for port in PROXY_PORTS:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.3):
+                _proxy_cache = f"http://127.0.0.1:{port}"
+                return _proxy_cache
+        except OSError:
+            continue
+    return None
+
+
+def _opener():
+    """带代理的 opener；没代理时显式直连 —— 不被环境里残留的坏变量带跑。"""
+    proxy = detect_proxy()
+    mapping = {"http": proxy, "https": proxy} if proxy else {}
+    return urllib.request.build_opener(urllib.request.ProxyHandler(mapping))
+
+
 # ── GitHub ───────────────────────────────────────────────────────────────
 def gh_request(url: str, token: str, timeout: int, raw: bool = False):
     headers = {
@@ -290,7 +327,7 @@ def gh_request(url: str, token: str, timeout: int, raw: bool = False):
     if token:
         headers["Authorization"] = "Bearer " + token
     req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with _opener().open(req, timeout=timeout) as r:
         return r.read() if raw else json.loads(r.read().decode("utf-8"))
 
 
@@ -838,6 +875,8 @@ def run(args) -> int:
         src_note = f"本地包 {tar_path.name}"
     else:
         token = get_token()
+        _proxy = detect_proxy()
+        log_line(cfg, f"  网络：{'走代理 ' + _proxy if _proxy else '直连（未探测到本机代理）'}")
         if not token:
             # 公开仓匿名可拉：没凭据不再是失败，只是拿不到私有仓而已。
             # 私有仓匿名访问返回 404（不是 401），下面按这个事实给提示。

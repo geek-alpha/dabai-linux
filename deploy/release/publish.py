@@ -43,6 +43,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 RELEASE_DIR = Path(__file__).resolve().parent
+
+# 同目录工具：代理探测（直连 GitHub 常见 60KB/s，走本机代理是 MB/s 量级）
+if str(RELEASE_DIR) not in sys.path:
+    sys.path.insert(0, str(RELEASE_DIR))
+import netproxy  # noqa: E402
 VERSION_FILE = ROOT / "VERSION"
 DIST_DIR = RELEASE_DIR / "dist"
 RELEASE_LOG = ROOT / "data" / "release_log.jsonl"
@@ -87,9 +92,12 @@ def _python() -> str:
 
 
 def _run(cmd: list, timeout: int | None = None, env: dict | None = None):
+    # 子进程统一带代理：git push 和 CI 轮询都要出网，直连时是国内最慢的一段
+    e = dict(os.environ if env is None else env)
+    e.update(netproxy.proxy_env())
     return subprocess.run(
         cmd, cwd=str(ROOT), capture_output=True, text=True,
-        timeout=timeout, env=env,
+        timeout=timeout, env=e,
     )
 
 

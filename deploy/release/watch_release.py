@@ -27,6 +27,10 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+# 同目录工具：代理探测（直连 GitHub 常见 60KB/s，走本机代理是 MB/s 量级）
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import netproxy  # noqa: E402
+
 SECRET_FILES = (
     Path("/etc/dabai/secrets.env"),
     Path.home() / ".config" / "dabai" / "secrets.env",
@@ -56,7 +60,7 @@ def api_get(url: str, token: str, timeout: int = 30):
         "User-Agent": "dabai-watch-release",
     })
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with netproxy.opener().open(req, timeout=timeout) as r:
             return r.status, json.load(r)
     except urllib.error.HTTPError as e:
         return e.code, {}
