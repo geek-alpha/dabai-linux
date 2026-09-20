@@ -174,7 +174,10 @@ def merge_roster(items: Any, via: str = "", hops: int = 0) -> Dict[str, int]:
                           "first_seen": now, "last_seen": seen}
             added += 1
             continue
-        if url and seen >= int(cur.get("last_seen") or 0) and url != cur.get("url"):
+        # 地址只信本人名片：转手的地址是「我听别人说他在哪」，拿它改本地记录会把节点
+        # 指到第三台机器上（实测把同伴的地址写成另一台的域名，gossip 于是自己发给自己）。
+        # 二手地址只在本地完全没有地址时补种。
+        if url and url != cur.get("url") and (nid == via or not cur.get("url")):
             cur["url"] = url
             updated += 1
         if str(it.get("label") or "") and not cur.get("label"):
@@ -217,9 +220,9 @@ def _promote_to_peers(nodes: Optional[Dict[str, Dict[str, Any]]] = None) -> int:
 def my_entry() -> List[Dict[str, Any]]:
     """我这一份名册（发给别人看的）。第一条永远是我自己 —— 名片跟名册一起走，
     这样一次请求既完成「交换名单」也完成「我上线了」。"""
-    card = my_card()
-    items = [{"node_id": card["node_id"], "label": card["label"], "url": card["url"],
-              "ts": card["ts"]}]
+    # 自己那条必须是**完整名片**（含账本摘要）：名册交换是两个方向，谁发起谁应答都
+    # 该拿到对方的账本承诺。只给瘦条目的话只有应答方存得下锚定，发起方永远零锚定。
+    items: List[Dict[str, Any]] = [my_card()]
     for nid, v in roster().items():
         if v.get("url"):
             items.append({"node_id": nid, "label": v.get("label") or nid,
@@ -241,7 +244,17 @@ def _post_to(node_id: str, path: str, payload: Dict[str, Any],
     url = known_url(node_id)
     if not url:
         return {"ok": False, "error": f"no url for {node_id}"}
-    return pm._post(url + path, payload, timeout)
+    r = pm._post(url + path, payload, timeout)
+    if r.get("ok"):
+        return r
+    # 名册地址可能过时（对方搬了家、或我们记错了）：连不上就回落到地址簿的种子地址，
+    # 否则一条错地址会让这台机器从联盟里静默消失。
+    alt = str((pm.peers().get(node_id) or {}).get("url") or "").rstrip("/")
+    if alt and alt != url:
+        r2 = pm._post(alt + path, payload, timeout)
+        if r2.get("ok"):
+            return {**r2, "fallback": alt}
+    return r
 
 
 def _targets(exclude: str = "", limit: int = 12) -> List[str]:
@@ -620,6 +633,35 @@ async def social_feed(request: Request):
 
 # ---------- 命令行 ----------
 
+def _doctor() -> int:
+    """查地址这一层最容易静默出错的三件事：自己没声明地址、自己声明了别人的地址、
+    名册里学到了空地址。这三样都不报错，只会让 gossip 悄悄自环（自己发给自己）。"""
+    mine = self_url()
+    peers = pm.peers()
+    bad = 0
+    if not mine:
+        print("✗ 我没声明自己的地址 —— 名片发出去是空的，别人只能靠猜")
+        bad += 1
+    else:
+        print(f"✓ 我的地址 {mine}")
+    for nid, p in sorted(peers.items()):
+        if mine and str(p.get("url") or "").rstrip("/") == mine:
+            print(f"✗ 我的地址和 {nid} 的相同（{mine}）—— 发给它的消息会发回我自己")
+            bad += 1
+    for nid, v in sorted(roster(prune=False).items()):
+        pu = str((peers.get(nid) or {}).get("url") or "").rstrip("/")
+        ru = str(v.get("url") or "").rstrip("/")
+        if not pu:
+            print(f"✗ {nid} 地址簿里没有地址 —— 联系不上它")
+            bad += 1
+        elif ru and ru != pu:
+            print(f"⚠ {nid} 名册地址 {ru} ≠ 地址簿 {pu}（名册优先，下一次 gossip 用名册那个）")
+        elif not ru:
+            print(f"⚠ {nid} 自己没声明地址 —— 它得跑一次 peer_social.py url <地址>")
+    print(f"{'发现问题' if bad else '地址这一层没问题'}：{bad} 处")
+    return 1 if bad else 0
+
+
 def _cli(argv: List[str]) -> int:
     cmd = (argv[0] if argv else "status").lower()
     rest = argv[1:]
@@ -663,6 +705,8 @@ def _cli(argv: List[str]) -> int:
     if cmd == "tick":
         print(json.dumps(tick(force=True), ensure_ascii=False, indent=2))
         return 0
+    if cmd in ("doctor", "check"):
+        return _doctor()
     if cmd == "url":
         if not rest:
             print(self_url() or "（还没设过自己的地址）")
