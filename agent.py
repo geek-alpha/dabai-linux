@@ -1102,6 +1102,23 @@ def _is_transient_stream_error(e: Exception) -> bool:
         ))
 
 
+def _stream_retry_delay(attempt: int, exc: Optional[BaseException] = None) -> float:
+    """流式中途断网后重建流的等待时长（唯一入口）。
+
+    服务端在流中途回 429 时会带 Retry-After，固定 2*attempt（封顶 15s）把这
+    个头整个忽略——服务端要求等 30s、我们 2s 后重撞，等于把限流又加重一次。
+    harness 不可用时退回原公式。
+    """
+    try:
+        from harness.core import _retry_after_of, backoff_delay
+    except Exception:
+        return min(2.0 * attempt, 15.0)
+    return backoff_delay(
+        attempt, base=2.0, max_exp=3,
+        retry_after=_retry_after_of(exc) if exc is not None else None,
+    )
+
+
 class _StreamIdleTimeout(TimeoutError):
     """流式静默看门狗触发：首包或块间隔超过阈值仍无事件。
 
@@ -5496,7 +5513,7 @@ class AIAgent:
                             assistant_content = ""
                             # 已发出的文本保留去重标记：重建流时跳过已播报前缀
                             skip_prefix_len = len(delivered_text)
-                            _delay = min(2.0 * stream_attempt, 15.0)
+                            _delay = _stream_retry_delay(stream_attempt, e)
                             logger.warning(
                                 "流式输出中途断网（%s），%.0fs 后第 %d/%d 次重建流",
                                 e, _delay, stream_attempt, max_stream_retries)
