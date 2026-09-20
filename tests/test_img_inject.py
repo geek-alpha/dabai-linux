@@ -510,3 +510,71 @@ def test_e2e_mid_cap_matches_inject_cap(fake_img):
     agent._append_img_messages(messages, marks, "music_search", True)
     assert len(_imgs(messages)) == agent._IMG_MAX_PER_RESULT
     assert _notes(messages) == []
+
+
+# ---------------- 压缩 / 落盘幂等（2026-09-20） ----------------
+# 背景：_compact_tool_history 每轮都会调（agent.py:5252 工具结果入 messages 后、
+# agent.py:6102 落断点前），_strip_img_for_disk 也在多处落盘路径上重复调。
+# 降级/剥离若不带幂等守卫，第二次调用会静默劣化：降级时 text part 已不在，
+# 只剩「工具图片」——路径没了，模型照着看不见的画面下结论；剥离则把同一句
+# 「图片已剥离」叠成两句。两者都不报错，只能靠契约测试守。
+
+def _mm(path: str, pad: int = 400) -> dict:
+    return {"role": "user", "content": [
+        {"type": "text", "text": f"【android 的图片】{path}"},
+        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + "A" * pad}},
+    ]}
+
+
+def _hist(n_img: int = 12) -> list:
+    """n_img 轮「assistant + 工具结果 + 多模态图」，总量远超下面给的小预算。"""
+    msgs = [{"role": "system", "content": "系统"}]
+    for i in range(n_img):
+        msgs.append({"role": "assistant", "content": f"调用工具 {i}"})
+        msgs.append({"role": "tool", "tool_call_id": f"c{i}", "content": "x" * 4000})
+        msgs.append(_mm(f"/tmp/round{i}.png"))
+    return msgs
+
+
+def _digest(msgs) -> str:
+    return "\n".join(str(m.get("content")) for m in msgs)
+
+
+def test_compact_history_is_idempotent():
+    """连调三次收敛到同一状态：路径不丢、条数不增、降级提示不叠加。"""
+    msgs = _hist()
+    n = len(msgs)
+    agent._compact_tool_history(msgs, budget=2000, keep_rounds=1)
+    first = _digest(msgs)
+    assert "【图已省略】" in first, "预算没触发降级 —— 这个构造测不到幂等"
+    for _ in range(2):
+        agent._compact_tool_history(msgs, budget=2000, keep_rounds=1)
+    assert _digest(msgs) == first, "第二次压缩改动了内容 —— 不幂等"
+    assert len(msgs) == n
+    assert all(f"/tmp/round{i}.png" in first for i in range(12)), "路径被压缩吃掉"
+    assert first.count("【图已省略】") == 12 - agent._IMG_KEEP_NEWEST
+    assert sum(1 for m in msgs if isinstance(m.get("content"), list)) == agent._IMG_KEEP_NEWEST
+
+
+def test_strip_img_for_disk_is_idempotent():
+    """剥离连调两次零变化，且不破坏原 messages（base64 只在副本里被剥）。"""
+    msgs = _hist(3)
+    once = agent._strip_img_for_disk(msgs)
+    twice = agent._strip_img_for_disk(once)
+    assert _digest(twice) == _digest(once), "第二次剥离又拼了一句说明"
+    assert len(once) == len(twice) == len(msgs) == 10
+    assert _digest(once).count("图片已剥离") == 3
+    assert not any(isinstance(m.get("content"), list) for m in once), "base64 没剥干净"
+    assert all(f"/tmp/round{i}.png" in _digest(once) for i in range(3))
+    assert sum(1 for m in msgs if isinstance(m.get("content"), list)) == 3, "原列表被就地改了"
+
+
+def test_downgraded_text_survives_compact_and_strip():
+    """跨函数：降级后的文本再走 strip 不重复包装，路径仍可重读。"""
+    msgs = _hist(12)
+    agent._compact_tool_history(msgs, budget=2000, keep_rounds=1)
+    stripped = agent._strip_img_for_disk(msgs)
+    txt = _digest(stripped)
+    assert txt.count("【图已省略】") == 12 - agent._IMG_KEEP_NEWEST
+    assert txt.count("图片已剥离") == agent._IMG_KEEP_NEWEST
+    assert all(f"/tmp/round{i}.png" in txt for i in range(12))
