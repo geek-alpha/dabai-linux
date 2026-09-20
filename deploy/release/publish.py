@@ -303,10 +303,10 @@ def do_notify(ver: str) -> dict:
         return {"notified": [], "failed": []}
 
     text = (f"v{ver} 已发布：dabai-{ver}.tar.gz + .sha256 资产齐全，可以拉。"
-            f"更新命令：python deploy/release/update.py")
+            f"开了 peer.auto_update 的机器会自己去查新版；否则手工：python deploy/release/update.py")
     sent, failed = [], []
     for n in nodes:
-        cmd = [_python(), str(ROOT / "peer_mesh.py"), "say", n, text]
+        cmd = [_python(), str(ROOT / "peer_mesh.py"), "say", n, text, "--kind", "release"]
         try:
             p = _run(cmd, timeout=30)
         except subprocess.TimeoutExpired:

@@ -28,6 +28,7 @@ DEFAULT_PEERS = {
     "rpi": ("https://dabai.battlephoenix.tech", "树莓派"),
     "aliyun": ("https://aliyun.battlephoenix.tech", "阿里云"),
     "wsl": ("https://wsl.battlephoenix.tech", "WSL"),
+    "orangepi": ("https://orangepi.battlephoenix.tech", "香橙派"),
 }
 
 IMPORT_ANCHOR = "import music_lib\n"

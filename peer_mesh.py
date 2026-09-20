@@ -707,10 +707,13 @@ def _cli(argv: List[str]) -> int:
         return 0
 
     if cmd == "say":
-        if len(rest) < 2:
-            print("用法: peer_mesh.py say <node_id> <文本>")
+        kind = opt("--kind", "say")
+        args = [x for i, x in enumerate(rest)
+                if x != "--kind" and (i == 0 or rest[i - 1] != "--kind")]
+        if len(args) < 2:
+            print("用法: peer_mesh.py say <node_id> <文本> [--kind release]")
             return 2
-        print(json.dumps(say(rest[0], " ".join(rest[1:])), ensure_ascii=False))
+        print(json.dumps(say(args[0], " ".join(args[1:]), kind=kind), ensure_ascii=False))
         return 0
 
     if cmd == "call":
