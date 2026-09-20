@@ -55,8 +55,9 @@ def test_retry_after_takes_priority():
     assert backoff_delay(5, base=1.0, retry_after=3.0) == 3.0
     # 超大 Retry-After 也封顶
     assert backoff_delay(1, retry_after=99999.0) == 30.0
-    # 负值/零 不报错
-    assert backoff_delay(1, retry_after=0.0) == 0.0
+    # 非正值退回指数退避：服务端回 Retry-After: 0 时照睡 0 秒就是热循环
+    assert backoff_delay(1, base=1.0, jitter=False, retry_after=0.0) == 1.0
+    assert backoff_delay(2, base=1.0, jitter=False, retry_after=-5.0) == 2.0
 
 
 def test_agent_reconnect_equivalent_no_jitter():
@@ -124,15 +125,15 @@ def test_retry_after_老格式也能认(fmt):
     assert 22.0 <= ra <= 25.0, (hdr, ra)
 
 
-def test_retry_after_http_date_过去时间归零():
-    """服务端给的时间已经过去 → 立即重试，不返回负数。"""
+def test_retry_after_http_date_过期退回指数退避():
+    """服务端给的时间已经过去 → 返回 None 退回指数退避（照睡 0 秒就是热循环）。"""
     from datetime import datetime, timedelta, timezone
     from email.utils import format_datetime
 
     from harness.core import _retry_after_of
 
     hdr = format_datetime(datetime.now(timezone.utc) - timedelta(seconds=60), usegmt=True)
-    assert _retry_after_of(_exc_with_retry_after(hdr)) == 0.0
+    assert _retry_after_of(_exc_with_retry_after(hdr)) is None
 
 
 def test_retry_after_http_date_超大也封顶():

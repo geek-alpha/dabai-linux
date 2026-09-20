@@ -538,7 +538,10 @@ _IMG_MAX_USER_UPLOAD = 8
 # 全留在上下文里，而压缩只压文字、不碰多模态消息，图一多压缩就等于失效。
 # 超预算时把最老的多模态消息降级成文本说明，只留最近 8 张（模型当前工作所依据的）。
 _IMG_KEEP_NEWEST = 8
-_IMG_DROP_NOTE = "【图已省略】{text}（需要时用工具按这个路径重新读）"
+# 「图已不在上下文里、按路径重读」这句在降级与落盘剥离两处同源：模型两次读到
+# 同一张图消失，措辞不同会让它以为发生了两件事。
+_IMG_REREAD_HINT = "需要时按上面的路径重新读"
+_IMG_DROP_NOTE = "【图已省略】{text}（" + _IMG_REREAD_HINT + "）"
 # 超出上限必须留一句说明：静默丢弃会让模型以为「这次只产出了 4 张图」，
 # 拿着残缺信息下结论比不看图更坏。
 _IMG_CAP_NOTE = ("【图片注入上限】本次共 {total} 张图，只注入了 {done} 张"
@@ -721,7 +724,7 @@ def _strip_img_for_disk(messages: list) -> list:
                      if isinstance(p, dict) and p.get("type") == "text"]
             m = dict(m)
             m["content"] = (" ".join(x for x in parts if x)
-                            + "（图片已剥离，需要时按上面的路径重新读）")
+                            + "（图片已剥离，" + _IMG_REREAD_HINT + "）")
         out.append(m)
     return out
 
@@ -1075,7 +1078,10 @@ def _is_retryable_llm_error(e: BaseException) -> bool:
     冷却结束后会半开探测自动恢复——等待即可，不应因此中止对话轮。
     """
     try:
-        from harness.core import is_transient_error
+        from harness.core import is_transient_error, retry_decision
+        decision = retry_decision(e)
+        if decision is not None:
+            return decision  # 服务端表态/状态码是确定的，文本兜底不许推翻
         if is_transient_error(e):
             return True
     except Exception:
@@ -1112,7 +1118,9 @@ def _stream_retry_delay(attempt: int, exc: Optional[BaseException] = None) -> fl
     try:
         from harness.core import _retry_after_of, backoff_delay
     except Exception:
-        return min(2.0 * attempt, 15.0)
+        # harness 不可用（包被删/导入报错）时的兜底：封顶与 DEFAULT_BACKOFF_CAP
+        # 对齐，同一套重连语义不该因为兜底换个上限。
+        return min(2.0 * attempt, 30.0)
     return backoff_delay(
         attempt, base=2.0, max_exp=3,
         retry_after=_retry_after_of(exc) if exc is not None else None,

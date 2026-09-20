@@ -88,14 +88,62 @@ def _status_code_of(e: BaseException) -> Optional[int]:
     return None
 
 
-def is_transient_error(e: BaseException) -> bool:
-    """判断异常是否属于「瞬时错误」（网络抖动/限流/服务端 5xx）。
+def _header_of(e: BaseException, name: str) -> Optional[str]:
+    """从异常的响应里取一个头（httpx.Headers 大小写不敏感；plain dict 兜一层）。
 
-    状态码优先于文本：拿得到 HTTP 状态码就按码判（4xx 默认致命，
-    408/409/429 例外），拿不到才退回关键词匹配。
+    取不到返回 None——区分「头不存在」与「头值为空」没有意义，调用方都当没给。
+    """
+    resp = getattr(e, "response", None)
+    hdrs = getattr(resp, "headers", None)
+    if hdrs is None:
+        return None
+    try:
+        raw = hdrs.get(name)
+    except Exception:
+        return None
+    if raw is None:
+        try:
+            for k, v in hdrs.items():
+                if str(k).lower() == name.lower():
+                    raw = v
+                    break
+        except Exception:
+            return None
+    if raw is None:
+        return None
+    return str(raw).strip()
+
+
+def _should_retry_header(e: BaseException) -> Optional[bool]:
+    """服务端显式表态：`x-should-retry: true/false`（Anthropic 私有头）。
+
+    它比状态码和关键词都准——服务端最清楚这次是不是瞬时故障。返回 None
+    表示没表态，交给常规分类器。
+    """
+    raw = _header_of(e, "x-should-retry")
+    if raw is None:
+        return None
+    low = raw.lower()
+    if low == "true":
+        return True
+    if low == "false":
+        return False
+    return None
+
+
+def retry_decision(e: BaseException) -> Optional[bool]:
+    """异常本身能确定的「该不该重试」；确定不了返回 None。
+
+    优先级：业务主动声明（RetryableError）→ 服务端 x-should-retry 表态 →
+    HTTP 状态码。三者都没有就只能靠文本猜（is_transient_error 的兜底），
+    而猜测不该推翻任何一条明确表态——agent.py 的重连分类器靠这个 None
+    区分「确定不重试」与「猜的」。
     """
     if isinstance(e, RetryableError):
         return True
+    override = _should_retry_header(e)
+    if override is not None:
+        return override
     if isinstance(e, (ConnectionError, TimeoutError, asyncio.TimeoutError)):
         return True
     code = _status_code_of(e)
@@ -103,6 +151,18 @@ def is_transient_error(e: BaseException) -> bool:
         if 400 <= code < 500:
             return code in _RETRYABLE_4XX
         return code >= 500
+    return None
+
+
+def is_transient_error(e: BaseException) -> bool:
+    """判断异常是否属于「瞬时错误」（网络抖动/限流/服务端 5xx）。
+
+    能确定的（业务声明 / 服务端表态 / HTTP 状态码）优先，确定不了才退回
+    关键词匹配。
+    """
+    decision = retry_decision(e)
+    if decision is not None:
+        return decision
     msg = (str(e) or "").lower()
     if any(k in msg for k in _NON_TRANSIENT_HINTS):
         return False
@@ -124,34 +184,45 @@ def _parse_http_date(txt: str) -> Optional[datetime]:
     return dt
 
 
-def _retry_after_of(e: BaseException) -> Optional[float]:
-    """服务端给了 Retry-After 就听它的（秒数或 HTTP-date，封顶）。
+def _clamp_retry_after(secs: float) -> Optional[float]:
+    """Retry-After 归一：非正值/NaN → None（退回指数退避），超大值封顶。
 
-    两种形式都得认：delta-seconds（"30"）与 HTTP-date（"Wed, 21 Oct 2015 07:28:00 GMT"）。
-    只认秒数时，带日期的响应会静默退回指数退避（~1s）——服务端要求等 30s、我们 1s
-    后重撞，等于把限流又加重一次。
+    ≤0 必须退回指数退避而不是照睡 0：服务端回 `Retry-After: 0`（或负数、已过期的
+    HTTP-date）时睡 0 秒就是热循环，而热循环正是被限流时最不该做的动作。
+    Anthropic SDK 同样只在 `retry_after > 0` 时采用它（_base_client.py:821）。
     """
-    resp = getattr(e, "response", None)
-    hdrs = getattr(resp, "headers", None)
-    if hdrs is None:
+    if isnan(secs) or secs <= 0:
         return None
-    try:
-        raw = hdrs.get("retry-after") or hdrs.get("Retry-After")
-    except Exception:
-        return None
+    return min(secs, DEFAULT_BACKOFF_CAP)
+
+
+def _retry_after_of(e: BaseException) -> Optional[float]:
+    """服务端给了 Retry-After 就听它的（毫秒头 / 秒数 / HTTP-date，封顶）。
+
+    三种形式按精度从高到低认：非标准 `retry-after-ms`（毫秒，Anthropic SDK 优先
+    认它，比整数秒的 retry-after 精确）→ delta-seconds（"30"）→ HTTP-date
+    （"Wed, 21 Oct 2015 07:28:00 GMT"）。只认秒数时，带日期的响应会静默退回指数
+    退避（~1s）——服务端要求等 30s、我们 1s 后重撞，等于把限流又加重一次。
+
+    返回 None = 没有可用的 Retry-After，调用方退回指数退避。
+    """
+    ms = _header_of(e, "retry-after-ms")
+    if ms is not None:
+        try:
+            return _clamp_retry_after(float(ms) / 1000.0)
+        except (TypeError, ValueError):
+            pass  # 毫秒头坏了就往下试秒数头，别整个放弃
+    raw = _header_of(e, "retry-after")
     if raw is None:
         return None
-    txt = str(raw).strip()
     try:
-        secs = float(txt)
+        secs = float(raw)
     except (TypeError, ValueError):
-        dt = _parse_http_date(txt)
+        dt = _parse_http_date(raw)
         if dt is None:
             return None
         secs = (dt - datetime.now(timezone.utc)).total_seconds()
-    if isnan(secs):  # 非法数值：退回指数退避，别当成 0 秒打热循环
-        return None
-    return max(0.0, min(secs, DEFAULT_BACKOFF_CAP))
+    return _clamp_retry_after(secs)
 
 
 def backoff_delay(
@@ -167,10 +238,12 @@ def backoff_delay(
 
     - 抖动乘在封顶之前：min(cap, base*2^n*jitter)，否则 1.2 倍能顶穿 cap
       （实测 attempts=12/backoff=10 时 35.1s > 30s 封顶）。
-    - 服务端给了 retry_after 就听它的（同样封顶，不叠抖动）。
+    - 服务端给了 retry_after 就听它的（同样封顶，不叠抖动）。非正值一律退回指数
+      退避：服务端回 0 时照睡 0 秒就是热循环（对齐 Anthropic SDK 的
+      `retry_after > 0` 判断）。
     """
-    if retry_after is not None:
-        return max(0.0, min(retry_after, cap))
+    if retry_after is not None and retry_after > 0:
+        return min(retry_after, cap)
     delay = base * (2 ** min(attempt - 1, max_exp))
     if jitter:
         delay *= random.uniform(0.8, 1.2)
