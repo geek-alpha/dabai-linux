@@ -262,6 +262,24 @@ def verify(from_id: str, ts: Any, text: str, sig: Any, key: Optional[bytes] = No
 
 
 # ---------- 收件箱 ----------
+# 邮箱的语义是「对方留给我的、我下次醒来才处理的东西」。同步电话（call/reply）和系统
+# 指令（release）共用同一条投递管道 —— 耳朵靠它收信、peer_call 靠它认领回话 —— 但它们
+# 不是留言：电话双方都在场、当场就答完了，再计一次未读等于把答过的话重复推到眼前
+# （2026-09-21 主人：打电话的过程不该存邮箱里）。管道照旧，只是不进邮箱出口。
+CALL_KINDS = ("call", "reply", "release")
+
+
+def is_mail(entry: Dict[str, Any]) -> bool:
+    """这条算不算「留言」—— 收件箱出口（读信 / 未读注入）只放留言。"""
+    return str(entry.get("kind") or "say") not in CALL_KINDS
+
+
+def _is_mail_line(line: str) -> bool:
+    """行级粗筛，不解析 JSON：未读计数要扫全部未读行，逐行 json.loads 在积压时是白烧
+    CPU。格式由 append_inbox 的 json.dumps 固定产出；粗筛命不中最多让一条通话记录多算
+    一次未读，不会丢信。"""
+    return not any(f'"kind": "{k}"' in line for k in CALL_KINDS)
+
 
 def append_inbox(entry: Dict[str, Any]) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -292,9 +310,11 @@ def read_inbox(mark_read: bool = False, limit: int = 50) -> List[Dict[str, Any]]
         if not line:
             continue
         try:
-            out.append(json.loads(line))
+            e = json.loads(line)
         except ValueError:
             continue
+        if is_mail(e):
+            out.append(e)
     if mark_read and len(lines) > start:
         cur["inbox"] = len(lines)
         _atomic_write(CURSOR_FILE, json.dumps(cur, ensure_ascii=False, indent=2))
@@ -312,14 +332,16 @@ def unread_summary(preview: int = 3) -> Dict[str, Any]:
     except OSError:
         return {"count": 0, "items": []}
     start = int(_read_cursor().get("inbox", 0) or 0)
-    tail = [ln for ln in lines[start:] if ln.strip()]
+    mail = [ln for ln in lines[start:] if ln.strip() and _is_mail_line(ln)]
     items: List[Dict[str, Any]] = []
-    for line in tail[-preview:]:
+    for line in mail[-preview:]:
         try:
-            items.append(json.loads(line))
+            e = json.loads(line)
         except ValueError:
             continue
-    return {"count": len(tail), "items": items}
+        if is_mail(e):
+            items.append(e)
+    return {"count": len(mail), "items": items}
 
 
 def _read_watch_cursor() -> int:
@@ -371,6 +393,166 @@ def _tail(n: int = 50) -> List[Dict[str, Any]]:
         except ValueError:
             continue
     return out
+
+
+# ---------- 通话通道（call session） ----------
+# 第一性原理：打电话的实质不是「消息能到」，是「双方共享同一段会话状态」。一问一答的
+# 往返不叫电话 —— 每通都要重新交代背景，问题稍微复杂就得打好几通，这不叫连续。
+# 所以电话有自己的账本（peer_calls.jsonl，与邮箱的「留言」语义彻底分开）：
+# 一轮一行，双方各自记自己这一侧，cid 相同的轮次属于同一通电话。
+# 拨号方不传 cid 时自动续接「跟这个同伴还没挂断的那通」—— 连续性由通道自己维持，
+# 不靠调用方记得带 id，就像真实电话拿起话筒就接上原来那通。
+CALL_LOG_FILE = DATA_DIR / "peer_calls.jsonl"
+CALL_STATE_FILE = DATA_DIR / "peer_calls.json"
+CALL_IDLE_TTL = 900.0     # 15 分钟没有新轮次就算挂断：会话不能永久挂着，否则上下文越滚越大
+CALL_LOG_TAIL = 4000      # 账本只扫尾部这么多行：通话要快，长历史不该拖慢每一次开口
+
+
+def _call_state() -> Dict[str, Any]:
+    try:
+        d = json.loads(CALL_STATE_FILE.read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _call_state_write(st: Dict[str, Any]) -> None:
+    try:
+        _atomic_write(CALL_STATE_FILE, json.dumps(st, ensure_ascii=False))
+    except OSError:
+        pass
+
+
+def _sweep_calls(st: Dict[str, Any]) -> Dict[str, Any]:
+    """闲置超时自动挂断。惰性清扫：读状态时顺手做，不值得为它养一个后台定时器。"""
+    now = time.time()
+    for c in (st.get("calls") or {}).values():
+        if str(c.get("status") or "open") != "open":
+            continue
+        if now - float(c.get("last") or 0) > CALL_IDLE_TTL:
+            c["status"] = "closed"
+            c["closed_reason"] = "idle"
+    return st
+
+
+def call_active(node_id: str = "") -> List[Dict[str, Any]]:
+    """还没挂断的通话，最近的排前面。node_id 为空时返回全部。"""
+    st = _sweep_calls(_call_state())
+    _call_state_write(st)
+    out = []
+    for cid, c in (st.get("calls") or {}).items():
+        if str(c.get("status") or "open") != "open":
+            continue
+        if node_id and str(c.get("with") or "") != node_id:
+            continue
+        out.append({"cid": cid, **c})
+    return sorted(out, key=lambda x: float(x.get("last") or 0), reverse=True)
+
+
+def call_record(cid: str, with_node: str, role: str, text: str,
+                ts: Optional[int] = None) -> Dict[str, Any]:
+    """记一轮通话。role: me=我说的 / peer=对方说的。返回该通话的最新状态。
+
+    双方各自记自己这一侧（我发的话写我的账本，对面回的话也写我的账本），
+    所以每一侧的账本都是一份完整的往返记录，不用去对方机器上取上下文。
+    """
+    cid = str(cid or "").strip()
+    if not cid:
+        return {}
+    ts_i = int(ts or time.time())
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        with open(CALL_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"cid": cid, "with": str(with_node or ""), "role": role,
+                                "text": str(text or ""), "ts": ts_i},
+                               ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+    st = _sweep_calls(_call_state())
+    calls = st.setdefault("calls", {})
+    c = dict(calls.get(cid) or {"with": str(with_node or ""), "started": ts_i, "round": 0})
+    c["with"] = str(with_node or c.get("with") or "")
+    c["last"] = ts_i
+    c["status"] = "open"
+    c.pop("closed_reason", None)
+    if role == "me":
+        # 只有「我说出去的一轮」才推进轮次：对方的回话属于同一轮，不另起一轮
+        c["round"] = int(c.get("round") or 0) + 1
+        c["last_text"] = str(text or "")[:200]
+    else:
+        c["last_reply"] = str(text or "")[:200]
+    calls[cid] = c
+    _call_state_write(st)
+    return {"cid": cid, **c}
+
+
+def call_transcript(cid: str, limit: int = 12) -> List[Dict[str, Any]]:
+    """某通电话的往返记录（老的在前）。对面据此接着上轮往下说，不用重问一遍。"""
+    cid = str(cid or "").strip()
+    if not cid:
+        return []
+    try:
+        lines = CALL_LOG_FILE.read_text(encoding="utf-8").splitlines()[-CALL_LOG_TAIL:]
+    except OSError:
+        return []
+    out: List[Dict[str, Any]] = []
+    for line in lines:
+        line = line.strip()
+        if not line or cid not in line:      # 粗筛：不解析明显不属于这通电话的行
+            continue
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if str(e.get("cid") or "") == cid:
+            out.append(e)
+    return out[-limit:]
+
+
+def call_history(cid: str, peer_label: str = "同伴", limit: int = 10,
+                 drop_last: str = "") -> str:
+    """这通电话前面几轮说过什么，拼成一段给 LLM 看的文本。空串 = 没什么可说的。
+
+    drop_last 传本次来电原文：账本里最后一条可能正是它，去掉避免重复。
+    只删确认是同一条的 —— 对端还没升级时没记账，那时删掉的就是上一轮真历史。
+    """
+    if not str(cid or "").strip():
+        return ""
+    turns = call_transcript(cid, limit=limit)
+    if turns and drop_last \
+            and str(turns[-1].get("text") or "")[:80] == str(drop_last)[:80]:
+        turns = turns[:-1]
+    if not turns:
+        return ""
+    lines = []
+    for t in turns:
+        who = "我" if str(t.get("role")) == "me" else peer_label
+        lines.append(f"  {who}：{str(t.get('text') or '')[:300]}")
+    return "\n【这通电话前面已经说过的】（接着往下说，别重问已答过的）\n" + "\n".join(lines)
+
+
+def call_hangup(cid: str = "", node_id: str = "") -> Dict[str, Any]:
+    """挂断。cid 和 node_id 都不给 = 挂断全部（别的地方要重开就当新电话）。"""
+    st = _sweep_calls(_call_state())
+    calls = st.setdefault("calls", {})
+    closed = []
+    for k, c in calls.items():
+        if str(c.get("status") or "open") != "open":
+            continue
+        if cid and k != cid:
+            continue
+        if node_id and str(c.get("with") or "") != node_id:
+            continue
+        c["status"] = "closed"
+        c["closed_reason"] = "hangup"
+        closed.append(k)
+    _call_state_write(st)
+    return {"closed": closed, "count": len(closed)}
+
+
+def _open_cid(node_id: str) -> str:
+    act = call_active(node_id)
+    return str(act[0].get("cid") or "") if act else ""
 
 
 # ---------- 联邦派活（kind=task） ----------
@@ -667,10 +849,19 @@ def _post(url: str, payload: Dict[str, Any], timeout: float) -> Dict[str, Any]:
         with _opener.open(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
+        # 带上状态码和 detail：不然 404（对方是旧版本，没这条路由）和 403（密钥不对）
+        # 都会退化成 {"detail": "Not Found"} 或空 error，排查时只能靠猜。
         try:
-            return json.loads(e.read().decode("utf-8"))
+            body = json.loads(e.read().decode("utf-8"))
         except Exception:
-            return {"ok": False, "error": f"HTTP {e.code}"}
+            return {"ok": False, "http": e.code, "error": f"HTTP {e.code}"}
+        if not isinstance(body, dict):
+            return {"ok": False, "http": e.code, "error": f"HTTP {e.code}"}
+        body.setdefault("ok", False)
+        body["http"] = e.code
+        if not body.get("error"):
+            body["error"] = body.get("detail") or f"HTTP {e.code}"
+        return body
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
@@ -724,40 +915,60 @@ def my_inbox(mark_read: bool = False, limit: int = 50) -> List[Dict[str, Any]]:
     return read_inbox(mark_read=mark_read, limit=limit)
 
 
-def call_peer(node_id: str, text: str, wait: float = 90.0) -> Dict[str, Any]:
+def call_peer(node_id: str, text: str, wait: float = 90.0,
+              cid: str = "") -> Dict[str, Any]:
     """打电话：说一句，然后守在收件箱等对方回话。
 
     对方那台跑着耳朵（peer_watch）时会秒级回；没人接就等满 wait 秒返回
     answered=False —— 消息仍在对方收件箱里，打不通不等于没送到。
     用 cid 而不是时间戳认回音：两台机器的时钟不需要同步。
+
+    cid 留空 = 续接与该同伴「还没挂断的那通」，没有才新开一通。同一通电话的每一轮
+    共享上下文（对面照 cid 取前几轮），所以连续性不靠调用方记 id。
     """
     me = node_info().get("node_id", "")
     sent_ts = int(time.time())
-    cid = f"{me}-{sent_ts}-{secrets.token_hex(3)}"
+    resumed = str(cid or "").strip() or _open_cid(node_id)
+    cid = resumed or f"{me}-{sent_ts}-{secrets.token_hex(3)}"
     r = say(node_id, text, kind="call", cid=cid)
     if not r.get("ok"):
         out: Dict[str, Any] = {"ok": False, "error": r.get("error", "send failed"),
-                              "known": r.get("known")}
+                              "known": r.get("known"), "cid": cid}
         if r.get("queued"):
             out["queued"] = True
             out["pending"] = r.get("pending")
         return out
+    seen = [int(t.get("ts") or 0) for t in call_transcript(cid, limit=6)]
+    last_seen = max(seen) if seen else 0
+    st = call_record(cid, node_id, "me", text, sent_ts)
     deadline = time.time() + max(0.0, wait)
     while True:
-        for m in _tail(50):
+        for m in reversed(_tail(50)):
             if m.get("kind") != "reply" or m.get("from") != node_id:
                 continue
-            # cid 是主判据；旧版服务端不落 cid（滚动升级期间），用「不早于我拨号」兜底
-            if m.get("cid") == cid or int(m.get("ts") or 0) >= sent_ts - 5:
-                return {"ok": True, "answered": True, "from": node_id,
-                        "reply": m.get("text", ""), "cid": cid,
+            # 主判据是 re ——「它回的是我哪一条」，由我方生成、对端原样带回，不受时钟漂移影响。
+            # 只认 cid 不行：同一通电话每一轮的 cid 都一样，会命中上一轮的回话，
+            # 表现成对方「复读」（2026-09-21 实测踩到：第 2 轮 1.5 秒回了第 1 轮的原话）。
+            if int(m.get("re") or 0) == sent_ts:
+                hit = True
+            else:
+                # 旧版对端不落 re：cid 相同 + 晚于上一轮回话 + 不早于我这次拨号
+                ts_m = int(m.get("ts") or 0)
+                hit = (m.get("cid") == cid and ts_m > last_seen and ts_m >= sent_ts - 5)
+            if hit:
+                reply = str(m.get("text", ""))
+                st = call_record(cid, node_id, "peer", reply, int(m.get("ts") or 0)) or st
+                return {"ok": True, "answered": True, "from": node_id, "reply": reply,
+                        "cid": cid, "round": int(st.get("round") or 1),
+                        "resumed": bool(resumed),
                         "latency_s": round(time.time() - sent_ts, 1)}
         if time.time() >= deadline:
             break
         time.sleep(CALL_POLL)
     return {"ok": True, "answered": False, "from": node_id, "cid": cid,
+            "round": int(st.get("round") or 1), "resumed": bool(resumed),
             "latency_s": round(time.time() - sent_ts, 1),
-            "note": f"{node_id} 没接（{int(wait)} 秒内没回话），话已留在它收件箱"}
+            "note": f"{node_id} 没接（{int(wait)} 秒内没回话），话已留在它收件箱，这通还没挂"}
 
 
 def survey(timeout: float = PROBE_TIMEOUT) -> List[Dict[str, Any]]:

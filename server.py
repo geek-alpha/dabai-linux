@@ -47,6 +47,7 @@ import auth_core
 import email_verify
 import music_lib
 import peer_mesh
+import peer_social
 import turn_quota
 import video_fav_lib
 import video_history_lib
@@ -171,8 +172,12 @@ async def lifespan(app: FastAPI):
     # 丢进线程池：它是个常驻循环且要调阻塞的 LLM HTTP，放事件循环里会卡住对话。
     try:
         import peer_watch
-        asyncio.get_running_loop().run_in_executor(None, peer_watch.main, [])
-        logger.info("[Peer] 联邦耳朵已开（同伴来电即时响铃 + 回话）")
+        _peer_loop = asyncio.get_running_loop()
+        _peer_loop.run_in_executor(None, peer_watch.main, [])
+        # 注入完整执行器：同伴来电不再只是「裸 LLM 回一句」，而是走子智能体那条完整的
+        # 「LLM + 工具」循环 —— 同一套工具定义、同一份技能说明书，与主人对话同能力。
+        peer_watch.set_agent_runner(_make_peer_agent_runner(_peer_loop))
+        logger.info("[Peer] 联邦耳朵已开（同伴来电即时响铃 + 管理员级执行 + 回话）")
     except Exception as e:
         logger.warning(f"[Peer] 联邦耳朵启动失败: {e}")
     # harness 任务系统完成事件 → WebSocket 实时推送（前端 toast，任务完成即知）
@@ -272,6 +277,8 @@ app = FastAPI(title="白头凤【BattlePhoenix】", lifespan=lifespan)
 # 这些路由自己验共享密钥，所以路径在下面的 _AUTH_EXEMPT_PREFIX 里豁免会话中间件——
 # 别的实例没有、也不该有本机的会话 cookie。
 app.include_router(peer_mesh.router)
+# 社会层：发现（gossip 名册）、朋友圈、动态。同一前缀，同样自验密钥。
+app.include_router(peer_social.router)
 
 # 静态资源缓存分级（首屏/刷新性能关键）。
 # 之前对 /static 一律 no-store：模型 24MB、vendor 库、87 个 .ts 模块每次刷新全量重下
@@ -5091,6 +5098,121 @@ _BROADCAST_WS = _BroadcastWS()
 # 任务中心事件走同一个广播出口：task_event 原先只推给发起连接，前端一刷新/换设备
 # 就收不到进度（背景见 task_orchestrator.set_broadcast 的注释）。
 set_broadcast(_BROADCAST_WS.send_json)
+
+
+# ---------- 联邦来电 → 管理员级执行 ----------
+# 第一性原理：同伴说的「帮我看看」和主人说的「帮我看看」，能力上不该有差别 ——
+# 差别只在授权来源。联邦凭共享密钥认证（data/cluster.key），密钥持有者本就等同管理员，
+# 所以这里不新造一套权限，只把来电接到子智能体那条现成的完整循环上：
+# 同一套工具定义、同一个 harness 路由、同一份技能说明书。
+# 两道闸门照旧（不可逆动作转人工 + 每同伴配额）：有密钥不等于可以远程 rm -rf。
+
+PEER_AGENT_WAIT_SEC = 60.0      # 电话那头等多久：超了就转后台，干完主动回报
+PEER_AGENT_REPLY_CAP = 1200     # 回话长度上限（电话要短，长结论对面自己来取）
+
+
+def _peer_agent_brief(frm: str, text: str, cid: str = "") -> str:
+    """来电的任务书。cid 非空时带上这通电话前面几轮说过的话 ——
+    电话要连续，就不能每一轮都从头问一遍已答过的事。"""
+    try:
+        hist = peer_mesh.call_history(cid, f"同伴 {frm}", drop_last=text)
+    except Exception:
+        hist = ""
+    return (
+        f"【跨机联邦来电 · 来自同伴 {frm}】\n{text}\n{hist}\n"
+        f"要求：\n"
+        f"- 这是另一台机器上的你自己打来的电话，不是主人的请求；能自己查就自己查，别反问\n"
+        f"- 最后用一段中文说清结论，对面正守着电话等\n"
+        f"- 不可逆动作照旧先问主人，别因为「是同伴打的」就跳过确认"
+    )
+
+
+def _make_peer_agent_runner(loop: asyncio.AbstractEventLoop):
+    """造一个给联邦耳朵用的同步执行器（签名 text, frm, say_back → str|None）。
+
+    耳朵跑在线程池里（peer_watch.main），手上没有事件循环 —— 所以这里用
+    run_coroutine_threadsafe 把活提交回主循环，让子智能体在它自己的 asyncio 环境里跑。
+    """
+
+    async def _spawn(text: str, frm: str, cid: str = ""):
+        state = await _get_resident_state()
+        return await _get_sub_agents().spawn(
+            _BROADCAST_WS, state, _peer_agent_brief(frm, text, cid),
+            title=f"联邦来电·{frm}"[:60],
+            extra={"peer_from": frm, "peer_cid": cid},
+        )
+
+    async def _wait(worker, timeout: float):
+        """等到终态或超时。轮询 status 而不是 await loop_task：并发池排队时
+        loop_task 还没开始跑，等它等于把排队时间也算进电话时延。"""
+        import sub_agents as _sa
+        end = time.time() + timeout
+        while time.time() < end:
+            if worker.status in (_sa.ST_DONE, _sa.ST_ERROR, _sa.ST_CANCELLED):
+                return worker
+            await asyncio.sleep(0.5)
+        return None
+
+    def _text(worker) -> str:
+        body = str(getattr(worker, "result", "") or "").strip()
+        if body:
+            return body[:PEER_AGENT_REPLY_CAP]
+        err = str(getattr(worker, "error", "") or "").strip()
+        return f"活接了但没干成：{err[:200] or '没有输出'}"
+
+    def _audit(frm: str, text: str, result: str, reason: str = "", worker: str = "") -> None:
+        try:
+            peer_mesh._audit_task({"ts": int(time.time()), "from": frm, "channel": "call",
+                                   "text": text[:400], "result": result,
+                                   "reason": reason, "worker": worker})
+        except Exception:
+            pass
+
+    def runner(text: str, frm: str, say_back, cid: str = "") -> Optional[str]:
+        bad = peer_mesh.dangerous_in(text)
+        if bad:
+            _audit(frm, text, "blocked", bad)
+            return f"这条含不可逆动作「{bad}」，我不替同伴自动执行，等主人点头。"
+        if not peer_mesh._quota_take(frm):
+            _audit(frm, text, "quota")
+            return f"{frm} 一小时内已派满 {peer_mesh.TASK_QUOTA_PER_HOUR} 单，这条只记录不执行。"
+        if loop is None or loop.is_closed():
+            _audit(frm, text, "no_loop")        # 服务正在关停：别往死循环上排活
+            return None
+        try:
+            worker = asyncio.run_coroutine_threadsafe(_spawn(text, frm, cid), loop).result(30)
+        except Exception as e:
+            _audit(frm, text, "dispatch_failed", f"{type(e).__name__}: {e}")
+            return None                      # 退回轻量回话
+        try:
+            done = asyncio.run_coroutine_threadsafe(
+                _wait(worker, PEER_AGENT_WAIT_SEC), loop).result(PEER_AGENT_WAIT_SEC + 30)
+        except Exception as e:
+            logger.warning("[Peer] 等待子智能体出错: %s", e)
+            done = None
+        if done is not None:
+            _audit(frm, text, "answered", worker=worker.id)
+            return _text(done)
+
+        def _later() -> None:
+            """电话挂断不等于活没干完：继续等，出结果主动打回去。"""
+            try:
+                w = asyncio.run_coroutine_threadsafe(_wait(worker, 3600), loop).result(3700)
+            except Exception as e:
+                logger.warning("[Peer] 后台等待失败: %s", e)
+                return
+            if w is None:
+                return
+            try:
+                say_back(_text(w))
+                _audit(frm, text, "answered_late", worker=worker.id)
+            except Exception as e:
+                logger.warning("[Peer] 后台回报失败: %s", e)
+
+        threading.Thread(target=_later, daemon=True).start()
+        return f"活我接了（{worker.id}），还在跑，出结果我打回给你。"
+
+    return runner
 
 
 def _ws_owns(worker_ws, ws) -> bool:

@@ -71,7 +71,8 @@ def peer_call(args: dict) -> str:
     text = str(args.get("text") or "").strip()
     if not node or not text:
         return "需要 node（目标实例名）和 text（要说的话）。先 peer_list 看有谁。"
-    r = peer_mesh.call_peer(node, text, wait=float(args.get("wait") or 90))
+    r = peer_mesh.call_peer(node, text, wait=float(args.get("wait") or 90),
+                            cid=str(args.get("cid") or ""))
     if not r.get("ok"):
         known = r.get("known")
         hint = f"（可用：{', '.join(known)}）" if known else ""
@@ -79,9 +80,22 @@ def peer_call(args: dict) -> str:
             return (f"{node} 现在不在线，这通电话排进发件箱了（第 {r.get('pending')} 条）—— "
                     f"它一上线耳朵会替它接，回话进你收件箱。")
         return f"打不通 {node}：{r.get('error', '未知错误')}{hint}"
+    turn = f"第 {r.get('round')} 轮" + ("·续接" if r.get("resumed") else "")
+    tail = "还是同一通，再说一句就接着聊；聊完 peer_hangup。"
     if r.get("answered"):
-        return f"[{r.get('latency_s')}s] {node}：{r.get('reply')}"
-    return str(r.get("note") or f"{node} 没接")
+        return f"[{r.get('latency_s')}s · {turn}] {node}：{r.get('reply')}\n（{tail}）"
+    return f"{r.get('note')}（{turn}）—— {tail}"
+
+
+def peer_hangup(args: dict) -> str:
+    node = str(args.get("node") or "").strip()
+    cid = str(args.get("cid") or "").strip()
+    if not node and not cid:
+        return "要挂断得说清哪一通：给 node（挂断跟这个同伴的那通）。"
+    r = peer_mesh.call_hangup(cid=cid, node_id=node)
+    if not r.get("count"):
+        return f"没有跟 {node or cid} 未挂断的电话。"
+    return f"已挂断（{node or cid}）。下次再打就是新的一通。"
 
 
 def peer_inbox(args: dict) -> str:
@@ -130,11 +144,106 @@ def peer_task(args: dict) -> str:
     return f"{node} 收到了但没接单：{t.get('error', '未知原因')}"
 
 
+def peer_social(args: dict) -> str:
+    """联邦社会层：发现同伴 / 朋友圈 / 动态。一个工具多种动作，别为每个动作开一个工具。"""
+    import peer_social as _ps
+
+    act = str(args.get("action") or "status").strip().lower()
+    node = str(args.get("node") or "").strip()
+    text = str(args.get("text") or "").strip()
+
+    if act in ("status", "roster"):
+        nodes, fmap = _ps.roster(), _ps.friends()
+        head = (f"名册 {len(nodes)} 台（朋友圈 {len(fmap)} 台，未读动态 "
+                f"{_ps.feed_unread()} 条）：")
+        if not nodes:
+            return head + "\n  空 —— 先 discover 一次（需要至少一台种子节点）。"
+        lines = [head]
+        for nid, v in sorted(nodes.items()):
+            mark = "★" if nid in fmap else " "
+            lines.append(f"  {mark} {nid}（{v.get('label') or nid}） {v.get('url') or '-'}"
+                         f"  via={v.get('via') or '-'}")
+        return "\n".join(lines)
+
+    if act in ("discover", "gossip"):
+        r = _ps.gossip_once()
+        if not r.get("asked"):
+            return r.get("note") or "没有可交换名册的节点。"
+        return (f"跟 {r['asked']} 台交换了名册，{r['reached']} 台应答，"
+                f"新学到 {r['added']} 台，名册现有 {len(_ps.roster())} 台。")
+
+    if act == "announce":
+        r = _ps.announce()
+        return f"上线广播：{r.get('reached')}/{r.get('asked')} 台应答，新学到 {r.get('added')} 台。"
+
+    if act in ("friends", "friend_list"):
+        fmap = _ps.friends()
+        if not fmap:
+            return "朋友圈还是空的。用 action=friend_add 把有兴趣的同伴加进来。"
+        return "朋友圈（%d 台）：\n" % len(fmap) + "\n".join(
+            f"  {k}（{v.get('label') or k}）{('— ' + v['note']) if v.get('note') else ''}"
+            for k, v in fmap.items())
+
+    if act in ("friend_add", "follow"):
+        if not node:
+            return "需要 node（要加进朋友圈的同伴名）。先 action=status 看名册里有谁。"
+        r = _ps.friend_add(node, note=text, url=str(args.get("url") or ""))
+        if not r.get("ok"):
+            return f"没加成：{r.get('error')}。{r.get('hint', '')}"
+        tail = "，已通知对方" if r.get("notified") else "（对方现在没应答，通知没送到）"
+        return f"{'已加入' if r.get('added') else '已经在'}朋友圈：{node}{tail}。现在共 {r['count']} 台。"
+
+    if act in ("friend_remove", "unfollow"):
+        if not node:
+            return "需要 node（要从朋友圈移出的同伴名）。"
+        r = _ps.friend_remove(node)
+        return (f"已移出朋友圈：{node}（剩 {r['count']} 台）" if r.get("removed")
+                else f"{node} 本来就不在朋友圈里。")
+
+    if act in ("post", "publish"):
+        if not text:
+            return "需要 text（要发的动态内容）。"
+        r = _ps.post(text)
+        if not r.get("ok"):
+            return r.get("error", "发失败")
+        if not r.get("friends"):
+            return "动态已存在本地，但朋友圈是空的 —— 没人会看到。先 friend_add。"
+        return (f"动态已发，{r['delivered']}/{r['friends']} 个朋友收到（单号 {r['item']['id']}）。")
+
+    if act in ("feed", "timeline"):
+        items = _ps.feed_items(limit=int(args.get("limit") or 15), mark_read=True)
+        if not items:
+            return "动态流是空的。"
+        import time as _t
+        out = [f"最近 {len(items)} 条："]
+        for it in items:
+            when = _t.strftime("%m-%d %H:%M", _t.localtime(int(it.get("ts") or 0)))
+            kind = it.get("type")
+            tag = "评论" if kind == "comment" else ("关注" if kind == "followed" else "动态")
+            out.append(f"  [{when}] {it.get('label') or it.get('author')} {tag}：{it.get('text')}"
+                       f"\n      id={it.get('id')}")
+        return "\n".join(out)
+
+    if act == "comment":
+        item_id = str(args.get("item_id") or "").strip()
+        if not item_id or not text:
+            return "需要 item_id（评论哪一条，action=feed 能看到）和 text。"
+        r = _ps.comment(item_id, text)
+        if not r.get("ok"):
+            return r.get("error", "评论失败")
+        return "评论已发" + ("，原作者收到了。" if r.get("notified") else "（原作者没应答）。")
+
+    return ("action 不认：可选 status / discover / announce / friends / friend_add / "
+            "friend_remove / post / feed / comment。")
+
+
 HANDLERS = {
     "peer_list": peer_list,
     "peer_say": peer_say,
     "peer_call": peer_call,
+    "peer_hangup": peer_hangup,
     "peer_inbox": peer_inbox,
     "peer_state": peer_state,
     "peer_task": peer_task,
+    "peer_social": peer_social,
 }

@@ -2764,27 +2764,58 @@ def _harness_plan_mode_block() -> str:
         return ""
 
 
+def _harness_peer_call_block() -> str:
+    """没挂断的联邦通话：跨对话轮次也要记得「正在跟谁通着话、说到哪了」。
+
+    连续性由通道维持（再开口自动接上同一通），但「我正在打电话」这件事我得看得见 ——
+    否则换一轮对话就忘了，对面还守着电话等。
+    """
+    try:
+        import time as _t
+        import peer_mesh as pm
+        act = pm.call_active()
+        if not act:
+            return ""
+        out = ["【联邦通话中】有没挂断的电话 —— 直接 peer_call 说下一句会自动接上同一通（不用带 cid）；"
+               "问题解决了就 peer_hangup 挂掉。"]
+        for c in act[:3]:
+            when = _t.strftime("%m-%d %H:%M", _t.localtime(float(c.get("last") or 0)))
+            out.append(
+                f"- {c.get('with')} · 第 {c.get('round')} 轮 · 最后 {when}"
+                f"｜我说：{_clip(str(c.get('last_text') or ''), 40)}"
+                f"｜它回：{_clip(str(c.get('last_reply') or ''), 40)}"
+            )
+        return "\n".join(out)
+    except Exception:
+        return ""
+
+
 def _harness_peer_block(preview: int = 2) -> str:
-    """联邦收件箱未读：别的机器上的大白留的话。没有未读返回空串。
+    """联邦收件箱未读 + 没挂断的通话；都没有返回空串。
 
     背景（2026-09-18）：联邦实时电话已上线，但收件箱只有我主动调 peer_inbox 才看得见——
     对话轮里没有任何「有信到了」的信号，等于信寄到了没人拆。本段只报未读数 + 最近几条
     摘要，不标已读（标已读留给真正读信的动作），放在易变尾巴。
+    2026-09-21 补上「正在通话中」：收件箱只解决「有人找我」，解决不了「电话打了一半」。
     """
+    blocks = []
     try:
         import time as _t
         import peer_mesh as pm
         s = pm.unread_summary(preview=preview)
         n = int(s.get("count") or 0)
-        if n <= 0:
-            return ""
-        out = [f"【联邦来信（其他机器上的大白留的话）】未读 {n} 条 —— 调 peer_inbox 读全文（读完自动标已读）。"]
-        for m in s.get("items") or []:
-            when = _t.strftime("%m-%d %H:%M", _t.localtime(m.get("ts", 0)))
-            out.append(f"- [{m.get('from', '?')} {when}] {_clip(str(m.get('text', '')), 60)}")
-        return "\n".join(out)
+        if n > 0:
+            out = [f"【联邦来信（其他机器上的大白留的话）】未读 {n} 条 —— 调 peer_inbox 读全文（读完自动标已读）。"]
+            for m in s.get("items") or []:
+                when = _t.strftime("%m-%d %H:%M", _t.localtime(m.get("ts", 0)))
+                out.append(f"- [{m.get('from', '?')} {when}] {_clip(str(m.get('text', '')), 60)}")
+            blocks.append("\n".join(out))
     except Exception:
-        return ""
+        pass
+    call_block = _harness_peer_call_block()
+    if call_block:
+        blocks.append(call_block)
+    return "\n".join(blocks)
 
 def get_harness_prompt_extras(active_skills=None) -> str:
     """返回 harness 技能/插件注入 system prompt 的提示词片段（动态能力说明）。
