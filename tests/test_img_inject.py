@@ -423,3 +423,90 @@ def test_truncation_without_marks_unchanged():
     out = agent._fit_tool_result("A" * 9000, "music_search")
     assert "IMG" not in out
     assert out.startswith("A" * 100)
+
+
+# ---------------- 端到端：截断 → 解析 → 注入（2026-09-20） ----------------
+# 背景：截断（_fit_tool_result）、注入上限（_IMG_MAX_PER_RESULT）、失败留痕
+# （_IMG_FAIL_NOTE）三段各自有单测，真实链路却是串起来的（agent.py:5931 → 6068）。
+# 各自绿而组合漏图，正是刚踩过的坑——所以这里按真实顺序串一次。
+
+def _e2e_raw(limit=None):
+    """超长结果：头部 2 个标记（含 1 个坏路径）、中段 1 个、尾部 1 个。
+
+    返回 (原文, 中段标记)。自检写在下面：中段标记必须真落在省略区间，
+    否则走不到补回分支，用例会假绿。
+    """
+    limit = limit or agent._TOOL_RESULT_LIMIT
+    tail_len = min(agent._TRUNC_TAIL, limit // 5)
+    nom_head = limit - tail_len - agent._TRUNC_NOTICE_RESERVE
+    mid = "[[IMG:/tmp/mid.png]]"
+    raw = ("A" * 100 + "[[IMG:/tmp/broken.png]]"
+           + "A" * 300 + "[[IMG:/tmp/head_ok.png]]"
+           + "B" * 2000 + mid + "B" * 2000
+           + "C" * 500 + "[[IMG:/tmp/tail_ok.png]]"
+           + "D" * (tail_len + 5000))
+    assert raw.index(mid) > nom_head, "中段标记没进省略区，测不到补回分支"
+    assert raw.index(mid) + len(mid) < len(raw) - tail_len, "中段标记进了尾部保留区"
+    assert len(raw) > limit
+    return raw, mid
+
+
+def _e2e_run(raw, img_ok=True):
+    """按真实顺序串：截断 → 从截断结果解析标记 → 注入。"""
+    fitted = agent._fit_tool_result(raw, "music_search")
+    marks = agent._img_marks(fitted)
+    messages = []
+    added = agent._append_img_messages(messages, marks, "music_search", img_ok)
+    return fitted, marks, messages, added
+
+
+def test_e2e_truncation_to_injection_no_lost_image(monkeypatch):
+    """中段标记被补回后必须真的注入——「标记还在、图没进来」是最坏的假象。"""
+    monkeypatch.setattr(agent, "_img_message", _fail_some("/tmp/broken.png"))
+    raw, _ = _e2e_raw()
+    fitted, marks, messages, added = _e2e_run(raw)
+    assert marks == ["/tmp/broken.png", "/tmp/head_ok.png", "/tmp/mid.png",
+                     "/tmp/tail_ok.png"], marks
+    assert len(_imgs(messages)) == 3, [m.get("content") for m in messages]
+    notes = _notes(messages)
+    assert len(notes) == 1 and "/tmp/broken.png" in notes[0] and "1 张" in notes[0], notes
+    # 预算守恒：注入的图 + 提示语都算进去了
+    assert added == 3 * agent._IMG_TOKEN_EST * 4 + len(notes[0])
+    assert len(fitted) <= agent._TOOL_RESULT_LIMIT
+
+
+def test_e2e_mark_conservation(fake_img):
+    """守恒：解析出的标记全部注入，一个不丢也不凭空多出。"""
+    raw, _ = _e2e_raw()
+    fitted, marks, messages, added = _e2e_run(raw)
+    assert len(marks) == 4, marks
+    assert len(_imgs(messages)) == 4
+    assert _notes(messages) == []
+    assert added == 4 * agent._IMG_TOKEN_EST * 4
+    assert len(fitted) <= agent._TOOL_RESULT_LIMIT
+
+
+def test_e2e_blind_model_never_gets_image(fake_img):
+    """看不见图时端到端零 image_url：提示说「未注入」就必须真的没注入。"""
+    raw, _ = _e2e_raw()
+    fitted, marks, messages, added = _e2e_run(raw, img_ok=False)
+    assert not _imgs(messages), "看不见图却注入了 image_url —— 会撞 400"
+    assert added == 0
+    assert any(m.get("content") == agent._IMG_NO_EYES for m in messages)
+
+
+def test_e2e_mid_cap_matches_inject_cap(fake_img):
+    """中段标记多于补回上限：补回数正好等于注入上限，不多补也不漏补。"""
+    limit = agent._TOOL_RESULT_LIMIT
+    tail_len = min(agent._TRUNC_TAIL, limit // 5)
+    nom_head = limit - tail_len - agent._TRUNC_NOTICE_RESERVE
+    many = "".join("[[IMG:/tmp/m%02d_%s.png]]" % (i, "x" * 40) for i in range(9))
+    raw = "A" * 500 + "B" * nom_head + many + "C" * (tail_len + 5000)
+    fitted = agent._fit_tool_result(raw, "music_search")
+    marks = agent._img_marks(fitted)
+    assert len(marks) == agent._IMG_MAX_PER_RESULT, marks
+    assert "已省略" in fitted
+    messages = []
+    agent._append_img_messages(messages, marks, "music_search", True)
+    assert len(_imgs(messages)) == agent._IMG_MAX_PER_RESULT
+    assert _notes(messages) == []
