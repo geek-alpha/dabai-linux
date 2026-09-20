@@ -103,7 +103,10 @@ def _generate_blocking(prompt: str, size: str, cfg: dict) -> str:
     size_mb = dest.stat().st_size / (1024 * 1024)
     link = f"/generated/{name}"
     _register_task(link, prompt)
-    return f"画好啦！图片已保存（{size_mb:.1f}MB）：打开链接查看 -> {link}"
+    # [[IMG:]] 是给 harness 的图片注入标记：只回访问链接的话，模型看不见自己刚画的
+    # 东西，也就没法自检质量（画错手、画错字只能等用户发现）。
+    return (f"画好啦！图片已保存（{size_mb:.1f}MB）：打开链接查看 -> {link}\n"
+            f"[[IMG:{dest}]]")
 
 
 def _register_task(link: str, prompt: str) -> None:
