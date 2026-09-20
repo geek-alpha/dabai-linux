@@ -516,6 +516,11 @@ _IMG_DROP_NOTE = "【图已省略】{text}（需要时用工具按这个路径�
 _IMG_CAP_NOTE = ("【图片注入上限】本次共 {total} 张图，只注入了 {done} 张"
                  "（单次上限 {cap} 张，防上下文超支）；其余 {left} 张未注入，"
                  "需要看哪张就用工具单独读取它的路径。")
+# 读不到的图同样要留痕：静默跳过时模型只看到结果文本里的路径，会照着不存在的
+# 画面下结论（文件被删、格式不支持、磁盘写失败都会走到这里）。
+_IMG_FAIL_NOTE = ("【图片未注入】本次 {n} 张图读不到（路径无效或编码失败）：{paths}。"
+                  "别按路径猜画面内容，先用工具确认文件存在再重读。")
+_IMG_FAIL_PATHS_MAX = 3
 
 
 def _img_marks(text) -> list:
@@ -619,6 +624,12 @@ def _img_injectable() -> bool:
         return True
 
 
+def _paths_brief(paths: list, show: int = _IMG_FAIL_PATHS_MAX) -> str:
+    """路径清单摘要：只列前几个，其余归成一句——提示语本身不能撑爆上下文。"""
+    head = "、".join(paths[:show])
+    return head if len(paths) <= show else f"{head} 等 {len(paths)} 个"
+
+
 def _append_img_messages(messages: list, marks: list, tool_name: str, img_ok: bool,
                          limit: int = None) -> int:
     """[[IMG:]] 标记 → 多模态消息；返回追加的字符当量（供预算累计）。
@@ -626,7 +637,8 @@ def _append_img_messages(messages: list, marks: list, tool_name: str, img_ok: bo
     看不见图时只留 _IMG_NO_EYES 提示、绝不注入 image_url：提示说「未注入」
     就必须真的没注入，否则非视觉模型会撞提供方 400。
 
-    超出 limit 的标记不注入、但留一句说明；编码失败的标记不占名额。
+    超出 limit 的标记不注入、但留一句说明；读不到的标记不占名额、但汇总成一句
+    提示——静默跳过会让模型照着不存在的画面下结论。
     """
     if not marks:
         return 0
@@ -635,13 +647,20 @@ def _append_img_messages(messages: list, marks: list, tool_name: str, img_ok: bo
         return 0
     cap = _IMG_MAX_PER_RESULT if limit is None else max(1, int(limit))
     added, done, i = 0, 0, 0
+    failed = []
     while i < len(marks) and done < cap:
         _im = _img_message(marks[i], tool_name)
         if _im:
             messages.append(_im)
             done += 1
             added += _IMG_TOKEN_EST * 4
+        else:
+            failed.append(str(marks[i]))
         i += 1
+    if failed:
+        note = _IMG_FAIL_NOTE.format(n=len(failed), paths=_paths_brief(failed))
+        messages.append({"role": "system", "content": note})
+        added += len(note)
     left = len(marks) - i
     if left > 0:
         note = _IMG_CAP_NOTE.format(total=len(marks), done=done, cap=cap, left=left)

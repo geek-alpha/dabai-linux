@@ -287,3 +287,75 @@ def test_downgrade_leaves_plain_text_alone():
     assert msgs[0]["content"] == "普通问题"
     assert agent._img_is_multimodal({"role": "user", "content": "x"}) is False
     assert agent._img_is_multimodal(_img_msg("/tmp/a.png")) is True
+
+
+# ---------------- 读不到的图必须留痕（2026-09-20） ----------------
+# 背景：_img_message 返回 None（路径不存在/编码失败）时原先静默跳过，模型只看到结果
+# 文本里的 [[IMG:路径]]，不知道图根本没进来——会照着不存在的画面下结论。
+
+def _fail_some(*bad):
+    """构造「指定路径读不到、其余正常」的 _img_message 替身。"""
+    ok = {"role": "user", "content": [
+        {"type": "text", "text": "x"},
+        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AAA"}},
+    ]}
+
+    def _f(path, name=""):
+        return None if path in bad else {"role": "user", "content": list(ok["content"])}
+    return _f
+
+
+def test_failed_marks_leave_note(monkeypatch):
+    """读不到就要说：模型必须知道这张图没进来，不能照路径猜画面。"""
+    monkeypatch.setattr(agent, "_img_message", _fail_some("/tmp/img0.png"))
+    messages = []
+    agent._append_img_messages(messages, _marks(1), "screenshot", True)
+    notes = _notes(messages)
+    assert len(notes) == 1, notes
+    assert "/tmp/img0.png" in notes[0] and "1 张" in notes[0]
+    assert not _imgs(messages)
+
+
+def test_failed_note_lists_at_most_three(monkeypatch):
+    """提示语本身不能撑爆上下文：20 个坏路径只列 3 个，其余归成一句。"""
+    monkeypatch.setattr(agent, "_img_message", _fail_some(*_marks(20)))
+    messages = []
+    agent._append_img_messages(messages, _marks(20), "screenshot", True)
+    note = _notes(messages)[0]
+    assert note.count("/tmp/img") == agent._IMG_FAIL_PATHS_MAX
+    assert "等 20 个" in note
+
+
+def test_failed_note_counts_into_budget(monkeypatch):
+    """提示语要算字符当量：漏计就是预算少算一截，且无任何报错。"""
+    monkeypatch.setattr(agent, "_img_message", _fail_some("/tmp/img0.png"))
+    messages = []
+    got = agent._append_img_messages(messages, _marks(1), "screenshot", True)
+    assert got == len(_notes(messages)[0]) > 0
+
+
+def test_all_marks_failed_still_says_so(monkeypatch):
+    """全军覆没时更不能沉默：done=0 不是「没什么可说」的理由。"""
+    monkeypatch.setattr(agent, "_img_message", _fail_some(*_marks(6)))
+    messages = []
+    agent._append_img_messages(messages, _marks(6), "screenshot", True)
+    assert not _imgs(messages)
+    assert "6 张" in _notes(messages)[0]
+
+
+def test_all_ok_adds_no_fail_note(fake_img):
+    """全成功时一个字都不加：白加一条 system 消息会让前缀每轮漂移。"""
+    messages = []
+    agent._append_img_messages(messages, _marks(2), "screenshot", True)
+    assert _notes(messages) == []
+
+
+def test_fail_note_and_cap_note_coexist(monkeypatch):
+    """失败 + 超上限同时发生：两条说明都要有，一条不能盖掉另一条。"""
+    monkeypatch.setattr(agent, "_img_message", _fail_some(*_marks(2)))
+    messages = []
+    agent._append_img_messages(messages, _marks(10), "screenshot", True)
+    notes = _notes(messages)
+    assert len(notes) == 2, notes
+    assert any("未注入" in n for n in notes)
+    assert any("上限" in n for n in notes)
