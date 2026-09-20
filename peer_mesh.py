@@ -713,8 +713,9 @@ def _cli(argv: List[str]) -> int:
         if len(args) < 2:
             print("用法: peer_mesh.py say <node_id> <文本> [--kind release]")
             return 2
-        print(json.dumps(say(args[0], " ".join(args[1:]), kind=kind), ensure_ascii=False))
-        return 0
+        r = say(args[0], " ".join(args[1:]), kind=kind)
+        print(json.dumps(r, ensure_ascii=False))
+        return 0 if r.get("ok") else 1
 
     if cmd == "call":
         parts: List[str] = []
