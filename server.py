@@ -8095,8 +8095,49 @@ if __name__ == "__main__":
     except Exception:
         pass  # 非 Windows 或版本差异，忽略
 
-    # host="::" 启用 IPv6 双栈监听（IPv4 + IPv6 均可访问）
-    host = "::" if has_ipv6 else "0.0.0.0"
+    # 监听 socket：需要 IPv6 时做真双栈。
+    #
+    # 为什么不能只写 host="::"：CPython asyncio 建 IPv6 socket 时会显式设
+    # IPV6_V6ONLY=1（asyncio/base_events.py 的 create_server 路径），Linux/Windows
+    # 上结果都是只监听 IPv6 —— IPv4 请求一律连不上，表现是「服务在跑、端口在听、
+    # 局域网 IPv4 访问全部超时」。
+    #
+    # 正解是自己建两个 socket：v4 一个、v6 一个（v6 显式 V6ONLY=1，免得和 v4 抢
+    # 同一端口），再交给 uvicorn.Server.run(sockets=...) —— uvicorn 对传进去的每个
+    # socket 各起一个 asyncio server（uvicorn/server.py:150-155）。
+    def _listen_sockets(port: int) -> list:
+        socks = []
+        s4 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s4.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s4.bind(("0.0.0.0", port))
+        socks.append(s4)
+        if has_ipv6:
+            s6 = None
+            try:
+                s6 = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+                s6.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s6.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                s6.bind(("::", port))
+                socks.append(s6)
+            except OSError as e:
+                # IPv6 起不来不该拖垮整个服务：退回纯 IPv4
+                logger.warning(f"IPv6 监听未启用（{e}），本次只监听 IPv4")
+                if s6 is not None:
+                    try:
+                        s6.close()
+                    except Exception:
+                        pass
+        return socks
+
+    def _run_server(port: int, ssl_certfile=None, ssl_keyfile=None):
+        """起服务。用自建 sockets 而不是 uvicorn.run(host=...) —— 后者没法传 socket。"""
+        cfg = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="warning",
+                             loop="uvloop", http="httptools",
+                             ssl_certfile=ssl_certfile, ssl_keyfile=ssl_keyfile)
+        _socks = _listen_sockets(port)
+        for _s in _socks:
+            logger.info(f"监听 {_s.getsockname()}")
+        uvicorn.Server(cfg).run(sockets=_socks)
 
     # 热更新守护：核心 Python 变化自动重启；技能/插件变化自动热重载
     # （settings.json 的 harness.hot_reload=false 可关闭）
@@ -8124,11 +8165,7 @@ if __name__ == "__main__":
     start_hot_reload(on_ext_reload=_hot_reload_ext_callback)
 
     if use_https:
-        uvicorn.run(app, host=host, port=SERVER_PORT, log_level="warning",
-                    loop="uvloop", http="httptools",
-                    ssl_certfile=str(cert_file), ssl_keyfile=str(key_file))
+        _run_server(SERVER_PORT, str(cert_file), str(key_file))
     else:
         # nginx 前置 TLS 终结模式：回源端口 8001，对外仍由 nginx 提供 8000 HTTPS
-        _serve_port = 8001 if _http_only else SERVER_PORT
-        uvicorn.run(app, host=host, port=_serve_port, log_level="warning",
-                    loop="uvloop", http="httptools")
+        _run_server(8001 if _http_only else SERVER_PORT)
