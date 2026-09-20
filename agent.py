@@ -25,6 +25,7 @@ from openai import AsyncOpenAI
 
 from memory import ChatMemory, estimate_tokens
 from proxy_utils import is_local_url, resolve_llm_proxy
+from stream_partial_json import parse_partial_json
 from tool_validation import find_tool_spec, validate_arguments
 
 logger = logging.getLogger("agent")
@@ -931,7 +932,7 @@ def _is_retryable_llm_error(e: BaseException) -> bool:
     if type(e).__name__ == "SupervisedBlockedError":
         return True
     msg = (str(e) or "").lower()
-    return any(k in msg for k in ("熔断", "rate limit", "429", "timeout", "connection"))
+    return any(k in msg for k in ("熔断", "rate limit", "too many requests", "timeout", "connection"))
 
 
 def _is_transient_stream_error(e: Exception) -> bool:
@@ -940,11 +941,13 @@ def _is_transient_stream_error(e: Exception) -> bool:
         from harness.core import is_transient_error
         return is_transient_error(e)
     except Exception:
+        # 兜底也得跟主分类器同源：裸数字会误命中（「需要 500 积分」），改用 5xx 的文本形式
         msg = (str(e) or "").lower()
         return any(k in msg for k in (
             "timeout", "timed out", "connection", "refused", "reset",
-            "closed", "rate limit", "temporarily", "429", "500", "502",
-            "503", "504",
+            "closed", "rate limit", "too many requests", "temporarily",
+            "bad gateway", "service unavailable", "internal server error",
+            "gateway timeout",
         ))
 
 
@@ -5351,22 +5354,30 @@ class AIAgent:
                                         tool_desc=self._tool_desc(tool_name))
 
                     # 解析参数（清洗可能的非法后缀，如 </tool_call>）
-                    try:
-                        if tool_args_str:
-                            # 截取到最后一个合法 JSON 结束位置
-                            tool_args_str = tool_args_str.strip()
-                            # 尝试找到最后一个 } 并截断
-                            last_brace = tool_args_str.rfind("}")
-                            if last_brace >= 0:
-                                tool_args_str = tool_args_str[:last_brace + 1]
-                            arguments = json.loads(tool_args_str)
-                        else:
-                            arguments = {}
-                    except (json.JSONDecodeError, TypeError):
+                    if tool_args_str:
+                        tool_args_str = tool_args_str.strip()
+                        # 截取到最后一个合法 JSON 结束位置
+                        last_brace = tool_args_str.rfind("}")
+                        if last_brace >= 0:
+                            tool_args_str = tool_args_str[:last_brace + 1]
+                    else:
+                        tool_args_str = ""
+                    arguments, args_status = parse_partial_json(tool_args_str)
+                    if args_status == "partial":
+                        # 流被截断（max_tokens 用尽 / 断网重建后仍不完整）：已收到的键可信，
+                        # 但 partial 结果绝不能拿去执行——截断的 code_edit 会写出半个文件。
+                        got = "、".join(arguments) if isinstance(arguments, dict) else ""
+                        parse_error = (f"工具参数未传完（流被截断），只收到字段：{got or '无'}；"
+                                       f"请重新发起一次完整调用")
+                        logger.warning(
+                            f"工具参数被截断: {tool_name} args={tool_args_str[:200]}"
+                        )
+                    elif args_status == "broken":
+                        arguments = {}
+                        parse_error = f"工具参数 JSON 解析失败: {tool_args_str[:200]}"
                         logger.warning(
                             f"工具参数 JSON 解析失败: {tool_name} args={tool_args_str[:200]}"
                         )
-                        arguments, parse_error = {}, f"工具参数 JSON 解析失败: {tool_args_str[:200]}"
                     else:
                         parse_error = None
                     # 严格校验参数：缺参/类型错误不执行，回填给模型自行修正

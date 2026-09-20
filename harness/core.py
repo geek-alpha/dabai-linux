@@ -15,6 +15,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
+import re
 import time
 from collections import deque
 from pathlib import Path
@@ -31,29 +33,95 @@ logger = logging.getLogger("harness.core")
 # 韧性重试的默认参数
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_BACKOFF = 1.0
+# 退避封顶：attempts 调大时指数会炸到小时级，封在 30s
+DEFAULT_BACKOFF_CAP = 30.0
 
 # 可重试的瞬时错误特征（小写子串匹配；鉴权类错误绝不重试）
 _TRANSIENT_HINTS = (
     "timeout", "timed out", "connection", "refused", "reset", "closed",
     "unavailable", "server error", "internal server", "bad gateway",
     "rate limit", "too many requests", "temporarily", "try again",
-    "429", "500", "502", "503", "504",
 )
 _NON_TRANSIENT_HINTS = (
     "authentication", "api key", "invalid_api_key", "unauthorized",
-    "forbidden", "not found", "401", "403", "404", "does not support",
+    "forbidden", "not found", "does not support",
     "unsupported", "doesn't support",
 )
 
+# 4xx 里仍值得重试的：请求超时、冲突、限流（对齐 Anthropic SDK 的 _RETRYABLE_4XX）
+_RETRYABLE_4XX = frozenset({408, 409, 429})
+
+# 裸数字不能当状态码：「需要 500 积分」「max_tokens 500」都会命中，必须带 HTTP 上下文前缀。
+# 5xx 的标准描述文本（service unavailable / internal server error / bad gateway /
+# gateway timeout / too many requests）已在 _TRANSIENT_HINTS 里覆盖，这里只补 "HTTP 503" 这类。
+_STATUS_HINTS = tuple(
+    re.compile(r"(?:http|status|status_code|code|状态码|响应码)[\s:=]{0,3}%d\b" % c)
+    for c in (429, 500, 502, 503, 504)
+)
+
+
+class RetryableError(Exception):
+    """业务侧主动声明「这次失败值得重试」。
+
+    自定义传输层/中间件/工具抓到瞬时失败、又不想依赖文本匹配时抛它：
+    retry_async 照常退避重试，次数耗尽后原样抛给调用方。
+    """
+
+
+def _status_code_of(e: BaseException) -> Optional[int]:
+    """尽力从异常上取 HTTP 状态码（httpx / requests / openai 风格都覆盖）。
+
+    只看明确是状态码的字段，不碰 `code`：OSError.errno 也是小整数，
+    111（ECONNREFUSED）会被误读成 HTTP 111。
+    """
+    for attr in ("status_code", "status", "http_status"):
+        v = getattr(e, attr, None)
+        if isinstance(v, int) and 100 <= v <= 599:
+            return v
+    resp = getattr(e, "response", None)
+    v = getattr(resp, "status_code", None)
+    if isinstance(v, int) and 100 <= v <= 599:
+        return v
+    return None
+
 
 def is_transient_error(e: BaseException) -> bool:
-    """判断异常是否属于「瞬时错误」（网络抖动/限流/服务端 5xx）。"""
+    """判断异常是否属于「瞬时错误」（网络抖动/限流/服务端 5xx）。
+
+    状态码优先于文本：拿得到 HTTP 状态码就按码判（4xx 默认致命，
+    408/409/429 例外），拿不到才退回关键词匹配。
+    """
+    if isinstance(e, RetryableError):
+        return True
     if isinstance(e, (ConnectionError, TimeoutError, asyncio.TimeoutError)):
         return True
+    code = _status_code_of(e)
+    if code is not None:
+        if 400 <= code < 500:
+            return code in _RETRYABLE_4XX
+        return code >= 500
     msg = (str(e) or "").lower()
     if any(k in msg for k in _NON_TRANSIENT_HINTS):
         return False
-    return any(k in msg for k in _TRANSIENT_HINTS)
+    if any(k in msg for k in _TRANSIENT_HINTS):
+        return True
+    return any(p.search(msg) for p in _STATUS_HINTS)
+
+
+def _retry_after_of(e: BaseException) -> Optional[float]:
+    """服务端给了 Retry-After 就听它的（只认秒数形式，封顶）。"""
+    resp = getattr(e, "response", None)
+    hdrs = getattr(resp, "headers", None)
+    if hdrs is None:
+        return None
+    try:
+        raw = hdrs.get("retry-after") or hdrs.get("Retry-After")
+    except Exception:
+        return None
+    try:
+        return max(0.0, min(float(str(raw).strip()), DEFAULT_BACKOFF_CAP))
+    except (TypeError, ValueError):
+        return None
 
 
 async def retry_async(coro_factory: Callable[[], Awaitable[Any]],
@@ -76,7 +144,13 @@ async def retry_async(coro_factory: Callable[[], Awaitable[Any]],
             last_exc = e
             if attempt >= attempts or not is_transient_error(e):
                 raise
-            delay = backoff * (2 ** (attempt - 1))
+            hint = _retry_after_of(e)
+            if hint is not None:
+                delay = hint
+            else:
+                # 抖动乘在封顶之前，否则 1.2 倍能把 delay 顶穿 cap（实测 35.1s > 30s）
+                delay = min(DEFAULT_BACKOFF_CAP,
+                            backoff * (2 ** (attempt - 1)) * random.uniform(0.8, 1.2))
             if on_retry:
                 try:
                     on_retry(attempt, e)
