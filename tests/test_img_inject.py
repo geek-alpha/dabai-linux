@@ -189,3 +189,101 @@ def test_user_upload_cap_aligns_with_server():
     """与 server.UPLOAD_MAX_FILES 对齐，否则用户传 8 张只看得到一半。"""
     import server  # noqa: E402
     assert agent._IMG_MAX_USER_UPLOAD == server.UPLOAD_MAX_FILES
+
+
+# ---------------- 图片总量上限（2026-09-20） ----------------
+# 背景：_IMG_MAX_PER_RESULT 只管单次。20 轮工具各 4 张 = 80 张 ≈ 81920 token 全留在
+# 上下文里，而 _compact_tool_history 原先只压文字、不碰多模态消息——图一多压缩就失效。
+
+def _img_msg(path: str, pad: int = 4000) -> dict:
+    return {"role": "user", "content": [
+        {"type": "text", "text": f"【android 的图片】{path}"},
+        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + "A" * pad}},
+    ]}
+
+
+def _weight(ms) -> int:
+    """与 _compact_tool_history 内部同一把尺子：多模态按 _IMG_TOKEN_EST、
+    文本按 estimate_tokens。混用字符数会让「降级省了多少」量出假差异。"""
+    import memory
+    return sum(agent._IMG_TOKEN_EST if isinstance(m.get("content"), list)
+               else memory.estimate_tokens(str(m.get("content") or "")) for m in ms)
+
+
+def _heavy_history(rounds: int = 20, per: int = 4, tlen: int = 100) -> list:
+    messages = [{"role": "system", "content": "系统"}]
+    for r in range(rounds):
+        messages.append({"role": "assistant", "content": "", "tool_calls": [
+            {"id": f"c{r}", "type": "function",
+             "function": {"name": "android", "arguments": '{"command":"annotate"}'}}]})
+        messages.append({"role": "tool", "tool_call_id": f"c{r}", "content": "x" * tlen})
+        for k in range(per):
+            messages.append(_img_msg(f"/tmp/r{r}_{k}.png"))
+    return messages
+
+
+def _dropped(messages) -> list:
+    return [m["content"] for m in messages
+            if isinstance(m.get("content"), str) and "【图已省略】" in m["content"]]
+
+
+def test_image_heavy_history_drops_down_to_keep_newest():
+    """图主导时压缩必须真降总量：文字压干也回不到预算内，能降的只有图。"""
+    messages = _heavy_history()
+    before = _weight(messages)
+    agent._compact_tool_history(messages, budget=3000,
+                                keep_rounds=agent.KEEP_NEWEST_TOOL_ROUNDS)
+    assert _weight(messages) < before
+    assert len(_imgs(messages)) == agent._IMG_KEEP_NEWEST, "没降到硬下限（或降过头）"
+    assert _weight(messages) >= agent._IMG_TOKEN_EST * agent._IMG_KEEP_NEWEST, \
+        "预算小于图本身时不该继续降——最近 8 张是模型当前工作所依据的"
+
+
+def test_dropped_image_keeps_path():
+    """省略的是像素，不是路径：模型仍知道看过这张图、文件在哪，能按路径重读。"""
+    messages = _heavy_history()
+    agent._compact_tool_history(messages, budget=3000,
+                                keep_rounds=agent.KEEP_NEWEST_TOOL_ROUNDS)
+    dropped = _dropped(messages)
+    assert len(dropped) == 80 - agent._IMG_KEEP_NEWEST
+    assert any("/tmp/r0_0.png" in c for c in dropped), "最老那张的路径丢了"
+    assert any("【android 的图片】" in c for c in dropped), "图注（工具名/路径）丢了"
+
+
+def test_keeps_newest_images_intact():
+    """保留的必须是最近 8 张（当前工作依据），不能反过来砍掉新的。"""
+    messages = _heavy_history()
+    agent._compact_tool_history(messages, budget=3000,
+                                keep_rounds=agent.KEEP_NEWEST_TOOL_ROUNDS)
+    kept_text = [str(m["content"]) for m in _imgs(messages)]
+    assert any("/tmp/r19_3.png" in t for t in kept_text), "最新一张被降级了"
+    assert not any("/tmp/r0_0.png" in t for t in kept_text), "最老一张没被降级"
+
+
+def test_stops_dropping_once_within_budget():
+    """够用就停：只降到回到预算内，不是每次都一刀切降到 8 张。"""
+    messages = _heavy_history()
+    budget = _weight(messages) - agent._IMG_TOKEN_EST * 3
+    agent._compact_tool_history(messages, budget=budget,
+                                keep_rounds=agent.KEEP_NEWEST_TOOL_ROUNDS)
+    assert len(_imgs(messages)) > agent._IMG_KEEP_NEWEST, "降过头了（够用就停失效）"
+    assert _weight(messages) <= budget
+
+
+def test_under_budget_images_untouched():
+    """不超预算时逐字节不动：无谓的降级会让前缀每轮漂移。"""
+    messages = _heavy_history(rounds=2, per=2, tlen=50)
+    snapshot = [m["content"] for m in messages]
+    agent._compact_tool_history(messages, budget=10 ** 9,
+                                keep_rounds=agent.KEEP_NEWEST_TOOL_ROUNDS)
+    assert [m["content"] for m in messages] == snapshot
+    assert len(_imgs(messages)) == 4
+
+
+def test_downgrade_leaves_plain_text_alone():
+    """普通文本 user 消息不能被误降级（_downgrade_img 只认带 image_url 的）。"""
+    msgs = [{"role": "user", "content": "普通问题"}]
+    assert agent._downgrade_img(msgs[0]) is False
+    assert msgs[0]["content"] == "普通问题"
+    assert agent._img_is_multimodal({"role": "user", "content": "x"}) is False
+    assert agent._img_is_multimodal(_img_msg("/tmp/a.png")) is True

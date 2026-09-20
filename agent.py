@@ -506,6 +506,11 @@ _IMG_MAX_PER_RESULT = 4
 # 用户主动上传放宽到 8：对齐 server.UPLOAD_MAX_FILES。那是明确意图，截断用户自己
 # 发来的图比截断工具批量产出更糟；8 张 = 8192 token，预算扛得住。
 _IMG_MAX_USER_UPLOAD = 8
+# 轮内图片总量上限：单次上限管不住累积——20 轮工具各 4 张 = 80 张 ≈ 81920 token
+# 全留在上下文里，而压缩只压文字、不碰多模态消息，图一多压缩就等于失效。
+# 超预算时把最老的多模态消息降级成文本说明，只留最近 8 张（模型当前工作所依据的）。
+_IMG_KEEP_NEWEST = 8
+_IMG_DROP_NOTE = "【图已省略】{text}（需要时用工具按这个路径重新读）"
 # 超出上限必须留一句说明：静默丢弃会让模型以为「这次只产出了 4 张图」，
 # 拿着残缺信息下结论比不看图更坏。
 _IMG_CAP_NOTE = ("【图片注入上限】本次共 {total} 张图，只注入了 {done} 张"
@@ -549,6 +554,28 @@ def _img_data_url(path: str) -> str:
     except Exception as e:
         logger.debug("图片编码失败 %s: %s", path, e)
         return ""
+
+
+def _img_is_multimodal(m) -> bool:
+    """这条消息是否真的带图（不是普通文本消息）。"""
+    c = m.get("content") if isinstance(m, dict) else None
+    return isinstance(c, list) and any(
+        isinstance(p, dict) and p.get("type") == "image_url" for p in c)
+
+
+def _downgrade_img(m) -> bool:
+    """多模态消息 → 纯文本（保留原路径说明）；已降级/结构异常返回 False。
+
+    只丢 base64 像素，不丢路径：模型仍知道「当时看过这张图、文件在哪」，
+    需要时按路径重读，比整条消息消失强。
+    """
+    if not _img_is_multimodal(m):
+        return False
+    parts = [str(p.get("text") or "") for p in m["content"]
+             if isinstance(p, dict) and p.get("type") == "text"]
+    text = " ".join(x for x in parts if x).strip() or "工具图片"
+    m["content"] = _IMG_DROP_NOTE.format(text=text)
+    return True
 
 
 def _img_message(path: str, tool_name: str = "") -> Optional[dict]:
@@ -743,6 +770,19 @@ def _compact_tool_history(messages: list, budget: int = None,
                 _shrink(m, ASSISTANT_RETRO_CAP, "…")
         if over_budget and total <= budget:
             break
+
+    # 1.5) 仍超预算：降级最老的多模态消息，只留最近 _IMG_KEEP_NEWEST 张。
+    #      一张图按 _IMG_TOKEN_EST=1024 计费，文字压干也回不到预算内时，
+    #      唯一能真把总量降下来的是图本身。从最老开始降、够用就停（改动尽量少）。
+    if total > budget:
+        img_idx = [k for k, m in enumerate(messages) if _img_is_multimodal(m)]
+        for k in img_idx[:max(0, len(img_idx) - _IMG_KEEP_NEWEST)]:
+            m = messages[k]
+            tok_before = _est(m)
+            if _downgrade_img(m):
+                total -= tok_before - _est(m)
+            if total <= budget:
+                break
 
     # 未超预算、且一条都没压：逐字节原样返回，绝不制造无谓的前缀失效
     if not over_budget and total == total0:
