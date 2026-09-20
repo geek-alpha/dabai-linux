@@ -1119,6 +1119,16 @@ def _stream_retry_delay(attempt: int, exc: Optional[BaseException] = None) -> fl
     )
 
 
+def _stream_retry_notice(attempt: int, delay: float) -> str:
+    """流式重建的用户可见提示：秒数必须来自真实等待时长。
+
+    delay 由调用方传同一个 _delay 变量，绝不在这里重算——文案说 2s 而实际
+    睡 30s，用户会当成卡死并手动打断（正好把自动重连的收益抵消掉）。
+    """
+    return (f"网络波动，{delay:.0f}s 后自动重连"
+            f"（第 {attempt} 次，任务不会中断）")
+
+
 class _StreamIdleTimeout(TimeoutError):
     """流式静默看门狗触发：首包或块间隔超过阈值仍无事件。
 
@@ -5518,9 +5528,7 @@ class AIAgent:
                                 "流式输出中途断网（%s），%.0fs 后第 %d/%d 次重建流",
                                 e, _delay, stream_attempt, max_stream_retries)
                             # 状态提示：让用户知道是网络波动、正在自动重连，而非卡死
-                            yield TurnStatus(
-                                f"网络波动，{_delay:.0f}s 后自动重连"
-                                f"（第 {stream_attempt} 次，任务不会中断）")
+                            yield TurnStatus(_stream_retry_notice(stream_attempt, _delay))
                             await asyncio.sleep(_delay)
                             stream = await _create_stream()
                     # 流式分支结束后读取 usage（优先用迭代中捕获的 usage chunk，
