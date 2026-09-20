@@ -4707,6 +4707,10 @@ class AIAgent:
         reasoning_all = ""  # 本轮累积的真实思维链（循环被强制停止时兜底生成正文）
         tools_retried_without = False
         resume_pending: list = []
+        # 已执行成功工具的持久化结果（tool_call_id -> {result, success}）：
+        # 对标 Anthropic _reconcile 的 _answered 集合——工具执行成功立即落盘，
+        # 断点续跑时已答工具直接回灌结果、绝不二次执行（写操作不重放两次）。
+        executed_results: dict = {}
         ckpt_round = 0
         # 文本工具模式：模型不支持原生 function calling（如本地 Ollama 模型）时，
         # 改用"提示词注入 + <tool_call> JSON 标记"的方式调用工具。
@@ -4718,6 +4722,7 @@ class AIAgent:
             reasoning_all = str(resume_ckpt.get("reasoning_all") or "")
             text_tool_mode = bool(resume_ckpt.get("text_tool_mode", False))
             resume_pending = [dict(p) for p in (resume_ckpt.get("pending_tools") or [])]
+            executed_results = dict(resume_ckpt.get("executed_results") or {})
         else:
             text_tool_mode = bool(tools) and self._text_tool_mode
 
@@ -4787,6 +4792,7 @@ class AIAgent:
                     "tool_round": (ckpt_round_num if ckpt_round_num is not None
                                    else tool_round),
                     "pending_tools": pending,
+                    "executed_results": executed_results,
                     "assistant_content": assistant_text,
                     "text_tool_mode": text_tool_mode,
                     "full_text": full_text,
@@ -4942,6 +4948,8 @@ class AIAgent:
             text_tool_call = None
             # 断点续跑：本轮工具尚未执行 → 跳过 LLM，直接复用检查点中的工具调用
             resume_round = bool(resume_pending) and ckpt_round == tool_round
+            # 断点续跑：已执行成功（结果已持久化）的工具不再重放，直接回灌结果
+            resume_answered: list = []
 
             try:
                 if resume_round:
@@ -4955,20 +4963,46 @@ class AIAgent:
                                 args = {}
                         if not isinstance(args, dict):
                             args = {}
-                        text_tool_call = {
-                            "name": str(p.get("name") or ""),
-                            "arguments": args,
-                            "raw": "",
-                        }
-                        assistant_content = str(resume_ckpt.get("assistant_content") or "")
+                        _tpid = f"text_{tool_round}"
+                        if _tpid in executed_results:
+                            _er = executed_results[_tpid]
+                            resume_answered.append({
+                                "id": _tpid,
+                                "name": str(p.get("name") or ""),
+                                "arguments": args,
+                                "arguments_str": str(p.get("arguments") or ""),
+                                "result": _er.get("result", ""),
+                                "llm_result": _er.get("result", ""),
+                                "success": bool(_er.get("success", True)),
+                            })
+                        else:
+                            text_tool_call = {
+                                "name": str(p.get("name") or ""),
+                                "arguments": args,
+                                "raw": "",
+                            }
+                            assistant_content = str(resume_ckpt.get("assistant_content") or "")
                     else:
                         has_tool_calls = True
                         for i, p in enumerate(resume_pending):
-                            tool_calls_buffer[i] = {
-                                "id": str(p.get("id") or f"resume_{tool_round}_{i}"),
-                                "name": str(p.get("name") or ""),
-                                "arguments": str(p.get("arguments") or ""),
-                            }
+                            _pid = str(p.get("id") or f"resume_{tool_round}_{i}")
+                            if _pid in executed_results:
+                                _er = executed_results[_pid]
+                                resume_answered.append({
+                                    "id": _pid,
+                                    "name": str(p.get("name") or ""),
+                                    "arguments": str(p.get("arguments") or ""),
+                                    "arguments_str": str(p.get("arguments") or ""),
+                                    "result": _er.get("result", ""),
+                                    "llm_result": _er.get("result", ""),
+                                    "success": bool(_er.get("success", True)),
+                                })
+                            else:
+                                tool_calls_buffer[i] = {
+                                    "id": _pid,
+                                    "name": str(p.get("name") or ""),
+                                    "arguments": str(p.get("arguments") or ""),
+                                }
                         assistant_content = str(resume_ckpt.get("assistant_content") or "")
                 elif text_tool_mode:
                     # 文本协议：非流式一次拿全，便于解析 <tool_call> 标记
@@ -5353,6 +5387,13 @@ class AIAgent:
                         else:
                             tools = self._all_tools
 
+                # 工具执行成功 → 立即持久化结果：断点续跑时该工具不重放（防写操作二次执行）
+                if success:
+                    executed_results[f"text_{tool_round}"] = {
+                        "result": str(result), "success": True}
+                    await _save_round_ckpt([], assistant_content, ckpt_memory_anchor,
+                                           ckpt_round_num=tool_round)
+
                 yield ToolCallResult(tool_name=tool_name, result=result, success=success)
 
                 eff_tool_calls += 1
@@ -5589,6 +5630,18 @@ class AIAgent:
                             else:
                                 tools = self._all_tools
 
+                    # 工具执行成功 → 立即持久化结果：断点续跑时该工具不重放（防写操作二次执行）
+                    if success:
+                        executed_results[str(tc["id"])] = {
+                            "result": str(result), "success": True}
+                        _remaining = [
+                            {"id": str(tc2.get("id") or f"r{tool_round}_{i2}"),
+                             "name": tn2, "arguments": ts2, "text_mode": False}
+                            for i2, (tc2, tn2, ts2, _a2, _e2) in enumerate(prepared)
+                            if str(tc2.get("id") or f"r{tool_round}_{i2}") not in executed_results]
+                        await _save_round_ckpt(_remaining, assistant_content,
+                                               ckpt_memory_anchor, ckpt_round_num=tool_round)
+
                     yield ToolCallResult(tool_name=tool_name, result=result, success=success)
 
                     eff_tool_calls += 1
@@ -5645,6 +5698,24 @@ class AIAgent:
                             "arguments": tool_args_str,
                         },
                     })
+
+            # 断点续跑：已执行成功（结果已持久化）的工具并入本轮结果，不回灌二次执行
+            for _ra in resume_answered:
+                tool_call_results.append({
+                    "name": _ra["name"],
+                    "arguments": _ra.get("arguments"),
+                    "result": _ra.get("result", ""),
+                    "llm_result": _ra.get("llm_result", _ra.get("result", "")),
+                    "success": _ra.get("success", True),
+                })
+                tool_calls_for_message.append({
+                    "id": _ra["id"],
+                    "type": "function",
+                    "function": {
+                        "name": _ra["name"],
+                        "arguments": _ra.get("arguments_str", ""),
+                    },
+                })
 
             # 回填本轮结果指纹：下一轮的「原地打转」判据要用
             # （结果在变 = 合理轮询不拦；一字不差重复 = 4 轮即停）
@@ -5753,6 +5824,9 @@ class AIAgent:
                 )
 
             # 断点落盘（c：本轮工具已执行完并写入记忆，下一步继续 LLM）
+            # 本轮工具已全部执行完（结果已入 messages），恢复现场无需再防重放，
+            # 清空 executed_results 防止断点文件随轮数无限膨胀
+            executed_results = {}
             try:
                 ckpt_memory_anchor = await self.memory.get_max_message_id()
             except Exception:
