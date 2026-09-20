@@ -50,6 +50,7 @@ export default function init_32_workspace_ui(App: AppKernel) {
     await App.loadWorkspaceDirs();
     await App.loadSavedWorkspaces();
     await App.loadGateAllow();
+    await App.loadGateAudit();
   };
 
   /* ---------- 永久白名单清单：已『总是允许』的操作，可一键撤销 ---------- */
@@ -104,6 +105,44 @@ export default function init_32_workspace_ui(App: AppKernel) {
     } catch (e) {
       const err = e as Error;
       App.showToast('撤销失败: ' + (err.message || e));
+    }
+  };
+
+  /* ---------- 确认卡历史：允许过/拒绝过什么，事后可查 ---------- */
+  App.loadGateAudit = async function loadGateAudit() {
+    const el = App.gateAuditList;
+    if (!el) return;
+    el.innerHTML = '<div style="text-align:center;color:#8888aa;padding:12px">加载中…</div>';
+    try {
+      const res = await fetch('/api/bridge/gate-audit');
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const data = await res.json();
+      const items: { id: string; desc: string; args: string; reason: string; decision: string; ts: number }[] = data.items || [];
+      el.innerHTML = '';
+      if (!items.length) {
+        el.innerHTML = '<div style="text-align:center;color:#8888aa;padding:12px">还没有确认卡记录——工具被拦下问过你之后，流水会出现在这里</div>';
+        return;
+      }
+      for (const it of items) {
+        const row = document.createElement('div');
+        row.className = 'ws-saved-item';
+        const when = it.ts ? new Date(it.ts * 1000).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '';
+        // 拒绝用红、未决用灰、放行用绿——扫一眼就能找到手滑放过的那条
+        const color = it.decision === 'deny' ? '#ff8888' : (it.decision === 'pending' ? '#8888aa' : '#88ddaa');
+        row.innerHTML =
+          '<span class="ws-saved-mark">·</span>'
+          + '<span class="ws-saved-path" style="white-space:normal;line-height:1.5">'
+          + '<span style="color:' + color + '">' + esc(it.desc) + '</span>'
+          + (it.args ? '<span style="color:#7777aa;font-size:11px;display:block;word-break:break-all">' + esc(it.args) + '</span>' : '')
+          + (it.reason ? '<span style="color:#8888aa;font-size:11px;display:block">' + esc(it.reason) + '</span>' : '')
+          + (when ? '<span style="color:#6666aa;font-size:10px;display:block">' + when + '</span>' : '')
+          + '</span>'
+          + '<span class="ws-saved-actions"></span>';
+        el.appendChild(row);
+      }
+    } catch (e) {
+      const err = e as Error;
+      el.innerHTML = '<div style="text-align:center;color:#8888aa;padding:12px">加载失败: ' + esc(err.message || String(e)) + '</div>';
     }
   };
 

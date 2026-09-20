@@ -3666,6 +3666,11 @@ class AIAgent:
                               arguments: dict, reason: str) -> None:
         """推送工具确认卡：复用前端 harness-modal（bridge_confirm 事件），零前端改动。"""
         try:
+            from gate_audit import record as _audit_record
+            _audit_record(rid, tool_name, arguments, reason)
+        except Exception as e:
+            logger.warning("确认卡审计登记失败 %s: %s", rid, e)
+        try:
             args_preview = json.dumps(arguments, ensure_ascii=False, default=str)[:120]
             fn = _gate_broadcast
             if fn:
@@ -3687,6 +3692,10 @@ class AIAgent:
         for sig, rid in list(self._gate_pending.items()):
             if rid == request_id:
                 self._gate_pending.pop(sig, None)
+                # 审计要在清缓存之前取参数：perm_key 得从弹卡时的工具/参数算
+                self._gate_audit_mark(
+                    rid, "always" if always else ("allow" if approve else "deny"),
+                    getattr(self, "_gate_card_args", {}).get(sig))
                 if not approve:
                     self._gate_denied[sig] = 1
                     self._gate_card_args.pop(sig, None)
@@ -3701,6 +3710,18 @@ class AIAgent:
                             + (" + 永久白名单" if always else ""))
                 return True
         return False
+
+    def _gate_audit_mark(self, rid: str, decision: str, entry) -> None:
+        """把用户决定记进审计流水（落盘失败只警告，不影响放行判定）。"""
+        try:
+            from gate_audit import mark as _audit_mark
+            pk = ""
+            if entry:
+                from tool_gate import perm_key
+                pk = perm_key(entry[0], entry[1]) or ""
+            _audit_mark(rid, decision, pk)
+        except Exception as e:
+            logger.warning("确认卡审计写入失败 %s: %s", rid, e)
 
     def _persist_gate_always(self, sig: str) -> None:
         """把一次『总是允许』落盘为永久白名单（按 perm_key 归类，跨会话放行）。"""

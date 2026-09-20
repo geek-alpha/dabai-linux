@@ -21,6 +21,15 @@ import tool_gate  # noqa: E402
 from tool_gate import evaluate, signature  # noqa: E402
 
 import agent  # noqa: E402
+import gate_audit  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _isolate_gate_audit(tmp_path, monkeypatch):
+    """闸门测试会触发审计留痕：隔离到临时文件，别写进线上 data/gate_audit.json。"""
+    monkeypatch.setattr(gate_audit, "AUDIT_FILE", tmp_path / "gate_audit.json")
+    monkeypatch.setattr(gate_audit, "_ENTRIES", [])
+    monkeypatch.setattr(gate_audit, "_LOADED", False)
 
 
 # ---------- evaluate 判定规则 ----------

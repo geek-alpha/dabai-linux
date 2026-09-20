@@ -2954,6 +2954,13 @@ async def gate_allow_delete(key: str):
     return {"ok": True, "removed": key}
 
 
+@app.get("/api/bridge/gate-audit")
+async def gate_audit_list(limit: int = 20):
+    """确认卡审计：允许过什么、拒绝过什么（管理面板的只读流水）。"""
+    import gate_audit
+    return {"ok": True, "items": gate_audit.list_audit(limit)}
+
+
 @app.get("/api/bridge/ask-history")
 async def ask_history(limit: int = 20):
     """提问卡留痕：最近问过什么、答了什么（刷新页面后聊天框补回这些卡片）。"""
