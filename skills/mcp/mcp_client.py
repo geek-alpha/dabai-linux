@@ -57,6 +57,9 @@ def format_tool_result(result: dict) -> str:
         else:
             parts.append(json.dumps(item, ensure_ascii=False))
     text = "\n".join(p for p in parts if p)
+    if not text and result.get("structuredContent") is not None:
+        # MCP 2025-06-18 起，server 可以只给 structuredContent（规范只是 SHOULD 同时给 text）
+        text = json.dumps(result["structuredContent"], ensure_ascii=False)
     if result.get("isError"):
         return f"[工具报错] {text or '（无输出）'}"
     return text or "（工具无输出）"

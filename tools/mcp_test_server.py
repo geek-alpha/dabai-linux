@@ -3,7 +3,8 @@
 """最小 MCP server（测试夹具）—— 只为验证 mcp 技能的协议层，不依赖网络/第三方包。
 
 实现的 MCP 子集：initialize / notifications/initialized / tools/list / tools/call。
-工具：echo(text)、add(a,b)、boom（返回 isError）、hang(seconds)（测超时）。
+工具：echo(text)、add(a,b)、boom（返回 isError）、hang(seconds)（测超时）、
+structured（只给 structuredContent）、both（两种都给，测优先级）。
 """
 from __future__ import annotations
 
@@ -35,6 +36,16 @@ TOOLS = [
         "name": "hang",
         "description": "睡 N 秒（测客户端超时）",
         "inputSchema": {"type": "object", "properties": {"seconds": {"type": "number"}}},
+    },
+    {
+        "name": "structured",
+        "description": "只给 structuredContent，不给 content（规范只 SHOULD 给 text，所以这是合法 server）",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "both",
+        "description": "content 与 structuredContent 都有（测优先级）",
+        "inputSchema": {"type": "object", "properties": {}},
     },
 ]
 
@@ -75,6 +86,13 @@ def handle(msg: dict):
         if name == "hang":
             time.sleep(float(a.get("seconds", 5)))
             return {"jsonrpc": "2.0", "id": mid, "result": _text("睡醒了")}
+        if name == "structured":
+            return {"jsonrpc": "2.0", "id": mid,
+                    "result": {"structuredContent": {"temperature": 22.5, "conditions": "Partly cloudy"}}}
+        if name == "both":
+            return {"jsonrpc": "2.0", "id": mid,
+                    "result": {"content": [{"type": "text", "text": "给人看的一句话"}],
+                               "structuredContent": {"temperature": 22.5}}}
         return {"jsonrpc": "2.0", "id": mid,
                 "error": {"code": -32602, "message": f"未知工具 {name}"}}
     if mid is None:

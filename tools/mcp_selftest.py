@@ -63,6 +63,11 @@ def main():
     r = sk.do_call({"server": NAME, "tool": "boom"})
     check("工具报错带 [工具报错] 前缀", r.startswith("[工具报错]"), r)
 
+    # 5b. structuredContent（MCP 2025-06-18：规范只 SHOULD 同时给 text，所以只给结构化结果的 server 合法）
+    r = sk.do_call({"server": NAME, "tool": "structured"})
+    check("只有 structuredContent 时不丢数据", "22.5" in r and "Partly cloudy" in r, r)
+    r = sk.do_call({"server": NAME, "tool": "both"})
+    check("两者并存时优先给人看的文本", r == "给人看的一句话", r)
     # 6. 未知工具 → 协议 error
     r = sk.do_call({"server": NAME, "tool": "not_exist"})
     check("未知工具返回协议错误", "未知工具" in r, r[:80])
