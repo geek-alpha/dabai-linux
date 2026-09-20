@@ -980,6 +980,62 @@ def _is_transient_stream_error(e: Exception) -> bool:
         ))
 
 
+class _StreamIdleTimeout(TimeoutError):
+    """流式静默看门狗触发：首包或块间隔超过阈值仍无事件。
+
+    str 自带 "timeout" 字样，确保被 _is_transient_stream_error 的文本兜底
+    判为瞬时错误 → 外层走前缀去重重建流，而不是整轮报废。
+    """
+
+
+def _stream_idle_timeout() -> float:
+    """流式块间隔静默上限（settings.json -> agent.stream_idle_timeout，默认 45s）。
+
+    卡死发现速度：httpx read timeout 120s → 45s，提早 2.7 倍触发重建。
+    """
+    try:
+        v = float(load_config().get("agent", {}).get("stream_idle_timeout", 45) or 0)
+        return max(5.0, min(v, 600.0))
+    except Exception:
+        return 45.0
+
+
+def _stream_first_byte_timeout() -> float:
+    """流式首包静默上限（settings.json -> agent.stream_first_byte_timeout，默认 180s）。
+
+    宽容慢思考模型（DeepSeek R1 类可 60-100s 才出首 token），比块间隔宽 4 倍，
+    避免把「在思考」误判成「卡死」。
+    """
+    try:
+        v = float(load_config().get("agent", {}).get("stream_first_byte_timeout", 180) or 0)
+        return max(10.0, min(v, 900.0))
+    except Exception:
+        return 180.0
+
+
+async def _watchdog_stream(stream, *, first_byte_timeout: float, idle_timeout: float):
+    """事件驱动的流式静默看门狗（对标 Anthropic _IdleClock）。
+
+    首包与稳态分两档计时：慢思考模型首包可宽（默认 180s），块间隔严
+    （默认 45s，比 httpx read timeout 120s 提前发现卡死）。每个 chunk 到达
+    即重置计时（wait_for 天然事件驱动、非轮询）；超时抛 _StreamIdleTimeout，
+    被 _is_transient_stream_error 判为瞬时错误 → 重建流续传。
+    """
+    first = True
+    while True:
+        stage = "first byte" if first else "steady state"
+        limit = first_byte_timeout if first else idle_timeout
+        first = False
+        try:
+            chunk = await asyncio.wait_for(anext(stream), timeout=limit)
+        except StopAsyncIteration:
+            return  # 流自然耗尽：显式结束，避免 PEP 479 把 StopAsyncIteration 转 RuntimeError
+        except asyncio.TimeoutError:
+            raise _StreamIdleTimeout(
+                f"stream {stage} idle timeout after {limit:.0f}s (reset on each chunk)")
+        yield chunk
+
+
 def _dedup_stream_text(assistant_content: str, chunk: str,
                        delivered_text: str, skip_prefix_len: int):
     """流式重试时的文本前缀去重。
@@ -5112,7 +5168,13 @@ class AIAgent:
                     while True:
                         last_usage = None
                         try:
-                            async for chunk in stream:
+                            # 静默看门狗包裹每次读取：首包/块间隔分档计时，卡死
+                            # 提前到 45s 发现（httpx read timeout 120s 兜底不再是一刀切）
+                            async for chunk in _watchdog_stream(
+                                    stream,
+                                    first_byte_timeout=_stream_first_byte_timeout(),
+                                    idle_timeout=_stream_idle_timeout(),
+                            ):
                                 # 兼容 openai 1.65.5：AsyncStream 无 .usage 属性，
                                 # 需在迭代中手动捕获最后一个带 usage 的 chunk
                                 if getattr(chunk, "usage", None) is not None:
