@@ -984,12 +984,13 @@ class TaskSystem:
         except TimeoutError:
             await self._leaf_failed(t, f"执行超时（>{t.timeout or self._cfg['default_timeout']}s）")
         except Exception as e:
-            await self._leaf_failed(t, f"{e.__class__.__name__}: {e}")
+            await self._leaf_failed(t, f"{e.__class__.__name__}: {e}", exc=e)
 
-    async def _leaf_failed(self, t: Task, msg: str) -> None:
+    async def _leaf_failed(self, t: Task, msg: str, exc: Optional[BaseException] = None) -> None:
         if t.attempts < t.max_attempts:
-            from harness.core import backoff_delay
-            delay = backoff_delay(t.attempts, base=float(self._cfg["backoff"]))
+            from harness.core import _retry_after_of, backoff_delay
+            delay = backoff_delay(t.attempts, base=float(self._cfg["backoff"]),
+                                  retry_after=_retry_after_of(exc) if exc is not None else None)
             t._set_state(PENDING, msg)
             t.status_text = f"第 {t.attempts} 次失败，{delay:.0f}s 后重试"
             self._emit("task", f"任务 {t.id}（{t.name}）{msg}，{delay:.0f}s 后重试"
