@@ -636,6 +636,10 @@ export default (function init(App: AppKernel) {
         if (App.taskBoardOnEvent) App.taskBoardOnEvent(msg.event);
         if (App.dshCardOnEvent) App.dshCardOnEvent(msg.event);
         break;
+      case 'plan_stall':
+        // 工作清单搁置：后台扫到「有活没干完却十来分钟没动」→ 聊天框里推一条提醒
+        renderPlanStallCard(msg.text || '');
+        break;
       case 'harness_task': {
         // harness 任务系统完成推送：长任务/批量任务到终态即弹出提示（无需轮询）
         const ht: HarnessTaskPush = msg.task || {};
@@ -1230,6 +1234,29 @@ export default (function init(App: AppKernel) {
       b.classList.toggle('chosen', !pending && status === 'answered' && b.dataset.value === answer);
     });
   }
+
+  /* ---------- 工作清单搁置提醒：聊天框里一条提示卡（无需作答，只为被看见） ---------- */
+  function renderPlanStallCard(text: string) {
+    if (!App.messagesEl) return;
+    const card = document.createElement('div');
+    card.className = 'msg ask-card plan-stall-card';
+    card.innerHTML =
+      '<div class="ask-head">' +
+        '<span class="ask-icon">📋</span>' +
+        '<span class="ask-title">工作清单搁置提醒</span>' +
+        '<span class="ask-status">⏸ 已中断</span>' +
+      '</div>' +
+      '<div class="ask-question"></div>';
+    const qEl = card.querySelector('.ask-question') as HTMLElement | null;
+    if (qEl) qEl.textContent = text || '清单很久没动了';
+    App.messagesEl.appendChild(card);
+    App._trimMessages();
+    App.bumpNewMsg(card);
+    App.scrollToBottom();
+    App.notifyFullscreenChat();
+    try { if (App.showToast) App.showToast('📋 ' + (text || '工作清单搁置了')); } catch (e) { /* toast 可选 */ }
+  }
+
 
   /** 建/取聊天框里的提问卡（同一 request_id 只建一次；quiet=恢复历史时不滚屏不提示） */
   function ensureAskCard(rid: string, question: string, options: any,

@@ -154,6 +154,7 @@ export type ServerMessage =
   | { type: 'task_event'; event?: any }
   | { type: 'media_worker_event'; kind?: string; event?: any; [k: string]: any }
   | { type: 'harness_task'; task?: HarnessTaskPush }
+  | { type: 'plan_stall'; text?: string; task_id?: string; idle_sec?: number; done?: number; total?: number }
   | { type: 'task_tree'; data?: any; tree?: any; [k: string]: any }
   | ScreenCommandMessage
   | { type: 'ai_behavior_command'; behavior?: string; [k: string]: any }

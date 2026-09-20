@@ -225,6 +225,13 @@ async def lifespan(app: FastAPI):
         logger.info("[Scheduler] 定时任务调度器已启动")
     except Exception as e:
         logger.warning(f"[Scheduler] 定时任务调度器启动失败: {e}")
+    # 工作清单搁置提醒：清单卡在 in_progress 没人管时，主动往对话里推一条
+    try:
+        asyncio.ensure_future(_plan_stall_watch())
+        logger.info("[PlanStall] 工作清单搁置提醒已启动（每 %s 秒扫一次）",
+                    _plan_stall_interval())
+    except Exception as e:
+        logger.warning(f"[PlanStall] 启动失败: {e}")
 
     yield
 
@@ -2885,6 +2892,50 @@ try:
     _ask_user.set_broadcast(_gate_broadcast_safe)
 except Exception:
     pass
+
+
+# ---------- 工作清单搁置提醒 ----------
+# plan_view 的「⏸ 已中断」只是显示层判定：没人盯任务中心时，搁置就一直搁着。
+# 这里补主动那一半——后台定期扫清单，搁置且有活没干完就推一条。
+
+
+def _plan_stall_interval() -> float:
+    """扫描间隔（秒）。测试要立刻看到提醒，不能真等一分钟。"""
+    try:
+        return max(1.0, float(os.environ.get("DABAI_PLAN_STALL_INTERVAL") or 60.0))
+    except ValueError:
+        return 60.0
+
+
+async def _plan_stall_watch() -> None:
+    """扫清单 → 广播提醒 → 只在真送达后标记已提醒。
+
+    无人在线（送达 0）不标记：提醒没人看见等于没提，留到下轮有人时再推。
+    """
+    from tools import plan_stall
+    while True:
+        await asyncio.sleep(_plan_stall_interval())
+        try:
+            items = plan_stall.pending_reminders()
+        except Exception as e:
+            logger.warning("[PlanStall] 扫描失败: %s", e)
+            continue
+        for it in items:
+            try:
+                n = await _gate_broadcast_safe({
+                    "type": "plan_stall",
+                    "text": it["text"],
+                    "task_id": it["task_id"],
+                    "idle_sec": int(it["idle_sec"]),
+                    "done": it["done"],
+                    "total": it["total"],
+                })
+            except Exception as e:
+                logger.warning("[PlanStall] 广播失败: %s", e)
+                continue
+            if n:
+                plan_stall.mark_reminded(it["path"], it["updated_at"])
+                logger.info("[PlanStall] 已提醒（%d 人在线）：%s", n, it["text"])
 
 
 @app.get("/api/bridge/gate-allow")
