@@ -419,16 +419,29 @@ def _fit_tool_result(result: str, tool_name: str) -> str:
         else _TOOL_RESULT_LIMIT
     if len(result) <= limit:
         return result
+    spans = _img_mark_spans(result)
     tail_len = min(_TRUNC_TAIL, limit // 5)
-    head_len = max(0, limit - tail_len - _TRUNC_NOTICE_RESERVE)
-    omitted = max(0, len(result) - head_len - tail_len)
+    nom_head = max(0, limit - tail_len - _TRUNC_NOTICE_RESERVE)
+    tail_cut = _cut_before_mark(result, len(result) - tail_len, spans)
+    # 中段里的 [[IMG:]] 标记不能随中段一起消失：标记没了，_img_marks 就抽不出路径，
+    # 图静默丢失且没有任何提示——模型会以为这次结果里本来就没有图。
+    mid_marks = _img_marks(result[_cut_before_mark(result, nom_head, spans):tail_cut])
+    keep = mid_marks[:_IMG_MAX_PER_RESULT]
+    extra = "".join(f"[[IMG:{p}]]" for p in keep)
+    if len(mid_marks) > len(keep):
+        extra += f"（中段另有 {len(mid_marks) - len(keep)} 张图的标记已省略）"
+    # 补回的标记要算进预算，否则「截断后仍 ≤ limit」这条约束会被自己破坏
+    head_cut = _cut_before_mark(result, max(0, nom_head - len(extra)), spans)
+    if tail_cut < head_cut:
+        tail_cut = head_cut
+    omitted = max(0, tail_cut - head_cut)
     notice = (
         f"\n\n⋯【结果被截断：原文 {len(result)} 字符，已省略中间 {omitted} 字符】"
         "不要凭这段残缺内容下结论，也不要原样重试。请缩小范围：读文件用 "
         "`路径:起-止` 指定行区间（每次 ≤300 行），搜索加更精确的关键词或 paths 限定，"
         "需要整体结构就先用 symbols / code_locate。\n\n"
     )
-    return result[:head_len] + notice + result[-tail_len:]
+    return result[:head_cut] + notice + extra + result[tail_cut:]
 
 
 # ---------- 工具级确认闸门：确认卡广播钩子（server 启动时 set_gate_broadcast 注入） ----------
@@ -492,6 +505,21 @@ def _single_result_max_tokens() -> int:
 # 为什么不直接把图放进 role=tool：实测提供方会静默丢弃（HTTP 200 但 content 为空串），
 # 只有 user 消息 content 数组里的 image_url 才被看见。
 _IMG_MARK_RE = re.compile(r"\[\[IMG:([^\]\n]+)\]\]")
+
+
+def _img_mark_spans(s: str) -> list:
+    """[[IMG:]] 标记的 (起,止) 区间。"""
+    return [(m.start(), m.end()) for m in _IMG_MARK_RE.finditer(s)]
+
+
+def _cut_before_mark(s: str, i: int, spans: list) -> int:
+    """把切口挪到标记起点之前——砍一半的 [[IMG:path]] 正则解析不出，图会静默丢失。"""
+    for a, b in spans:
+        if a < i < b:
+            return a
+    return i
+
+
 _IMG_MAX_SIDE = 1280
 _IMG_JPEG_Q = 70
 # 本地估算必须用固定值：base64 有 14 万字符，按字符估会把预算撑爆、把工具历史砍光。

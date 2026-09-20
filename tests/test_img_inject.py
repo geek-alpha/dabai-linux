@@ -359,3 +359,67 @@ def test_fail_note_and_cap_note_coexist(monkeypatch):
     assert len(notes) == 2, notes
     assert any("未注入" in n for n in notes)
     assert any("上限" in n for n in notes)
+
+
+# ---------------- 截断不能吃掉 [[IMG:]] 标记（2026-09-20） ----------------
+# 背景：_fit_tool_result 在 _img_marks 之前跑（agent.py:422 → 6069），按字符数硬砍。
+# 标记被砍成残片 → 正则抽不出路径 → 图静默丢失且没有任何提示，和「读不到不吭声」
+# 是同一类病：模型以为这次结果里本来就没有图。
+
+def _head_budget(limit=None):
+    limit = limit or agent._TOOL_RESULT_LIMIT
+    return limit - min(agent._TRUNC_TAIL, limit // 5) - agent._TRUNC_NOTICE_RESERVE
+
+
+def test_truncation_keeps_middle_marks():
+    """中段被省略时，里面的标记必须补回：文字可以丢，图不能悄悄丢。"""
+    raw = "A" * (_head_budget() + 500) + "[[IMG:/tmp/middle.png]]" + "B" * 4000
+    out = agent._fit_tool_result(raw, "music_search")
+    assert "/tmp/middle.png" in agent._img_marks(out), out[-400:]
+    assert len(out) <= agent._TOOL_RESULT_LIMIT
+
+
+def test_truncation_never_splits_a_mark():
+    """跨切口的标记不许砍成残片——残片解析不出路径，图就没了。
+
+    构造要让切口真的落在标记内部（尾部切口 = 长度 - min(600, limit/5)）；
+    标记只是落在中段时走的是补回分支，那是另一个用例，这个用例会成假绿。
+    """
+    tail_len = min(agent._TRUNC_TAIL, agent._TOOL_RESULT_LIMIT // 5)
+    m = "[[IMG:/tmp/boundary.png]]"
+    raw = "A" * 4000 + m + "B" * (tail_len - 10)
+    assert 4000 < len(raw) - tail_len < 4000 + len(m), "构造没跨切口，测不到"
+    out = agent._fit_tool_result(raw, "music_search")
+    assert "/tmp/boundary.png" in agent._img_marks(out), out[-300:]
+
+    m2 = "[[IMG:/tmp/headcut.png]]"
+    head = _head_budget()
+    raw2 = "A" * (head - 10) + m2 + "B" * 4000
+    assert head - 10 < head < head - 10 + len(m2), "头部构造没跨切口"
+    out2 = agent._fit_tool_result(raw2, "music_search")
+    assert "/tmp/headcut.png" in agent._img_marks(out2), out2[:300]
+    # 残片特征：出现 [[IMG: 的次数多于完整标记数
+    assert out2.count("[[IMG:") == len(agent._img_mark_spans(out2))
+
+
+def test_truncation_marks_capped_with_note():
+    """中段标记很多时只补回 4 个，并说明还有多少——提示不能自己撑爆预算。"""
+    many = "".join("[[IMG:/tmp/p%02d_%s.png]]" % (i, "x" * 60) for i in range(20))
+    out = agent._fit_tool_result("A" * 3000 + many + "B" * 6000, "music_search")
+    assert len(agent._img_marks(out)) == agent._IMG_MAX_PER_RESULT
+    assert "已省略" in out
+    assert len(out) <= agent._TOOL_RESULT_LIMIT
+
+
+def test_truncation_marks_never_break_the_limit():
+    """极端长路径也不许超预算：预算被自己破坏等于截断白做。"""
+    many = "".join("[[IMG:/tmp/%s.png]]" % ("x" * 400) for _ in range(6))
+    out = agent._fit_tool_result("A" * 3000 + many + "B" * 6000, "music_search")
+    assert len(out) <= agent._TOOL_RESULT_LIMIT, len(out)
+
+
+def test_truncation_without_marks_unchanged():
+    """没标记时一个字都不多加：凭空多出的提示会让前缀每轮漂移。"""
+    out = agent._fit_tool_result("A" * 9000, "music_search")
+    assert "IMG" not in out
+    assert out.startswith("A" * 100)
