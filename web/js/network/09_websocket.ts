@@ -1314,6 +1314,7 @@ export default (function init(App: AppKernel) {
       const items = (data.items || []).slice().reverse();
       for (const it of items) {
         if (!it || !it.id) continue;
+        if (it.status && it.status !== 'pending') continue;  // 只补还没答的：已答/跳过/超时的卡销毁后不诈尸
         const old = askCards.get(it.id);
         if (old && document.body.contains(old)) continue;
         ensureAskCard(it.id, it.q, it.options, it.status || 'pending', it.answer || '', true);
@@ -1321,10 +1322,18 @@ export default (function init(App: AppKernel) {
     }).catch(() => {});
   };
 
-  /** 状态更新（答题后 / 超时广播 / 过期回写） */
+  /** 销毁提问卡：卡片的使命是「等一个答案」，答完/跳过/超时/过期即焚，不留占位噪音 */
+  function destroyAskCard(rid: string) {
+    const card = askCards.get(rid);
+    if (card && card.parentNode) card.parentNode.removeChild(card);
+    askCards.delete(rid);
+  }
+
+  /** 状态更新（答题后 / 超时广播 / 过期回写）；非 pending 一律销毁 */
   App.updateAskCard = function updateAskCard(rid: string, answer: string, status: string) {
     const card = askCards.get(rid);
     if (!card || !document.body.contains(card)) return;
+    if (status && status !== 'pending') { destroyAskCard(rid); return; }
     applyAskState(card, status, answer);
   };
 
