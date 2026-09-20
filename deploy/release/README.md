@@ -60,7 +60,35 @@ git push origin v1.0.0     推 v* tag（或网页上手动 dispatch）
                                发布后自检：gh release view 核对资产名
 ```
 
-发一版：
+发一版（一条命令）：
+
+```bash
+python deploy/release/publish.py -m "这次改了什么"
+```
+
+它把六步串成一条命令，任何一步不过就停、不留半成品：
+
+| 步 | 做什么 | 不过怎么办 |
+|---|---|---|
+| ① | 前置闸门：工作区干净 / 在 main 上 / 不落后远端 / VERSION 与最新 tag 对齐 / token 可用 | 拒绝 |
+| ② | `build_release.py --bump <part>`（内含解包回验） | 恢复 VERSION 后拒绝 |
+| ③ | 全量 pytest（本机实测 42s / 966 项） | 不发布 |
+| ④ | 提交 VERSION 并 push main | 拒绝 |
+| ⑤ | 打 tag 并 push（触发 CI） | 拒绝，tag 留在本地 |
+| ⑥ | `watch_release.py` 盯到资产齐全 | 给退出码，可单独重盯 |
+
+常用变体：
+
+```bash
+python deploy/release/publish.py --check                 # 只过前置闸门，不动工作区
+python deploy/release/publish.py --dry-run -m "..."      # 走到打包+测试，不提交不推送
+python deploy/release/publish.py --bump minor -m "..."   # 升 minor 位
+python deploy/release/publish.py -m "..." --commit-all   # 连未提交改动一起提
+python deploy/release/publish.py --tag-only              # VERSION 已升好，只补推 tag
+```
+
+手工等价于下面四步 —— 手工做容易漏：漏 `--bump` 会拿旧版本号打包（CI 那条 tag
+一致性检查会拦下），漏测试会发出没背书的一版，忘了 fetch 会拿旧代码打。
 
 ```bash
 # 1. 升版本号（改 VERSION，或 build_release.py --bump patch 自动升）
@@ -81,6 +109,8 @@ tag 名与清单版本不一致会被 CI 自己拦住（工作流里那条「确
 python deploy/release/watch_release.py v1.0.0
 ```
 
+（`publish.py` 第 ⑥ 步跑的就是它。）
+
 只读观察者，不产生任何发布能力——建 release 的仍是 CI 的 publish 步骤，不违背
 「发布只能有一个实现」。
 
@@ -92,8 +122,10 @@ python deploy/release/watch_release.py v1.0.0
 `Settings → Environments → New environment → 名字填 release → 勾 Required reviewers → 选自己`。
 没配这个 environment 时工作流照跑，只是没人拦 —— 所以配了才算数。
 
-**刻意不做本地直发脚本**：多一条能上传资产的本地路径，就等于在这道门旁边开了个洞，
-发布这件事只能有一个实现。本地要验包，跑 `build_release.py` 看回验输出即可。
+**为什么 `publish.py` 不算「本地直发脚本」**：它到第 ⑤ 步为止只推 tag，而 tag 本身
+不产生 release —— 建 release 的仍是 CI 的 publish 步骤，且必须过管理员 Approve。
+本地依然没有、也不该有直接上传资产的能力：多一条能上传资产的本地路径，就等于在这道门
+旁边开了个洞。本地要单独验包，跑 `build_release.py` 看回验输出即可。
 
 ## 更新路径
 
