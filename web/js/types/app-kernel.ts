@@ -633,6 +633,7 @@ export interface AppKernel {
   workspaceBrowsePath: HTMLDivElement | null;
   workspaceUpBtn: HTMLButtonElement | null;
   workspaceSavedList: HTMLDivElement | null;
+  gateAllowList: HTMLDivElement | null;
   /* 工作区方法（32_workspace_ui 挂载） */
   openWorkspaceModal: () => void;
   closeWorkspaceModal: () => void;
@@ -643,6 +644,8 @@ export interface AppKernel {
   loadSavedWorkspaces: () => Promise<void>;
   activateSavedWorkspace: (path: string) => Promise<void>;
   saveWorkspaceToSaved: () => Promise<void>;
+  loadGateAllow: () => Promise<void>;
+  revokeGateAllow: (key: string) => Promise<void>;
 
   /* ---------- 状态机 ---------- */
   State: AppKernelState;

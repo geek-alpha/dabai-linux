@@ -68,8 +68,11 @@ def load_permanent() -> dict:
 def save_permanent(key: str, tool_name: str, reason: str) -> bool:
     """把一条永久白名单写进 settings.json（读改写，保留其它配置）。失败返回 False。"""
     try:
-        with open(_SETTINGS_PATH, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
+        if _SETTINGS_PATH.exists():
+            with open(_SETTINGS_PATH, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        else:
+            cfg = {}  # 新部署无 settings.json：按空配置直接建，不能静默失败
         tg = cfg.setdefault("tool_gate", {})
         allow = tg.setdefault("permanent_allow", {})
         allow[key] = {
@@ -83,6 +86,57 @@ def save_permanent(key: str, tool_name: str, reason: str) -> bool:
     except Exception as e:
         logger.warning("永久白名单写入失败: %s (%s)", key, e)
         return False
+def list_permanent() -> list:
+    """永久白名单全量清单（按加入时间倒序），给管理面板展示。"""
+    raw = load_permanent()
+    items = []
+    for key, meta in raw.items():
+        if not isinstance(meta, dict):
+            meta = {}
+        items.append({
+            "key": key,
+            "tool": str(meta.get("tool") or ""),
+            "reason": str(meta.get("reason") or ""),
+            "at": int(meta.get("at") or 0),
+            "desc": _perm_desc(key, meta),
+        })
+    items.sort(key=lambda i: i["at"], reverse=True)
+    return items
+
+
+def remove_permanent(key: str) -> bool:
+    """从永久白名单撤销一条（settings.json 读改写，保留其它配置）。"""
+    try:
+        if not _SETTINGS_PATH.exists():
+            return False
+        with open(_SETTINGS_PATH, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        tg = cfg.get("tool_gate") or {}
+        allow = tg.get("permanent_allow") or {}
+        if key not in allow:
+            return False
+        del allow[key]
+        with open(_SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        logger.info("永久白名单已撤销: %s", key)
+        return True
+    except Exception as e:
+        logger.warning("永久白名单撤销失败: %s (%s)", key, e)
+        return False
+
+
+def _perm_desc(key: str, meta: dict) -> str:
+    """把 perm_key / 元信息翻译成人话，给管理面板的行内说明。"""
+    tool = str(meta.get("tool") or "")
+    if key.startswith("tool:"):
+        return f"工具 {tool}：同类不可逆操作不再询问"
+    if key.startswith("shell:"):
+        return f"shell 命令命中第 {key.split(':', 1)[1]} 条危险模式：不再询问"
+    if key.startswith("overwrite:"):
+        return f"工具 {tool} 带覆盖/强推参数：不再询问"
+    return f"永久信任 {tool or key}"
+
+
 # ---------- 高危工具：不可逆/越界/花钱/委派/自动执行 ----------
 # 判定依据（对应 agent 里的「该问不该问」）：
 #   ①动作不可逆（删除/覆盖/重启/发布）；②越出被点名范围；③代价差一个量级。

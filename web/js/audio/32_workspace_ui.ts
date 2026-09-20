@@ -49,6 +49,62 @@ export default function init_32_workspace_ui(App: AppKernel) {
     }
     await App.loadWorkspaceDirs();
     await App.loadSavedWorkspaces();
+    await App.loadGateAllow();
+  };
+
+  /* ---------- 永久白名单清单：已『总是允许』的操作，可一键撤销 ---------- */
+  App.loadGateAllow = async function loadGateAllow() {
+    const el = App.gateAllowList;
+    if (!el) return;
+    el.innerHTML = '<div style="text-align:center;color:#8888aa;padding:12px">加载中…</div>';
+    try {
+      const res = await fetch('/api/bridge/gate-allow');
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const data = await res.json();
+      const items: { key: string; desc: string; reason: string; at: number }[] = data.items || [];
+      el.innerHTML = '';
+      if (!items.length) {
+        el.innerHTML = '<div style="text-align:center;color:#8888aa;padding:12px">还没有永久信任的操作——点确认卡「总是允许」会登记到这里</div>';
+        return;
+      }
+      for (const it of items) {
+        const row = document.createElement('div');
+        row.className = 'ws-saved-item';
+        const when = it.at ? new Date(it.at * 1000).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '';
+        row.innerHTML =
+          '<span class="ws-saved-mark" title="永久信任">✓</span>'
+          + '<span class="ws-saved-path" style="white-space:normal;line-height:1.5">'
+          + esc(it.desc)
+          + (it.reason ? '<span style="color:#8888aa;font-size:11px;display:block">' + esc(it.reason) + '</span>' : '')
+          + (when ? '<span style="color:#6666aa;font-size:10px;display:block">' + when + '</span>' : '')
+          + '</span>'
+          + '<span class="ws-saved-actions">'
+          + '<button class="ws-saved-del" title="撤销永久信任">撤销</button>'
+          + '</span>';
+        row.querySelector('.ws-saved-del')!.addEventListener('click', async (e) => {
+          e.stopPropagation();
+          if (!confirm('撤销对这项操作的永久信任？同类操作之后会重新弹出确认卡。')) return;
+          await App.revokeGateAllow(it.key);
+        });
+        el.appendChild(row);
+      }
+    } catch (e) {
+      const err = e as Error;
+      el.innerHTML = '<div style="text-align:center;color:#8888aa;padding:12px">加载失败: ' + esc(err.message || String(e)) + '</div>';
+    }
+  };
+
+  App.revokeGateAllow = async function revokeGateAllow(key: string) {
+    try {
+      const res = await fetch('/api/bridge/gate-allow/' + encodeURIComponent(key), { method: 'DELETE' });
+      const data = await res.json();
+      if (!res.ok) throw new Error((data && data.detail) || ('HTTP ' + res.status));
+      App.showToast('已撤销永久信任，同类操作将重新确认');
+      await App.loadGateAllow();
+    } catch (e) {
+      const err = e as Error;
+      App.showToast('撤销失败: ' + (err.message || e));
+    }
   };
 
   /* ---------- 已保存工作区列表 ---------- */

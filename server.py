@@ -2873,6 +2873,22 @@ except Exception:
     pass
 
 
+@app.get("/api/bridge/gate-allow")
+async def gate_allow_list():
+    """永久白名单清单（仅供管理面板：列出已『总是允许』的条目，可撤销）。"""
+    from tool_gate import list_permanent
+    return {"ok": True, "items": list_permanent()}
+
+
+@app.delete("/api/bridge/gate-allow/{key}")
+async def gate_allow_delete(key: str):
+    """撤销一条永久白名单——用户点错『总是允许』的挽回通道。"""
+    from tool_gate import remove_permanent
+    if not remove_permanent(key):
+        raise HTTPException(status_code=404, detail="白名单条目不存在或写入失败")
+    return {"ok": True, "removed": key}
+
+
 @app.post("/api/bridge/confirm")
 async def harness_bridge_confirm(payload: dict):
     request_id = str(payload.get("request_id") or "")

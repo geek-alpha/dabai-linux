@@ -327,3 +327,83 @@ def test_弹卡事件带always标记(monkeypatch):
     fake = _FakeAgent()
     _gate(fake, "todo_delete", {"task_id": "t1"})
     assert calls[0].get("always_opt") is True  # 前端据此显示『总是允许』按钮
+# ---------- 永久白名单清单/撤销（管理面板：/api/bridge/gate-allow） ----------
+
+@pytest.fixture
+def perm_settings(tmp_path, monkeypatch):
+    """把永久白名单读写隔离到临时文件，绝不碰真实的 settings.json。"""
+    monkeypatch.setattr(tool_gate, "_SETTINGS_PATH", tmp_path / "settings.json")
+    return tmp_path / "settings.json"
+
+
+def test_list_空配置返回空列表(perm_settings):
+    assert tool_gate.list_permanent() == []
+
+
+def test_save后_list带描述与时间(perm_settings):
+    assert tool_gate.save_permanent("tool:send_message", "send_message", "用户点了总是允许")
+    items = tool_gate.list_permanent()
+    assert len(items) == 1
+    it = items[0]
+    assert it["key"] == "tool:send_message"
+    assert it["tool"] == "send_message"
+    assert "send_message" in it["desc"] and "不再询问" in it["desc"]
+    assert it["at"] > 0
+
+
+def test_list_按加入时间倒序(perm_settings):
+    # at 是秒级时间戳，直接用不同 at 构造，验证降序契约
+    import json as _json
+    perm_settings.write_text(_json.dumps({"tool_gate": {"permanent_allow": {
+        "tool:a": {"tool": "a", "reason": "r", "at": 100},
+        "tool:b": {"tool": "b", "reason": "r", "at": 200},
+    }}}), encoding="utf-8")
+    keys = [i["key"] for i in tool_gate.list_permanent()]
+    assert keys == ["tool:b", "tool:a"]  # at 大的排前面
+
+
+def test_remove_撤销成功(perm_settings):
+    tool_gate.save_permanent("tool:a", "a", "r")
+    assert tool_gate.remove_permanent("tool:a") is True
+    assert tool_gate.list_permanent() == []
+
+
+def test_remove_不存在的key返回False(perm_settings):
+    assert tool_gate.remove_permanent("tool:ghost") is False
+
+
+def test_remove_只删目标保留其它(perm_settings):
+    tool_gate.save_permanent("tool:a", "a", "r")
+    tool_gate.save_permanent("shell:3", "shell_run", "r")
+    assert tool_gate.remove_permanent("tool:a") is True
+    assert [i["key"] for i in tool_gate.list_permanent()] == ["shell:3"]
+
+
+def test_desc_三类键翻译成白话(perm_settings):
+    tool_gate.save_permanent("tool:todo_delete", "todo_delete", "r1")
+    tool_gate.save_permanent("shell:3", "shell_run", "r2")
+    tool_gate.save_permanent("overwrite:code_create_file", "code_create_file", "r3")
+    descs = {i["key"]: i["desc"] for i in tool_gate.list_permanent()}
+    assert "todo_delete" in descs["tool:todo_delete"] and "不再询问" in descs["tool:todo_delete"]
+    assert "第 3 条危险模式" in descs["shell:3"]
+    assert "覆盖" in descs["overwrite:code_create_file"]
+
+
+def test_损坏配置_容错返回(perm_settings):
+    perm_settings.write_text("{ not json", encoding="utf-8")
+    assert tool_gate.list_permanent() == []
+    assert tool_gate.remove_permanent("tool:x") is False
+
+
+def test_roundtrip_读改写保留其它配置节(perm_settings):
+    """save/remove 都是整文件读改写：settings.json 里的其它配置不能丢。"""
+    import json as _json
+    perm_settings.write_text(_json.dumps({"llm": {"model": "x"}}), encoding="utf-8")
+    tool_gate.save_permanent("tool:a", "a", "r")
+    cfg1 = _json.loads(perm_settings.read_text(encoding="utf-8"))
+    assert cfg1["llm"]["model"] == "x"
+    assert list(cfg1["tool_gate"]["permanent_allow"]) == ["tool:a"]
+    tool_gate.remove_permanent("tool:a")
+    cfg2 = _json.loads(perm_settings.read_text(encoding="utf-8"))
+    assert cfg2["llm"]["model"] == "x"
+    assert not cfg2["tool_gate"]["permanent_allow"]

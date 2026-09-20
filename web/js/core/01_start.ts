@@ -204,6 +204,7 @@ App.rcRoleName = App.$('rc-role-name') as HTMLInputElement | null;
   App.workspaceBrowsePath = App.$('workspace-browse-path') as HTMLDivElement | null;
   App.workspaceUpBtn = App.$('workspace-up-btn') as HTMLButtonElement | null;
   App.workspaceSavedList = App.$('workspace-saved-list') as HTMLDivElement | null;
+  App.gateAllowList = App.$('gate-allow-list') as HTMLDivElement | null;
   /* ---------- 状态 ---------- */
   App.State = {
     IDLE: 'idle',
