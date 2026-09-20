@@ -126,6 +126,8 @@ class _FakeAgent(agent.AIAgent):
         self._gate_allowed = {}
         self._gate_denied = {}
         self._gate_pending = {}
+        self._gate_card_args = {}
+        self._gate_permanent = {}
 
 
 def _gate(fake, tool, args):
@@ -197,3 +199,131 @@ def test_广播钩子未注册_弹卡不炸():
     fake = _FakeAgent()
     out = _gate(fake, "wt_discard", {"confirm": True})
     assert "确认" in out  # 无广播函数也不抛异常
+# ---------- 永久白名单（『总是允许』第三选项） ----------
+
+def test_perm_key_高危工具按工具名分桶():
+    assert tool_gate.perm_key("todo_delete", {"task_id": "t1"}) == "tool:todo_delete"
+    assert tool_gate.perm_key("todo_delete", {"task_id": "t2"}) == "tool:todo_delete"
+
+
+def test_perm_key_shell按危险模式分桶():
+    k1 = tool_gate.perm_key("shell_run", {"command": "rm -rf /tmp/x"})
+    k2 = tool_gate.perm_key("shell_run", {"command": "git push -f origin main"})
+    assert k1.startswith("shell:") and k2.startswith("shell:")
+    assert k1 != k2  # 不同危险模式 → 不同桶，精确放行
+
+
+def test_perm_key_overwrite参数单独分桶():
+    assert tool_gate.perm_key("code_create_file", {"path": "a.py", "overwrite": True}) == \
+        "overwrite:code_create_file"
+
+
+def test_perm_key_普通工具无桶():
+    assert tool_gate.perm_key("code_edit", {"file": "a.py"}) == ""
+
+
+def test_永久白名单命中_直接放行():
+    permanent = {"tool:todo_delete": 1}
+    v, _, _ = evaluate("todo_delete", {"task_id": "t1"}, {}, {}, {}, permanent)
+    assert v == "allow"
+
+
+def test_永久白名单未命中_仍ask():
+    permanent = {"tool:sched_remove": 1}
+    v, _, _ = evaluate("todo_delete", {"task_id": "t1"}, {}, {}, {}, permanent)
+    assert v == "ask"
+
+
+def test_永久白名单_拒绝过的签名仍优先_用户可反悔():
+    # 用户永久允许了 todo_delete 整类，但这次具体签名被拒绝过 → deny 优先
+    denied = {signature("todo_delete", {"task_id": "t1"}): 1}
+    permanent = {"tool:todo_delete": 1}
+    v, _, _ = evaluate("todo_delete", {"task_id": "t1"}, {}, denied, {}, permanent)
+    assert v == "deny"
+
+
+# ---------- 读写 settings.json ----------
+
+def test_save_load_roundtrip(monkeypatch, tmp_path):
+    fake_settings = tmp_path / "settings.json"
+    fake_settings.write_text('{"llm_providers": []}', encoding="utf-8")
+    monkeypatch.setattr(tool_gate, "_SETTINGS_PATH", fake_settings)
+
+    assert tool_gate.save_permanent("tool:todo_delete", "todo_delete", "删除任务不可逆")
+    loaded = tool_gate.load_permanent()
+    assert "tool:todo_delete" in loaded
+    assert loaded["tool:todo_delete"]["tool"] == "todo_delete"
+    # 原有配置保留（读改写，不整体覆盖）
+    import json
+    cfg = json.loads(fake_settings.read_text(encoding="utf-8"))
+    assert "llm_providers" in cfg
+
+
+def test_load_损坏文件返回空(monkeypatch, tmp_path):
+    fake_settings = tmp_path / "settings.json"
+    fake_settings.write_text("{broken", encoding="utf-8")
+    monkeypatch.setattr(tool_gate, "_SETTINGS_PATH", fake_settings)
+    assert tool_gate.load_permanent() == {}
+
+
+def test_load_无tool_gate段返回空(monkeypatch, tmp_path):
+    fake_settings = tmp_path / "settings.json"
+    fake_settings.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(tool_gate, "_SETTINGS_PATH", fake_settings)
+    assert tool_gate.load_permanent() == {}
+
+
+# ---------- resolve_gate always 分支（agent 侧） ----------
+
+def test_resolve_gate_always_落盘并永久放行(monkeypatch, tmp_path):
+    fake_settings = tmp_path / "settings.json"
+    fake_settings.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(tool_gate, "_SETTINGS_PATH", fake_settings)
+
+    fake = _FakeAgent()
+    fake._gate_permanent = {}  # 模拟启动时 load_permanent 为空
+    _gate(fake, "todo_delete", {"task_id": "t1"})
+    rid = next(iter(fake._gate_pending.values()))
+
+    assert agent.AIAgent.resolve_gate(fake, rid, True, always=True) is True
+    # 永久白名单已落盘
+    assert "tool:todo_delete" in tool_gate.load_permanent()
+    assert "tool:todo_delete" in fake._gate_permanent
+    # 同类不同参数也不再弹卡（不是签名级放行，是整类放行）
+    assert _gate(fake, "todo_delete", {"task_id": "t2"}) is None
+
+
+def test_resolve_gate_always_拒绝仍只进黑名单(monkeypatch, tmp_path):
+    fake_settings = tmp_path / "settings.json"
+    fake_settings.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(tool_gate, "_SETTINGS_PATH", fake_settings)
+
+    fake = _FakeAgent()
+    fake._gate_permanent = {}
+    _gate(fake, "todo_delete", {"task_id": "t1"})
+    rid = next(iter(fake._gate_pending.values()))
+    agent.AIAgent.resolve_gate(fake, rid, False)
+    assert tool_gate.load_permanent() == {}  # 拒绝不落盘
+
+
+def test_resolve_gate_无弹卡参数_不落盘但允许本次():
+    fake = _FakeAgent()  # 无 _gate_card_args（旧实例/异常路径）
+    if not hasattr(fake, "_gate_card_args"):
+        fake._gate_card_args = {}
+    fake._gate_permanent = {}
+    sig = signature("todo_delete", {"task_id": "t1"})
+    fake._gate_pending[sig] = "tool_gate:xyz"
+    assert agent.AIAgent.resolve_gate(fake, "tool_gate:xyz", True, always=True) is True
+    assert fake._gate_permanent == {}  # 落盘失败不影响本次放行
+
+
+def test_弹卡事件带always标记(monkeypatch):
+    calls = []
+
+    async def fake_broadcast(ev):
+        calls.append(ev)
+
+    monkeypatch.setattr(agent, "_gate_broadcast", fake_broadcast)
+    fake = _FakeAgent()
+    _gate(fake, "todo_delete", {"task_id": "t1"})
+    assert calls[0].get("always_opt") is True  # 前端据此显示『总是允许』按钮

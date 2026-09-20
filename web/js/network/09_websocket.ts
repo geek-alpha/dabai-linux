@@ -1201,11 +1201,16 @@ export default (function init(App: AppKernel) {
     const hintEl = document.getElementById('harness-hint');
     if (taskEl) taskEl.textContent = task || '（空任务）';
     if (replyEl) { replyEl.style.display = 'none'; replyEl.textContent = ''; }
-if (hintEl) hintEl.textContent = '角色「' + ((App.rcRoleName && App.rcRoleName.value) || '大白') + '」想请 AI 助手执行上面的任务，确认后才会真正动手，你也可以直接关闭拒绝。';
+    if (hintEl) hintEl.textContent = '角色「' + ((App.rcRoleName && App.rcRoleName.value) || '大白') + '」想请 AI 助手执行上面的任务，确认后才会真正动手，你也可以直接关闭拒绝。';
     const cancelBtn = document.getElementById('harness-cancel-btn');
     const approveBtn = document.getElementById('harness-approve-btn');
+    const alwaysBtn = document.getElementById('harness-always-btn');
     cancelBtn.textContent = '拒绝';
     approveBtn.textContent = '确认执行';
+    // 工具级确认卡（tool_gate: 前缀）才显示『总是允许』；任务卡不显示
+    const isToolGate = typeof requestId === 'string' && requestId.indexOf('tool_gate:') === 0;
+    if (alwaysBtn) alwaysBtn.style.display = isToolGate ? '' : 'none';
+    if (isToolGate) approveBtn.textContent = '允许一次';
     approveBtn.style.display = '';
     cancelBtn.style.display = '';
     modal.style.display = 'flex';
@@ -1273,17 +1278,21 @@ if (hintEl) hintEl.textContent = '角色「' + ((App.rcRoleName && App.rcRoleNam
     }
   };
 
-  /** 确认/拒绝调用（按钮事件在模块底部绑定一次） */
-  App.harnessApprove = function harnessApprove(approve) {
+  /** 确认/拒绝调用（按钮事件在模块底部绑定一次）
+   *  always=true 是确认卡第三选项：允许这一次 + 写进永久白名单（settings.json） */
+  App.harnessApprove = function harnessApprove(approve, always) {
     if (!App.harnessRequestId) return;
     const rid = App.harnessRequestId;
     const hintEl = document.getElementById('harness-hint');
-    if (hintEl) hintEl.textContent = approve ? '已确认，正在交给 AI 助手（DSH）执行…' : '已拒绝，任务未执行。';
+    if (hintEl) hintEl.textContent = always ? '已记住，同类操作以后不再询问。' : (approve ? '已确认，正在交给 AI 助手（DSH）执行…' : '已拒绝，任务未执行。');
+    const ctrlAborter = new AbortController();
+    const timer = setTimeout(() => ctrlAborter.abort(), 20000);
     fetch('/api/bridge/confirm', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ request_id: rid, approve })
+      body: JSON.stringify({ request_id: rid, approve, always: always ? true : undefined })
     }).then(r => r.json()).then(data => {
+      clearTimeout(timer);
       if (data && data.ok && data.status === 'running') {
         if (App._harnessPolling) { App.harnessPoll(); }
       } else if (data && data.ok && data.status === 'pending') {
@@ -1297,6 +1306,7 @@ if (hintEl) hintEl.textContent = '角色「' + ((App.rcRoleName && App.rcRoleNam
       // 拒绝后让 AI 自然回应（画图类会转回 image_gen_create），避免对话卡住
       if (!approve && App.notifyTaskDeclined) App.notifyTaskDeclined();
     }).catch(() => {
+      clearTimeout(timer);
       if (hintEl) hintEl.textContent = '⚠️ 提交失败，请检查服务器。';
     });
   };
@@ -1326,9 +1336,11 @@ if (hintEl) hintEl.textContent = '角色「' + ((App.rcRoleName && App.rcRoleNam
   (function bindHarnessUI() {
     const confirmBtn = document.getElementById('harness-approve-btn');
     const cancelBtn = document.getElementById('harness-cancel-btn');
+    const alwaysBtn = document.getElementById('harness-always-btn');
     const closeBtn = document.getElementById('harness-modal-close');
     const backdrop = document.querySelector('#harness-modal .modal-backdrop');
-    if (confirmBtn) confirmBtn.addEventListener('click', () => App.harnessApprove(true));
+    if (confirmBtn) confirmBtn.addEventListener('click', () => App.harnessApprove(true, false));
+    if (alwaysBtn) alwaysBtn.addEventListener('click', () => App.harnessApprove(true, true));
     if (cancelBtn) cancelBtn.addEventListener('click', () => {
       // 取消/关闭二合一：pending→拒绝；running→中断；done/error→关闭
       if (App.harnessRequestId && (App._harnessPolling || App.harnessStatus === 'running')) {

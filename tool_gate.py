@@ -21,10 +21,68 @@ import hashlib
 import json
 import logging
 import re
+import time
+from pathlib import Path
 from typing import Any, Dict, FrozenSet, Tuple
 
 logger = logging.getLogger("tool_gate")
 
+BASE_DIR = Path(__file__).parent.resolve()
+_SETTINGS_PATH = BASE_DIR / "settings.json"
+
+
+def perm_key(tool_name: str, arguments: dict) -> str:
+    """永久白名单键：按『高危判定单元』而非签名——同一工具同一危险模式归一类。
+
+    用户点『总是允许』的语义是『这类操作以后别再问』，不是『这一次放行』：
+    rm -rf 的签名随参数变，但危险模式只有一个。三类：
+      tool:<名>      HIGHRISK_TOOLS 命中的整工具
+      shell:<i>      第 i 条危险 shell 模式（含 rm -rf / git push -f 等）
+      overwrite:<名> 带覆盖/强推参数的工具
+    未命中任何高危 → 返回空串（不需要永久白名单）。
+    """
+    if tool_name in HIGHRISK_TOOLS:
+        return f"tool:{tool_name}"
+    if tool_name in ("shell_run", "shell", "exec", "sh"):
+        cmd = _shell_arg(arguments)
+        for i, pat in enumerate(_HIGHRISK_SHELL_PATTERNS):
+            if pat.search(cmd):
+                return f"shell:{i}"
+    if tool_name == "code_create_file" and any(
+            bool(arguments.get(k)) for k in _OVERWRITE_ARGS):
+        return f"overwrite:{tool_name}"
+    return ""
+
+
+def load_permanent() -> dict:
+    """读 settings.json 的 tool_gate.permanent_allow；缺失/损坏返回 {}。"""
+    try:
+        with open(_SETTINGS_PATH, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        return dict((cfg.get("tool_gate") or {}).get("permanent_allow") or {})
+    except Exception as e:
+        logger.warning("永久白名单读取失败: %s", e)
+        return {}
+
+
+def save_permanent(key: str, tool_name: str, reason: str) -> bool:
+    """把一条永久白名单写进 settings.json（读改写，保留其它配置）。失败返回 False。"""
+    try:
+        with open(_SETTINGS_PATH, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        tg = cfg.setdefault("tool_gate", {})
+        allow = tg.setdefault("permanent_allow", {})
+        allow[key] = {
+            "tool": tool_name,
+            "reason": reason[:60],
+            "at": int(time.time()),
+        }
+        with open(_SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception as e:
+        logger.warning("永久白名单写入失败: %s (%s)", key, e)
+        return False
 # ---------- 高危工具：不可逆/越界/花钱/委派/自动执行 ----------
 # 判定依据（对应 agent 里的「该问不该问」）：
 #   ①动作不可逆（删除/覆盖/重启/发布）；②越出被点名范围；③代价差一个量级。
@@ -97,6 +155,7 @@ def evaluate(
     allowed: Any = None,
     denied: Any = None,
     pending: Any = None,
+    permanent: Any = None,
 ) -> Tuple[str, str, str]:
     """评估一次工具调用。
 
@@ -110,6 +169,11 @@ def evaluate(
         sig = signature(tool_name, arguments)
         if denied is not None and sig in denied:
             return "deny", "你已拒绝过这个操作", sig
+        if permanent is not None:
+            pk = perm_key(tool_name, arguments)
+            if pk and pk in permanent:
+                # 永久白名单：用户点过『总是允许』，整类操作直接放行
+                return "allow", "", sig
         if allowed is not None and sig in allowed:
             return "allow", "", sig
         if pending is not None and sig in pending:

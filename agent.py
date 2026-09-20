@@ -2832,6 +2832,14 @@ class AIAgent:
         self._gate_allowed: dict = {}   # 签名 -> 1（用户允许过的动作，重调直接放行）
         self._gate_denied: dict = {}    # 签名 -> 1（用户拒绝过的动作，重调直接拒）
         self._gate_pending: dict = {}   # 签名 -> 确认卡 request_id（未决确认，重调不重复弹卡）
+        self._gate_card_args: dict = {}  # 签名 -> (工具, 参数, 原因)：『总是允许』落盘回查用，confirm 后清理
+        # 永久白名单（settings.json -> tool_gate.permanent_allow，重启不丢）：
+        # 用户点『总是允许』→ 整类高危操作（按 perm_key 分桶）跨会话放行。
+        try:
+            from tool_gate import load_permanent
+            self._gate_permanent: dict = load_permanent()
+        except Exception:
+            self._gate_permanent: dict = {}
 
     async def initialize(self):
         """初始化 Agent：加载配置、加载技能工具、初始化记忆。"""
@@ -3632,7 +3640,8 @@ class AIAgent:
             from tool_gate import evaluate
             verdict, reason, sig = evaluate(
                 tool_name, arguments,
-                self._gate_allowed, self._gate_denied, self._gate_pending)
+                self._gate_allowed, self._gate_denied, self._gate_pending,
+                self._gate_permanent)
         except Exception as e:
             logger.warning(f"工具闸门评估失败，放行 {tool_name}: {e}")
             return None
@@ -3647,6 +3656,8 @@ class AIAgent:
                     f"你允许后我会继续执行，拒绝则不会。")
         rid = f"tool_gate:{uuid.uuid4().hex[:10]}"
         self._gate_pending[sig] = rid
+        # 缓存弹卡时的工具/参数/原因：用户点『总是允许』时按 perm_key 落盘用
+        self._gate_card_args[sig] = (tool_name, arguments, reason)
         await self._emit_gate_card(rid, tool_name, arguments, reason)
         return (f"⏳ 操作需你确认：{tool_name}——{reason}。"
                 f"确认卡片已弹出（编号 {rid}），你允许后我会继续执行，拒绝则不会。")
@@ -3664,23 +3675,54 @@ class AIAgent:
                     "task": f"工具「{tool_name}」{reason}\n参数：{args_preview}",
                     "require_confirm": True,
                     "task_id": rid,
+                    "always_opt": True,   # 确认卡显示『总是允许』第三选项
                 })
         except Exception:
             pass
 
-    def resolve_gate(self, request_id: str, approve: bool) -> bool:
+    def resolve_gate(self, request_id: str, approve: bool, always: bool = False) -> bool:
         """用户对确认卡做出决定：allow → 签名进白名单（同动作重调即放行）；
+        always → 额外写进永久白名单（settings.json，按 perm_key 整类跨会话放行）；
         deny → 签名进黑名单（同动作直接拒绝）。返回是否命中待决确认卡。"""
         for sig, rid in list(self._gate_pending.items()):
             if rid == request_id:
                 self._gate_pending.pop(sig, None)
-                if approve:
-                    self._gate_allowed[sig] = 1
-                else:
+                if not approve:
                     self._gate_denied[sig] = 1
-                logger.info(f"工具闸门: 用户{'允许' if approve else '拒绝'} 签名 {sig}")
+                    self._gate_card_args.pop(sig, None)
+                    logger.info(f"工具闸门: 用户拒绝 签名 {sig}")
+                    return True
+                if always:
+                    # 先落盘（_persist_gate_always 要读弹卡时缓存的参数），再清缓存
+                    self._persist_gate_always(sig)
+                self._gate_allowed[sig] = 1
+                self._gate_card_args.pop(sig, None)
+                logger.info(f"工具闸门: 用户允许 签名 {sig}"
+                            + (" + 永久白名单" if always else ""))
                 return True
         return False
+
+    def _persist_gate_always(self, sig: str) -> None:
+        """把一次『总是允许』落盘为永久白名单（按 perm_key 归类，跨会话放行）。"""
+        try:
+            from tool_gate import perm_key, save_permanent
+            # 回查待决确认卡里的工具与参数（弹卡时缓存过），失败则不落盘
+            entry = getattr(self, "_gate_card_args", {}).get(sig)
+            if not entry:
+                logger.warning("永久白名单: 找不到签名 %s 的弹卡参数，跳过落盘", sig)
+                return
+            tname, args, reason = entry
+            pk = perm_key(tname, args)
+            if not pk:
+                logger.warning("永久白名单: %s 无对应高危键，跳过落盘", tname)
+                return
+            if not save_permanent(pk, tname, reason):
+                logger.warning("永久白名单: 落盘失败 %s", pk)
+                return
+            self._gate_permanent[pk] = 1
+            logger.info("工具闸门: 永久允许 %s (%s)", pk, tname)
+        except Exception as e:
+            logger.warning("永久白名单: 写入异常 %s", e)
 
     def _tool_exec_config(self, tool_name: str = "") -> dict:
         """读取工具执行的超时与心跳配置（settings.json -> agent 段），失败用默认值。

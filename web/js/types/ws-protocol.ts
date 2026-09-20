@@ -148,7 +148,7 @@ export type ServerMessage =
   | { type: 'session_archived'; session_id?: string; archived?: boolean; active_changed?: boolean }
   | { type: 'error'; message?: string }
   | { type: 'restart_vad'; reason?: string }
-  | { type: 'bridge_confirm'; request_id?: string; task?: string }
+  | { type: 'bridge_confirm'; request_id?: string; task?: string; always_opt?: boolean }
   | BridgeStatusMessage
   | { type: 'bridge_say'; text?: string }
   | { type: 'task_event'; event?: any }

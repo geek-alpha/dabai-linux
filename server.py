@@ -2877,11 +2877,12 @@ except Exception:
 async def harness_bridge_confirm(payload: dict):
     request_id = str(payload.get("request_id") or "")
     approve = bool(payload.get("approve"))
+    always = bool(payload.get("always"))  # 工具确认卡第三选项『总是允许』
     if request_id.startswith("tool_gate:"):
-        # 工具级确认：写进 agent 闸门状态（白名单/黑名单）并广播收尾卡片
+        # 工具级确认：写进 agent 闸门状态（白名单/黑名单/永久白名单）并广播收尾卡片
         from agent import get_agent as _ga
         agent = await _ga()
-        if not agent.resolve_gate(request_id, approve):
+        if not agent.resolve_gate(request_id, approve, always=always):
             raise HTTPException(status_code=404, detail="确认请求不存在或已过期")
         # 允许 → running（已放行，模型下轮重试即执行）；拒绝 → cancelled（未执行）
         status = "running" if approve else "cancelled"
