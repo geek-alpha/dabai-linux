@@ -11,7 +11,7 @@
     python deploy/release/publish.py --tag-only                 # VERSION 已升好，只补推 tag
     python deploy/release/publish.py -m "改了啥" --no-tests     # 紧急跳过测试（会明确警告）
 
-六步，任何一步不过就停，不留半成品：
+七步，任何一步不过就停，不留半成品：
     ① 前置闸门   工作区 / 分支 / 是否落后远端 / VERSION 与最新 tag 是否对齐 / token
     ② 打包回验   build_release.py --bump（内含解包回验：sha256 全对、包内无受保护路径）
     ③ 跑测试     默认全量，不过就不发
