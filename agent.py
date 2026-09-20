@@ -2660,6 +2660,31 @@ def _harness_lessons_block(cap: int = 6) -> str:
         return ""
 
 
+def _harness_balance_block() -> str:
+    """资源账状态注入段：余额正常返回空串，只在见底时才说话。
+
+    常态下多一段提示词是纯噪音，还废前缀缓存。见底时必须说 —— 否则我会一直
+    撞闸门却不知道为什么，压力就变成了纯粹的失败。
+    """
+    try:
+        import peer_ledger as pl
+        q = pl.quota_mode()
+    except Exception:
+        return ""
+    if q.get("mode") != "low":
+        return ""
+    return (
+        "\n【资源账·低配额模式】" + str(q.get("reason") or "") + "。"
+        "余额来自真实 token 消耗（peer_ledger.py 的 append-only 账本，同伴可复核），"
+        "花完为止、不按天刷新。低配额下这些动作会被闸门直接拒掉：起子智能体"
+        "（delegate_agent_task / sub_agent_spawn / harness_flow_*）、定时任务（sched_add）、"
+        "跨机派活（peer_task）；读文件、查代码、算账照旧放行。"
+        "恢复额度只有两条路：主人调 peer_ledger.DEFAULT_ENDOWMENT，"
+        "或者等跨机 transfer 接入后靠替同伴干活挣 earn——省着用。\n"
+    )
+
+
+
 def _harness_longterm_block(cap: int = 3, cap_q: int = 3) -> str:
     """读长期事业台账，生成「未完成的事业」注入段；无进行中项目返回空串。
 
@@ -5157,6 +5182,9 @@ class AIAgent:
             _longterm_block = _harness_longterm_block()
             if _longterm_block:
                 messages.append({"role": "system", "content": _longterm_block})
+            _balance_block = _harness_balance_block()
+            if _balance_block:
+                messages.append({"role": "system", "content": _balance_block})
             _conviction_block = _harness_conviction_block()
             if _conviction_block:
                 messages.append({"role": "system", "content": _conviction_block})
@@ -5231,6 +5259,9 @@ class AIAgent:
             _longterm_block = _harness_longterm_block()
             if _longterm_block:
                 messages.append({"role": "system", "content": _longterm_block})
+            _balance_block = _harness_balance_block()
+            if _balance_block:
+                messages.append({"role": "system", "content": _balance_block})
             _conviction_block = _harness_conviction_block()
             if _conviction_block:
                 messages.append({"role": "system", "content": _conviction_block})

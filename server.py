@@ -47,6 +47,7 @@ import auth_core
 import email_verify
 import music_lib
 import peer_mesh
+import peer_ledger
 import peer_social
 import turn_quota
 import video_fav_lib
@@ -279,6 +280,9 @@ app = FastAPI(title="白头凤【BattlePhoenix】", lifespan=lifespan)
 app.include_router(peer_mesh.router)
 # 社会层：发现（gossip 名册）、朋友圈、动态。同一前缀，同样自验密钥。
 app.include_router(peer_social.router)
+# 资源账：把自己的 token 消耗记成 append-only 哈希链，同伴可拉取复核。
+# 也是「余额见底就接不了活」那个闸门的账本。
+app.include_router(peer_ledger.router)
 
 # 静态资源缓存分级（首屏/刷新性能关键）。
 # 之前对 /static 一律 no-store：模型 24MB、vendor 库、87 个 .ts 模块每次刷新全量重下

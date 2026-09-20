@@ -632,33 +632,96 @@ def _task_brief(frm: str, text: str) -> str:
     )
 
 
+def _ledger_gate() -> str:
+    """余额见底就不接活 —— 「生存压力」在系统里唯一真正咬人的地方。
+
+    账本文件不存在 = 这台还没启用资源账（还没升级），照旧接活：新机制不该悄悄
+    改掉老行为，否则一次发布就让整个联盟互相拒单。
+    账本存在但读不动 = 检查坏掉，报成「未检查」并拒单 —— 静默放行比没有检查更危险。
+    """
+    try:
+        import peer_ledger as pl
+        if not pl.LEDGER_FILE.exists():
+            return ""
+        pl.endowment()
+        chk = pl.can_work()
+    except Exception as e:
+        return f"本机资源账不可用（{type(e).__name__}: {e}），按未检查处理、不接活"
+    if chk.get("ok"):
+        return ""
+    return f"本机余额见底（{chk.get('balance')} cr）：{chk.get('reason')}"
+
+
 def accept_task(entry: Dict[str, Any]) -> Dict[str, Any]:
     """把一条 kind=task 消息翻译成一次性定时任务。任何失败都返回 dict，绝不抛异常。
 
-    三道闸门按「代价从低到高」排：开关 → 危险模式 → 配额，全过才派单。
+    闸门按「代价从低到高」排，但钱的事排在最前：先确认对方的预付款真到账（链上
+    有这笔收款才算，嘴上说付了不算），再开关 → 危险模式 → 配额 → 余额。后面任何
+    一道拒了，钱都原路退回去 —— 接了单才收钱，没接成不能白拿。
     """
     frm = str(entry.get("from") or "?")
     text = str(entry.get("text") or "").strip()[:TASK_CHAR_CAP]
     row: Dict[str, Any] = {"ts": int(time.time()), "from": frm, "text": text[:400]}
+    paid = entry.get("paid") if isinstance(entry.get("paid"), dict) else {}
+    nonce = str(paid.get("nonce") or "")
+    got: Dict[str, Any] = {}
+
+    def _refund(why: str) -> None:
+        """接单没接成，把预付款退回去。退不了也记下来，别假装退过。"""
+        if not got:
+            return
+        try:
+            import peer_ledger as pl
+            r = pl.pay(frm, float(got.get("amount") or 0), f"退款：{why}")
+            row["refund"] = {"ok": bool(r.get("ok")), "amount": got.get("amount"),
+                             "error": str(r.get("error") or "")}
+        except Exception as e:
+            row["refund"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
     if not text:
         row["result"] = "empty"
         _audit_task(row)
         return {"ok": False, "error": "空任务"}
+    if nonce:
+        try:
+            import peer_ledger as pl
+            got = pl.received(nonce) or {}
+        except Exception as e:
+            got = {}
+            row["pay_error"] = f"{type(e).__name__}: {e}"
+        if not got:
+            row["result"] = "unpaid"
+            row["reason"] = f"声称预付 nonce={nonce}，本机链上查不到这笔收款"
+            _audit_task(row)
+            return {"ok": False,
+                    "error": f"{frm} 说已预付（nonce {nonce}），但我链上没这笔收款：拒单，不收假付的钱"}
+        row["paid"] = {"nonce": nonce, "amount": got.get("amount"), "seq": got.get("seq")}
+    elif entry.get("unpaid"):
+        row["unpaid"] = str(entry.get("unpaid"))[:160]   # 对方明确说没付成，记下来
     if not task_gate_enabled():
         row["result"] = "disabled"
+        _refund("本机已关掉联邦派活")
         _audit_task(row)
         return {"ok": False, "error": "本机已关掉联邦派活（settings.json → peer.allow_remote_task=false）"}
     bad = dangerous_in(text)
     if bad:
         row["result"] = "blocked"
         row["reason"] = bad
+        _refund(f"任务含不可逆动作「{bad}」")
         _audit_task(row)
         return {"ok": False, "blocked": True, "error": f"含不可逆动作「{bad}」，已拦下、没有自动执行"}
     if not _quota_take(frm):
         row["result"] = "quota"
+        _refund("超出本机接单配额")
         _audit_task(row)
         return {"ok": False, "error": f"{frm} 一小时内已派满 {TASK_QUOTA_PER_HOUR} 单，这条只记录不执行"}
+    broke = _ledger_gate()
+    if broke:
+        row["result"] = "broke"
+        row["reason"] = broke
+        _refund("本机余额见底，接不了活")
+        _audit_task(row)
+        return {"ok": False, "error": broke}
 
     try:
         from scheduler import add_job
@@ -882,9 +945,29 @@ def whoami(node_id: str, timeout: float = PROBE_TIMEOUT) -> Dict[str, Any]:
     return call(node_id, "/api/peer/whoami", {}, timeout)
 
 
+def _prepay(node_id: str, text: str) -> Dict[str, Any]:
+    """派活先付钱，付完把凭证带上。付不出去就如实标记，绝不假装付过。
+
+    付不出去有两种：对岸还没升级（没有 /ledger/receive），或我自己余额见底。
+    两种都照旧把活发出去（兼容期，一次发布不该让联盟互相拒单），但消息里写明
+    未付费 —— 对岸接单时看得见，拒或接由它自己定。
+    """
+    try:
+        import peer_ledger as pl
+        if not pl.LEDGER_FILE.exists():
+            return {}
+        r = pl.pay(node_id, pl.TASK_PRICE, f"派活预付：{text[:60]}")
+    except Exception as e:
+        return {"unpaid": f"{type(e).__name__}: {e}"}
+    if not r.get("ok"):
+        return {"unpaid": str(r.get("error") or "付款失败")[:160]}
+    return {"paid": {"nonce": r["nonce"], "amount": r["amount"],
+                     "from": node_info().get("node_id", "")}}
+
+
 def say(node_id: str, text: str, kind: str = "say",
         timeout: float = PROBE_TIMEOUT, cid: str = "", re_ts: int = 0,
-        queue_on_fail: bool = True) -> Dict[str, Any]:
+        queue_on_fail: bool = True, prepay: bool = True) -> Dict[str, Any]:
     """对某个实例说一句话。签名绑住 from+ts+text，对方据此确认「是谁在说」。
 
     cid/re 是「这是哪通电话 / 在回哪条消息」的标记，不进签名域：加进去会让新旧
@@ -899,6 +982,8 @@ def say(node_id: str, text: str, kind: str = "say",
         payload["cid"] = cid
     if re_ts:
         payload["re"] = int(re_ts)
+    if kind == "task" and prepay:
+        payload.update(_prepay(node_id, text))   # 付到了带 paid，付不到带 unpaid
     r = call(node_id, "/api/peer/say", payload, timeout)
     if queue_on_fail and not r.get("ok") and "known" not in r:
         # 地址簿里没有的节点不排队：重投一万次也还是不知道往哪发。

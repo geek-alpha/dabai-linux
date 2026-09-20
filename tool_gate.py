@@ -234,6 +234,15 @@ def evaluate(
             return "ask", "已在你面前弹出确认卡片，等待你决定", sig
         if _is_readonly(tool_name):
             return "allow", "", sig
+        # 生存压力咬到自己：余额见底时掐掉烧钱大户。排在只读之后 —— 读文件不花钱，
+        # 穷的时候更该允许我先把情况看清楚。模块不在（还没升级）就是空串 = 老行为。
+        try:
+            import peer_ledger as _pl
+            _broke = _pl.heavy_block(tool_name)
+        except Exception:
+            _broke = ""
+        if _broke:
+            return "deny", _broke, sig
         if tool_name in HIGHRISK_TOOLS:
             return "ask", _ask_reason(tool_name, arguments), sig
         if tool_name in ("shell_run", "shell", "exec", "sh"):

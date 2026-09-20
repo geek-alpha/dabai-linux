@@ -88,8 +88,18 @@ def set_self_url(url: str) -> Dict[str, Any]:
     return {"ok": True, "node_id": info.get("node_id"), "url": info["url"]}
 
 
+def _ledger_brief() -> Dict[str, Any]:
+    """我的账本摘要，跟着名片走。同伴存下来就是一份「我在这个时刻的账本承诺」——
+    以后我想偷改历史，得先过他们手里那份旧链头这关。账本坏掉时返回空，不假装有。"""
+    try:
+        import peer_ledger as pl
+        return pl.summary()
+    except Exception:
+        return {}
+
+
 def my_card() -> Dict[str, Any]:
-    """我这张名片：别人拿到它就知道我是谁、在哪、在关心谁。"""
+    """我这张名片：别人拿到它就知道我是谁、在哪、在关心谁、还剩多少家底。"""
     info = pm.node_info(create=False)
     return {
         "node_id": info.get("node_id", ""),
@@ -97,6 +107,7 @@ def my_card() -> Dict[str, Any]:
         "url": self_url(),
         "ts": _now(),
         "friends": sorted(friends().keys()),
+        "ledger": _ledger_brief(),
     }
 
 
@@ -141,9 +152,12 @@ def merge_roster(items: Any, via: str = "", hops: int = 0) -> Dict[str, int]:
     me = pm.node_info(create=False).get("node_id")
     nodes = roster(prune=False)
     now = _now()
+    cards: List[Dict[str, Any]] = []
     for it in items[:ROSTER_MAX]:
         if not isinstance(it, dict):
             continue
+        if isinstance(it.get("ledger"), dict):
+            cards.append(it)          # 每张名册条目就是一张名片，顺手把它的账本链头存下来
         nid = str(it.get("node_id") or "").strip()
         url = str(it.get("url") or "").strip().rstrip("/")
         if not nid or nid == me:
@@ -171,6 +185,12 @@ def merge_roster(items: Any, via: str = "", hops: int = 0) -> Dict[str, int]:
         nodes = dict(keep)
     _write_roster(nodes)
     _promote_to_peers(nodes)
+    if cards:
+        try:
+            import peer_ledger as pl
+            pl.remember_heads(cards, via=via)
+        except Exception:
+            pass          # 账本摘要只是附加信息，存不下不该阻断名册交换
     return {"added": added, "updated": updated, "skipped": skipped}
 
 
