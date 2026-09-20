@@ -18,6 +18,7 @@
     ④ 提交       VERSION（或 --commit-all 时的全部改动）并 push main
     ⑤ 打 tag     推 tag —— 这一步触发 CI
     ⑥ 盯落地     watch_release.py 轮询到 release 资产齐全才返回 0
+    ⑦ 通知联邦   给地址簿里其它实例留言「新版可拉」（只在 ⑥ 成功后才发）
 
 为什么推了 tag 还不等于发布：
     真正的 release 由 CI 的 publish 作业创建，而它挂在 environment: release 的
@@ -278,6 +279,50 @@ def do_watch(ver: str, timeout: int) -> int:
     return subprocess.run(cmd, cwd=str(ROOT)).returncode
 
 
+def _peer_nodes() -> list:
+    """地址簿里的同伴，剔除自己。读不到就返回空 —— 通知不是发布的必要环节。"""
+    try:
+        nodes = json.loads((ROOT / "data" / "peers.json").read_text(encoding="utf-8"))
+        me = json.loads((ROOT / "data" / "node.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    mine = (me or {}).get("node_id", "")
+    return [n for n in sorted((nodes or {}).get("nodes", {})) if n != mine]
+
+
+def do_notify(ver: str) -> dict:
+    """给其它实例留言。任何失败都只警告 —— 包已经发出去了，通知失败不能改成发布失败。
+
+    为什么只在 ⑥ 成功后才发：tag 推完不等于 release 建出来了（CI 要管理员 Approve）。
+    提前喊「可以拉」会让对面去拉一个还不存在的资产，比不通知更坏。
+    """
+    _p("⑦ 通知联邦其它实例")
+    nodes = _peer_nodes()
+    if not nodes:
+        warn("地址簿里没有别的实例（data/peers.json），跳过")
+        return {"notified": [], "failed": []}
+
+    text = (f"v{ver} 已发布：dabai-{ver}.tar.gz + .sha256 资产齐全，可以拉。"
+            f"更新命令：python deploy/release/update.py")
+    sent, failed = [], []
+    for n in nodes:
+        cmd = [_python(), str(ROOT / "peer_mesh.py"), "say", n, text]
+        try:
+            p = _run(cmd, timeout=30)
+        except subprocess.TimeoutExpired:
+            failed.append(n)
+            warn(f"{n}：留言超时 30s（对方可能离线，不影响发布）")
+            continue
+        if p.returncode == 0:
+            sent.append(n)
+            ok(f"{n}：已留言")
+        else:
+            failed.append(n)
+            last = ((p.stdout or "") + (p.stderr or "")).strip().splitlines()
+            warn(f"{n}：留言失败 —— {last[-1] if last else '无输出'}")
+    return {"notified": sent, "failed": failed}
+
+
 def do_log(entry: dict) -> None:
     try:
         RELEASE_LOG.parent.mkdir(parents=True, exist_ok=True)
@@ -307,6 +352,7 @@ def main() -> int:
                     help="把当前未提交改动一起提交（默认拒绝脏工作区）")
     ap.add_argument("--no-tests", action="store_true", help="跳过测试（不推荐）")
     ap.add_argument("--no-watch", action="store_true", help="不盯 CI 落地，推完就返回")
+    ap.add_argument("--no-notify", action="store_true", help="不通知联邦其它实例")
     ap.add_argument("--tests-timeout", type=int, default=1800, help="测试超时秒数（默认 1800）")
     ap.add_argument("--watch-timeout", type=int, default=1800, help="盯落地超时秒数（默认 1800）")
     ap.add_argument("--branch", default=BRANCH_DEFAULT, help=f"发布分支（默认 {BRANCH_DEFAULT}）")
@@ -367,6 +413,25 @@ def main() -> int:
             _p("⑥ 已跳过盯落地（--no-watch）")
         else:
             rc = do_watch(ver, args.watch_timeout)
+
+        note = {"notified": [], "failed": []}
+        if rc != 0:
+            _p("⑦ 不通知联邦：release 还没落地")
+            _p("   （等 CI 跑完/点了 Approve 之后，重跑 watch_release.py 确认，再手工通知）")
+        elif args.no_notify:
+            _p("⑦ 已跳过联邦通知（--no-notify）")
+        else:
+            note = do_notify(ver)
+
+        do_log({
+            "phase": "outcome",
+            "version": ver,
+            "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "watch_rc": rc,
+            "notified": note["notified"],
+            "notify_failed": note["failed"],
+            "seconds": round(time.time() - t0, 1),
+        })
 
         _p()
         if rc == 0:

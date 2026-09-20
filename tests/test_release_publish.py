@@ -9,8 +9,10 @@
 import argparse
 import base64
 import importlib.util
+import json
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -267,3 +269,110 @@ def test_wait_run_returns_immediately_on_hit(monkeypatch):
     run, err = watch.wait_run("o/r", "abc", "tok", window=30, interval=5)
     assert run == {"id": 7}
     assert len(calls) == 1
+
+
+# --- ⑦ 联邦通知：包已经发出去了，通知失败不能变成发布失败 ---
+#
+# 通知只有两种错法值得防：一是把「没通知到」当成发布失败（包都发了，报错吓人），
+# 二是 release 还没落地就喊「可以拉」——对面会去拉一个不存在的资产，比不通知更坏。
+
+def _wire_peers(monkeypatch, tmp_path, nodes, me="aliyun"):
+    (tmp_path / "data").mkdir(exist_ok=True)
+    if nodes is not None:
+        (tmp_path / "data" / "peers.json").write_text(
+            json.dumps({"nodes": {n: {"url": f"https://{n}.x"} for n in nodes}}),
+            encoding="utf-8")
+    (tmp_path / "data" / "node.json").write_text(
+        json.dumps({"node_id": me, "label": me}), encoding="utf-8")
+    monkeypatch.setattr(publish, "ROOT", tmp_path)
+
+
+def test_peer_nodes_excludes_self(monkeypatch, tmp_path):
+    """地址簿里万一写了自己，不能给自己发留言 —— 那是自问自答的无限循环入口。"""
+    _wire_peers(monkeypatch, tmp_path, ["aliyun", "rpi", "wsl"])
+    assert publish._peer_nodes() == ["rpi", "wsl"]
+
+
+def test_peer_nodes_empty_when_address_book_missing(monkeypatch, tmp_path):
+    _wire_peers(monkeypatch, tmp_path, None)
+    assert publish._peer_nodes() == []
+
+
+def test_notify_says_to_each_peer(monkeypatch, tmp_path):
+    _wire_peers(monkeypatch, tmp_path, ["rpi", "wsl"])
+    seen = []
+
+    def fake_run(cmd, timeout=None, env=None):
+        seen.append((cmd, timeout))
+        return _cp('{"ok": true}')
+
+    monkeypatch.setattr(publish, "_run", fake_run)
+    r = publish.do_notify("1.0.11")
+
+    assert r == {"notified": ["rpi", "wsl"], "failed": []}
+    assert [c[0][2] for c in seen] == ["say", "say"]
+    assert [c[0][3] for c in seen] == ["rpi", "wsl"]
+    assert all(c[0][1].endswith("peer_mesh.py") for c in seen)
+    assert "1.0.11" in seen[0][0][4] and "update.py" in seen[0][0][4]
+
+
+def test_notify_reports_failure_without_raising(monkeypatch, tmp_path):
+    """对面离线时退出码非 0 —— 必须只警告并继续，不能把已完成的发布判成失败。"""
+    _wire_peers(monkeypatch, tmp_path, ["rpi", "wsl"])
+
+    def fake_run(cmd, timeout=None, env=None):
+        return _cp("打不通：unreachable", returncode=1) if cmd[3] == "rpi" else _cp("{}")
+
+    monkeypatch.setattr(publish, "_run", fake_run)
+    r = publish.do_notify("1.0.11")
+    assert r == {"notified": ["wsl"], "failed": ["rpi"]}
+
+
+def test_notify_timeout_is_not_fatal(monkeypatch, tmp_path):
+    _wire_peers(monkeypatch, tmp_path, ["rpi"])
+
+    def fake_run(cmd, timeout=None, env=None):
+        raise subprocess.TimeoutExpired(cmd, timeout or 30)
+
+    monkeypatch.setattr(publish, "_run", fake_run)
+    assert publish.do_notify("1.0.11") == {"notified": [], "failed": ["rpi"]}
+
+
+def _wire_main(monkeypatch, watch_rc):
+    """把 main 的六步全换成桩，只观察 ⑦ 在什么条件下被调。"""
+    calls = {"notify": []}
+    monkeypatch.setattr(publish, "read_token", lambda *a, **k: "tok")
+    monkeypatch.setattr(publish, "preflight", lambda a, t: {
+        "version": "1.0.11", "branch": "main", "dirty": [], "ahead": 1})
+    monkeypatch.setattr(publish, "do_build", lambda part: "1.0.11")
+    monkeypatch.setattr(publish, "do_tests", lambda t: None)
+    monkeypatch.setattr(publish, "do_commit", lambda *a: None)
+    monkeypatch.setattr(publish, "do_push", lambda *a: None)
+    monkeypatch.setattr(publish, "do_log", lambda e: None)
+    monkeypatch.setattr(publish, "do_watch", lambda v, t: watch_rc)
+    monkeypatch.setattr(publish, "do_notify",
+                        lambda ver: (calls["notify"].append(ver), {"notified": [], "failed": []})[1])
+    monkeypatch.setattr(publish, "git", _FakeGit({"rev-parse HEAD": _cp("abc123\n")}))
+    return calls
+
+
+def test_main_notifies_only_after_release_lands(monkeypatch):
+    calls = _wire_main(monkeypatch, watch_rc=0)
+    monkeypatch.setattr(sys, "argv", ["publish.py", "-m", "test"])
+    assert publish.main() == 0
+    assert calls["notify"] == ["1.0.11"]
+
+
+def test_main_skips_notify_when_watch_failed(monkeypatch):
+    """盯落地没成功 = release 还没建出来。这时喊「可以拉」会让对面去拉空资产。"""
+    calls = _wire_main(monkeypatch, watch_rc=2)
+    monkeypatch.setattr(sys, "argv", ["publish.py", "-m", "test"])
+    assert publish.main() == 2
+    assert calls["notify"] == []
+
+
+def test_main_no_notify_flag(monkeypatch):
+    calls = _wire_main(monkeypatch, watch_rc=0)
+    monkeypatch.setattr(sys, "argv", ["publish.py", "-m", "test", "--no-notify"])
+    assert publish.main() == 0
+    assert calls["notify"] == []

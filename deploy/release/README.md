@@ -66,7 +66,7 @@ git push origin v1.0.0     推 v* tag（或网页上手动 dispatch）
 python deploy/release/publish.py -m "这次改了什么"
 ```
 
-它把六步串成一条命令，任何一步不过就停、不留半成品：
+它把七步串成一条命令，任何一步不过就停、不留半成品：
 
 | 步 | 做什么 | 不过怎么办 |
 |---|---|---|
@@ -76,6 +76,11 @@ python deploy/release/publish.py -m "这次改了什么"
 | ④ | 提交 VERSION 并 push main | 拒绝 |
 | ⑤ | 打 tag 并 push（触发 CI） | 拒绝，tag 留在本地 |
 | ⑥ | `watch_release.py` 盯到资产齐全 | 给退出码，可单独重盯 |
+| ⑦ | 给地址簿里其它实例留言「新版可拉」 | 只警告，不影响发布 |
+
+⑦ 只在 ⑥ 成功后才发：tag 推完不等于 release 建出来了（CI 要管理员 Approve），
+提前喊「可以拉」会让对面去拉一个还不存在的资产。通知走 `peer_mesh.py say`，
+任一实例离线只警告不失败 —— 包已经发出去了，通知失败不该改成发布失败。
 
 常用变体：
 
@@ -85,6 +90,7 @@ python deploy/release/publish.py --dry-run -m "..."      # 走到打包+测试�
 python deploy/release/publish.py --bump minor -m "..."   # 升 minor 位
 python deploy/release/publish.py -m "..." --commit-all   # 连未提交改动一起提
 python deploy/release/publish.py --tag-only              # VERSION 已升好，只补推 tag
+python deploy/release/publish.py -m "..." --no-notify    # 不通知联邦其它实例
 ```
 
 手工等价于下面四步 —— 手工做容易漏：漏 `--bump` 会拿旧版本号打包（CI 那条 tag
