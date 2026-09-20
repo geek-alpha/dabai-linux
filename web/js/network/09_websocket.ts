@@ -615,8 +615,8 @@ export default (function init(App: AppKernel) {
         });
         break;
       case 'bridge_confirm':
-        // 角色请求了 AI 助手（DSH）执行任务 → 弹出确认卡片
-        App.showHarnessConfirm(msg.request_id, msg.task);
+        // 角色请求了 AI 助手（DSH）执行任务 / 想中途问你一个问题 → 弹卡片
+        App.showHarnessConfirm(msg.request_id, msg.task, msg.options);
         break;
       case 'bridge_status':
         if (App.updateHarnessStatus) App.updateHarnessStatus(msg);
@@ -1190,31 +1190,75 @@ export default (function init(App: AppKernel) {
   App.harnessRequestId = null;
   App._harnessPollTimer = null;
   App._harnessPolling = false;
+  App.harnessAskMode = false;
 
-  /** 弹出 AI 助手任务确认卡片（bridge_confirm 触发） */
-  App.showHarnessConfirm = function showHarnessConfirm(requestId, task) {
+  /** 渲染提问卡的选项按钮（点一下即作答） */
+  function renderHarnessOptions(options) {
+    const el = document.getElementById('harness-options');
+    if (!el) return;
+    el.innerHTML = '';
+    const list = Array.isArray(options) ? options : [];
+    if (!list.length) { el.style.display = 'none'; return; }
+    list.forEach((opt) => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'harness-opt-btn';
+      btn.textContent = String(opt);
+      btn.addEventListener('click', () => App.harnessAnswer(String(opt)));
+      el.appendChild(btn);
+    });
+    el.style.display = '';
+  }
+
+  /** 弹出卡片（bridge_confirm 触发）。request_id 前缀决定语义：
+   *  ask_user:  → 提问卡（问题+选项，等一个答案，答完模型继续）
+   *  tool_gate: → 工具确认卡（允许一次 / 总是允许 / 拒绝）
+   *  其余       → 任务确认卡（DSH 执行任务前的人工闸门） */
+  App.showHarnessConfirm = function showHarnessConfirm(requestId, task, options) {
     const modal = document.getElementById('harness-modal');
     if (!modal) return;
     const taskEl = modal.querySelector('.harness-task');
     const replyEl = document.getElementById('harness-reply');
-    const actionsEl = document.getElementById('harness-actions');
     const hintEl = document.getElementById('harness-hint');
-    if (taskEl) taskEl.textContent = task || '（空任务）';
-    if (replyEl) { replyEl.style.display = 'none'; replyEl.textContent = ''; }
-    if (hintEl) hintEl.textContent = '角色「' + ((App.rcRoleName && App.rcRoleName.value) || '大白') + '」想请 AI 助手执行上面的任务，确认后才会真正动手，你也可以直接关闭拒绝。';
+    const optionsEl = document.getElementById('harness-options');
+    const answerRow = document.getElementById('harness-answer-row');
     const cancelBtn = document.getElementById('harness-cancel-btn');
     const approveBtn = document.getElementById('harness-approve-btn');
     const alwaysBtn = document.getElementById('harness-always-btn');
-    cancelBtn.textContent = '拒绝';
-    approveBtn.textContent = '确认执行';
-    // 工具级确认卡（tool_gate: 前缀）才显示『总是允许』；任务卡不显示
-    const isToolGate = typeof requestId === 'string' && requestId.indexOf('tool_gate:') === 0;
-    if (alwaysBtn) alwaysBtn.style.display = isToolGate ? '' : 'none';
-    if (isToolGate) approveBtn.textContent = '允许一次';
-    approveBtn.style.display = '';
-    cancelBtn.style.display = '';
+    const rid = typeof requestId === 'string' ? requestId : '';
+    const isAsk = rid.indexOf('ask_user:') === 0;
+    const isToolGate = rid.indexOf('tool_gate:') === 0;
+    App.harnessAskMode = isAsk;
+    if (taskEl) taskEl.textContent = task || '（空任务）';
+    if (replyEl) { replyEl.style.display = 'none'; replyEl.textContent = ''; }
     modal.style.display = 'flex';
     App.harnessRequestId = requestId;
+    if (isAsk) {
+      // 提问卡没有任务可轮询，等的是一个答案；空输入行永远留着（自由回答）
+      App._harnessPolling = false;
+      if (hintEl) hintEl.textContent = '大白在等你回答这个问题，答完它会带着答案继续干活；跳过它就会按默认继续。';
+      cancelBtn.textContent = '跳过';
+      cancelBtn.style.display = '';
+      approveBtn.style.display = 'none';
+      if (alwaysBtn) alwaysBtn.style.display = 'none';
+      renderHarnessOptions(options);
+      if (answerRow) answerRow.style.display = '';
+      const input = document.getElementById('harness-answer-input');
+      if (input) {
+        input.value = '';
+        setTimeout(() => { try { input.focus(); } catch (e) { /* 移动端可能拒绝聚焦 */ } }, 60);
+      }
+      return;
+    }
+    if (optionsEl) { optionsEl.style.display = 'none'; optionsEl.innerHTML = ''; }
+    if (answerRow) answerRow.style.display = 'none';
+    if (hintEl) hintEl.textContent = '角色「' + ((App.rcRoleName && App.rcRoleName.value) || '大白') + '」想请 AI 助手执行上面的任务，确认后才会真正动手，你也可以直接关闭拒绝。';
+    cancelBtn.textContent = '拒绝';
+    approveBtn.textContent = isToolGate ? '允许一次' : '确认执行';
+    // 工具级确认卡（tool_gate: 前缀）才显示『总是允许』；任务卡不显示
+    if (alwaysBtn) alwaysBtn.style.display = isToolGate ? '' : 'none';
+    approveBtn.style.display = '';
+    cancelBtn.style.display = '';
     App._harnessPolling = true;
     App.harnessPoll();
   };
@@ -1311,8 +1355,24 @@ export default (function init(App: AppKernel) {
     });
   };
 
+  /** 提交提问卡的答案（value 为空 = 跳过，让模型按默认继续，不干等超时） */
+  App.harnessAnswer = function harnessAnswer(value) {
+    const rid = App.harnessRequestId;
+    if (!rid || !App.harnessAskMode) return;
+    App.harnessAskMode = false;
+    const hintEl = document.getElementById('harness-hint');
+    if (hintEl) hintEl.textContent = value ? '已回复，大白继续干活…' : '已跳过，大白按默认继续…';
+    App.harnessClose();
+    fetch('/api/bridge/confirm', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ request_id: rid, value: String(value || '') })
+    }).catch(() => { /* 离线/失败：模型侧会走超时说明，不阻塞界面 */ });
+  };
+
   /** 关闭确认卡片 */
   App.harnessClose = function harnessClose() {
+    App.harnessAskMode = false;
     App._harnessPolling = false;
     if (App._harnessPollTimer) { clearTimeout(App._harnessPollTimer); App._harnessPollTimer = null; }
     App.harnessRequestId = null;
@@ -1339,9 +1399,22 @@ export default (function init(App: AppKernel) {
     const alwaysBtn = document.getElementById('harness-always-btn');
     const closeBtn = document.getElementById('harness-modal-close');
     const backdrop = document.querySelector('#harness-modal .modal-backdrop');
+    const answerInput = document.getElementById('harness-answer-input');
+    const answerSend = document.getElementById('harness-answer-send');
+    const submitAnswer = () => {
+      const v = answerInput ? String(answerInput.value || '').trim() : '';
+      if (!v) return;
+      App.harnessAnswer(v);
+    };
+    if (answerSend) answerSend.addEventListener('click', submitAnswer);
+    if (answerInput) answerInput.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') { ev.preventDefault(); submitAnswer(); }
+    });
     if (confirmBtn) confirmBtn.addEventListener('click', () => App.harnessApprove(true, false));
     if (alwaysBtn) alwaysBtn.addEventListener('click', () => App.harnessApprove(true, true));
     if (cancelBtn) cancelBtn.addEventListener('click', () => {
+      // 提问卡：取消 = 跳过（模型按默认继续，不干等超时）
+      if (App.harnessAskMode) { App.harnessAnswer(''); return; }
       // 取消/关闭二合一：pending→拒绝；running→中断；done/error→关闭
       if (App.harnessRequestId && (App._harnessPolling || App.harnessStatus === 'running')) {
         const wasPolling = App._harnessPolling;
@@ -1356,8 +1429,13 @@ export default (function init(App: AppKernel) {
         App.harnessClose();
       }
     });
-    if (closeBtn) closeBtn.addEventListener('click', App.harnessClose);
-    if (backdrop) backdrop.addEventListener('click', App.harnessClose);
+    const dismiss = () => {
+      // 提问卡：关闭即跳过（否则模型要干等到超时）
+      if (App.harnessAskMode) { App.harnessAnswer(''); return; }
+      App.harnessClose();
+    };
+    if (closeBtn) closeBtn.addEventListener('click', dismiss);
+    if (backdrop) backdrop.addEventListener('click', dismiss);
   })();
 
   /* ============================================================

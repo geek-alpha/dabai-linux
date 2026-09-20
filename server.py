@@ -2860,15 +2860,29 @@ async def harness_bridge_info():
 # 函数体内 manager 是延迟解析：运行时已定义（4744 行），定义顺序无碍。
 
 
-async def _gate_broadcast_safe(ev: dict) -> None:
-    """工具确认卡广播到所有已连接前端（复用 harness-modal 确认卡 UI）。"""
+async def _gate_broadcast_safe(ev: dict) -> int:
+    """工具确认卡广播到所有已连接前端（复用 harness-modal 确认卡 UI）。
+
+    返回送达的在线前端数——提问卡靠它判断「有没有人能看到」：
+    0 表示无人在线，工具立刻返回说明而不是干等超时。
+    """
+    n = 0
     for ws in list(manager.active):
         await safe_send_json(ws, ev)
+        n += 1
+    return n
 
 
 try:
     from agent import set_gate_broadcast
     set_gate_broadcast(_gate_broadcast_safe)
+except Exception:
+    pass
+
+try:
+    # 提问卡复用同一条通道（bridge_confirm + harness-modal），只是语义不同
+    import ask_user as _ask_user
+    _ask_user.set_broadcast(_gate_broadcast_safe)
 except Exception:
     pass
 
@@ -2894,6 +2908,12 @@ async def harness_bridge_confirm(payload: dict):
     request_id = str(payload.get("request_id") or "")
     approve = bool(payload.get("approve"))
     always = bool(payload.get("always"))  # 工具确认卡第三选项『总是允许』
+    if request_id.startswith("ask_user:"):
+        # 提问卡：把用户的选项/文字回填给挂起等待的工具（value 为空 = 跳过）
+        import ask_user as _ask_user
+        if not _ask_user.resolve(request_id, str(payload.get("value") or "")):
+            raise HTTPException(status_code=404, detail="提问卡不存在或已过期")
+        return {"ok": True, "request_id": request_id, "status": "answered"}
     if request_id.startswith("tool_gate:"):
         # 工具级确认：写进 agent 闸门状态（白名单/黑名单/永久白名单）并广播收尾卡片
         from agent import get_agent as _ga

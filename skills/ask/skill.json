@@ -1,0 +1,38 @@
+{
+  "name": "ask",
+  "title": "中途问用户（等答案）",
+  "version": "1.0.0",
+  "description": "把「需要用户拍板」的问题弹成卡片并原地等答案：用户点选选项或打字后，答案作为工具结果返回，模型带着答案继续同一轮。",
+  "author": "dabai",
+  "enabled": true,
+  "disclosure": "full",
+  "prompt": "【技能 中途问用户】遇到「查不到、只能用户拍板」的偏好/取舍时用 request_user_input：问题 + 2-4 个互斥选项（推荐项放第一个），工具会挂起等你回答，答案直接回到模型手里继续干活。能从代码/配置/系统里查到的事实绝不许拿去问用户；用户跳过或超时会返回说明，别重复提问，按默认继续并说明你选了哪个默认。",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "request_user_input",
+        "description": "中途问用户并原地等答案：把问题+选项弹成卡片，用户点选或打字后答案作为本工具结果返回，你可以带着答案继续同一轮工作（不用重试、不用重述上下文）。只在「查不到、必须用户拍板」的偏好/取舍上问；能从代码/配置/系统查到的事实不许问。用户跳过或超时会返回说明，别重复提问，按默认继续并说明你选了哪个默认。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "question": {
+              "type": "string",
+              "description": "要问的问题，一句话说清（别把背景再复述一遍）"
+            },
+            "options": {
+              "type": "array",
+              "items": {"type": "string"},
+              "description": "2-4 个互斥选项，推荐项放第一个并标注「（推荐）」；留空则只给输入框让用户自由回答"
+            },
+            "timeout_seconds": {
+              "type": "number",
+              "description": "最多等多少秒（默认 300，最长 1800）；超时会返回「用户没回答」的说明"
+            }
+          },
+          "required": ["question"]
+        }
+      }
+    }
+  ]
+}

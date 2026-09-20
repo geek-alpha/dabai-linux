@@ -1315,10 +1315,12 @@ export interface AppKernel {
   harnessStatus?: string;
   _harnessPollTimer: number | null;
   _harnessPolling: boolean;
-  showHarnessConfirm: (requestId: string, task?: string) => void;
+  harnessAskMode: boolean;
+  showHarnessConfirm: (requestId: string, task?: string, options?: string[]) => void;
   harnessPoll: () => void;
   updateHarnessStatus: (msg: BridgeStatusMessage) => void;
   harnessApprove: (approve: boolean, always?: boolean) => void;
+  harnessAnswer: (value: string) => void;
   harnessClose: () => void;
   onBridgeSay: (text: string) => void;
   dshCardExists: (requestId: string) => boolean;

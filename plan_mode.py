@@ -32,6 +32,7 @@ _READ_ONLY_EXACT = frozenset({
     "linux_senses", "linux_audit", "linux_net", "linux_storage", "linux_guard",
     "linux_media", "linux_process", "linux_service",
     "plan_mode",  # 开关自身必须永远可达：拦了它就进了出不来
+    "request_user_input",  # 阶段2 的提问通道：拦了它就只能把问题写进正文
 })
 
 # code_verify/code_test/code_smoke 会执行代码，但 plan.md 明确允许 tests/builds
@@ -58,7 +59,9 @@ INSTRUCTIONS = (
     "三条硬约束（执行前闸门强制，绕不过去）：\n"
     "1. 只读探索，不做改动——写文件/改代码/跑有副作用的命令会被直接拒；\n"
     "2. 先探索再提问——能从代码/配置/系统里查到的事实绝不许拿去问用户；"
-    "只有「偏好与取舍」（查不到的）才问，且给 2-4 个互斥选项 + 一个推荐默认；\n"
+    "只有「偏好与取舍」（查不到的）才问，且用 request_user_input 工具问"
+    "（2-4 个互斥选项 + 一个推荐默认，工具会挂起等你点选），"
+    "别只在正文里问完就停——那样用户答了你也接不住；\n"
     "3. 方案不完整不许交付——必须 decision complete：拿到它的人不需要再做任何决定。\n"
     "三阶段（别跳步）：\n"
     "· 阶段1 落地事实：先做一轮只读探索（代码/配置/入口/类型），把能从环境查到的未知消掉；\n"

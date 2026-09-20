@@ -4192,6 +4192,50 @@ body.locked #task-btn { display: none; }
     word-break: break-word;
     color: var(--text);
 }
+/* 提问卡（ask_user）：选项按钮 + 自由输入，与确认卡的按钮行区分开 */
+#harness-modal .harness-options {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-top: 12px;
+}
+#harness-modal .harness-opt-btn {
+    width: 100%;
+    text-align: left;
+    padding: 10px 12px;
+    border-radius: 10px;
+    border: 1px solid rgba(124,92,255,0.35);
+    background: rgba(124,92,255,0.10);
+    color: var(--text);
+    font-size: 13px;
+    line-height: 1.5;
+    cursor: pointer;
+    transition: all 0.15s;
+    word-break: break-word;
+}
+#harness-modal .harness-opt-btn:hover {
+    background: rgba(124,92,255,0.22);
+    border-color: rgba(124,92,255,0.6);
+}
+#harness-modal .harness-answer-row {
+    display: flex;
+    gap: 8px;
+    margin-top: 10px;
+}
+#harness-modal .harness-answer-row input {
+    flex: 1;
+    min-width: 0;
+    padding: 9px 12px;
+    border-radius: 10px;
+    border: 1px solid rgba(255,255,255,0.14);
+    background: rgba(0,0,0,0.25);
+    color: var(--text);
+    font-size: 13px;
+}
+#harness-modal .harness-answer-row .harness-btn {
+    flex: 0 0 76px;
+    padding: 9px 0;
+}
 #harness-modal .harness-hint {
     font-size: 12px;
     color: var(--text-dim);
