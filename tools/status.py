@@ -13,8 +13,8 @@
   status.py challenge "结论"     结构化反问：强制过证据/反例/权威/反向假设
 """
 import argparse
+import importlib.util
 import json
-import re
 import sys
 from pathlib import Path
 
@@ -26,10 +26,6 @@ DRAFTS = BASE / "data" / "learn_drafts.json"
 LESSON_STATE = BASE / "data" / "lesson_state.json"
 LESSON_ARCHIVE = BASE / "harness_task_memory.archive.json"
 
-RULE_START = "【工作准则（任何模式下"
-RULE_END = "shell 输出不许用"
-RULE_WARN = 3000
-STR_LIT = re.compile(r'"((?:[^"\\]|\\.)*)"')
 
 
 def _load_json(path, default):
@@ -40,24 +36,30 @@ def _load_json(path, default):
 
 
 def rule_stats():
-    """统计 sys_prompt 规则区的字符数与条款数；锚点失配则退回全文统计。"""
+    """规则区口径只有一处定义：tools/rule_budget.py，本函数只负责展示。
+
+    2026-09-22 之前这里自己数一遍（锚点区间 + 字符串字面量）得 raw 3584 / 17 条，
+    而 prompt_rules_audit 只数 agent_rules 段得 1432 / 11 条——两个工具各管一半、
+    都叫「规则区」，两段区间根本不重叠，谁都没看到全貌。现在合计口径由预算门禁
+    统一给出；这里若再出现锚点常量，rule_budget 的 SECOND_SOURCE 会报红。
+    """
     try:
-        lines = AGENT.read_text(encoding="utf-8").splitlines()
+        spec = importlib.util.spec_from_file_location(
+            "_status_rule_budget", Path(__file__).resolve().parent / "rule_budget.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        rep = mod.build()
     except Exception:
-        return {"chars": 0, "clauses": 0, "anchored": False}
-    start = end = None
-    for i, line in enumerate(lines):
-        if start is None and RULE_START in line:
-            start = i
-        if start is not None and RULE_END in line:
-            end = i
-            break
-    anchored = start is not None and end is not None
-    text = "\n".join(lines[start:end + 1] if anchored else lines)
+        return {"chars": 0, "clauses": 0, "anchored": False, "level": "unknown",
+                "target": 0, "healthy": 0, "over": 0}
     return {
-        "chars": sum(len(m) for m in STR_LIT.findall(text)),
-        "clauses": len(re.findall(r"【[^】]{2,20}】", text)),
-        "anchored": anchored,
+        "chars": rep["total_chars"],
+        "clauses": rep["block_count"],
+        "anchored": True,
+        "level": rep["level"],
+        "target": rep["target"],
+        "healthy": rep["healthy"],
+        "over": rep["over_healthy"],
     }
 
 
@@ -120,9 +122,15 @@ def cmd_report(as_json=False):
         print(json.dumps(d, ensure_ascii=False, indent=1))
         return 0
     r = d["rules"]
-    over = "  ← 超警告线，该审计合并了" if r["chars"] > RULE_WARN else ""
+    tag = {"green": "绿", "yellow": "黄", "red": "红"}.get(r.get("level"), "?")
+    over = ""
+    if r.get("level") == "red":
+        over = "  ← 超上限：先搬迁/压缩（tools/rule_budget.py）"
+    elif r.get("level") == "yellow":
+        over = "  ← 余量不足 5%，该瘦身了"
     print("【自我记账】")
-    print(f"  规则区    {r['chars']} 字符 / {r['clauses']} 条（警告线 {RULE_WARN}）{over}")
+    print(f"  规则区    {r['chars']} 字符 / {r['clauses']} 块"
+          f"（{tag}，target {r['target']}，healthy {r['healthy']}）{over}")
     print(f"  经验库    {d['lessons']} 条")
     print(f"  长期事业  {d['active']} 项进行中 / 共 {d['projects']} 项")
     for p in d["progress"]:
@@ -135,7 +143,7 @@ def cmd_report(as_json=False):
     if d["last_lesson"]:
         print(f"  最新教训  {d['last_lesson'][:46]}")
     if not r["anchored"]:
-        print("  [!] 规则区锚点未命中，上面数字是全文统计")
+        print("  [!] rule_budget 跑不起来，规则区数字是空值——不是「通过」")
     return 0
 
 

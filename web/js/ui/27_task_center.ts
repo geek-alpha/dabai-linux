@@ -44,6 +44,8 @@ export default (function init(App: AppKernel) {
   let pollTimer: number | null = null;
   let selectedId: string | null = null;
   let detailTimer: number | null = null;
+  // 自我迭代循环是否在跑（按钮文案/颜色以服务端状态为准，不靠本地记忆）
+  let siRunning = false;
   // codex/opencode 任务的结构化执行明细缓存（/api/tasks/<id>/trace）
   const traceCache = new Map<string, { entries: any[]; fetchedAt: number; steps: number; lines: number }>();
 
@@ -66,6 +68,60 @@ export default (function init(App: AppKernel) {
     return e;
   }
 
+  // ---------- 自我迭代按钮 ----------
+  // 按钮只是「开关」，真正的推进由后端调度器派发子智能体完成：
+  // 页面关掉、用户睡着，循环照样跑 —— 这才是这个按钮的意义。
+
+  function paintIterate(st?: any) {
+    const b = document.getElementById('task-center-iterate') as HTMLButtonElement | null;
+    if (!b) return;
+    b.textContent = siRunning ? '⏸ 停止自我迭代' : '♾ 自我迭代';
+    b.classList.toggle('on', siRunning);
+    if (st) {
+      // 「状态说在跑、调度任务却没了」= 实际不会再有下一轮，必须能看出来，
+      // 否则用户以为它在自己努力，其实早停了。
+      const dead = siRunning && st.scheduled === false;
+      b.title = dead
+        ? '⚠️ 状态在跑但没有调度任务 —— 实际不会再有下一轮，点一下重新启动'
+        : (siRunning
+            ? `第 ${(st.spent || 0) + 1}/${st.budget || 0} 轮｜有效 ${st.good || 0}/${st.rounds || 0}｜连续无效 ${st.streak || 0}/${st.max_streak || 0}`
+            : '启动后按评估器读数自动找缺口 → 修一处 → 留证据；连续无效自动停');
+      if (dead) b.classList.add('dead'); else b.classList.remove('dead');
+    }
+  }
+
+  function refreshIterate() {
+    fetch('/api/self-iterate/status').then(r => r.json()).then((d: any) => {
+      const st = (d && d.status) || {};
+      siRunning = !!st.running;
+      paintIterate(st);
+    }).catch(() => {});
+  }
+
+  function toggleIterate() {
+    const stopping = siRunning;
+    fetch(stopping ? '/api/self-iterate/stop' : '/api/self-iterate/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({})
+    }).then(r => r.json()).then((d: any) => {
+      if (!d || !d.ok) {
+        if (App.showToast) App.showToast('自我迭代操作失败：' + ((d && d.message) || '未知错误'));
+        return;
+      }
+      siRunning = !!(d.status && d.status.running);
+      paintIterate(d.status);
+      if (App.showToast) {
+        App.showToast(siRunning
+          ? '♾ 自我迭代已启动：按评估器读数推进，连续无效自动停'
+          : '已停止自我迭代');
+      }
+      fetchList();
+    }).catch(() => {
+      if (App.showToast) App.showToast('自我迭代操作失败（网络错误）');
+    });
+  }
+
   // ---------- 面板 ----------
 
   function ensurePanel() {
@@ -80,7 +136,10 @@ export default (function init(App: AppKernel) {
       '</div>' +
       '<div class="task-center-body">' +
         '<div class="task-center-side">' +
-          '<div class="task-center-toolbar"><button id="task-center-clear" class="task-center-clear">🗑 清除已完成</button></div>' +
+          '<div class="task-center-toolbar">' +
+            '<button id="task-center-iterate" class="task-center-iterate" title="启动后按评估器读数自动找缺口 → 修一处 → 留证据；连续无效自动停">♾ 自我迭代</button>' +
+            '<button id="task-center-clear" class="task-center-clear">🗑 清除已完成</button>' +
+          '</div>' +
           '<div id="task-center-list" class="task-center-list"></div>' +
         '</div>' +
         '<div id="task-center-detail" class="task-center-detail">' +
@@ -90,6 +149,8 @@ export default (function init(App: AppKernel) {
       '<div id="task-center-hint" class="task-center-hint"></div>';
     document.body.appendChild(panel);
     document.getElementById('task-center-close')!.addEventListener('click', () => App.closeTaskCenter());
+    document.getElementById('task-center-iterate')!.addEventListener('click', () => toggleIterate());
+    refreshIterate();
     document.getElementById('task-center-clear')!.addEventListener('click', () => {
       fetch('/api/tasks/clear', { method: 'POST' }).then(r => r.json()).then((d: any) => {
         if (d && d.ok) {

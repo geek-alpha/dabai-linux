@@ -1715,6 +1715,33 @@ def _rule_op_kinds(tool_name: str, arguments) -> tuple:
     return img, music, delete
 
 
+# 命令里的 .py 脚本名（取 basename）。只留文件名，不留命令原文。
+_SCRIPT_RE = re.compile(r"[\w./\\-]*?([A-Za-z0-9_\-]+\.py)\b")
+
+
+def _rule_script_names(tool_name: str, arguments) -> list:
+    """一次 shell 调用跑过的 .py 脚本名（规则区「经验回流/长期事业」埋点）。
+
+    为什么记脚本名：call_names 只到工具名一层，而 94% 的轮（252/269）都用
+    shell_run——「教训写了吗」「长期事业 log 了吗」全藏在命令参数里，不埋就
+    永远是 UNMEASURED。只留脚本名不留命令原文：足够回答「这条规则有没有作用
+    面」，又不会把命令里的路径写进日志。
+    """
+    n = str(tool_name or "").lower()
+    if n not in _SHELL_TOOLS:
+        return []
+    cmd = ""
+    if isinstance(arguments, dict):
+        cmd = str(arguments.get("command") or arguments.get("cmd") or "")
+    if not cmd:
+        return []
+    out: list = []
+    for m in _SCRIPT_RE.findall(cmd):
+        if m not in out:
+            out.append(m)
+    return out[:20]
+
+
 def _tool_fp(name: str, arguments: dict) -> str:
     """工具调用指纹：工具名 + 参数 JSON（键排序），用于死循环检测。"""
     try:
@@ -1793,6 +1820,26 @@ def _single_ro_note(streak: int, names: list, pending_names: list) -> tuple:
         names = (list(names) + [pending_names[0]])[-SINGLE_RO_NAMES_MAX:]
         return streak, names, streak % SINGLE_RO_STREAK_N == 0
     return 0, [], False
+
+
+# 「多步轮未提清单」检测：一轮里调了 >= PLAN_MISS_MIN_CALLS 个工具却没调 plan_update。
+# 阈值与审计工具 call_stats 的 multi_rounds 判据（tool_calls>=3）同源——口径一分叉，
+# 提醒就会打偏，埋点也和审计对不上账。
+PLAN_MISS_MIN_CALLS = 3
+# 连续 2 轮才提醒一次：单轮漏提太常见（小改动本来就无需清单），每轮都提醒等于噪声。
+PLAN_MISS_STREAK_N = 2
+
+
+def _plan_miss_note(streak: int, tool_calls: int, used_plan: bool) -> tuple:
+    """更新「多步轮未提清单」计数，返回 (streak, 本轮是否该给反馈)。
+
+    只有「本轮工具调用 >= PLAN_MISS_MIN_CALLS 且没调 plan_update」才累加；
+    提过清单、轮次不够多、纯文本轮一律清零。
+    """
+    if tool_calls >= PLAN_MISS_MIN_CALLS and not used_plan:
+        streak += 1
+        return streak, streak % PLAN_MISS_STREAK_N == 0
+    return 0, False
 
 
 def _get_tool_cache():
@@ -3253,6 +3300,10 @@ class AIAgent:
         self._single_ro_streak = 0
         self._single_ro_names: list = []
         self._single_ro_armed = False   # 本轮已判定该给反馈，由结果构造处消费
+        # 「多步轮未提清单」：轮末判定，下一轮的工具结果里注入事实反馈。
+        # 提醒绝不进 sys_prompt——首条一变，整条前缀（含全部历史）白付一次全价。
+        self._plan_miss_streak = 0
+        self._plan_miss_armed = False   # 已判定该给反馈，由下一轮结果构造处消费
         # 实例标识：写进诊断日志，用来区分「视图被清」和「换了实例」
         # （真实样本里同一 sid 反复 reset_sid，只有这个能证伪）。
         self._inst_tag = f"{os.getpid()}-{id(self) & 0xFFFF:04x}"
@@ -4401,6 +4452,22 @@ class AIAgent:
             f"（{names}）。只读调用之间无冲突、同一轮可以并行发出——"
             "下次需要多个只读信息时请一次发完，每省一轮就省一次秒级往返。")
 
+    def _plan_miss_hint(self) -> str:
+        """「多步轮未提清单」的事实反馈，只加给 LLM 那份结果（UI 与记忆库保持原样）。
+
+        为什么不只靠规则区的「工作准则」：那条规则实测 333 轮的清单率 26%，
+        稳定低于达标线 50%——抽象要求改不动行为，改成在模型刚做完一轮时告诉它
+        「你已连着 N 轮调了 3 个以上工具却没提清单」。
+        """
+        if not self._plan_miss_armed:
+            return ""
+        self._plan_miss_armed = False
+        return (
+            f"\n\n【清单提示】你已连续 {self._plan_miss_streak} 轮调用 "
+            f"{PLAN_MISS_MIN_CALLS} 个以上工具却没提过工作清单。多步任务（≥3 步或跨轮）"
+            "开工前先 plan_update 提交整份清单：漏提最容易漏的是收尾项，"
+            "而且用户看不到你的进度。")
+
     def _remember_cross_fp(self, fp: str) -> None:
         """登记工具调用指纹，供跨轮重复统计（只统计，不拦截）。
 
@@ -5369,9 +5436,11 @@ class AIAgent:
         eff_tool_errors = 0     # 本轮工具报错**次数**（注意：不是「整轮失败」）
         eff_mergeable = 0       # 本轮「本该合并成一次调用」的多余调用数（并行度优化的尺子）
         eff_single_ro = 0       # 本轮注入的「连续单发只读」反馈次数（跨轮串行埋点）
+        eff_plan_hints = 0      # 本轮注入的「多步轮未提清单」反馈次数（准则段埋点）
         eff_img_ops = 0         # 本轮画图工具调用数（规则区「画图」埋点）
         eff_music_ops = 0       # 本轮 music_* 调用数（规则区「音乐」埋点）
         eff_delete_ops = 0      # 本轮删除类操作数（规则区「删除」埋点）
+        eff_script_names: list = []  # 本轮 shell 跑过的 .py 脚本名（准则段埋点）
         # 工具名级明细：只有次数时，106 次报错分不清是哪个工具、哪类错，
         # 「教训写入之后同类错误还犯不犯」就无从对比。纯观测，不干预行为。
         eff_call_names: list = []   # 本轮调用过的工具名（去重保序）
@@ -5551,6 +5620,13 @@ class AIAgent:
             except Exception:
                 pass
             _learn_tick(tool_round, eff_tool_calls, eff_tool_errors, eff_err_names, message, _reply)
+            # 「多步轮未提清单」跨轮反馈：纯文本轮 eff_tool_calls=0，会走到这里把 streak
+            # 清零，所以必须在 tool_round 早退之前——否则「多步轮→纯文本轮→多步轮」
+            # 会被误算成连续两轮。
+            self._plan_miss_streak, _plan_armed_now = _plan_miss_note(
+                self._plan_miss_streak, eff_tool_calls,
+                "plan_update" in eff_call_names)
+            self._plan_miss_armed = self._plan_miss_armed or _plan_armed_now
             if tool_round <= 0:
                 return
             try:
@@ -5566,6 +5642,7 @@ class AIAgent:
                     "tool_errors": eff_tool_errors,
                     "mergeable_calls": eff_mergeable,
                     "single_ro_hints": eff_single_ro,
+                    "plan_hints": eff_plan_hints,
                     # 规则区「删除/画图/音乐」三条的行为暴露量：0 次 ≠ 规则没用，
                     # 只说明这段时间没被触发过——审计工具据此区分「无据可删」与「有作用面」。
                     "img_gen_calls": eff_img_ops,
@@ -5583,6 +5660,7 @@ class AIAgent:
                     "cold_miss": max(0, first_miss),
                     "tool_chars": tool_chars,
                     "call_names": eff_call_names,
+                    "script_names": eff_script_names,
                     "err_names": eff_err_names,
                     "call_trace": call_trace,
                     "prefix": _prefix_rep,
@@ -6096,6 +6174,10 @@ class AIAgent:
                 eff_img_ops += _kinds[0]
                 eff_music_ops += _kinds[1]
                 eff_delete_ops += _kinds[2]
+                for _s in _rule_script_names(
+                        tool_name, cleaned_args if cleaned_args is not None else arguments):
+                    if _s not in eff_script_names:
+                        eff_script_names.append(_s)
                 _fp = _tool_fp(tool_name, cleaned_args if cleaned_args is not None else arguments)
                 if _fp in eff_seen:
                     eff_re_reads += 1
@@ -6111,6 +6193,10 @@ class AIAgent:
                 if _ro_hint:
                     _llm_result = str(_llm_result) + _ro_hint
                     eff_single_ro += 1
+                _plan_hint = self._plan_miss_hint()
+                if _plan_hint:
+                    _llm_result = str(_llm_result) + _plan_hint
+                    eff_plan_hints += 1
                 self._remember_cross_fp(_fp)
 
                 tool_call_results.append({
@@ -6343,6 +6429,9 @@ class AIAgent:
                     eff_img_ops += _kinds[0]
                     eff_music_ops += _kinds[1]
                     eff_delete_ops += _kinds[2]
+                    for _s in _rule_script_names(tool_name, arguments):
+                        if _s not in eff_script_names:
+                            eff_script_names.append(_s)
                     _fp = _tool_fp(tool_name, arguments)
                     if _fp in eff_seen:
                         eff_re_reads += 1

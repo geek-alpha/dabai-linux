@@ -8,18 +8,22 @@
 混成一类会让下一轮去补根本不需要的埋点。
 
 契约：
-  1. 映射表必须覆盖 agent.py 里每一条规则——规则文本一改就报 drift，
-     否则审计表会悄悄过期，得出的「零收益候选」是假的
+  1. 映射表必须覆盖规则区两段（agent_rules + 行为准则）里每一条规则——规则文本
+     一改就报 drift，否则审计表会悄悄过期，得出的「零收益候选」是假的
+  1b. 可量化率与映射覆盖率分开报：进了映射表 ≠ 有数据源能回答
   2. 并行度 < 2.0/批 → MEASURED_GAP；>= 2.0 → MEASURED_OK
   3. 坏行为率 < 1% → MEASURED_OK（规则零收益，候选删）；>= 1% → MEASURED_GAP
   4. 无埋点的规则必须如实标 UNMEASURED，不许猜成 OK 或 GAP
   5. 数据文件缺失 → 不抛异常，如实报空样本
   6. 没有 seg.sys 数据时 render 不许崩（占比未知要能表达）
+  7. 趋势表必须含准则段两个判据（清单率/验证率），空分母记 None 不崩——
+     只看当日汇总数字，分不清「行为没改」还是「这天恰好没这类轮」
 
 这些用例不写真实日志，全部造数据；只有覆盖性用例读真实 agent.py。
 """
 import importlib.util
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -63,6 +67,32 @@ def test_rule_map_covers_every_rule():
     rep = mod.build()
     assert rep["map_drift"] is False, f"未覆盖的规则：{rep['unmatched']}"
     assert rep["mapped"] == rep["rules_count"] > 0
+
+
+def test_审计覆盖两段规则区():
+    """行为准则段必须进审计——此前它 3539 字符在分母里、不在分子里，覆盖率假报 28%。"""
+    mod = _load_audit()
+    rep = mod.build()
+    segs = {e["segment"] for e in rep["entries"]}
+    assert segs == {"agent_rules", "work_rules"}
+    assert rep["segment_chars"]["work_rules"] > 3000
+    assert rep["map_drift"] is False
+
+
+def test_可量化率与映射覆盖率分开报(tmp_path, monkeypatch):
+    """进了映射表 ≠ 有数据源能回答：kind=none 的规则算覆盖，但不该算进可量化率。"""
+    mod = _load_audit()
+    body = "【摸清大项目】" + "y" * 50
+    monkeypatch.setattr(mod, "extract_rules",
+                        lambda: (["⚠ 删除类任务：x" * 3], "⚠ 删除类任务：x" * 3))
+    monkeypatch.setattr(mod, "extract_work_rules", lambda: {
+        "ok": True, "blocks": [("摸清大项目", body)],
+        "live": body, "raw": 0, "lines": [1, 2]})
+    monkeypatch.setattr(mod, "METRICS", tmp_path / "none.jsonl")
+    monkeypatch.setattr(mod, "SUBAGENTS", tmp_path / "none.jsonl")
+    rep = mod.build()
+    assert rep["mapped"] == rep["rules_count"] == 2
+    assert 0 < rep["sourced_ratio"] < 1, "删除类有数据源、摸清大项目没有"
 
 
 def test_drift_is_reported_and_rc_nonzero(tmp_path, monkeypatch, capsys):
@@ -385,3 +415,147 @@ def test_render_separates_the_two_undecidable_buckets():
     assert "无数据源  （1）：说重点" in out
     assert "补埋点没用" in out
     assert "要补的是埋点" in out
+
+
+def test_trend_carries_plan_and_verify_rate(tmp_path, monkeypatch):
+    """趋势表必须含准则段两个判据（清单率/验证率）。
+
+    只有当日汇总数字时，分不清「行为没改」还是「这天恰好没这类轮」——校准
+    达标线会拿噪声当依据。2026-09-22 实测：清单率 34%→13%→41% 是噪声，
+    验证率 44%→46%→38% 才是稳定基线，两个结论靠的就是这两列。
+    """
+    mod = _load_audit()
+    rows = [
+        {"ts": 1_789_000_000.0, "tool_calls": 3, "batches": 3, "tool_rounds": 3,
+         "re_reads": 0, "truncations": 0, "seg": {"sys": 5000},
+         "call_names": ["code_edit", "code_verify", "plan_update"]},
+        {"ts": 1_789_000_100.0, "tool_calls": 4, "batches": 4, "tool_rounds": 4,
+         "re_reads": 0, "truncations": 0, "seg": {"sys": 5000},
+         "call_names": ["code_read", "code_search", "code_locate"]},
+    ]
+    monkeypatch.setattr(mod, "METRICS", _write_metrics(tmp_path, rows))
+    monkeypatch.setattr(mod, "SUBAGENTS", tmp_path / "none.jsonl")
+    rep = mod.build()
+    assert len(rep["trend"]) == 1
+    t = rep["trend"][0]
+    assert t["multi_rounds"] == 2
+    assert t["plan_rate"] == 0.5      # 2 个多步轮里 1 个先提了清单
+    assert t["edit_rounds"] == 1
+    assert t["verify_rate"] == 1.0    # 唯一改码轮同轮跑了验证
+    assert "清单率" in mod.render(rep)
+    assert "验证率" in mod.render(rep)
+
+
+def test_trend_rate_is_none_not_crash_when_no_denominator(tmp_path, monkeypatch):
+    """没有多步轮/改码轮时比率必须是 None 而不是 ZeroDivisionError。
+
+    空分母在真实日志里很常见（只读探索日、只聊天日），崩了整份报告就没了。
+    """
+    mod = _load_audit()
+    rows = [{"ts": 1_789_000_000.0, "tool_calls": 1, "batches": 1, "tool_rounds": 1,
+             "re_reads": 0, "truncations": 0, "seg": {"sys": 5000},
+             "call_names": ["code_read"]}]
+    monkeypatch.setattr(mod, "METRICS", _write_metrics(tmp_path, rows))
+    monkeypatch.setattr(mod, "SUBAGENTS", tmp_path / "none.jsonl")
+    rep = mod.build()
+    t = rep["trend"][0]
+    assert t["plan_rate"] is None and t["verify_rate"] is None
+    assert "n/a" in mod.render(rep)
+
+
+def _hint_rows(hints):
+    """造多步轮；hints 里 None = 该轮没有 plan_hints 字段（重启前的旧数据）。"""
+    out = []
+    for i, h in enumerate(hints):
+        r = {"ts": 1_789_000_000.0 + i, "tool_calls": 4, "batches": 2, "tool_rounds": 4,
+             "call_names": ["code_read", "code_search", "shell_run", "code_edit"]}
+        if h is not None:
+            r["plan_hints"] = h
+        out.append(r)
+    return out
+
+
+def test_call_stats_counts_hint_triggers():
+    """字段缺失的轮不能算进采样——否则重启前那 335 轮会把「没数据」变成「0 次触发」。"""
+    mod = _load_audit()
+    c = mod.call_stats(_hint_rows([None, 0, 1, 2, None]))
+    assert c["hint_sampled_rounds"] == 3
+    assert c["plan_hint_total"] == 3
+    assert c["plan_hint_turns"] == 2
+
+
+def test_hint_note_distinguishes_no_sample_from_zero_trigger():
+    """「没采样」与「采到了但 0 次触发」结论相反：一个等数据，一个查 streak 判据。"""
+    mod = _load_audit()
+    assert "尚无采样" in mod.hint_note({})
+    assert "尚无采样" in mod.hint_note({"hint_sampled_rounds": 0})
+    zero = mod.hint_note({"hint_sampled_rounds": 12, "plan_hint_total": 0,
+                          "plan_hint_turns": 0})
+    assert "0 次触发" in zero and "streak" in zero
+    fired = mod.hint_note({"hint_sampled_rounds": 12, "plan_hint_total": 3,
+                           "plan_hint_turns": 2})
+    assert "3 次" in fired and "2 轮" in fired
+
+
+def test_plan_verdict_carries_hint_note():
+    """清单率判定必须带提醒触发情况：26% 这个数字本身不说明机制动过手没有。"""
+    mod = _load_audit()
+    calls = {"multi_rounds": 253, "plan_rounds": 67, "hint_sampled_rounds": 20,
+             "plan_hint_total": 0, "plan_hint_turns": 0}
+    tag, obs = mod.judge("work", "plan_update", {}, [], "工作准则", calls)
+    assert tag == "MEASURED_GAP"
+    assert "26%" in obs and "0 次触发" in obs
+    calls["plan_hint_total"], calls["plan_hint_turns"] = 4, 3
+    _, obs = mod.judge("work", "plan_update", {}, [], "工作准则", calls)
+    assert "4 次" in obs
+
+
+# ---------- 运行时提醒：门槛必须与 agent.py 同源 ----------
+
+def _agent_const(name):
+    """从 agent.py 源码取模块级常量值——不 import agent（那会拉起网络/记忆库）。"""
+    src = (BASE / "agent.py").read_text(encoding="utf-8")
+    m = re.search(rf"^{name} = (\d+)$", src, re.M)
+    assert m, f"agent.py 里找不到 {name}"
+    return int(m.group(1))
+
+
+def test_hint_streak_constants_match_agent():
+    """最小触发轮数是硬编码在本工具里的，分叉后果与 multi_rounds 判据一样：
+    门槛比 agent 大，会把「样本不足」误报成「判据坏了」；比 agent 小则相反。"""
+    mod = _load_audit()
+    assert mod.PLAN_MISS_STREAK_N == _agent_const("PLAN_MISS_STREAK_N")
+    assert mod.SINGLE_RO_STREAK_N == _agent_const("SINGLE_RO_STREAK_N")
+
+
+def test_call_stats_keeps_two_hint_families_apart():
+    """plan_hints 与 single_ro_hints 的可累加轮不是同一批，采样数不能互相顶替。"""
+    mod = _load_audit()
+    rows = _hint_rows([None, 0, 1, 1])
+    rows[0]["single_ro_hints"] = 2      # 两族的带字段轮数故意不等，错用字段就会露出来
+    c = mod.call_stats(rows)
+    assert c["hint_sampled_rounds"] == 3      # 后三轮带 plan_hints
+    assert c["ro_hint_sampled_rounds"] == 1   # 只有第一轮带 single_ro_hints
+    assert c["plan_hint_total"] == 2 and c["ro_hint_total"] == 2
+
+
+def test_hint_note_says_insufficient_below_streak():
+    """采样轮数不到最小触发轮数时 0 次触发是必然——报告不能喊「先查 streak 判据」。"""
+    mod = _load_audit()
+    short = mod.hint_note({"hint_sampled_rounds": 1, "plan_hint_total": 0})
+    assert "样本不足" in short and "streak" not in short
+    enough = mod.hint_note({"hint_sampled_rounds": 12, "plan_hint_total": 0})
+    assert "streak" in enough
+
+
+def test_parallel_verdict_carries_ro_hint():
+    """并行判定要带「并行提示」的触发情况：并行度没动时，得分清机制动过手没有。"""
+    mod = _load_audit()
+    agg = {"per_batch": 1.08, "per_llm_round": 1.36, "llm_calls": 100, "tool_calls": 136,
+           "turns": 50, "mergeable_calls": 3, "prompt_tokens": 1000, "per_call_tokens": 1000}
+    tag, obs = mod.judge("parallel", "batch_ratio", agg, [], "并行优先",
+                         {"ro_hint_sampled_rounds": 0})
+    assert tag == "MEASURED_GAP" and "并行提示尚无采样" in obs
+    _, obs = mod.judge("parallel", "batch_ratio", agg, [], "并行优先",
+                       {"ro_hint_sampled_rounds": 20, "ro_hint_total": 4, "ro_hint_turns": 4})
+    assert "并行提示已触发 4 次" in obs

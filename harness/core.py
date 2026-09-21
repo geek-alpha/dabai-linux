@@ -524,8 +524,43 @@ class Harness:
             self._tool_index = index
 
     def tool_owner(self, tool_name: str) -> Optional[tuple]:
-        """返回工具的属主 (kind, owner_name)，未命中返回 None。"""
+        """返回工具的属主 (kind, owner_name)，未命中返回 None。
+
+        未命中不再就此罢手：先把「还没进加载表」的技能/插件补齐，重建索引后再查一次
+        （见 _resolve_owner）。少了这一步，调用方拿到的 (None, '') 会被当成「这不是
+        harness 工具」而回落到本地工具表 —— 那张表现在只剩 skill_help，于是
+        「技能还没加载」被伪装成「工具不存在」，模型既没拿到结果也没有可行动的线索。
+        """
         self.ensure_loaded()
+        with self._index_lock:
+            owner = self._tool_index.get(tool_name)
+        if owner is not None:
+            return owner
+        return self._resolve_owner(tool_name)
+
+    def _resolve_owner(self, tool_name: str) -> Optional[tuple]:
+        """属主索引未命中时的兜底：补齐加载表 → 重建索引 → 再查一次。
+
+        为什么会真的缺（不是空想）：
+          · Harness.ensure_loaded 只在进程首次生效（_loaded 为真后直接 return），
+            所以「进程起来之后才落盘 / 刚被启用的技能」不会自动进索引；
+          · 热重载窗口里索引可能落后一拍。
+        两条都会让 harness 路由的调用方（流程/批量步骤、子智能体 —— 它们不经过
+        agent._validate_tool_call 那次自动加载）拿到一个「存在、只是还没加载」的工具，
+        然后把它判成不存在：白跑一轮。err_recidivism 的 A 类（技能未加载，43/57）
+        就是这个浪费模式的实测证据，本方法把同一笔浪费在 harness 这一层也堵上。
+
+        只补加载、不注入说明书：说明书该由模型按需自己读（与 agent 侧的自动加载同一
+        口径）。索引依旧由 _rebuild_index 生成，被禁用 / 损坏的技能不会因这条兜底而
+        混进来 —— 启停选择不被绕过。
+        """
+        try:
+            self.skills.ensure_loaded()
+            self.plugins.ensure_loaded()
+            self._rebuild_index()
+        except Exception as e:
+            logger.warning("补齐工具索引失败（%s）：%s", tool_name, e)
+            return None
         with self._index_lock:
             return self._tool_index.get(tool_name)
 

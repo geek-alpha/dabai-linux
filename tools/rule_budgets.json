@@ -1,0 +1,8 @@
+{
+  "_note": "规则区预算。天花板只降不升：要提额必须改本文件，并在提交信息里写清为什么这些字必须占位。超额处理顺序写死——① 搬迁到该管的层 ② 压缩 ③ 才提上限（限额太低是预算 bug，不是规则 bug）。",
+  "_baseline": "2026-09-22 首次建立：实测 live 4971 字符 / 28 块（agent_rules 1432 + 行为准则 3539），target 向上取整到 5000 作为基线，healthy 4750（=target×0.95，deepseek-harness 的 5% 余量规矩）才是真正该回到的线。基线不等于合法化——超 healthy 即欠债。",
+  "target_chars": 5000,
+  "headroom_ratio": 0.05,
+  "block_max_chars": 520,
+  "max_blocks": 30
+}

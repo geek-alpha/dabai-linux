@@ -223,6 +223,7 @@ async def lifespan(app: FastAPI):
             # 定时任务从出生起就与连接解耦：广播代理 + 常驻状态——
             # 页面从未打开/已全部关闭时照样派发、执行、汇报（后台完成，落库）
             state = await _get_resident_state()
+            _self_iterate_tick(job)
             worker = await _get_sub_agents().spawn(
                 _BROADCAST_WS, state,
                 str(job.get("task") or job.get("name") or ""),
@@ -2635,6 +2636,16 @@ async def task_center_list():
             tasks.append(_pv)
     except Exception as e:
         logger.warning(f"[TaskCenter] 合并工作清单失败: {e}")
+    # 自我迭代循环也是合成条目：它由调度器按间隔派发、自己维护轮次账本，
+    # 不注册进 orchestrator（那不是「一次派发一个任务」的模型）。
+    try:
+        from tools.self_iterate import snapshot as _si_snap, TASK_ID as _SI_ID
+        _si = _si_snap(full=False)
+        if _si:
+            tasks = [t for t in tasks if str(t.get("id") or "") != _SI_ID]
+            tasks.append(_si)
+    except Exception as e:
+        logger.warning(f"[TaskCenter] 合并自我迭代失败: {e}")
     tasks.sort(key=lambda x: -(x.get("created_at") or 0))
     return {"ok": True, "tasks": tasks[:50]}
 
@@ -2823,7 +2834,130 @@ async def task_center_clear():
             n += 1
     except Exception as e:
         logger.warning(f"[TaskCenter] 清除长跑条目失败: {e}")
+    # 自我迭代是合成条目，走与工作清单同一条路：已收工时记一笔「看过了」，
+    # 不记就会 UI 消失一秒、下轮轮询又原样回来。还在跑时 dismiss() 拒绝。
+    try:
+        from tools.self_iterate import dismiss as _si_dismiss
+        if _si_dismiss():
+            n += 1
+    except Exception as e:
+        logger.warning(f"[TaskCenter] 清除自我迭代条目失败: {e}")
     return {"ok": True, "cleared": n}
+
+
+# ---------- 自我迭代循环（任务中心「♾ 自我迭代」按钮） ----------
+
+# 一轮自我迭代 = 子智能体跑 brief → 改一处 → 验证 → 落盘，40 分钟是保守值：
+# 太短会让下一轮在上一轮还没改完时踩进同一个文件；调度的 running 标志只能防重入，
+# 防不住「两轮先后改同一处」的逻辑冲突。
+SELF_ITERATE_INTERVAL_SEC = 2400
+
+
+def _self_iterate_tick(job: dict) -> None:
+    """自我迭代的派发计数：由调度器写，不依赖执行体自觉。
+
+    为什么必须由调度器写：执行体忘了/挂了/卡住时不调 record，轮次就不涨，
+    预算永远耗不完 —— 无人值守时这就是无限烧钱。
+    """
+    try:
+        from tools.self_iterate import JOB_NAME, tick
+        if str(job.get("name") or "") != JOB_NAME:
+            return
+        st = tick()
+        logger.info("[SelfIterate] 派发计数 %s/%s", st.get("dispatched"),
+                    st.get("budget_rounds"))
+    except Exception as e:
+        logger.warning(f"[SelfIterate] 派发计数失败: {e}")
+
+
+def _self_iterate_task_text() -> str:
+    """调度任务描述（正文在 tools/self_iterate.py 里，单源）。"""
+    from tools.self_iterate import job_task_text
+    return job_task_text()
+
+
+def _self_iterate_job():
+    """当前的自我迭代调度任务（没挂过则 None）。"""
+    try:
+        import scheduler
+        for j in scheduler.list_jobs():
+            if str(j.get("name") or "") == _self_iterate_job_name():
+                return j
+    except Exception as e:
+        logger.warning(f"[SelfIterate] 读调度任务失败: {e}")
+    return None
+
+
+def _self_iterate_job_name() -> str:
+    from tools.self_iterate import JOB_NAME
+    return JOB_NAME
+
+
+@app.get("/api/self-iterate/status")
+async def self_iterate_status():
+    """自我迭代状态：状态文件 + 调度任务是否真在挂。"""
+    try:
+        from tools.self_iterate import status as si_status
+        st = si_status()
+    except Exception as e:
+        return JSONResponse({"ok": False, "message": str(e)}, status_code=500)
+    job = _self_iterate_job()
+    st["job"] = {"id": job.get("id"), "enabled": bool(job.get("enabled")),
+                 "runs": job.get("runs"), "next_run_at": job.get("next_run_at"),
+                 "last_result": str(job.get("last_result") or "")[:200]} if job else None
+    # 「状态说在跑、调度任务却没了」= 实际不会再有下一轮：按钮上必须能看出来，
+    # 否则用户以为它在自己努力，其实早停了。
+    st["scheduled"] = bool(job and job.get("enabled"))
+    return {"ok": True, "status": st}
+
+
+@app.post("/api/self-iterate/start")
+async def self_iterate_start(payload: dict | None = None):
+    """启动自我迭代：置位状态 + 挂/启用调度任务（创建即触发第一次）。
+
+    为什么必须挂调度任务、而不是只置位：置位只是「我想跑」，派发才是「真的在跑」。
+    调度器无人值守也工作（页面全关照样派发）—— 这才是用户睡着时能继续的原因。
+    """
+    payload = payload or {}
+    try:
+        budget = int(payload.get("budget") or 0) or None
+    except (TypeError, ValueError):
+        return JSONResponse({"ok": False, "message": "budget 需为数字"}, status_code=400)
+    try:
+        import scheduler
+        from tools.self_iterate import start as si_start, status as si_status
+    except Exception as e:
+        return JSONResponse({"ok": False, "message": f"自我迭代模块不可用：{e}"},
+                            status_code=500)
+
+    si_start(budget or 24)
+    job = _self_iterate_job()
+    if job:
+        job, err = scheduler.set_enabled(job.get("id"), True)
+    else:
+        job, err = scheduler.add_job(_self_iterate_job_name(), _self_iterate_task_text(),
+                                     SELF_ITERATE_INTERVAL_SEC)
+    if err:
+        return JSONResponse({"ok": False, "message": err}, status_code=400)
+    logger.info("[SelfIterate] 已启动，调度任务 %s（每 %s 秒）",
+                job.get("id"), SELF_ITERATE_INTERVAL_SEC)
+    return {"ok": True, "job_id": job.get("id"), "status": si_status()}
+
+
+@app.post("/api/self-iterate/stop")
+async def self_iterate_stop():
+    """停下：置位停止 + 禁用调度任务（不删 —— 删了历史 runs/结果就没了）。"""
+    try:
+        import scheduler
+        from tools.self_iterate import stop as si_stop, status as si_status
+    except Exception as e:
+        return JSONResponse({"ok": False, "message": str(e)}, status_code=500)
+    si_stop("手动停止")
+    job = _self_iterate_job()
+    if job and job.get("enabled"):
+        scheduler.set_enabled(job.get("id"), False)
+    logger.info("[SelfIterate] 已停止")
+    return {"ok": True, "status": si_status()}
 
 
 @app.post("/api/longrun/{action}")
