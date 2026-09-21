@@ -30,10 +30,12 @@
 from __future__ import annotations
 
 import argparse
+import grp
 import gzip
 import hashlib
 import json
 import os
+import pwd
 import re
 import shutil
 import socket
@@ -213,18 +215,44 @@ def get_token() -> str:
     return ""
 
 
+def _probe_writable(d: Path) -> bool:
+    """这个目录（连同它自己）真能建、真能写吗 —— 不是看 mode，是写入探一次。"""
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        probe = d / ".writable"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        return True
+    except OSError:
+        return False
+
+
+def state_candidates(cfg: Dict[str, str]) -> Tuple[Path, ...]:
+    return (Path(cfg["STATE"]), Path.home() / ".local" / "state" / "dabai-update")
+
+
 def state_dir(cfg: Dict[str, str]) -> Path:
-    """状态与备份放在仓库之外 —— 更新器自己的痕迹不该落进被更新的目录。"""
-    for cand in (Path(cfg["STATE"]), Path.home() / ".local" / "state" / "dabai-update"):
-        try:
-            cand.mkdir(parents=True, exist_ok=True)
-            probe = cand / ".writable"
-            probe.write_text("ok", encoding="utf-8")
-            probe.unlink(missing_ok=True)
-            return cand
-        except OSError:
+    """状态与备份放在仓库之外 —— 更新器自己的痕迹不该落进被更新的目录。
+
+    探测下探到子目录级：光「父目录能写」不算数。实测踩过的坑（2026-09-20，orangepi）：
+    /var/lib/dabai-update 本身可写，探测照样通过，可里面的 staging 子目录属 root:root；
+    候选被选中后，run() 里那句 rmtree(ignore_errors=True) 又把「清不掉」吞掉，
+    三行之后才以「下载失败（已尝试 3 次）：[Errno 13] Permission denied: …staging/xxx.part」
+    报出来 —— 看着像网络故障，实际是权限，还白等两轮重试。
+    所以真正要往里写的 staging / backups 两个子目录一并探；探不过就换下一个候选，
+    都探不过才报错，并且报错里直接给能原地执行的修法。
+    """
+    for cand in state_candidates(cfg):
+        if not _probe_writable(cand):
             continue
-    raise SystemExit("✘ 找不到可写的状态目录")
+        if all(_probe_writable(cand / sub) for sub in ("staging", "backups")):
+            return cand
+    tried = "、".join(str(c) for c in state_candidates(cfg))
+    raise SystemExit(
+        "✘ 找不到可写的状态目录（staging/backups 至少得能写）\n"
+        f"   试过：{tried}\n"
+        f"   若是历史遗留的 root 属主目录，原地修：sudo chown -R $(id -u):$(id -g) {cfg['STATE']}"
+    )
 
 
 def log_line(cfg: Dict[str, str], msg: str) -> None:
@@ -310,6 +338,57 @@ def detect_proxy() -> Optional[str]:
     return None
 
 
+# ── 国内镜像路由（内嵌副本，理由同文件头）────────────────────────────────
+# 有代理走代理直连；没代理时 GitHub 直连是国内最慢的一段（60KB/s 量级，26MB
+# 要 6 分钟还常超时），自动切 ghproxy 类国内加速前缀。环境变量 DABAI_GITHUB_MIRROR
+# 可显式指定（如 https://ghproxy.net/，部署时写进 /etc/dabai/proxy.env 或 export）。
+# 候选逐个轻量探测，第一个能用的锁住；全挂回退直连 —— 没镜像的机器行为不变。
+MIRROR_PREFIXES = (
+    "https://ghproxy.net/",
+    "https://gh-proxy.com/",
+    "https://mirror.ghproxy.com/",
+)
+MIRROR_PROBE_TIMEOUT = 8
+_mirror_cache: Optional[str] = None
+_mirror_probed = False
+
+
+def mirror_prefix() -> Optional[str]:
+    """当前生效的镜像前缀；有代理或探测不到可用镜像时返回 None（直连）。"""
+    global _mirror_cache, _mirror_probed
+    if _mirror_probed:
+        return _mirror_cache
+    _mirror_probed = True
+    if detect_proxy():
+        return None                      # 有代理就直连，镜像只是没代理时的兜底
+    override = os.environ.get("DABAI_GITHUB_MIRROR", "").strip().rstrip("/")
+    if override:
+        _mirror_cache = override + "/"
+        return _mirror_cache
+    for prefix in MIRROR_PREFIXES:
+        try:
+            probe = urllib.request.Request(
+                prefix + "https://api.github.com/rate_limit",
+                headers={"User-Agent": "dabai-update"})
+            with urllib.request.urlopen(probe, timeout=MIRROR_PROBE_TIMEOUT) as r:
+                if r.status < 500:
+                    _mirror_cache = prefix
+                    return _mirror_cache
+        except Exception:
+            continue
+    return None
+
+
+def route_url(url: str) -> str:
+    """有代理直连；无代理时给 GitHub 官方域名套镜像前缀。API 与资产下载同走。"""
+    mp = mirror_prefix()
+    if not mp:
+        return url
+    if url.startswith("https://api.github.com/") or url.startswith("https://github.com/"):
+        return mp + url
+    return url
+
+
 def _opener():
     """带代理的 opener；没代理时显式直连 —— 不被环境里残留的坏变量带跑。"""
     proxy = detect_proxy()
@@ -319,6 +398,7 @@ def _opener():
 
 # ── GitHub ───────────────────────────────────────────────────────────────
 def gh_request(url: str, token: str, timeout: int, raw: bool = False):
+    url = route_url(url)
     headers = {
         "Accept": "application/octet-stream" if raw else "application/vnd.github+json",
         "User-Agent": "dabai-update",
@@ -372,6 +452,7 @@ DOWNLOAD_CHUNK = 8 * 1024 * 1024       # 后续每块 8MB（块越小握手次�
 
 def _range_get(url: str, token: str, start: int, size: int, timeout: int):
     """取 [start, start+size) 一段。返回 (数据, 状态码, 文件总大小或 None)。"""
+    url = route_url(url)
     headers = {
         "Accept": "application/octet-stream",
         "User-Agent": "dabai-update",
@@ -432,6 +513,12 @@ def download(url: str, dest: Path, token: str,
             tmp.unlink()      # 上一轮残片不拼进这一轮：脏字节别产生，别指望 sha256 兜底
         try:
             _fetch_whole(url, token, tmp)
+        except PermissionError as ex:
+            # 权限错重试三次只会把「写不进暂存目录」伪装成网络故障，还白等 2+4 秒。
+            raise RuntimeError(
+                f"写不进暂存目录：{ex}\n   目录属主不是当前用户？"
+                f"原地修：sudo chown -R $(id -u):$(id -g) {dest.parent}"
+            ) from ex
         except Exception as ex:
             last = ex
             if i < attempts:
@@ -766,6 +853,23 @@ def _token_in_file() -> bool:
     return False
 
 
+def _run_user_for(cfg: Dict[str, str]) -> Optional[Tuple[str, str]]:
+    """脱离出来的 unit 该以谁的身份跑 —— 答案是「安装目录的属主」，不是 root。
+
+    为什么必须钉死：systemd-run 默认落系统级 unit，User= 缺省是 root。而整套更新器
+    按设计是「普通用户跑，只在重启服务这一件事上升权」（见 install-update.sh 文件头）。
+    升权一旦覆盖到写盘，代价立刻可见：root 写出的 staging/backups 属主是 root，
+    下一次普通用户跑的更新器就再也写不进同一份暂存目录 —— 报出来的却是「下载失败」。
+    实测 2026-09-20 orangepi：✘ Permission denied: /var/lib/dabai-update/staging/…part。
+    解析不出属主就返回 None（维持旧行为），调用方负责把这件事记进日志。
+    """
+    try:
+        st = Path(cfg.get("ROOT") or ".").stat()
+        return (pwd.getpwuid(st.st_uid).pw_name, grp.getgrgid(st.st_gid).gr_name)
+    except (OSError, KeyError):
+        return None
+
+
 def detach_self(cfg: Dict[str, str], argv: Sequence[str]) -> int:
     """把自己交给 systemd-run 起的独立 unit，本进程立即退出。
 
@@ -776,6 +880,14 @@ def detach_self(cfg: Dict[str, str], argv: Sequence[str]) -> int:
     cmd = ["systemd-run", "--unit", unit, "--collect", "--quiet",
            "--property=Type=oneshot",
            f"--property=WorkingDirectory={os.getcwd()}"]
+    # 升权只用来「起一个与目标服务平级的 unit」，不该让整套更新改以 root 跑
+    owner = _run_user_for(cfg)
+    if owner:
+        cmd.append(f"--property=User={owner[0]}")
+        cmd.append(f"--property=Group={owner[1]}")
+    else:
+        log_line(cfg, "  ! 解析不出安装目录属主，脱离出来的 unit 按调用者身份跑"
+                      "（调用者是 root 时，暂存/备份会变成 root 属主）")
     tok = os.environ.get("GITHUB_TOKEN", "").strip()
     if tok and not _token_in_file():
         # 文件里没有才靠环境变量带过去。代价：systemd-run 的 argv 会短暂暴露这个值。
@@ -924,6 +1036,9 @@ def run(args) -> int:
     cur = local_version(root)
     stage = state_dir(cfg) / "staging"
     shutil.rmtree(stage, ignore_errors=True)
+    if stage.exists():
+        # state_dir 已经保证这个目录可写，所以剩下的解释只有一种：别的进程正在用同一份暂存。
+        log_line(cfg, f"  ! 旧暂存目录没清干净，继续用 {stage}")
     stage.mkdir(parents=True, exist_ok=True)
 
     # ── ① 取包 ──────────────────────────────────────────────────────────

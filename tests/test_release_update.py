@@ -713,3 +713,46 @@ def test_download_failure_exits_cleanly(tmp_path, monkeypatch):
         no_restart=True, ignore_active_turn=False, keep_backups=0)
     rc = update.run(args)
     assert rc == 1, rc
+
+
+# ── 网络路由：代理优先，无代理切国内镜像 ─────────────────────────────────
+def _reset_mirror(monkeypatch):
+    monkeypatch.setattr(update, "_mirror_probed", False)
+    monkeypatch.setattr(update, "_mirror_cache", None)
+
+
+def test_route_url_proxy_direct(monkeypatch):
+    """有代理：URL 原样，不套镜像。"""
+    _reset_mirror(monkeypatch)
+    monkeypatch.setattr(update, "detect_proxy", lambda: "http://127.0.0.1:7890")
+    url = "https://api.github.com/repos/geek-alpha/dabai-linux/releases/latest"
+    assert update.route_url(url) == url
+
+
+def test_route_url_mirror_no_proxy(monkeypatch):
+    """无代理 + 有镜像：api/github.com 套前缀，其它域名不动。"""
+    _reset_mirror(monkeypatch)
+    monkeypatch.setattr(update, "detect_proxy", lambda: None)
+    monkeypatch.setattr(update, "mirror_prefix", lambda: "https://ghproxy.net/")
+    assert update.route_url("https://api.github.com/repos/x/y/releases/assets/1") == \
+        "https://ghproxy.net/https://api.github.com/repos/x/y/releases/assets/1"
+    assert update.route_url("https://github.com/geek-alpha/dabai-linux") == \
+        "https://ghproxy.net/https://github.com/geek-alpha/dabai-linux"
+    assert update.route_url("https://objects.githubusercontent.com/xx") == \
+        "https://objects.githubusercontent.com/xx"
+
+
+def test_mirror_prefix_override_env(monkeypatch):
+    """无代理 + 环境变量指定镜像：直接用，不做网络探测。"""
+    _reset_mirror(monkeypatch)
+    monkeypatch.setattr(update, "detect_proxy", lambda: None)
+    monkeypatch.setenv("DABAI_GITHUB_MIRROR", "https://mirror.example.com")
+    assert update.mirror_prefix() == "https://mirror.example.com/"
+
+
+def test_mirror_prefix_proxy_wins(monkeypatch):
+    """有代理：即使设了镜像环境变量也直连（代理优先）。"""
+    _reset_mirror(monkeypatch)
+    monkeypatch.setattr(update, "detect_proxy", lambda: "http://127.0.0.1:7890")
+    monkeypatch.setenv("DABAI_GITHUB_MIRROR", "https://mirror.example.com")
+    assert update.mirror_prefix() is None
