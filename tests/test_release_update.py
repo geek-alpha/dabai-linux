@@ -140,6 +140,27 @@ def apply_args(root: Path, state: Path, tar: Path):
             "--local-tarball", str(tar), "--apply", "--no-restart"]
 
 
+@pytest.fixture(scope="session")
+def real_package(tmp_path_factory):
+    """真仓库打包一次，给本模块所有「拿真产物验契约」的用例共用。
+
+    为什么共享：build_release 打 1030 个文件要 ~9s（27MB 走 gzip 是瓶颈），
+    本模块有两处要真产物，各打一次就是整个测试套里最贵的 20s。产物只读，
+    共享没有副作用——断言的对象是同一个包，语义没变。
+
+    为什么必须配 xdist_group 标记：pytest-xdist 的 session fixture 是
+    per-worker 的，两个用例落到不同 worker 就各打一次、白省。
+
+    返回 (产物目录, build_release 的 stdout)。
+    """
+    out = tmp_path_factory.mktemp("real_package")
+    p = subprocess.run(
+        [sys.executable, str(REL / "build_release.py"), "--out", str(out)],
+        cwd=str(REPO), capture_output=True, text=True, timeout=900)
+    assert p.returncode == 0, p.stdout + p.stderr
+    return out, p.stdout
+
+
 # ── 契约不漂移 ───────────────────────────────────────────────────────────
 def test_floor_matches_paths():
     """update.py 内嵌地板必须与 paths.py 的 FLOOR_GLOBS 完全一致。
@@ -318,15 +339,13 @@ def test_rollback_restores_previous_and_spares_experience(tmp_path):
 
 
 # ── 真实仓库端到端 ───────────────────────────────────────────────────────
-def test_real_repo_package_has_no_protected_path(tmp_path):
+@pytest.mark.xdist_group("real_package")
+def test_real_repo_package_has_no_protected_path(real_package):
     """在真仓库上打一次包，断言：能打出来、包内无受保护路径、经历文件不在包里。"""
-    p = subprocess.run(
-        [sys.executable, str(REL / "build_release.py"), "--out", str(tmp_path)],
-        cwd=str(REPO), capture_output=True, text=True, timeout=900)
-    assert p.returncode == 0, p.stdout + p.stderr
-    assert "解包回验通过" in p.stdout, p.stdout
+    out, build_out = real_package
+    assert "解包回验通过" in build_out, build_out
 
-    tars = sorted(tmp_path.glob("dabai-*.tar.gz"))
+    tars = sorted(out.glob("dabai-*.tar.gz"))
     assert tars, "没打出包"
     with tarfile.open(tars[0], "r:gz") as tar:
         names = [manifest_mod.norm_rel(m.name) for m in tar.getmembers()]
@@ -462,7 +481,8 @@ def test_vendor_is_packaged():
 
 
 
-def test_release_sha256_is_file_hash_and_updater_accepts_it(tmp_path):
+@pytest.mark.xdist_group("real_package")
+def test_release_sha256_is_file_hash_and_updater_accepts_it(real_package, tmp_path):
     """真产物喂真更新器：.sha256 语义两端必须对得上。
 
     这条曾经真的错了：build_release 把 gzip 前的 tar 内容哈希写进 .sha256，
@@ -471,11 +491,7 @@ def test_release_sha256_is_file_hash_and_updater_accepts_it(tmp_path):
     「包哈希不符」拒绝更新。原因是测试夹具自己用的就是文件哈希，全绿恰恰掩盖了
     生产端的错 —— 两端各自自洽，接口对不上。
     """
-    out = tmp_path / "dist"
-    p = subprocess.run(
-        [sys.executable, str(REL / "build_release.py"), "--out", str(out)],
-        cwd=str(REPO), capture_output=True, text=True, timeout=900)
-    assert p.returncode == 0, p.stdout + p.stderr
+    out, _ = real_package
 
     version = build_mod.read_version(REPO)
     tar = out / f"dabai-{version}.tar.gz"

@@ -33,7 +33,13 @@ norecursedirs = [
 
 # 收集阶段不因单个模块导入失败而中断——一个坏模块不该挡住其余测试。
 # 兜底用：将来若又混进需要特殊运行时的目录，也不会再出现「全中断」。
-addopts = "--continue-on-collection-errors"
+#
+# --dist loadgroup：让标了 xdist_group 的用例落到同一个 worker。
+# 为什么需要：pytest-xdist 的 session fixture 是 per-worker 的，
+# test_release_update 里那对共享「真仓库打包」产物的用例一旦被分到两个 worker，
+# 就各打一次 27MB 的包（多花 ~9s）。loadgroup 把同组用例钉在一起，共享才真发生。
+# 不带 -n 裸跑时这个选项无副作用（已实测）。
+addopts = "--continue-on-collection-errors --dist loadgroup"
 
 # 测试套就是 tests/：裸跑 pytest 只该收集它。
 # tools/ 与 skills/ 下也散着 *_test.py，但那些是脚本式自测（顶层 sys.exit(0)），
