@@ -410,6 +410,12 @@ class SubAgentManager:
                 wid = rec.get("id")
                 if wid:
                     latest[wid] = rec
+            # 重启那一刻还在跑/排队的 worker 已随旧进程消失，状态却停在 running/queued，
+            # 回灌后会被当成「正在干活」（实测 8 个僵尸占满面板）——一律改判为已中断。
+            for rec in latest.values():
+                if rec.get("status") in (ST_QUEUED, ST_RUNNING):
+                    rec["status"] = ST_CANCELLED
+                    rec["status_label"] = "已中断（进程重启）"
             self._history = sorted(latest.values(), key=lambda r: r.get("ts", 0))
             logger.info("[SubAgent] 回灌审计历史 %d 条", len(self._history))
         except Exception as e:
