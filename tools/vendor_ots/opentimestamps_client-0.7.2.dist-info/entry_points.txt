@@ -1,0 +1,3 @@
+[console_scripts]
+ots = otsclient.ots:main
+ots-git-gpg-wrapper = otsclient.git_gpg_wrapper:main
