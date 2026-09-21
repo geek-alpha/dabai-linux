@@ -132,3 +132,54 @@ def test_every_service_stop_is_guarded_by_detach_check():
     for s in stops:
         assert any(d < s for d in detaches), (
             f"第 {s + 1} 行的停机没有前置的脱离检查 —— 原地跑会把自己杀掉")
+
+
+# ── 自脱离出来的 unit 不能以 root 写盘 ──────────────────────────────────
+def test_detached_unit_is_pinned_to_repo_owner(monkeypatch, tmp_path):
+    """systemd-run 默认落系统级 unit、User=root。
+
+    不钉住的话，升权就从「起一个平级 unit」悄悄变成「整套更新以 root 跑」：
+    root 写出来的 staging/backups 属主是 root，下一次普通用户跑的更新器再也写不进
+    同一份暂存目录 —— 报出来却是「下载失败」。这就是 orangepi 那份 root:root 的来源。
+    """
+    seen = {}
+
+    def fake_run(cmd, **k):
+        seen["cmd"] = list(cmd)
+        return _Done(0)
+
+    monkeypatch.setattr(update.subprocess, "run", fake_run)
+    monkeypatch.setattr(update, "_token_in_file", lambda: True)
+    monkeypatch.setattr(update, "_run_user_for", lambda cfg: ("wxf", "wxf"))
+    assert update.detach_self({"STATE": str(tmp_path)}, ["--apply"]) == 0
+    joined = " ".join(seen["cmd"])
+    assert "--property=User=wxf" in joined
+    assert "--property=Group=wxf" in joined
+
+
+def test_run_user_comes_from_install_dir_owner(tmp_path):
+    import grp as _grp
+    import pwd as _pwd
+
+    st = tmp_path.stat()
+    assert update._run_user_for({"ROOT": str(tmp_path)}) == (
+        _pwd.getpwuid(st.st_uid).pw_name, _grp.getgrgid(st.st_gid).gr_name)
+    assert update._run_user_for({"ROOT": str(tmp_path / "不存在")}) is None
+
+
+def test_detach_still_runs_when_owner_unknown(monkeypatch, tmp_path):
+    """解析不出属主时维持旧行为 —— 但不能因此变成静默：调用方记了一条日志。"""
+    seen = {}
+    logs = []
+
+    def fake_run(cmd, **k):
+        seen["cmd"] = list(cmd)
+        return _Done(0)
+
+    monkeypatch.setattr(update.subprocess, "run", fake_run)
+    monkeypatch.setattr(update, "_token_in_file", lambda: True)
+    monkeypatch.setattr(update, "_run_user_for", lambda cfg: None)
+    monkeypatch.setattr(update, "log_line", lambda cfg, msg: logs.append(msg))
+    assert update.detach_self({"STATE": str(tmp_path)}, ["--apply"]) == 0
+    assert "--property=User=" not in " ".join(seen["cmd"])
+    assert any("属主" in m for m in logs)
