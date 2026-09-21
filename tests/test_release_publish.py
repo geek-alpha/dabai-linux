@@ -310,10 +310,12 @@ def test_notify_says_to_each_peer(monkeypatch, tmp_path):
     r = publish.do_notify("1.0.11")
 
     assert r == {"notified": ["rpi", "wsl"], "failed": []}
-    assert [c[0][2] for c in seen] == ["say", "say"]
-    assert [c[0][3] for c in seen] == ["rpi", "wsl"]
+    # 并行发送：完成顺序天然不定，只断言「每个节点都被发到、参数正确」
+    assert sorted(c[0][2] for c in seen) == ["say", "say"]
+    assert sorted(c[0][3] for c in seen) == ["rpi", "wsl"]
     assert all(c[0][1].endswith("peer_mesh.py") for c in seen)
-    assert "1.0.11" in seen[0][0][4] and "update.py" in seen[0][0][4]
+    texts = {c[0][3]: c[0][4] for c in seen}
+    assert "1.0.11" in texts["rpi"] and "update.py" in texts["rpi"]
 
 
 def test_notify_reports_failure_without_raising(monkeypatch, tmp_path):
@@ -349,7 +351,7 @@ def _wire_main(monkeypatch, watch_rc):
     monkeypatch.setattr(publish, "do_commit", lambda *a: None)
     monkeypatch.setattr(publish, "do_push", lambda *a: None)
     monkeypatch.setattr(publish, "do_log", lambda e: None)
-    monkeypatch.setattr(publish, "do_watch", lambda v, t: watch_rc)
+    monkeypatch.setattr(publish, "do_watch", lambda *a, **k: watch_rc)
     monkeypatch.setattr(publish, "do_notify",
                         lambda ver: (calls["notify"].append(ver), {"notified": [], "failed": []})[1])
     monkeypatch.setattr(publish, "git", _FakeGit({"rev-parse HEAD": _cp("abc123\n")}))

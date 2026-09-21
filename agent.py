@@ -3136,7 +3136,8 @@ def _model_first_transport(inner):
     return _ModelFirstTransport(inner)
 
 
-def _build_llm_client(base_url: str, api_key: str, proxy: str | None = None) -> AsyncOpenAI:
+def _build_llm_client(base_url: str, api_key: str, proxy: str | None = None,
+                      session_id: str | None = None) -> AsyncOpenAI:
     """构建 LLM 客户端（可走 fq 代理）。
 
     默认 trust_env=True 会让 httpx 读取 Windows 系统代理（注册表
@@ -3146,12 +3147,21 @@ def _build_llm_client(base_url: str, api_key: str, proxy: str | None = None) -> 
     这里显式传入 trust_env=False 的 httpx 客户端，让 LLM 调用只走
     显式指定的 proxy（settings.json 的 llm_proxy：auto=自动拉起 fq 代理；
     自定义地址；缺省直连），绝不信任系统代理。
+
+    opencode.ai/zen/go 网关要求 x-opencode-session 头（稳定 session ID），
+    否则返回 400 MissingSessionID。检测到 opencode.ai 域名时自动注入。
     """
     import httpx as _httpx
     inner = _httpx.AsyncHTTPTransport(proxy=proxy) if proxy else _httpx.AsyncHTTPTransport()
+    extra_headers = {}
+    if "opencode.ai" in (base_url or "").lower():
+        sid = session_id or str(uuid.uuid4())
+        extra_headers["x-opencode-session"] = sid
+        extra_headers["User-Agent"] = "dabai-agent/1.0"
     return AsyncOpenAI(
         api_key=api_key,
         base_url=base_url,
+        default_headers=extra_headers or None,
         http_client=_httpx.AsyncClient(
             transport=_model_first_transport(inner),
             trust_env=False,

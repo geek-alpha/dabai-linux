@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import concurrent.futures
 import json
 import os
 import subprocess
@@ -318,24 +319,27 @@ def do_notify(ver: str) -> dict:
     text = (f"v{ver} 已发布：dabai-{ver}.tar.gz + .sha256 资产齐全，可以拉。"
             f"开了 peer.auto_update 的机器会自己去查新版；否则手工：python deploy/release/update.py")
     sent, failed = [], []
-    # 并行通知：每节点独立子进程，总耗时 = max(单节点) 而非 sum(单节点)
-    procs = {}
-    for n in nodes:
+
+    def _say(n: str):
         cmd = [_python(), str(ROOT / "peer_mesh.py"), "say", n, text, "--kind", "release"]
-        procs[n] = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    for n, p in procs.items():
         try:
-            p.wait(timeout=30)
+            return n, _run(cmd, timeout=30)
         except subprocess.TimeoutExpired:
-            p.kill()
-            p.wait()
-        if p.returncode == 0:
+            return n, None
+
+    # 并行通知：每节点一个线程，总耗时 = max(单节点) 而非 sum(单节点)。
+    # 走 _run 而不是裸 Popen —— 它会给子进程带上 netproxy 代理环境（peer_mesh 要出网）。
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(nodes)) as pool:
+        results = list(pool.map(_say, nodes))
+    for n, cp in results:
+        if cp is not None and cp.returncode == 0:
             sent.append(n)
             ok(f"{n}：已留言")
         else:
             failed.append(n)
-            last = ((p.stdout or "") + (p.stderr or "")).strip().splitlines()
-            warn(f"{n}：留言失败 —— {last[-1] if last else '无输出'}")
+            out = ((cp.stdout or "") + (cp.stderr or "")) if cp is not None else ""
+            last = out.strip().splitlines()
+            warn(f"{n}：留言失败 —— {last[-1] if last else ('超时' if cp is None else '无输出')}")
     return {"notified": sent, "failed": failed}
 
 
