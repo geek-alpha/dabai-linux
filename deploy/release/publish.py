@@ -276,7 +276,9 @@ def do_push(branch: str, ver: str, token: str) -> None:
     if git("rev-parse", "--verify", f"refs/tags/{tag}").returncode == 0:
         warn(f"tag {tag} 已存在（重发同一版本），不重复创建")
     else:
-        git("tag", "-a", tag, "-m", f"大白 {tag}", check=True)
+        git("tag", "-a", tag, "-m",
+            f"大白 {tag}\npublished-by: {_publisher() or 'unknown'}"
+            f"\npublished-at: {time.strftime('%Y-%m-%d %H:%M:%S %z')}", check=True)
     p = git("push", "origin", tag, token=token)
     if p.returncode != 0:
         die(f"推 tag 失败：\n    {p.stderr.strip()}\n"
@@ -291,6 +293,19 @@ def do_watch(ver: str, timeout: int, interval: int = 10) -> int:
     cmd = [_python(), str(RELEASE_DIR / "watch_release.py"), f"v{ver}",
            "--root", str(ROOT), "--timeout", str(timeout), "--interval", str(interval)]
     return subprocess.run(cmd, cwd=str(ROOT)).returncode
+
+
+def _publisher() -> str:
+    """发布者标识。三台机器的 git 身份是同一个，只有 node_id 分得出这版是哪台发的。
+
+    写进 tag annotation：tag 永久留在仓库里，`git tag -n99 vX` 就能查，比广播一条消息
+    便宜 —— 零运行时成本、不依赖对面在线、事后也能追。
+    """
+    try:
+        me = json.loads((ROOT / "data" / "node.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    return str((me or {}).get("node_id") or "")
 
 
 def _peer_nodes() -> list:

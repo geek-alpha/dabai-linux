@@ -82,6 +82,18 @@ python deploy/release/publish.py -m "这次改了什么"
 提前喊「可以拉」会让对面去拉一个还不存在的资产。通知走 `peer_mesh.py say`，
 任一实例离线只警告不失败 —— 包已经发出去了，通知失败不该改成发布失败。
 
+每一版的 tag 自带发布者标记，发布这件事本身可回溯，不靠广播：
+
+```bash
+git tag -n99 vX.Y.Z               # 人读：published-by / published-at
+git cat-file -p refs/tags/vX.Y.Z  # 机器读：tag 对象正文里的同样两行
+```
+
+三台机器的 git 身份是同一个（同一个主人的邮箱），只有 `data/node.json` 的 node_id
+分得出这版是哪台发的。标记写在 tag 对象里，跟着 tag 永久留在仓库，谁都能验，
+零运行时成本 —— 不需要谁在线、不需要谁回话。v1.1.12 及以前的 tag 只有一行标题，
+标记从下一版起生效。
+
 常用变体：
 
 ```bash
