@@ -656,11 +656,19 @@ def _get_db() -> sqlite3.Connection:
     """
     conn = getattr(_db_local, 'conn', None)
     # 检查连接是否有效（未关闭；锁冲突视为失效，交由 _connect_db 重试重建）
+    # 必须真读一次 schema：SELECT 1 是常量表达式，SQLite 不碰数据库文件就能回答，
+    # NOTADB（file is not a database）这类损坏探不出来 —— 探活通过、真查询才炸，
+    # 坏连接永远重建不了，服务持续回不了消息。
     if conn is not None:
         try:
-            conn.execute("SELECT 1")
-        except (sqlite3.ProgrammingError, sqlite3.OperationalError):
-            conn = None  # 连接已关闭（如 conn.close() 遗留）或已锁定，重建
+            conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+        except sqlite3.DatabaseError:
+            # DatabaseError 是 OperationalError/ProgrammingError 的基类，只捕子类会漏掉 NOTADB
+            try:
+                conn.close()
+            except Exception:
+                pass
+            conn = None
     if conn is None:
         conn = _connect_db()
         _db_local.conn = conn

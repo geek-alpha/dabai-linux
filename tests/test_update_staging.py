@@ -53,7 +53,14 @@ def home_fallback(tmp_path, monkeypatch):
     return home / ".local" / "state" / "dabai-update"
 
 
+# root 无视目录权限位（chmod 0o555 照样写得进去），权限类断言只在非 root 下成立。
+_IS_ROOT = getattr(os, "geteuid", lambda: -1)() == 0
+_root_cannot_be_blocked = pytest.mark.skipif(
+    _IS_ROOT, reason="root 无视目录权限位：权限类断言在 root 下恒不成立（假失败）")
+
+
 # ── ① 候选目录要按「真能写」挑 ────────────────────────────────────────────
+@_root_cannot_be_blocked
 def test_state_dir_skips_candidate_whose_staging_is_unwritable(tmp_path, home_fallback):
     state = tmp_path / "state"
     st = state / "staging"
@@ -73,6 +80,7 @@ def test_state_dir_creates_staging_and_backups(tmp_path, home_fallback):
     assert (state / "backups").is_dir()
 
 
+@_root_cannot_be_blocked
 def test_state_dir_error_names_the_chown_fix(tmp_path, home_fallback):
     state = tmp_path / "state"
     (state / "staging").mkdir(parents=True)
@@ -114,6 +122,7 @@ def test_download_permission_error_fails_fast(tmp_path, monkeypatch):
 
 
 # ── ③ 端到端：老暂存目录写不进去，这次升级照样装得成 ──────────────────────
+@_root_cannot_be_blocked
 def test_apply_survives_stale_unwritable_staging(tmp_path, monkeypatch):
     inst = tru.make_instance(tmp_path, "1.0.0")
     tar, man, digest = tru.make_package(

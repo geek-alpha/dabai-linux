@@ -32,6 +32,14 @@ def _isolate_gate_audit(tmp_path, monkeypatch):
     monkeypatch.setattr(gate_audit, "_LOADED", False)
 
 
+@pytest.fixture(autouse=True)
+def _isolate_ledger_quota(monkeypatch):
+    """余额是本机状态，不是闸门契约：余额见底时 heavy_block 把烧钱大户判 deny，
+    「高危工具该 ask」就会随机器余额变红。低配额拦截由 test_ledger_quota 专测。"""
+    import peer_ledger
+    monkeypatch.setattr(peer_ledger, "heavy_block", lambda tool_name: "")
+
+
 # ---------- evaluate 判定规则 ----------
 
 def test_只读工具零确认():

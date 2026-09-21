@@ -21,6 +21,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 BASE = Path(__file__).resolve().parents[1]
 if str(BASE) not in sys.path:
     sys.path.insert(0, str(BASE))
@@ -49,6 +51,16 @@ def _audit_rows(pm):
         return [json.loads(ln) for ln in pm.TASK_LOG_FILE.read_text(encoding="utf-8").splitlines() if ln.strip()]
     except OSError:
         return []
+
+
+@pytest.fixture(autouse=True)
+def _isolate_ledger(tmp_path_factory, monkeypatch):
+    """余额是本机状态，不是派活契约：余额见底时 _ledger_gate 会拒掉每一单，
+    让「三道闸门」的用例随机器余额变红。指到不存在的账本 = 未启用资源账的老行为。
+    余额闸门本身由 test_ledger_quota 专测。"""
+    import peer_ledger as pl
+    monkeypatch.setattr(pl, "LEDGER_FILE", tmp_path_factory.mktemp("ledger") / "ledger.jsonl")
+
 
 
 def test_dangerous_blocked_and_not_scheduled(tmp_path):
