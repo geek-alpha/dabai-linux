@@ -2906,13 +2906,6 @@ try:
 except Exception:
     pass
 
-try:
-    # 提问卡复用同一条通道（bridge_confirm + harness-modal），只是语义不同
-    import ask_user as _ask_user
-    _ask_user.set_broadcast(_gate_broadcast_safe)
-except Exception:
-    pass
-
 
 # ---------- 工作清单搁置提醒 ----------
 # plan_view 的「⏸ 已中断」只是显示层判定：没人盯任务中心时，搁置就一直搁着。
@@ -2981,24 +2974,12 @@ async def gate_audit_list(limit: int = 20):
     return {"ok": True, "items": gate_audit.list_audit(limit)}
 
 
-@app.get("/api/bridge/ask-history")
-async def ask_history(limit: int = 20):
-    """提问卡留痕：最近问过什么、答了什么（刷新页面后聊天框补回这些卡片）。"""
-    import ask_user as _ask_user
-    return {"ok": True, "items": _ask_user.list_history(limit)}
-
 
 @app.post("/api/bridge/confirm")
 async def harness_bridge_confirm(payload: dict):
     request_id = str(payload.get("request_id") or "")
     approve = bool(payload.get("approve"))
     always = bool(payload.get("always"))  # 工具确认卡第三选项『总是允许』
-    if request_id.startswith("ask_user:"):
-        # 提问卡：把用户的选项/文字回填给挂起等待的工具（value 为空 = 跳过）
-        import ask_user as _ask_user
-        if not _ask_user.resolve(request_id, str(payload.get("value") or "")):
-            raise HTTPException(status_code=404, detail="提问卡不存在或已过期")
-        return {"ok": True, "request_id": request_id, "status": "answered"}
     if request_id.startswith("tool_gate:"):
         # 工具级确认：写进 agent 闸门状态（白名单/黑名单/永久白名单）并广播收尾卡片。
         # 卡片挂在会话实例上，这里必须按 rid 反查持卡实例——用 get_agent() 会落到另一个实例，永远 404。

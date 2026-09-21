@@ -289,9 +289,6 @@ export default (function init(App: AppKernel) {
         App._sentBgName = savedBg2.name;
       }
 
-      // 刷新/重连后把最近的提问卡补回聊天框（服务端留痕，关掉弹窗也翻得到）
-      if (App.syncAskCards) App.syncAskCards();
-
       // 启动 WebSocket 心跳（每25秒发一次 ping，防止 NAT/代理超时断连）
       App.wsHeartbeat = setInterval(() => {
         if (App.ws && App.ws.readyState === WebSocket.OPEN) {
@@ -623,8 +620,6 @@ export default (function init(App: AppKernel) {
         break;
       case 'bridge_status':
         if (App.updateHarnessStatus) App.updateHarnessStatus(msg);
-        // 提问卡超时（expired）：聊天框里的卡片同步置灰，别让按钮看着还能点
-        if (msg.status === 'expired' && App.updateAskCard) App.updateAskCard(msg.request_id || '', '', 'timeout');
         break;
       case 'bridge_say':
         // 反向通道：DSH 侧的 AI 助手给用户递话（经「大白」的信使角色）
@@ -1199,55 +1194,21 @@ export default (function init(App: AppKernel) {
   App.harnessRequestId = null;
   App._harnessPollTimer = null;
   App._harnessPolling = false;
-  App.harnessAskMode = false;
 
-  /* ---------- 提问卡留痕：问过什么、答了什么，聊天框里留一张可回看的卡片 ---------- */
-  const askCards = new Map<string, HTMLElement>(); // request_id -> 聊天框卡片
-
-  const ASK_STATUS_TEXT: Record<string, string> = {
-    pending: '⏳ 等你回答',
-    answered: '✅ 已回答',
-    skipped: '⏭ 已跳过',
-    timeout: '⌛ 已超时',
-    expired: '⌛ 已过期',
-  };
-
-  /** 把状态刷到卡片上：答过的显示答案并置灰按钮，未答的保持可点 */
-  function applyAskState(card: HTMLElement, status: string, answer: string) {
-    const st = ASK_STATUS_TEXT[status] || ASK_STATUS_TEXT.pending;
-    const stEl = card.querySelector('.ask-status') as HTMLElement | null;
-    if (stEl) { stEl.textContent = st; stEl.className = 'ask-status ' + status; }
-    const ansEl = card.querySelector('.ask-answer') as HTMLElement | null;
-    const pending = status === 'pending';
-    if (ansEl) {
-      if (pending) { ansEl.style.display = 'none'; ansEl.textContent = ''; }
-      else {
-        ansEl.style.display = 'block';
-        ansEl.textContent = status === 'answered'
-          ? '你的回答：' + (answer || '')
-          : (status === 'skipped' ? '你跳过了这个问题（按默认继续）' : '没有回答（按默认继续）');
-      }
-    }
-    card.querySelectorAll('.ask-opt-btn').forEach((n) => {
-      const b = n as HTMLButtonElement;
-      b.disabled = !pending;
-      b.classList.toggle('chosen', !pending && status === 'answered' && b.dataset.value === answer);
-    });
-  }
 
   /* ---------- 工作清单搁置提醒：聊天框里一条提示卡（无需作答，只为被看见） ---------- */
   function renderPlanStallCard(text: string) {
     if (!App.messagesEl) return;
     const card = document.createElement('div');
-    card.className = 'msg ask-card plan-stall-card';
+    card.className = 'msg plan-stall-card';
     card.innerHTML =
-      '<div class="ask-head">' +
-        '<span class="ask-icon">📋</span>' +
-        '<span class="ask-title">工作清单搁置提醒</span>' +
-        '<span class="ask-status">⏸ 已中断</span>' +
+      '<div class="stall-head">' +
+        '<span class="stall-icon">📋</span>' +
+        '<span class="stall-title">工作清单搁置提醒</span>' +
+        '<span class="stall-status">⏸ 已中断</span>' +
       '</div>' +
-      '<div class="ask-question"></div>';
-    const qEl = card.querySelector('.ask-question') as HTMLElement | null;
+      '<div class="stall-question"></div>';
+    const qEl = card.querySelector('.stall-question') as HTMLElement | null;
     if (qEl) qEl.textContent = text || '清单很久没动了';
     App.messagesEl.appendChild(card);
     App._trimMessages();
@@ -1258,123 +1219,9 @@ export default (function init(App: AppKernel) {
   }
 
 
-  /** 建/取聊天框里的提问卡（同一 request_id 只建一次；quiet=恢复历史时不滚屏不提示） */
-  function ensureAskCard(rid: string, question: string, options: any,
-                         status: string, answer: string, quiet?: boolean): HTMLElement | null {
-    if (!rid || !App.messagesEl) return null;
-    let card = askCards.get(rid);
-    if (card && !document.body.contains(card)) { askCards.delete(rid); card = undefined; }
-    if (!card) {
-      card = document.createElement('div');
-      card.className = 'msg ask-card';
-      card.dataset.askId = rid;
-      card.innerHTML =
-        '<div class="ask-head">' +
-          '<span class="ask-icon">❓</span>' +
-          '<span class="ask-title">大白问了你一个问题</span>' +
-          '<span class="ask-status"></span>' +
-        '</div>' +
-        '<div class="ask-question"></div>' +
-        '<div class="ask-options"></div>' +
-        '<div class="ask-answer" style="display:none"></div>';
-      App.messagesEl.appendChild(card);
-      askCards.set(rid, card);
-      if (!quiet) {
-        App._trimMessages();
-        App.bumpNewMsg(card);
-        App.scrollToBottom();
-        App.notifyFullscreenChat();
-      }
-    }
-    const qEl = card.querySelector('.ask-question') as HTMLElement | null;
-    if (qEl) qEl.textContent = question || '（空问题）';
-    const optBox = card.querySelector('.ask-options') as HTMLElement | null;
-    if (optBox && !optBox.childElementCount) {
-      const list = Array.isArray(options) ? options : [];
-      list.forEach((opt) => {
-        const btn = document.createElement('button');
-        btn.type = 'button';
-        btn.className = 'ask-opt-btn';
-        btn.textContent = String(opt);
-        btn.dataset.value = String(opt);
-        btn.addEventListener('click', () => App.submitAskAnswer(rid, String(opt)));
-        optBox.appendChild(btn);
-      });
-      optBox.style.display = list.length ? '' : 'none';
-    }
-    applyAskState(card, status, answer);
-    return card;
-  }
 
-  /** 刷新/重连后补回最近的提问卡（服务端留痕；只补聊天框里没有的） */
-  App.syncAskCards = function syncAskCards() {
-    fetch('/api/bridge/ask-history?limit=20').then(r => r.json()).then((data: any) => {
-      if (!data || !data.ok) return;
-      // 服务端新的在前，插入按时间正序
-      const items = (data.items || []).slice().reverse();
-      for (const it of items) {
-        if (!it || !it.id) continue;
-        if (it.status && it.status !== 'pending') continue;  // 只补还没答的：已答/跳过/超时的卡销毁后不诈尸
-        const old = askCards.get(it.id);
-        if (old && document.body.contains(old)) continue;
-        ensureAskCard(it.id, it.q, it.options, it.status || 'pending', it.answer || '', true);
-      }
-    }).catch(() => {});
-  };
-
-  /** 销毁提问卡：卡片的使命是「等一个答案」，答完/跳过/超时/过期即焚，不留占位噪音 */
-  function destroyAskCard(rid: string) {
-    const card = askCards.get(rid);
-    if (card && card.parentNode) card.parentNode.removeChild(card);
-    askCards.delete(rid);
-  }
-
-  /** 状态更新（答题后 / 超时广播 / 过期回写）；非 pending 一律销毁 */
-  App.updateAskCard = function updateAskCard(rid: string, answer: string, status: string) {
-    const card = askCards.get(rid);
-    if (!card || !document.body.contains(card)) return;
-    if (status && status !== 'pending') { destroyAskCard(rid); return; }
-    applyAskState(card, status, answer);
-  };
-
-  /** 提交提问卡答案（聊天卡与弹窗共用）；value 为空 = 跳过，别让模型干等到超时 */
-  App.submitAskAnswer = function submitAskAnswer(rid: string, value: string) {
-    if (!rid) return;
-    App.updateAskCard(rid, String(value || ''), value ? 'answered' : 'skipped');
-    if (App.harnessRequestId === rid) {
-      App.harnessAskMode = false;
-      App.harnessClose();
-    }
-    fetch('/api/bridge/confirm', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ request_id: rid, value: String(value || '') })
-    }).then(r => {
-      // 404 = 卡片已过期（模型侧超时/进程重启）：卡片置灰，别让人以为还能答
-      if (r.status === 404) App.updateAskCard(rid, '', 'expired');
-    }).catch(() => { /* 离线/失败：模型侧会走超时说明，不阻塞界面 */ });
-  };
-
-  /** 渲染提问卡的选项按钮（点一下即作答） */
-  function renderHarnessOptions(options) {
-    const el = document.getElementById('harness-options');
-    if (!el) return;
-    el.innerHTML = '';
-    const list = Array.isArray(options) ? options : [];
-    if (!list.length) { el.style.display = 'none'; return; }
-    list.forEach((opt) => {
-      const btn = document.createElement('button');
-      btn.type = 'button';
-      btn.className = 'harness-opt-btn';
-      btn.textContent = String(opt);
-      btn.addEventListener('click', () => App.harnessAnswer(String(opt)));
-      el.appendChild(btn);
-    });
-    el.style.display = '';
-  }
 
   /** 弹出卡片（bridge_confirm 触发）。request_id 前缀决定语义：
-   *  ask_user:  → 提问卡（问题+选项，等一个答案，答完模型继续）
    *  tool_gate: → 工具确认卡（允许一次 / 总是允许 / 拒绝）
    *  其余       → 任务确认卡（DSH 执行任务前的人工闸门） */
   App.showHarnessConfirm = function showHarnessConfirm(requestId, task, options) {
@@ -1383,39 +1230,15 @@ export default (function init(App: AppKernel) {
     const taskEl = modal.querySelector('.harness-task');
     const replyEl = document.getElementById('harness-reply');
     const hintEl = document.getElementById('harness-hint');
-    const optionsEl = document.getElementById('harness-options');
-    const answerRow = document.getElementById('harness-answer-row');
     const cancelBtn = document.getElementById('harness-cancel-btn');
     const approveBtn = document.getElementById('harness-approve-btn');
     const alwaysBtn = document.getElementById('harness-always-btn');
     const rid = typeof requestId === 'string' ? requestId : '';
-    const isAsk = rid.indexOf('ask_user:') === 0;
     const isToolGate = rid.indexOf('tool_gate:') === 0;
-    App.harnessAskMode = isAsk;
     if (taskEl) taskEl.textContent = task || '（空任务）';
     if (replyEl) { replyEl.style.display = 'none'; replyEl.textContent = ''; }
     modal.style.display = 'flex';
     App.harnessRequestId = requestId;
-    if (isAsk) {
-      // 提问卡没有任务可轮询，等的是一个答案；空输入行永远留着（自由回答）
-      App._harnessPolling = false;
-      if (hintEl) hintEl.textContent = '大白在等你回答这个问题，答完它会带着答案继续干活；跳过它就会按默认继续。';
-      cancelBtn.textContent = '跳过';
-      cancelBtn.style.display = '';
-      approveBtn.style.display = 'none';
-      if (alwaysBtn) alwaysBtn.style.display = 'none';
-      ensureAskCard(rid, task || '', options, 'pending', '');
-      renderHarnessOptions(options);
-      if (answerRow) answerRow.style.display = '';
-      const input = document.getElementById('harness-answer-input');
-      if (input) {
-        input.value = '';
-        setTimeout(() => { try { input.focus(); } catch (e) { /* 移动端可能拒绝聚焦 */ } }, 60);
-      }
-      return;
-    }
-    if (optionsEl) { optionsEl.style.display = 'none'; optionsEl.innerHTML = ''; }
-    if (answerRow) answerRow.style.display = 'none';
     if (hintEl) hintEl.textContent = '角色「' + ((App.rcRoleName && App.rcRoleName.value) || '大白') + '」想请 AI 助手执行上面的任务，确认后才会真正动手，你也可以直接关闭拒绝。';
     cancelBtn.textContent = '拒绝';
     approveBtn.textContent = isToolGate ? '允许一次' : '确认执行';
@@ -1519,16 +1342,8 @@ export default (function init(App: AppKernel) {
     });
   };
 
-  /** 提交提问卡的答案（value 为空 = 跳过，让模型按默认继续，不干等超时） */
-  App.harnessAnswer = function harnessAnswer(value) {
-    const rid = App.harnessRequestId;
-    if (!rid || !App.harnessAskMode) return;
-    App.submitAskAnswer(rid, String(value || ''));
-  };
-
   /** 关闭确认卡片 */
   App.harnessClose = function harnessClose() {
-    App.harnessAskMode = false;
     App._harnessPolling = false;
     if (App._harnessPollTimer) { clearTimeout(App._harnessPollTimer); App._harnessPollTimer = null; }
     App.harnessRequestId = null;
@@ -1555,22 +1370,9 @@ export default (function init(App: AppKernel) {
     const alwaysBtn = document.getElementById('harness-always-btn');
     const closeBtn = document.getElementById('harness-modal-close');
     const backdrop = document.querySelector('#harness-modal .modal-backdrop');
-    const answerInput = document.getElementById('harness-answer-input');
-    const answerSend = document.getElementById('harness-answer-send');
-    const submitAnswer = () => {
-      const v = answerInput ? String(answerInput.value || '').trim() : '';
-      if (!v) return;
-      App.harnessAnswer(v);
-    };
-    if (answerSend) answerSend.addEventListener('click', submitAnswer);
-    if (answerInput) answerInput.addEventListener('keydown', (ev) => {
-      if (ev.key === 'Enter') { ev.preventDefault(); submitAnswer(); }
-    });
     if (confirmBtn) confirmBtn.addEventListener('click', () => App.harnessApprove(true, false));
     if (alwaysBtn) alwaysBtn.addEventListener('click', () => App.harnessApprove(true, true));
     if (cancelBtn) cancelBtn.addEventListener('click', () => {
-      // 提问卡：取消 = 跳过（模型按默认继续，不干等超时）
-      if (App.harnessAskMode) { App.harnessAnswer(''); return; }
       // 取消/关闭二合一：pending→拒绝；running→中断；done/error→关闭
       if (App.harnessRequestId && (App._harnessPolling || App.harnessStatus === 'running')) {
         const wasPolling = App._harnessPolling;
@@ -1586,8 +1388,6 @@ export default (function init(App: AppKernel) {
       }
     });
     const dismiss = () => {
-      // 提问卡：关闭即跳过（否则模型要干等到超时）
-      if (App.harnessAskMode) { App.harnessAnswer(''); return; }
       App.harnessClose();
     };
     if (closeBtn) closeBtn.addEventListener('click', dismiss);
