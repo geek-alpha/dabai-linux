@@ -178,7 +178,13 @@ async def lifespan(app: FastAPI):
         # 注入完整执行器：同伴来电不再只是「裸 LLM 回一句」，而是走子智能体那条完整的
         # 「LLM + 工具」循环 —— 同一套工具定义、同一份技能说明书，与主人对话同能力。
         peer_watch.set_agent_runner(_make_peer_agent_runner(_peer_loop))
-        logger.info("[Peer] 联邦耳朵已开（同伴来电即时响铃 + 管理员级执行 + 回话）")
+        # 同伴的留言（回执/进展）也自动接手：派出去的活不能等主人下次开口才有人管。
+        # 留言自动接手默认关：它是唯一「同伴一句话就能在本机起子智能体烧 token」的通道。
+        # 要开：settings.json → peer.auto_takeover=true（核心改动，改完要重启）。
+        if bool((_load_settings().get("peer") or {}).get("auto_takeover")):
+            peer_watch.set_takeover_runner(_make_peer_takeover_runner(_peer_loop))
+            logger.info("[Peer] 留言自动接手已开（settings.json → peer.auto_takeover）")
+        logger.info("[Peer] 联邦耳朵已开（来电响铃回话；留言只落盘，不起 agent）")
     except Exception as e:
         logger.warning(f"[Peer] 联邦耳朵启动失败: {e}")
     # harness 任务系统完成事件 → WebSocket 实时推送（前端 toast，任务完成即知）
@@ -5196,6 +5202,46 @@ def _make_peer_agent_runner(loop: asyncio.AbstractEventLoop):
 
         threading.Thread(target=_later, daemon=True).start()
         return f"活我接了（{worker.id}），还在跑，出结果我打回给你。"
+
+    return runner
+
+
+def _peer_takeover_brief(frm: str, text: str) -> str:
+    """同伴回执的任务书：接手把活往下推，不往回说。"""
+    return (
+        f"【跨机联邦回执 · 来自同伴 {frm}】\n{text}\n\n"
+        f"要求：\n"
+        f"- 这是另一台机器上的你自己干完活发回的回执，不是主人的请求；先把「这条回执说明什么」看明白\n"
+        f"- 该接着办的就办（核对结果/继续派活/把改动落地），办完用 2~4 句中文说清结论与证据\n"
+        f"- 别为了礼貌回一句「收到」：回执不需要回声，需要有人接着干活\n"
+        f"- 不可逆动作照旧先问主人"
+    )
+
+
+def _make_peer_takeover_runner(loop: asyncio.AbstractEventLoop):
+    """造一个「同伴留言自动接手」的执行器（签名 text, frm → str|None）。
+
+    和 _make_peer_agent_runner 只差一件事：来电要当场回话，留言不要回声。
+    回执的价值在「有人接着办」；把结论说回去只会让两台机器互相刷屏。
+    """
+
+    async def _spawn(text: str, frm: str):
+        state = await _get_resident_state()
+        return await _get_sub_agents().spawn(
+            _BROADCAST_WS, state, _peer_takeover_brief(frm, text),
+            title=f"联邦回执·{frm}"[:60],
+            extra={"peer_from": frm, "peer_takeover": True},
+        )
+
+    def runner(text: str, frm: str) -> Optional[str]:
+        if loop is None or loop.is_closed():
+            return None
+        try:
+            worker = asyncio.run_coroutine_threadsafe(_spawn(text, frm), loop).result(30)
+        except Exception as e:
+            logger.warning("[Peer] 接手派发失败: %s", e)
+            return None
+        return f"已接手（{getattr(worker, 'id', '?')}）"
 
     return runner
 

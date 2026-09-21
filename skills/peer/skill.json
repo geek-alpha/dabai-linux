@@ -4,7 +4,7 @@
   "version": "1.0.0",
   "description": "跨机大白联邦：peer_list 点名、peer_call 当场问话（同一通电话可多轮续接）、peer_hangup 挂断、peer_task 派活让对面真去执行、peer_say 留言、peer_inbox 读信、peer_state 问状态、peer_social 社会层（去中心化发现新同伴/朋友圈/动态/评论）。走域名直连。",
   "author": "dabai",
-  "enabled": true,
+  "enabled": false,
   "disclosure": "on_demand",
   "prompt": "【技能 大白联邦】树莓派/阿里云/WSL 上跑着多个大白实例，它们是一个联邦。想知道同伴在不在、在忙什么、能不能接电话用 peer_list；要同伴当场回话（实时对话、问它状态、让它表态）用 peer_call——同一通电话可以连着说多轮，不传 cid 就自动接上没挂断的那通，对方也记得前几轮，所以追问、补条件、一步步逼近结论都直接再说一句，不用重述背景；聊完用 peer_hangup 挂断；只是留个话让对方下次醒来看到用 peer_say；读自己收到的消息用 peer_inbox；只看某个实例的实时负载/内存/温度用 peer_state。用户问『阿里云那台怎么样』『别的你在干嘛』『让 WSL 上的你看看』『问问另一台』时走这里——要它答话用 peer_call；要另一台真的动手干活（跑命令、查日志、改文件、装东西）用 peer_task，它那边会起一个后台子智能体执行，干完把结论回你收件箱。联邦是去中心化的：有新的机器上线、或主人问『现在有几台大白』『还有谁在』『把某台加进朋友圈』『看看大家最近在干嘛』『发条动态告诉大家』时用 peer_social——discover 学新同伴、friend_add 单向加友、post/feed/comment 发动态和评论。",
   "tools": [

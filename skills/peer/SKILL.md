@@ -1,6 +1,16 @@
 # 大白联邦（peer）
 
 让散落在不同机器上的大白互相找到、互相说话、互相打电话。
+> **2026-09-21 收口：整套联邦已收进一个 MCP 工具，默认关闭。**
+> 本技能 `enabled:false` —— 那 9 个 `peer_*` 工具不再常驻工具表（每轮对话都在提醒
+> 「你可以指派别的机器」本身就是祸根）。要用走两步：
+> ① `python peer_admin.py grant --scope read|talk|task --ttl 600 --why "…"` 拿限时授权；
+> ② `mcp_connect("peer")` → `mcp_call(server="peer", tool="peer",
+> arguments={"action": "...", "why": "..."})`。
+> 分级：`read`（list/state/inbox/board）< `talk`（call/say/hangup）< `task`（派活、social 写类）。
+> `why` 每次必填。耳朵只收信落盘，留言**不再**自动起子智能体
+> （要开：`settings.json → peer.auto_takeover=true`，改完重启）。
+
 
 ## 一句话原理
 

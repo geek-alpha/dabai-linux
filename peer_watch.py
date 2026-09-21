@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import inspect
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -108,6 +109,19 @@ def set_agent_runner(fn) -> None:
     """
     global _AGENT_RUNNER
     _AGENT_RUNNER = fn
+
+
+_TAKEOVER_RUNNER: Optional[Callable[..., Optional[str]]] = None
+
+
+def set_takeover_runner(fn) -> None:
+    """注入「同伴留言自动接手」的执行器（签名 fn(text, frm) → str|None）。
+
+    与 set_agent_runner 的分工：来电要当场回话（runner 拿得到 say_back），
+    留言不要回声 —— 回执需要的是有人接着办，不是礼貌应答；两个都回话会变成刷屏。
+    """
+    global _TAKEOVER_RUNNER
+    _TAKEOVER_RUNNER = fn
 
 
 _GOOD_CFG: Dict[str, str] = {}
@@ -253,6 +267,21 @@ def handle(entry: Dict[str, Any], auto_reply: bool, do_notify: bool,
         peer_autoupdate.handle(entry)
         return
 
+    # 同伴留言（回执/进展）不能响完铃就完 —— 派出去的活得有人接着办。
+    # 只接 say：reply 是电话的回声（主对话当场已拿到），task 由对面 server 转成
+    # 定时任务派给子智能体，接它们等于同一件事干两遍。
+    if kind == "say" and auto_reply and _TAKEOVER_RUNNER is not None:
+        verdict = classify(text)
+        if verdict == "fact":
+            board_append(entry, verdict, facts_of(text))
+            log(f"↳ 事实回报 → 黑板（不起 agent）")
+            return
+        if _takeover_budget_ok(frm, budget):
+            threading.Thread(target=_takeover, args=(frm, text), daemon=True).start()
+        else:
+            log(f"↳ 接手节流：{frm} 这条只落盘")
+        return
+
     if kind != "call" or not auto_reply:
         return
 
@@ -331,6 +360,128 @@ def _reply_full(frm: str, text: str, entry: Dict[str, Any]) -> None:
         return
     if out:
         _say_back(frm, out, entry)
+
+
+# ── 留言分级：事实回报走黑板，只有「要谁去做事」才值得起一个大脑 ────────────
+# 第一性原理：起一个子智能体 = 一次完整的 LLM 循环（实测每轮数万 token）；
+# 而「rpi 的 VERSION 是 1.1.7」这种事实，答案就在字符串里 —— 拿大脑去读它，
+# 等于把零成本的信息检索按判断类任务计价。分级器只做一件事：
+# 分清「报告一个已确定的事实」和「要求对方做事」。
+_REQUEST_PAT = re.compile(
+    r"请(你|问|帮)|帮我|麻烦|需要你|你去|要你|能否|可以的话|"
+    r"把[^，。；]{0,14}(改|修|重启|部署|装|删|加|关|开|换)|"
+    r"去(查|看|改|跑|执行|装|发布|同步|拉|推|办)"
+)
+_DONE_PAT = re.compile(
+    r"已(经)?[^，。；]{0,8}(改|完|成功|通过|核对|验|上|落地|推|发)|"
+    r"完成|通过|搞定|好了|回报|证据|实测|核对结果|查过|确认过"
+)
+_FACT_PAT = re.compile(
+    r"VERSION\s*=|版本|\d+\.\d+\.\d+|/[\w./-]{4,}|https?://|rc=\d|"
+    r"PID|pid=|active|inactive|hash|commit|余额|balance|签名|校验"
+)
+# 对方自己声明「这条不用办」的标记：链路测试、通报、知悉 —— 这类消息唯一的价值是留痕。
+_NOACTION_PAT = re.compile(
+    r"无需回复|不用回|不必回|勿回复|无需处理|不用管|仅供参考|仅通报|知悉|测试消息"
+)
+
+
+def classify(text: str) -> str:
+    """把一条同伴留言判成 fact / action。判不准就判 action —— 错杀的代价是活没人干。"""
+    if _NOACTION_PAT.search(text):
+        return "fact"
+    if _REQUEST_PAT.search(text):
+        return "action"
+    if _DONE_PAT.search(text) or _FACT_PAT.search(text):
+        return "fact"
+    return "action"
+
+
+_VERSION_PAT = re.compile(r"\b\d+\.\d+\.\d+\b")
+_PATH_PAT = re.compile(r"(?:/[\w.-]+){2,}")
+_URL_PAT = re.compile(r"https?://[^\s，。）)]+")
+
+
+def facts_of(text: str) -> Dict[str, List[str]]:
+    """从事实回报里抽出可检索的结构 —— 以后问「rpi 什么版本」直接查黑板，不必再问人。"""
+    out: Dict[str, List[str]] = {}
+    for key, pat in (("version", _VERSION_PAT), ("path", _PATH_PAT), ("url", _URL_PAT)):
+        vals: List[str] = []
+        for v in pat.findall(text):
+            if v not in vals:
+                vals.append(v)
+        if vals:
+            out[key] = vals[:6]
+    return out
+
+
+BOARD_FILE = BASE_DIR / "data" / "peer_board.jsonl"
+_BOARD_LOCK = threading.Lock()
+
+
+def board_append(entry: Dict[str, Any], verdict: str, facts: Dict[str, Any]) -> None:
+    """事实回报落黑板：append-only，不需要谁醒着就能留下、随时能查。"""
+    row = {"ts": int(entry.get("ts") or time.time()),
+           "from": str(entry.get("from") or "?"),
+           "verdict": verdict,
+           "facts": facts,
+           "text": str(entry.get("text") or "")[:2000]}
+    try:
+        with _BOARD_LOCK:
+            BOARD_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with BOARD_FILE.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except OSError as e:
+        log(f"↳ 黑板写不进（已吞）：{type(e).__name__}: {e}")
+
+
+_TAKEOVER_LOCK = threading.Lock()
+_TAKEOVER_STAMPS: List[float] = []
+MAX_TAKEOVERS_PER_MIN = 3          # 全局熔断：两台自动接手的大白会互相触发，必须有硬上限
+TAKEOVER_PER_PEER_PER_MIN = 1
+
+
+def _takeover_budget_ok(frm: str, budget: Dict[str, List[float]]) -> bool:
+    """接手的双闸门：单来源每分钟 1 次 + 全局每分钟 3 次。
+
+    全局那道防的是对撞：我接手后子智能体可能又发一条留言出去，对面也自动接手，
+    两边都能自证「我在干活」——只有次数上限能把这个循环掐断。
+    """
+    global _TAKEOVER_STAMPS
+    now = time.time()
+    _TAKEOVER_STAMPS = [t for t in _TAKEOVER_STAMPS if now - t < 60]
+    if len(_TAKEOVER_STAMPS) >= MAX_TAKEOVERS_PER_MIN:
+        return False
+    key = "takeover:" + frm
+    recent = [t for t in budget.get(key, []) if now - t < 60]
+    if len(recent) >= TAKEOVER_PER_PEER_PER_MIN:
+        budget[key] = recent
+        return False
+    budget[key] = recent + [now]
+    _TAKEOVER_STAMPS.append(now)
+    return True
+
+
+def _takeover(frm: str, text: str) -> None:
+    """同伴留言自动接手：起子智能体读它、判断要不要动、把结论交给主人。
+
+    为什么必须有：派出去的活，回执只是躺进收件箱 —— 主对话要等主人下次开口
+    才知道对面干完了。留言得自己把活往下推，不能把「等下一次唤醒」当流程。
+    """
+    runner = _TAKEOVER_RUNNER
+    if runner is None:
+        return
+    if not _TAKEOVER_LOCK.acquire(blocking=False):
+        log(f"↳ 已有接手在跑，{frm} 这条只落盘")
+        return
+    try:
+        out = runner(text, frm)
+        if out:
+            log(f"接手 ← {frm}: {str(out)[:200]}")
+    except Exception as e:
+        log(f"接手异常（已吞）{frm}: {type(e).__name__}: {e}")
+    finally:
+        _TAKEOVER_LOCK.release()
 
 
 _FLUSH_RUNNING = threading.Event()

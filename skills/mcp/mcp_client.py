@@ -579,6 +579,32 @@ def resource_guard(action: str, name: str = "", spec: dict = None,
     return st
 
 
+_ADMIN_FLAG = "require_admin"
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def admin_guard(name: str, spec: dict = None) -> None:
+    """标了 require_admin 的 server：没有未过期的管理员凭证就不许连。
+
+    为什么拦在连接这一步：MCP 的形态只管「不连接就不占工具表」，管不住
+    「模型想连就自己连」。联邦这类能对外指派别台机器干活的能力，门外得有人。
+    凭证只由 peer_admin 写，这里只读校验 —— 消费方不能给自己发许可。
+    """
+    cfg = dict(spec or load_specs().get(name) or {})
+    if not cfg.get(_ADMIN_FLAG):
+        return
+    if _ROOT not in sys.path:
+        sys.path.insert(0, _ROOT)
+    try:
+        import peer_admin
+    except ImportError as e:
+        raise MCPError(f"'{name}' 标了 require_admin，但授权模块 peer_admin 不可用：{e}")
+    ok, msg = peer_admin.check("read")
+    if not ok:
+        raise MCPError(f"'{name}' 需要管理员授权：{msg}。"
+                       f"授权：python peer_admin.py grant --scope read --ttl 600 --why \"…\"")
+
+
 def get(name: str):
     with _LOCK:
         return _SERVERS.get(name)
@@ -601,6 +627,7 @@ def connect(name: str, spec: dict = None, timeout: float = DEFAULT_TIMEOUT,
             raise MCPError(f"没有 '{name}' 的配置：请用 mcp_connect 传 url（远程 server）"
                            f"或 command/args（本地子进程），或写进 servers.json。")
         resource_guard("connect", name, cfg, allow_heavy)
+        admin_guard(name, cfg)
         if url:
             from mcp_http import MCPHttpServer  # 延迟导入：mcp_http 反向依赖本模块
             srv = MCPHttpServer(name, url, cfg.get("headers"), timeout=timeout)

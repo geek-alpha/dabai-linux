@@ -2801,8 +2801,9 @@ def _harness_peer_call_block() -> str:
         act = pm.call_active()
         if not act:
             return ""
-        out = ["【联邦通话中】有没挂断的电话 —— 直接 peer_call 说下一句会自动接上同一通（不用带 cid）；"
-               "问题解决了就 peer_hangup 挂掉。"]
+        out = ["【联邦通话中】有没挂断的电话。联邦已收进 MCP、默认关闭 —— 要看内容或回一句，"
+               "都得先管理员授权（python peer_admin.py grant --scope talk --ttl 600 --why \"…\"）"
+               "再用 mcp 调 peer(action=call)。没授权就别动它。"]
         for c in act[:3]:
             when = _t.strftime("%m-%d %H:%M", _t.localtime(float(c.get("last") or 0)))
             out.append(
@@ -2830,7 +2831,9 @@ def _harness_peer_block(preview: int = 2) -> str:
         s = pm.unread_summary(preview=preview)
         n = int(s.get("count") or 0)
         if n > 0:
-            out = [f"【联邦来信（其他机器上的大白留的话）】未读 {n} 条 —— 调 peer_inbox 读全文（读完自动标已读）。"]
+            out = [f"【联邦来信】未读 {n} 条。联邦已收进 MCP、默认关闭 —— 要读全文先管理员授权"
+                   f"（python peer_admin.py grant --scope read --ttl 600 --why \"…\"）再用 mcp 调 "
+                   f"peer(action=inbox)。没授权就别动它。"]
             for m in s.get("items") or []:
                 when = _t.strftime("%m-%d %H:%M", _t.localtime(m.get("ts", 0)))
                 out.append(f"- [{m.get('from', '?')} {when}] {_clip(str(m.get('text', '')), 60)}")

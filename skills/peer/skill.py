@@ -111,6 +111,46 @@ def peer_inbox(args: dict) -> str:
     return "\n".join(lines)
 
 
+def peer_board(args: dict) -> str:
+    """读联邦黑板：同伴的事实回报（版本/路径/URL/状态）落在那里，不占大脑。
+
+    和 peer_inbox 的分工：inbox 是「谁跟我说过什么」（原始留言，按时间读），
+    board 是「同伴现在是什么状态」（结构化事实，按来源/键查）。
+    """
+    import json as _json
+    import time as _t
+    import peer_watch as _pw
+
+    limit = int(args.get("limit") or 15)
+    node = str(args.get("node") or "").strip()
+    key = str(args.get("key") or "").strip()
+    path = _pw.BOARD_FILE
+    if not os.path.exists(path):
+        return "黑板还空着 —— 没有同伴发过事实回报。"
+    rows = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            try:
+                d = _json.loads(line)
+            except ValueError:
+                continue
+            if node and d.get("from") != node:
+                continue
+            if key and key not in (d.get("facts") or {}):
+                continue
+            rows.append(d)
+    if not rows:
+        return f"黑板上没有匹配记录（node={node or '任意'} key={key or '任意'}）。"
+    out = [f"黑板 {len(rows)} 条匹配，显示最近 {min(limit, len(rows))} 条："]
+    for d in rows[-limit:]:
+        when = _t.strftime("%m-%d %H:%M", _t.localtime(d.get("ts", 0)))
+        bits = [f"{k}={','.join(str(x) for x in v[:3])}"
+                for k, v in (d.get("facts") or {}).items()]
+        head = " ".join(bits)[:150] or str(d.get("text") or "")[:100]
+        out.append(f"  [{when}] {d.get('from', '?')}：{head}")
+    return "\n".join(out)
+
+
 def peer_state(args: dict) -> str:
     node = str(args.get("node") or "").strip()
     if not node:
@@ -243,6 +283,7 @@ HANDLERS = {
     "peer_call": peer_call,
     "peer_hangup": peer_hangup,
     "peer_inbox": peer_inbox,
+    "peer_board": peer_board,
     "peer_state": peer_state,
     "peer_task": peer_task,
     "peer_social": peer_social,

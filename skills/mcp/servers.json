@@ -17,5 +17,13 @@
     ]
   },
   "_url_example": "远程 server 这样写：{\"url\": \"https://host/mcp\", \"headers\": {\"Authorization\": \"Bearer xxx\"}}；不带 headers 就只写 url。",
+  "_peer_note": "跨机联邦收成一个 MCP 工具：默认不连接（不连就不占工具表），连接要管理员授权 —— python peer_admin.py grant --scope read|talk|task --ttl 600 --why \"…\"。派活(task)单独要 task 级。",
+  "peer": {
+    "command": "/home/wxf/dabai/venv/bin/python",
+    "args": [
+      "/home/wxf/dabai/tools/peer_mcp_server.py"
+    ],
+    "require_admin": true
+  },
   "_removed_playwright": "已撤：浏览器内核在 1GB 的 Pi 3 上会烧到硬关机（实测空载 63°C，chromium 一开直冲 85°C）。读网页用 read_web。真要临时用就现场传 command/args + allow_heavy=true，用完立刻 mcp_disconnect。"
 }
