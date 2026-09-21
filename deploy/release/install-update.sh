@@ -26,7 +26,7 @@ ROOT="$REPO_ROOT"
 STATE="/var/lib/dabai-update"
 SERVICE="myservice"
 RUN_USER="wxf"
-PORT="8000"
+PORT=""        # 空 = 从运行中的服务自动探测；探不到才回落 8000
 REPO_SLUG="geek-alpha/dabai-linux"
 LIB_DIR="/usr/local/lib/dabai-update"
 CONF="/etc/dabai/update.conf"
@@ -50,6 +50,23 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+
+# 体检端口不靠人记：能从运行中的服务里探到就用真的。
+# 本机是 nginx 前置（8000 TLS → 8001 回源）时，写死 8000 会让体检探错端口，
+# 后果是每次更新都「体检未通过 → 自动回滚」，功能看着装了其实永远不生效。
+if [ -z "$PORT" ]; then
+  PORT="8000"
+  _pid="$(systemctl show -p MainPID --value "$SERVICE" 2>/dev/null || true)"
+  if [ -n "$_pid" ] && [ "$_pid" != "0" ] && command -v ss >/dev/null 2>&1; then
+    _p="$(ss -lntpH 2>/dev/null | awk -v pat="pid=$_pid," '$0 ~ pat {print $4}' | sed 's/.*://' | head -1 || true)"
+    if [ -n "$_p" ]; then
+      PORT="$_p"
+      echo "  · 体检端口自动探得：$PORT（来自运行中的 $SERVICE，pid $_pid）"
+    else
+      echo "  · 没探到 $SERVICE 的监听端口，体检端口回落 $PORT —— 不对就传 --port"
+    fi
+  fi
+fi
 
 ok()   { echo "  ✓ $*"; }
 step() { echo; echo "$*"; }
@@ -169,7 +186,7 @@ run install -m 0644 "$REPO_ROOT/deploy/systemd/dabai-update.service" "$UNIT_DIR/
 run install -m 0644 "$REPO_ROOT/deploy/systemd/dabai-update.timer" "$UNIT_DIR/dabai-update.timer"
 run "$SYSTEMCTL" daemon-reload
 run "$SYSTEMCTL" enable --now dabai-update.timer
-ok "定时器已启用（每天 04:30 前后，随机错开最多 30 分钟）"
+ok "定时器已启用（每次启动后 3 分钟查一次，此后每天 04:30 前后随机错开最多 30 分钟）"
 
 # ── 接线自检 ────────────────────────────────────────────────────────────
 step "⑥ 接线自检"

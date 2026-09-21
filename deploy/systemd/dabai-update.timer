@@ -3,7 +3,9 @@ Description=定时检查大白新版
 Documentation=file:/home/wxf/dabai/deploy/release/README.md
 
 [Timer]
-# 凌晨四点——这个点几乎不会有人在跟我说话，重启打断的成本最低。
+# 每次启动后先查一次：等系统稳下来再动，免得把启动期的负载当成异常
+OnBootSec=3min
+# 之后每天 04:30 再查一次——这个点几乎不会有人在跟我说话，重启打断的成本最低
 OnCalendar=*-*-* 04:30:00
 # 三台机器错开最多 30 分钟，避免同时打 GitHub API、同时重启
 RandomizedDelaySec=30m

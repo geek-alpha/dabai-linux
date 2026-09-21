@@ -987,6 +987,204 @@ def active_turn(root: Path, window: float = 120.0) -> Optional[str]:
     return None
 
 
+# ── 工作区闸门 ───────────────────────────────────────────────────────────
+def _git(root: Path, *args: str) -> Optional[str]:
+    """跑一条 git 命令，成功返回 stdout；不是仓库 / 没装 git 返回 None。"""
+    if not shutil.which("git"):
+        return None
+    try:
+        p = subprocess.run(("git", "-C", str(root)) + args,
+                           capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return p.stdout if p.returncode == 0 else None
+
+
+def _last_apply_path(cfg: Dict[str, str]) -> Path:
+    return state_dir(cfg) / "last_apply.json"
+
+
+def read_last_apply(cfg: Dict[str, str]) -> Dict[str, str]:
+    """上次更新写进安装目录的 {相对路径: sha256}；没记录过就是空表。"""
+    try:
+        d = json.loads(_last_apply_path(cfg).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    files = d.get("files")
+    return files if isinstance(files, dict) else {}
+
+
+def write_last_apply(cfg: Dict[str, str], ver: str, root: Path, entries) -> None:
+    """记下这次写了哪些文件、写成什么内容。
+
+    下次判定「工作区脏」时要靠它区分「人改的」和「更新自己改的」—— 更新器按设计
+    不碰 .git，所以每更新一次，被替换的文件相对 HEAD 都会显示为已修改。
+    """
+    files: Dict[str, str] = {}
+    for rel, _prev in entries:
+        try:
+            files[rel] = hashlib.sha256((root / rel).read_bytes()).hexdigest()
+        except OSError:
+            continue
+    try:
+        _last_apply_path(cfg).write_text(
+            json.dumps({"version": ver, "files": files,
+                        "at": time.strftime("%Y-%m-%d %H:%M:%S")},
+                       ensure_ascii=False, indent=1), encoding="utf-8")
+    except OSError as ex:
+        log_line(cfg, f"  ! 记不下本次写入清单（{ex}）—— 下次可能把更新造成的改动误判成人工改动")
+
+
+def worktree_changes(root: Path, cfg: Dict[str, str]) -> List[str]:
+    """安装目录是 git 工作区、且有人改了没提交时，返回那些文件；否则空表。
+
+    为什么必须拦：更新器只认包清单，不看工作区里有没有没提交的东西。安装目录恰好
+    就是开发现场时（本机就是），自动更新会把「改了还没提交」的文件静默盖回发布版 ——
+    版本号往前走了，工作内容却退回去了，日志里还只写着「已替换 N 个文件」。
+
+    为什么要排除上次更新的痕迹：那些文件的内容等于 last_apply 记下的哈希，git 说它脏
+    只是因为 .git 没跟着走。不排除就是死锁 —— 更新过一次之后永远判定为脏，从此再也
+    不更新，功能看着装了其实失效。
+    """
+    if _git(root, "rev-parse", "--is-inside-work-tree") is None:
+        return []            # 不是 git 工作区（同伴的安装目录常常不是），不拦
+    out = _git(root, "status", "--porcelain", "--untracked-files=no")
+    if not out:
+        return []
+    files = []
+    for line in out.splitlines():
+        if len(line) < 4:
+            continue
+        rel = line[3:].strip().strip('"')
+        if " -> " in rel:                       # 重命名写成 "旧 -> 新"
+            rel = rel.split(" -> ", 1)[1]
+        if rel:
+            files.append(rel)
+    if not files:
+        return []
+    done = read_last_apply(cfg)
+    if not done:
+        return files
+    left = []
+    for rel in files:
+        want = done.get(rel)
+        if want:
+            try:
+                if hashlib.sha256((root / rel).read_bytes()).hexdigest() == want:
+                    continue                # 这就是上次更新写的，不算人工改动
+            except OSError:
+                pass
+        left.append(rel)
+    return left
+
+
+def _skipped_path(cfg: Dict[str, str]) -> Path:
+    return state_dir(cfg) / "skipped.json"
+
+
+def _session_buses(uid: int) -> List[Path]:
+    """能拿来发桌面通知的总线：目标用户的、当前会话的，谁在算谁。"""
+    cands: List[Path] = []
+    env = os.environ.get("DBUS_SESSION_BUS_ADDRESS", "")
+    if env.startswith("unix:path="):
+        cands.append(Path(env.split("=", 1)[1]))
+    for u in (uid, os.geteuid()):
+        cands.append(Path(f"/run/user/{u}/bus"))
+    out, seen = [], set()
+    for c in cands:
+        if c in seen or not c.exists():
+            continue
+        seen.add(c)
+        out.append(c)
+    return out
+
+
+def _desktop_notify(cfg: Dict[str, str], title: str, body: str) -> bool:
+    """更新器以 root 跑，通知得落到登录会话的总线上；落不下去就只留日志，不算失败。"""
+    exe = shutil.which("notify-send") or "/usr/bin/notify-send"
+    if not Path(exe).is_file():
+        return False
+    try:
+        st = Path(cfg["ROOT"]).stat()
+    except OSError:
+        return False
+    for bus in _session_buses(st.st_uid):
+        try:
+            owner = bus.stat().st_uid
+            gid = pwd.getpwuid(owner).pw_gid
+        except (OSError, KeyError):
+            continue
+        env = dict(os.environ)
+        env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={bus}"
+        env["XDG_RUNTIME_DIR"] = str(bus.parent)
+        cmd = [exe, title, body]
+        if os.geteuid() == 0 and owner != 0 and shutil.which("setpriv"):
+            cmd = ["setpriv", f"--reuid={owner}", f"--regid={gid}",
+                   "--init-groups", *cmd]
+        try:
+            if subprocess.run(cmd, env=env, capture_output=True,
+                              timeout=15).returncode == 0:
+                return True
+        except (OSError, subprocess.SubprocessError):
+            continue
+    return False
+
+
+def record_skip(cfg: Dict[str, str], dirty: List[str], local_ver: str,
+                remote_ver: str, reason: str) -> bool:
+    """记下「有新版但没装上」并提醒一次 —— 静默落后，等于更新器没装。"""
+    behind = bool(remote_ver) and vkey(remote_ver) > vkey(local_ver)
+    try:
+        prev = json.loads(_skipped_path(cfg).read_text(encoding="utf-8"))
+        prev = prev if isinstance(prev, dict) else {}
+    except (OSError, ValueError):
+        prev = {}
+    rec = {
+        "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "local": local_ver, "remote": remote_ver, "behind": behind,
+        "reason": reason, "dirty_count": len(dirty), "dirty": dirty[:20],
+        "notified_remote": str(prev.get("notified_remote") or ""),
+    }
+    if behind and rec["notified_remote"] != remote_ver:
+        told = _desktop_notify(
+            cfg, f"大白：有新版没装上 v{remote_ver}",
+            f"本机停在 v{local_ver}，安装目录有 {len(dirty)} 个未提交改动，本次跳过。"
+            f"提交并发布后会自动跟上。")
+        if told:
+            rec["notified_remote"] = remote_ver
+    try:
+        _skipped_path(cfg).write_text(
+            json.dumps(rec, ensure_ascii=False, indent=1), encoding="utf-8")
+    except OSError:
+        pass
+    return behind
+
+
+def worktree_gate(cfg: Dict[str, str], root: Path, args,
+                  remote_ver: str = "") -> int:
+    """有未提交的工作就拒绝自动覆盖，返回 21；放行返回 0。"""
+    if args.force:
+        return 0
+    dirty = worktree_changes(root, cfg)
+    if not dirty:
+        return 0
+    cur = local_version(root)
+    if remote_ver and vkey(remote_ver) > vkey(cur):
+        # 发布源这台机器版本天然领先，走到这儿说明别处发了比本机新的版本
+        log_line(cfg, f"⚠ 远端 v{remote_ver} 比本机 v{cur} 新（别处发布的），但安装目录有"
+                      f" {len(dirty)} 个未提交改动 —— 本次跳过，本机仍停在 v{cur}")
+    else:
+        log_line(cfg, f"跳过本次：安装目录里有 {len(dirty)} 个改了没提交的文件"
+                      "，自动更新会把它们盖回发布版")
+    for rel in dirty[:10]:
+        log_line(cfg, f"   {rel}")
+    if len(dirty) > 10:
+        log_line(cfg, f"   …另 {len(dirty) - 10} 个")
+    log_line(cfg, "   先提交并发布（deploy/release/publish.py），或加 --force 接受覆盖")
+    record_skip(cfg, dirty, cur, remote_ver, "dirty-worktree")
+    return 21
+
+
 # ── 主流程 ───────────────────────────────────────────────────────────────
 def do_rollback(cfg: Dict[str, str], args) -> int:
     j = read_journal(cfg)
@@ -1016,6 +1214,47 @@ def do_rollback(cfg: Dict[str, str], args) -> int:
     return 0
 
 
+def do_status(cfg: Dict[str, str], args) -> int:
+    """一条命令看清：本机在哪一版、上次更新是什么时候、有没有「有新版但没装上」。"""
+    root = Path(cfg["ROOT"]).resolve()
+    cur = local_version(root)
+    print(f"安装目录  {root}")
+    print(f"本机版本  v{cur}")
+    try:
+        cv = (state_dir(cfg) / "current_version").read_text(encoding="utf-8").strip()
+        print(f"上次装到  v{cv}")
+    except OSError:
+        print("上次装到  （没有记录 —— 从没自动更新过）")
+    try:
+        d = json.loads(_last_apply_path(cfg).read_text(encoding="utf-8"))
+        print(f"上次写入  v{d.get('version')} @ {d.get('at')}，"
+              f"{len(d.get('files') or {})} 个文件")
+    except (OSError, ValueError):
+        print("上次写入  （无）")
+    j = read_journal(cfg)
+    if j:
+        print(f"可回滚到  v{j.get('from_version')}（备份 {j.get('backup_dir')}）")
+    try:
+        sk = json.loads(_skipped_path(cfg).read_text(encoding="utf-8"))
+        sk = sk if isinstance(sk, dict) else None
+    except (OSError, ValueError):
+        sk = None
+    if sk and sk.get("behind"):
+        print(f"⚠ 有新版没装上：远端 v{sk.get('remote')} 比本机 v{sk.get('local')} 新")
+        print(f"   原因：{sk.get('dirty_count')} 个未提交改动（{sk.get('at')}）")
+        for rel in (sk.get("dirty") or [])[:10]:
+            print(f"     {rel}")
+        print("   提交并发布后会自动跟上；想直接覆盖加 --force")
+    elif sk:
+        print(f"上次跳过  {sk.get('at')}：{sk.get('reason')}"
+              f"（远端 v{sk.get('remote') or '—'}）")
+    else:
+        print("跳过记录  （无）")
+    dirty = worktree_changes(root, cfg)
+    print("工作区    干净" if not dirty else f"工作区    {len(dirty)} 个未提交改动")
+    return 0
+
+
 def run(args) -> int:
     cfg = load_conf()
     for key, val in (("ROOT", args.root), ("STATE", args.state), ("REPO", args.repo),
@@ -1029,6 +1268,9 @@ def run(args) -> int:
     if not (root / cfg["ENTRY"]).is_file():
         log_line(cfg, f"✘ {root} 里找不到 {cfg['ENTRY']}，不像安装目录")
         return 2
+
+    if getattr(args, "status", False):
+        return do_status(cfg, args)
 
     if args.rollback:
         return do_rollback(cfg, args)
@@ -1091,6 +1333,20 @@ def run(args) -> int:
                 return 10
             log_line(cfg, f"已是最新：v{cur}（远端 v{remote_ver}）")
             return 0
+        # 版本判定放在下载之前：远端 tag 已经拿到了，没必要为了「发现自己不用更新」
+        # 先下 28MB 包、解 1030 个文件再说 —— 树莓派上这笔开销是分钟级，而且每次开机都付。
+        if not args.force and not args.tag and vkey(remote_ver) <= vkey(cur):
+            log_line(cfg, f"跳过：远端 v{remote_ver} 不比本地 v{cur} 新（要强制就加 --force）")
+            for line in stale_updater_note(updater_copy_stale(root)):
+                log_line(cfg, line)
+            return 0
+
+        # 安装目录里有没提交的工作时，绝不自动覆盖 —— 版本可以落后，工作不能丢。
+        # 放在下载之前：脏工作区是「不更新」的充分理由，没必要为它先下 28MB 包。
+        gate = worktree_gate(cfg, root, args, remote_ver)
+        if gate:
+            return gate
+
         tar_url, sha_url = pick_assets(rel, remote_ver)
         if not tar_url:
             log_line(cfg, f"✘ 发行版 v{remote_ver} 没有 .tar.gz 资产")
@@ -1156,6 +1412,12 @@ def run(args) -> int:
         log_line(cfg, f"有新版：本地 v{cur} → 远端 v{ver}")
         return 10
     log_line(cfg, f"③ 版本 {cur} → {ver}")
+
+    # --local-tarball 不经过上面的远端分支，闸门在这里补一次（远端路径已经拦过，
+    # 能走到这儿说明它是干净的，重复检查只是一次 git status）。
+    gate = worktree_gate(cfg, root, args, ver)
+    if gate:
+        return gate
 
     # ── ⑤ 写入计划 ──────────────────────────────────────────────────────
     writes, wproblems = plan_writes(man, root, stage)
@@ -1231,6 +1493,7 @@ def run(args) -> int:
         "at": time.strftime("%Y-%m-%d %H:%M:%S"),
     })
     log_line(cfg, f"⑦ 已替换 {len(entries)} 个文件（旧版备份在 {backup_dir}）")
+    write_last_apply(cfg, ver, root, entries)
 
     # ── ⑧ 经历复核 ──────────────────────────────────────────────────────
     after = witness(root)
@@ -1263,6 +1526,10 @@ def run(args) -> int:
         log_line(cfg, f"⑨ 体检通过：{detail}")
 
     (state_dir(cfg) / "current_version").write_text(ver + "\n", encoding="utf-8")
+    try:
+        _skipped_path(cfg).unlink()      # 跟上了，落后记录作废
+    except OSError:
+        pass
     log_line(cfg, f"✔ 更新完成：v{cur} → v{ver}")
 
     # ── ⑩ 更新器副本自检 ────────────────────────────────────────────────
@@ -1280,6 +1547,8 @@ def main() -> int:
     ap.add_argument("--service", default="", help="systemd 服务名")
     ap.add_argument("--port", default="", help="服务端口")
     ap.add_argument("--check", action="store_true", help="只看有没有新版（默认行为）")
+    ap.add_argument("--status", action="store_true",
+                    help="看本机版本/上次更新/有没有「有新版没装上」")
     ap.add_argument("--dry-run", action="store_true", help="全流程演练：不写盘、不重启")
     ap.add_argument("--apply", action="store_true", help="真更新")
     ap.add_argument("--rollback", action="store_true", help="回滚到上一版")
