@@ -161,6 +161,47 @@ def cmd_fork(args) -> int:
     return 0
 
 
+def _ref_conflict(remote_branches: list[str], branch: str) -> str | None:
+    """git 的 refs 不能同时有 a 和 a/b，推之前得先看。
+
+    撞上时 GitHub 只回一句 directory file conflict，完全不提原因，
+    照字面理解会以为是权限问题而反复重试。
+    """
+    for existing in remote_branches:
+        if existing != branch and (existing.startswith(branch + "/") or branch.startswith(existing + "/")):
+            return existing
+    return None
+
+
+def cmd_push(args) -> int:
+    me = _api("/user")["login"]
+    name = args.repo.split("/")[1]
+    cwd = Path(args.dir)
+    branch = args.branch or _git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=cwd).stdout.strip()
+    if branch in ("master", "main", "HEAD"):
+        sys.exit(f"当前分支是 {branch}：先 git checkout -b <分支名>，别往 fork 的主干推")
+
+    remote_branches = [b["name"] for b in _api(f"/repos/{me}/{name}/branches?per_page=100")]
+    clash = _ref_conflict(remote_branches, branch)
+    if clash:
+        sys.exit(
+            f"分支名撞车：远端已有 {clash!r}，git 不允许 {clash} 和 {branch} 同时存在\n"
+            f"  push 会被拒（directory file conflict），换一个不带斜杠的名字：\n"
+            f"  git branch -m {branch.replace('/', '-')} && 再跑一次"
+        )
+
+    url = f"https://github.com/{me}/{name}.git"
+    proc = subprocess.run(
+        ["git", "-c", "credential.helper=!f() { echo username=x-access-token; echo password=$GITHUB_TOKEN; }; f",
+         "push", url, f"HEAD:refs/heads/{branch}"],
+        cwd=str(cwd), capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        sys.exit(f"push 失败:\n{proc.stderr.strip()}")
+    print(f"已推到 {me}/{name}:{branch}")
+    return 0
+
+
 def cmd_pr(args) -> int:
     me = _api("/user")["login"]
     cwd = Path(args.dir)
@@ -216,6 +257,12 @@ def main() -> int:
     p.add_argument("repo")
     p.add_argument("--dir", default=str(DEFAULT_WORK_DIR))
     p.set_defaults(func=cmd_fork)
+
+    p = sub.add_parser("push", help="推分支到 fork（先查 ref 名冲突）")
+    p.add_argument("repo")
+    p.add_argument("--dir", default=".")
+    p.add_argument("--branch", default=None)
+    p.set_defaults(func=cmd_push)
 
     p = sub.add_parser("pr", help="从当前分支开 PR")
     p.add_argument("repo")
