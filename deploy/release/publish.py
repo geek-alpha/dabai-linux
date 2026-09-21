@@ -233,8 +233,13 @@ def do_build(part: str) -> str:
 def do_tests(timeout: int) -> None:
     _p("③ 测试（全量）")
     t0 = time.time()
+    nproc = os.cpu_count() or 1
+    args = [_python(), "-m", "pytest", "-q", "-x"]
+    if nproc > 2:
+        args += ["-n", "auto"]
+        _p(f"   {nproc} 核 → xdist 并行")
     try:
-        p = _run([_python(), "-m", "pytest", "-q"], timeout=timeout)
+        p = _run(args, timeout=timeout)
     except subprocess.TimeoutExpired:
         die(f"测试超过 {timeout}s 没跑完 —— 加 --tests-timeout 放宽，或用 --no-tests 明确跳过")
     lines = [l for l in (p.stdout or "").splitlines() if l.strip()]
@@ -278,12 +283,12 @@ def do_push(branch: str, ver: str, token: str) -> None:
     ok(f"tag {tag} → origin")
 
 
-def do_watch(ver: str, timeout: int) -> int:
+def do_watch(ver: str, timeout: int, interval: int = 10) -> int:
     _p("⑥ 盯 CI 直到 release 落地")
     _p("   publish 作业挂在 environment: release 上，需要管理员在网页点 Approve —— "
        "脚本会停在这里等")
     cmd = [_python(), str(RELEASE_DIR / "watch_release.py"), f"v{ver}",
-           "--root", str(ROOT), "--timeout", str(timeout)]
+           "--root", str(ROOT), "--timeout", str(timeout), "--interval", str(interval)]
     return subprocess.run(cmd, cwd=str(ROOT)).returncode
 
 
@@ -313,14 +318,17 @@ def do_notify(ver: str) -> dict:
     text = (f"v{ver} 已发布：dabai-{ver}.tar.gz + .sha256 资产齐全，可以拉。"
             f"开了 peer.auto_update 的机器会自己去查新版；否则手工：python deploy/release/update.py")
     sent, failed = [], []
+    # 并行通知：每节点独立子进程，总耗时 = max(单节点) 而非 sum(单节点)
+    procs = {}
     for n in nodes:
         cmd = [_python(), str(ROOT / "peer_mesh.py"), "say", n, text, "--kind", "release"]
+        procs[n] = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    for n, p in procs.items():
         try:
-            p = _run(cmd, timeout=30)
+            p.wait(timeout=30)
         except subprocess.TimeoutExpired:
-            failed.append(n)
-            warn(f"{n}：留言超时 30s（对方可能离线，不影响发布）")
-            continue
+            p.kill()
+            p.wait()
         if p.returncode == 0:
             sent.append(n)
             ok(f"{n}：已留言")
@@ -363,6 +371,7 @@ def main() -> int:
     ap.add_argument("--no-notify", action="store_true", help="不通知联邦其它实例")
     ap.add_argument("--tests-timeout", type=int, default=1800, help="测试超时秒数（默认 1800）")
     ap.add_argument("--watch-timeout", type=int, default=1800, help="盯落地超时秒数（默认 1800）")
+    ap.add_argument("--watch-interval", type=int, default=10, help="CI 轮询间隔秒数（默认 10）")
     ap.add_argument("--branch", default=BRANCH_DEFAULT, help=f"发布分支（默认 {BRANCH_DEFAULT}）")
     args = ap.parse_args()
 
@@ -420,7 +429,7 @@ def main() -> int:
         if args.no_watch:
             _p("⑥ 已跳过盯落地（--no-watch）")
         else:
-            rc = do_watch(ver, args.watch_timeout)
+            rc = do_watch(ver, args.watch_timeout, args.watch_interval)
 
         note = {"notified": [], "failed": []}
         if rc != 0:
