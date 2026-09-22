@@ -72,8 +72,15 @@ done
 
 echo
 echo "③ 独立验证（不依赖自家扫描器）"
-HITS="$(git grep -nIE 'sk-[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY' HEAD -- . 2>/dev/null \
-        | grep -v 'deploy/gitguard/secretscan.py' || true)"
+# PEM 头单列一条：真私钥的头独占一行，而代码里把它当字符串处理时头嵌在表达式中间
+# （Cryptodome 的 startswith(b'-----BEGIN OPENSSH PRIVATE KEY') 就是后者）。
+# 混在同一条 grep 里，vendored 库会把闸门报成「HEAD 里发现密钥形态」而常年卡红。
+# -e 不能省：pattern 以 '-' 开头时 git grep 会把它当选项，错误又被 2>/dev/null 吞掉，
+# 那条规则就成了永远不命中的死规则（静默失效比误报更危险）。
+HITS="$( { git grep -nIE -e 'sk-[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}' HEAD -- . ; \
+           git grep -nIE -e '^[[:space:]]*-----BEGIN [A-Z ]*PRIVATE KEY-----[[:space:]]*$' HEAD -- . ; \
+           git grep -nIE -e '-----BEGIN [A-Z ]*PRIVATE KEY-----.*[A-Za-z0-9+/]{64,}' HEAD -- . ; } 2>/dev/null \
+        | grep -v -e 'deploy/gitguard/secretscan.py' -e 'deploy/gitguard/safe-push.sh' || true)"
 if [ -n "$HITS" ]; then
   echo "$HITS" | head -10 | sed 's/^/    /'
   die "HEAD 里发现密钥形态"
