@@ -559,3 +559,99 @@ def test_parallel_verdict_carries_ro_hint():
     _, obs = mod.judge("parallel", "batch_ratio", agg, [], "并行优先",
                        {"ro_hint_sampled_rounds": 20, "ro_hint_total": 4, "ro_hint_turns": 4})
     assert "并行提示已触发 4 次" in obs
+
+
+# ---------- 0 触发必须有对照组：样本不足 ≠ 判据坏了 ----------
+
+def _window_state(tmp_path, at):
+    """造一个 hot_reload_state.json，把「本进程加载时刻」钉死。"""
+    p = tmp_path / "hot_reload_state.json"
+    p.write_text(json.dumps({"pid": 1, "at": at}), encoding="utf-8")
+    return p
+
+
+def test_loaded_at_unknown_when_state_missing():
+    """拿不到加载快照 → 报 0.0（未知），调用方必须退化成「不知道起点」。"""
+    mod = _load_audit()
+    mod.HOT_STATE = Path("/nonexistent/hot_reload_state.json")
+    assert mod.loaded_at() == 0.0
+
+
+def test_plan_hint_expect_replays_streak_state_machine():
+    """重放要与 agent._plan_miss_note 的 streak 语义一致：连续 2 轮多步漏提才算 1 次。"""
+    mod = _load_audit()
+    rows = [
+        {"ts": 100.0, "tool_calls": 4, "call_names": ["code_read", "code_search", "shell_run"]},
+        {"ts": 101.0, "tool_calls": 4, "call_names": ["code_read", "code_search", "plan_update"]},
+        {"ts": 102.0, "tool_calls": 4, "call_names": ["code_read", "code_search", "shell_run"]},
+        {"ts": 103.0, "tool_calls": 4, "call_names": ["code_read", "code_search", "shell_run"]},
+        {"ts": 104.0, "tool_calls": 0, "call_names": []},
+        {"ts": 105.0, "tool_calls": 4, "call_names": ["code_read", "code_search", "shell_run"]},
+        {"ts": 106.0, "tool_calls": 4, "call_names": ["code_read", "code_search", "shell_run"]},
+    ]
+    for r in rows:
+        r["plan_hints"] = 0        # 带埋点字段 = 该轮进过状态机
+    assert mod.plan_hint_expect(rows, 0.5) == {"expect": 2, "rounds": 7}
+    # 没有埋点字段的轮（重启前的旧数据）不进重放——那些轮跑的是别的代码。
+    # 用一个「会清零的纯文本轮」造差异：算进来就把 expect 从 1 压成 0。
+    rows = [
+        {"ts": 100.0, "tool_calls": 4, "plan_hints": 0,
+         "call_names": ["code_read", "code_search", "shell_run"]},
+        {"ts": 100.5, "tool_calls": 0, "call_names": []},          # 无字段
+        {"ts": 101.0, "tool_calls": 4, "plan_hints": 0,
+         "call_names": ["code_read", "code_search", "shell_run"]},
+    ]
+    assert mod.plan_hint_expect(rows, 0.5) == {"expect": 1, "rounds": 2}
+
+
+def test_plan_hint_expect_window_changes_the_verdict():
+    """同一批数据，起点换成本进程加载时刻 → 应触发数变小。
+
+    反证：起点退回数据文件开头（跨进程重放）会把上一代进程的轮次算进来，得到
+    「应触发 2 次却 0 次」的假警报——2026-09-22 就是这样被指去查一个没坏的判据。
+    """
+    mod = _load_audit()
+    rows = [{"ts": 100.0 + i, "tool_calls": 4, "plan_hints": 0,
+             "call_names": ["code_read", "code_search", "shell_run"]} for i in range(4)]
+    assert mod.plan_hint_expect(rows, 0.5)["expect"] == 2      # 跨进程重放 → 假警报
+    assert mod.plan_hint_expect(rows, 102.0)["expect"] == 1    # 本进程窗口
+    assert mod.plan_hint_expect(rows, 103.0)["expect"] == 0    # 只剩 1 轮，攒不满 2 轮
+
+
+def test_plan_hint_expect_unknown_without_start():
+    """拿不到进程起点 → 判 None，绝不当成 0 起点（那等于跨进程重放）。"""
+    mod = _load_audit()
+    rows = [{"ts": 100.0, "tool_calls": 4, "plan_hints": 0,
+             "call_names": ["code_read", "code_search", "shell_run"]}]
+    assert mod.plan_hint_expect(rows, 0.0)["expect"] is None
+
+
+def test_call_stats_attaches_expect_and_window(tmp_path, monkeypatch):
+    """call_stats 必须把对照组和它的窗口一起吐出来，否则判词只是换个说法。"""
+    mod = _load_audit()
+    monkeypatch.setattr(mod, "HOT_STATE", _window_state(tmp_path, 101.5))
+    rows = [{**r, "ts": 100.0 + i} for i, r in enumerate(_hint_rows([0, 0, 0, 0]))]
+    c = mod.call_stats(rows)
+    assert c["hint_sampled_rounds"] == 4 and c["plan_hint_total"] == 0
+    assert c["plan_hint_since"] == 101.5
+    assert c["plan_hint_expect_rounds"] == 2     # 只重放 ts>=101.5 的两轮
+    assert c["plan_hint_expect"] == 1            # 这两轮连漏 → 第 2 轮该给提示
+
+
+def test_hint_note_checks_expect_before_crying_wolf():
+    """0 触发：对照组说「本该 0 次」→ 样本不足；说「本该 2 次」→ 才去查判据。"""
+    mod = _load_audit()
+    calm = mod.hint_note({"hint_sampled_rounds": 20, "plan_hint_total": 0,
+                          "plan_hint_expect": 0, "plan_hint_expect_rounds": 2})
+    assert "样本不足" in calm and "streak 判据" not in calm
+    alarm = mod.hint_note({"hint_sampled_rounds": 20, "plan_hint_total": 0,
+                           "plan_hint_expect": 2, "plan_hint_expect_rounds": 20})
+    assert "去查 streak 判据" in alarm
+
+
+def test_ro_hint_never_borrows_plan_expect():
+    """并行提示不许借清单提示的对照组：可累加轮不是同一批（等于换了人的体检报告）。"""
+    mod = _load_audit()
+    note = mod.hint_note({"ro_hint_sampled_rounds": 1, "ro_hint_total": 0,
+                          "plan_hint_expect": 3, "plan_hint_expect_rounds": 30}, "ro")
+    assert "样本不足" in note and "去查" not in note

@@ -24,7 +24,7 @@ DEFAULT_UID = "default"
 
 # 只读白名单：命中才放行。存疑一律拦（漏拦 = 模式被绕过，误拦 = 模型被拒后自己退出去）。
 _READ_ONLY_EXACT = frozenset({
-    "skill_help", "symbols", "read_json", "read_lines", "search_text", "list_files",
+    "skill_help", "context_read", "symbols", "read_json", "read_lines", "search_text", "list_files",
     "find_file", "system_check", "plan_show", "plan_history",
     "todo_list", "todo_get", "todo_plan",
     "harness_task_status", "harness_task_list",

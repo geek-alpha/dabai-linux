@@ -151,22 +151,41 @@ emit({"type": "UsageEvent", "prompt_tokens": 1234, "completion_tokens": 56, "rou
 
 
 def _isolate_runner(tmp_path, monkeypatch):
-    """把 runner 的磁盘路径全挪进 tmp_path —— 测试绝不碰真引擎的运行数据。"""
+    """把 runner 的磁盘路径全挪进 tmp_path —— 测试绝不碰真引擎的运行数据。
+
+    2026-09-22 教训：这里原来是手写的 patch 清单，漏了 REPORT（模块级常量写死
+    RUN_DIR / "report.md"，只 patch RUN_DIR 挪不动它），于是本文件那个「跑一轮」
+    的用例跑完，真目录的 data/longrun/report.md 被改写成「累计 1 轮 / 演示目标 /
+    没有等你决定的事」—— 主人唯一那份汇报变成假话。现在改成按 runner._run_dir_derived()
+    整体搬，新增同类常量不会再漏。
+    """
     run_dir = tmp_path / "data" / "longrun"
     stub = tmp_path / "stub_cli.py"
     stub.write_text(STUB_CLI, encoding="utf-8")
     monkeypatch.setattr(rn, "BASE", tmp_path)
-    monkeypatch.setattr(rn, "RUN_DIR", run_dir)
-    monkeypatch.setattr(rn, "TRACES", run_dir / "traces")
-    monkeypatch.setattr(rn, "JOURNAL", run_dir / "journal.jsonl")
-    monkeypatch.setattr(rn, "STATE", run_dir / "state.json")
-    monkeypatch.setattr(rn, "STOP", run_dir / "STOP")
-    monkeypatch.setattr(rn, "HEARTBEAT", run_dir / "heartbeat")
     monkeypatch.setattr(rn, "LEDGER", tmp_path / "long_horizon.json")
     monkeypatch.setattr(rn, "CLI", stub)
     monkeypatch.setattr(rn, "PY", Path(sys.executable))
     monkeypatch.setattr(rn, "CALL_TIMEOUT", 60)
+    # 必须在改 RUN_DIR 之前取相对路径（_run_dir_derived 按当前 RUN_DIR 现算）
+    for _name, _rel in rn._run_dir_derived().items():
+        monkeypatch.setattr(rn, _name, run_dir / _rel)
+    monkeypatch.setattr(rn, "RUN_DIR", run_dir)
     return run_dir
+
+
+def _dir_fingerprint(root: Path) -> dict:
+    """{相对路径: (是否目录, 大小, mtime_ns)} —— 用来证明一个目录「一个字节没动」。"""
+    out = {}
+    if not root.exists():
+        return out
+    for p in sorted(root.rglob("*")):
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        out[str(p.relative_to(root))] = (p.is_dir(), st.st_size, st.st_mtime_ns)
+    return out
 
 
 def test_one_cycle_writes_drillable_trace(tmp_path, monkeypatch):
@@ -197,6 +216,61 @@ def test_one_cycle_writes_drillable_trace(tmp_path, monkeypatch):
     assert entry["trace"].endswith("traces/1.jsonl")
     assert entry["tools"] == ["code_read"] and entry["usage"]["out"] == 56
     assert "结论先给" in entry["out_tail"], "journal 的 out_tail 应仍是正文，不是 JSON 事件"
+
+
+def test_isolate_covers_every_run_dir_derived_constant(tmp_path, monkeypatch):
+    """守卫：隔离之后，没有任何「RUN_DIR 派生常量」还指向真目录。
+
+    这条是针对 2026-09-22 那个漏 REPORT 的 bug 的哨兵：以后谁新加一个
+    `X = RUN_DIR / "x"` 却忘了搬，这里立刻红，不会等到主人发现汇报被改写。
+    断言用「值不在真目录下」而不是「名字在白名单里」——名字对不上真路径的检查是空的。
+    """
+    real = Path(__file__).resolve().parents[1] / "data" / "longrun"
+    derived = set(rn._run_dir_derived())
+    assert {"REPORT", "WS_ROOT", "JOURNAL", "STATE", "STOP",
+            "HEARTBEAT", "TRACES"} <= derived, f"隔离清单漏了：{derived}"
+
+    _isolate_runner(tmp_path, monkeypatch)          # 搬走
+
+    leaked = [n for n in derived
+              if str(getattr(rn, n)).startswith(str(real))]
+    assert not leaked, f"隔离后这些常量仍指向真运行目录：{leaked}"
+    assert str(rn.RUN_DIR).startswith(str(tmp_path)), "RUN_DIR 没搬走"
+
+
+def test_one_cycle_does_not_touch_real_report(tmp_path, monkeypatch):
+    """跑一轮 worker 不许改写主人的汇报文件 —— 这是真事故的回归测试。
+
+    事故现场（2026-09-22 11:46 实测）：只 patch RUN_DIR 不 patch REPORT，
+    本文件那个跑一轮的用例结束后 data/longrun/report.md 变成
+    「累计 1 轮 / 上次目标：演示目标 / 没有等你决定的事」，
+    而 state.json 里是 cycle=72、20 条 active 目标在等主人。汇报说假话，
+    比没有汇报更坏（runner._engine_alive 的注释也这么说）。
+    """
+    real_run_dir = Path(__file__).resolve().parents[1] / "data" / "longrun"
+    real_report = real_run_dir / "report.md"
+    before = _dir_fingerprint(real_run_dir)          # 整个真运行目录的指纹
+    existed = real_report.exists()
+    before_bytes = real_report.read_bytes() if existed else None
+
+    run_dir = _isolate_runner(tmp_path, monkeypatch)
+    (tmp_path / "long_horizon.json").write_text(json.dumps({
+        "projects": [{"id": "demo", "title": "演示目标", "stage": "active",
+                      "next": "读一遍 runner.py", "progress": 0, "log": []}],
+    }, ensure_ascii=False), encoding="utf-8")
+    assert rn.one_cycle(rn.load_state()) == "run"
+
+    # ① 汇报文件内容没被动过
+    if existed:
+        assert real_report.read_bytes() == before_bytes, \
+            "跑一轮把主人的 report.md 改写了 —— 隔离漏了 REPORT"
+    # ② 真运行目录整体一个字节没动（连 mtime 都不许变）
+    assert _dir_fingerprint(real_run_dir) == before, \
+        "跑一轮动了真运行目录（新增/改写/删除了文件）"
+    # ③ 本轮该落的东西确实落在 tmp_path 里，而不是「什么都没写」的假绿
+    assert (run_dir / "report.md").exists(), "隔离目录里没有汇报，说明这轮没真跑"
+    assert (run_dir / "journal.jsonl").exists()
+    assert (run_dir / "ws" / "demo").is_dir(), "worker 工作区没落进隔离目录"
 
 
 def test_parse_events_survives_non_json_noise():

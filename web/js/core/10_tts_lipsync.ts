@@ -302,8 +302,9 @@ export default (function init(App: AppKernel) {
       end: true
     });
     if (!App.isPlayingQueue) App.playNextAudio();
-    // 本轮回复完成：工作流工具链卡片收尾（步骤标绿/标错）
-    if (App.toolChainEndTurn) App.toolChainEndTurn();
+    // 本轮回复完成：工作流工具链卡片收尾已迁到 turn_text_done（文本输出完成
+    // 即轮结束，不等语音播报）。这里再收尾会重复结算游戏回合，只留
+    // 09_websocket 的 audio_end 分支做兜底。
   };
   /* 被打断 */
   App.handleInterrupted = function handleInterrupted() {

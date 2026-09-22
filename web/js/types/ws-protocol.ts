@@ -128,6 +128,7 @@ export type ServerMessage =
   | { type: 'stream_text'; session_id?: string; text?: string }
   | { type: 'retract_text'; session_id?: string; length?: number }
   | { type: 'turn_status'; session_id?: string; text?: string }
+  | { type: 'turn_text_done'; session_id?: string | null; tool_calls?: number | null }
   | { type: 'turn_in_progress'; session_id?: string | null; resume?: boolean; full_text?: string; reasoning_tail?: string; tool_events?: any[] }
   | { type: 'listening' }
   | { type: 'system_msg'; text?: string }

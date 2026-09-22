@@ -116,6 +116,29 @@ def add_job(name: str, task: str, interval_sec: int,
     return job, None
 
 
+def set_task(job_id: str, task: str) -> tuple:
+    """刷新任务的执行文本，返回 (job, error)。
+
+    为什么需要：任务书由脚本的 job_task_text() 生成，而任务创建时文本就固化了 ——
+    脚本改了流程（第 5 步轮末批判、--gap-ratio），已存在的任务仍按旧流程跑，且没人报错。
+    实测：自我迭代循环的任务文本停在「4 步版」，每轮都漏掉轮末批判。
+    """
+    task = str(task or "").strip()
+    if not task:
+        return None, "task 不能为空"
+    jobs = _load()
+    job = _find(jobs, job_id)
+    if not job:
+        return None, "任务不存在"
+    if str(job.get("task") or "") == task:
+        return job, ""
+    job["task"] = task
+    job["updated_at"] = time.time()
+    if not _save(jobs):
+        return None, "写入失败（已静默降级）"
+    return job, ""
+
+
 def remove_job(job_id: str, confirm: bool = False) -> tuple:
     """删除定时任务；必须显式 confirm=True（破坏性操作）。"""
     if not confirm:
@@ -186,6 +209,48 @@ def record_result(job_id: str, ok: bool, result: str = "") -> bool:
     hit["last_error"] = "" if ok else str(result or "")[:300]
     hit["updated_at"] = now
     return _save(jobs)
+
+
+def release_running(job_id: str, note: str = "") -> tuple:
+    """解除悬挂的运行标记，且不计 runs。
+
+    进程重启后执行体必然已经死了，但 running 标记还在文件里 —— _sweep_stale
+    要等 2 小时才清，期间任务看着「正在执行」、实际永远不会派发。
+    重启不是一次运行，所以不走 record_result（那个会 runs+1 并写 last_result）。
+    """
+    jobs = _load()
+    hit = _find(jobs, job_id)
+    if hit is None:
+        return None, "定时任务不存在：%s" % job_id
+    if not hit.get("running"):
+        return hit, None
+    hit["running"] = False
+    hit["last_error"] = str(note or "已解除悬挂标记")[:300]
+    hit["updated_at"] = time.time()
+    if not _save(jobs):
+        return None, "写入失败（已静默降级）"
+    return hit, None
+
+
+def defer_job(job_id: str, seconds: float) -> tuple:
+    """保证下次执行不早于 now+N 秒（重启宽限）。
+
+    只推后、不提前：已经过期才推到 now+N；本来就在更远的未来就原样保留，
+    否则每次重启都会把正常节奏硬拽回眼前。
+    没有宽限的话：next_run_at 已过期 + 重启即恢复 = 改一次代码重启就烧掉一轮。
+    """
+    jobs = _load()
+    hit = _find(jobs, job_id)
+    if hit is None:
+        return None, "定时任务不存在：%s" % job_id
+    now = time.time()
+    hit["next_run_at"] = max(float(hit.get("next_run_at") or 0),
+                             now + max(0.0, float(seconds or 0)))
+    hit["updated_at"] = now
+    if not _save(jobs):
+        return None, "写入失败（已静默降级）"
+    return hit, None
+
 
 
 def _sweep_stale(jobs: list, now: float) -> list:

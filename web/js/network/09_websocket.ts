@@ -410,6 +410,7 @@ export default (function init(App: AppKernel) {
         App.currentReplySeg = '';
         App.audioQueue = [];
         App._streamTextOn = false; // 本轮是否走"即时文本流"（stream_text）
+        App._turnTextDone = false; // 新轮开始：文本完成标志复位
         App.removeTyping();
         // 若分片已先于 thinking 到达并开始播放，不再切回思考态（避免"只显示省略号"）
         if (App.currentState !== App.State.SPEAKING) App.setState(App.State.THINKING);
@@ -477,9 +478,22 @@ export default (function init(App: AppKernel) {
         if (App.noteTurnActivity) App.noteTurnActivity();
         App.handleAudioChunk(msg);
         break;
-      case 'audio_end':
+      case 'turn_text_done':
+        // 轮次结束的判据是「文本输出完成」：audio_end 要等 TTS 队列把所有分片
+        // 发完才到，挂在它上面整轮就被语音拖住（TTS 慢/挂 → 工具期保护不解除、
+        // 工具链不收尾、游戏回合不结算）
         if (App.noteTurnActivity) App.noteTurnActivity();
         App._turnInTools = false;   // 回合结束：工具执行期保护解除
+        App._replyEmotionDone = false;
+        App._turnTextDone = true;
+        if (App.toolChainEndTurn) App.toolChainEndTurn();
+        break;
+      case 'audio_end':
+        if (App.noteTurnActivity) App.noteTurnActivity();
+        App._turnInTools = false;   // 兜底：文本完成事件没到时也要解除保护
+        // 收尾兜底：正常路径已由 turn_text_done 收尾；toolChainEndTurn 会结算
+        // 游戏回合，重复调用会重复加分，所以必须判标志
+        if (!App._turnTextDone && App.toolChainEndTurn) App.toolChainEndTurn();
         App.handleAudioEnd(msg);
         break;
       case 'usage':

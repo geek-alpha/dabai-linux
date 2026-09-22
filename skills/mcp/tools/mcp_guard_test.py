@@ -50,6 +50,8 @@ check("给出 allow_heavy 出口", r and "allow_heavy" in r, r)
 r2 = blocked(action="connect", name="pw", spec={"command": "npx", "args": ["chromium", "--headless"]})
 check("裸 chromium 也被拦", r2 is not None and "chromium" in r2, r2)
 check("allow_heavy=true 放行", blocked(action="connect", name="pw", spec=HEAVY, allow_heavy=True) is None)
+check("heavy 标记放行（mcp_call 自动重连走这条路）",
+      blocked(action="connect", name="pw", spec={**HEAVY, "heavy": True}) is None)
 
 print("\n=== 四、温度/内存阈值（打桩）===")
 _real_t, _real_m, _real_run = mc._read_temp_c, mc._read_avail_mb, mc.running

@@ -84,3 +84,77 @@ def test_write_failure_is_swallowed(monkeypatch):
     """写盘失败（如目录不可写）只告警，不抛异常打断执行。"""
     monkeypatch.setattr(SA, "_HIST_FILE", Path("/proc/nonexistent/h.jsonl"))
     SA._hist_record(SA.SubAgent("任务", "T", ws=None), "spawn")   # 不抛即通过
+
+
+# ---------- 用户端输入通道（自我迭代轮的批判人格指引） ----------
+# 判据：指引必须以独立 user 消息进入上下文（与主人原话同级），
+# 不是拼进任务书文本里当背景 —— 后者模型可以绕过。
+
+def test_user_inputs_appended_as_separate_user_messages():
+    msgs = [{"role": "system", "content": "S"}, {"role": "user", "content": "任务书"}]
+    n = SA._inject_user_inputs(msgs, {"user_inputs": ["【用户端输入】照做", "第二条"]})
+    assert n == 2
+    assert [m["role"] for m in msgs] == ["system", "user", "user", "user"]
+    assert msgs[1]["content"] == "任务书"        # 任务书原样保留，不被改写
+    assert msgs[2]["content"].startswith("【用户端输入】")
+
+
+def test_user_inputs_absent_noop():
+    msgs = [{"role": "user", "content": "任务书"}]
+    assert SA._inject_user_inputs(msgs, {}) == 0
+    assert SA._inject_user_inputs(msgs, None) == 0
+    assert SA._inject_user_inputs(msgs, {"user_inputs": ["", "   "]}) == 0
+    assert len(msgs) == 1
+
+
+def test_user_inputs_non_dict_extra_tolerated():
+    """extra 被别处塞成字符串时不许炸掉整轮任务。"""
+    msgs = []
+    assert SA._inject_user_inputs(msgs, "user_inputs") == 0
+    assert msgs == []
+
+
+def _mk_manager(monkeypatch, replies):
+    """造一个不碰网络/档案的 manager，replies 依次作为每轮 LLM 的正文。"""
+    import sub_agents as mod
+
+    mgr = mod.SubAgentManager.__new__(mod.SubAgentManager)
+    monkeypatch.setattr(mgr, "_get_client", lambda prof=None: (None, "m"))
+    monkeypatch.setattr(mgr, "_tool_defs", lambda prof=None: [])
+
+    async def _noop(*a, **k):
+        return None
+    monkeypatch.setattr(mgr, "_mirror_log", _noop)
+
+    seen = []
+
+    async def fake_llm(client, model, messages, tools):
+        import types
+        seen.append([m["role"] for m in messages])
+        text = replies[min(len(seen) - 1, len(replies) - 1)]
+        msg = types.SimpleNamespace(content=text, tool_calls=[])
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(message=msg)])
+
+    monkeypatch.setattr(mgr, "_llm_call", fake_llm)
+    return mod, mgr, seen
+
+
+def test_empty_final_content_retries_once(monkeypatch):
+    """模型只回思考不回正文 → 补一次要结论的重试，而不是把整轮记成「没有结论」。"""
+    import asyncio
+    mod, mgr, seen = _mk_manager(monkeypatch, ["", "结论：干完了"])
+    worker = mod.SubAgent("任务", "标题", None)
+    out = asyncio.run(mgr._run_loop(worker))
+    assert out == "结论：干完了"
+    assert len(seen) == 2
+    assert seen[1][-1] == "user"
+
+
+def test_empty_final_content_retry_is_bounded(monkeypatch):
+    """持续空回只补一次，不能无限重试。"""
+    import asyncio
+    mod, mgr, seen = _mk_manager(monkeypatch, [""])
+    worker = mod.SubAgent("任务", "标题", None)
+    out = asyncio.run(mgr._run_loop(worker))
+    assert out == "（子智能体没有给出结论）"
+    assert len(seen) == 2

@@ -515,6 +515,10 @@ def load_specs() -> dict:
 
 def save_spec(name: str, spec: dict):
     specs = _load_raw()  # 保留注释键，别把它们冲掉
+    if specs.get(name) == spec:
+        # 内容没变就别写盘：servers.json 在 skills/ 下，写一次就触发技能热重载，
+        # 清空 _SERVERS 让下次调用重建进程（浏览器页面状态全丢、内存翻倍）
+        return
     specs[name] = spec
     with open(_SPECS_PATH, "w", encoding="utf-8") as f:
         json.dump(specs, f, ensure_ascii=False, indent=2)
@@ -571,7 +575,7 @@ def resource_guard(action: str, name: str = "", spec: dict = None,
         cmdline = " ".join([str((spec or {}).get("command") or "")] +
                            [str(a) for a in ((spec or {}).get("args") or [])]).lower()
         hit = next((h for h in _HEAVY_HINTS if h in cmdline), None)
-        if hit and not allow_heavy:
+        if hit and not allow_heavy and not (spec or {}).get("heavy"):
             bad.append(f"命令含浏览器内核 '{hit}'——1GB 的 Pi 上会烧机，"
                        f"确实要跑就显式传 allow_heavy=true")
     if bad:

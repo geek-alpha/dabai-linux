@@ -29,13 +29,15 @@ import sys
 sys.path.insert(0, "/home/wxf/dabai")
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-from openai import AsyncOpenAI  # noqa: E402
+from agent import _build_llm_client  # noqa: E402
 
 CFG = json.load(open("/home/wxf/dabai/settings.json", encoding="utf-8"))
 MODEL = CFG.get("model")
 THINKING = {"reasoning_effort": "high", "thinking_budget": 2000}
 
-client = AsyncOpenAI(base_url=CFG["base_url"], api_key=CFG["api_key"])
+# 必须走项目自己的构造函数：opencode zen/go 网关缺 x-opencode-session 头会直接
+# 400 MissingSessionID，探针会把这个与 reasoning 回传无关的 400 当成复现。
+client = _build_llm_client(CFG["base_url"], CFG["api_key"])
 
 TOOLS = [{
     "type": "function",
@@ -72,9 +74,10 @@ def with_r(a, rc):
     return m
 
 
-async def call(label, messages, stream=False, tools=True):
-    kw = dict(model=MODEL, messages=messages, max_tokens=64, temperature=0.1,
-              extra_body=THINKING)
+async def call(label, messages, stream=False, tools=True, thinking=True):
+    kw = dict(model=MODEL, messages=messages, max_tokens=64, temperature=0.1)
+    if thinking:
+        kw["extra_body"] = THINKING
     if tools:
         kw["tools"] = TOOLS
     try:
@@ -128,6 +131,15 @@ async def main():
                      {"role": "tool", "tool_call_id": tid1, "content": "第1行：hello probe"},
                      {"role": "user", "content": "再读第 2 行，只调工具别回答。"},
                      a2, *tail])
+
+    # 子智能体（sub_agents.py:_llm_call）的真实形状：不传 extra_body 的 thinking
+    # 调优参数，且它自产的 assistant 消息永远不带 reasoning_content 字段。
+    print("\n阶段3：子智能体真实形状（无 thinking 参数）")
+    await call("6a 全不带 reasoning + 无 thinking 参数 ← 子智能体形状",
+               build(a1, a2), thinking=False)
+    await call("6b 全补空串 + 无 thinking 参数",
+               build({**a1, "reasoning_content": ""},
+                     {**a2, "reasoning_content": ""}), thinking=False)
 
 
 if __name__ == "__main__":

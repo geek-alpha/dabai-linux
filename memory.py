@@ -139,7 +139,7 @@ LONG_TERM_MAX_TOKENS = 300               # 常驻长期记忆块预算
 LONG_TERM_TOP_K = 4                      # 常驻长期记忆条数（稳定排序）
 RECALL_MAX_TOKENS = 400                  # 主动回忆预算（与 recall_max_chars 取更小者）
 # 最近任务执行摘要：每轮注入最近一次带工具执行的用户轮次的真实工具结果上限
-RECENT_WORK_MAX_CHARS = 1200
+RECENT_WORK_MAX_CHARS = 800
 RECORD_CONTEXT_STATS = True              # 每轮写入 context_stats
 
 # 用于类别推断与关键词降级提取的常见模式（类别 -> 触发词）
@@ -2369,14 +2369,14 @@ class ChatMemory:
             if len(goal) > 120:
                 goal = goal[:117] + "…"
             digest = []
-            for i, m in enumerate(tool_msgs[:8]):
+            for i, m in enumerate(tool_msgs[:6]):
                 nm = names[i] if i < len(names) else "工具"
                 c = (str(m.get("content") or "").strip()
                      .replace("\r", " ").replace("\n", " "))
                 if not c:
                     continue
-                if len(c) > 160:
-                    c = c[:157] + "…"
+                if len(c) > 110:
+                    c = c[:107] + "…"
                 digest.append(f"- {nm}: {c}")
             if not digest:
                 continue

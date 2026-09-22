@@ -1822,24 +1822,176 @@ def _single_ro_note(streak: int, names: list, pending_names: list) -> tuple:
     return 0, [], False
 
 
-# 「多步轮未提清单」检测：一轮里调了 >= PLAN_MISS_MIN_CALLS 个工具却没调 plan_update。
-# 阈值与审计工具 call_stats 的 multi_rounds 判据（tool_calls>=3）同源——口径一分叉，
+# 「多步轮未提清单」检测：一轮里调了 >= PLAN_MISS_MIN_CALLS 个工具、且跨了多个环节，
+# 却没调 plan_update。判据与审计工具 call_stats 的 multi_rounds 同源——口径一分叉，
 # 提醒就会打偏，埋点也和审计对不上账。
 PLAN_MISS_MIN_CALLS = 3
+# 轮内「不同工具种类」下限：3 次同一种工具（一次并行读 3 个文件、连跑 3 条 grep）是批量
+# 查询，不是多步任务。实测这类轮 40 个（占多步轮 15%）、0 次列清单——放进来只会让提示
+# 对着「我刚读了几个文件」喊「你没提清单」，模型判定不适用后连真多步轮的提示一起忽略。
+PLAN_MISS_MIN_KINDS = 3
 # 连续 2 轮才提醒一次：单轮漏提太常见（小改动本来就无需清单），每轮都提醒等于噪声。
 PLAN_MISS_STREAK_N = 2
+# 「有文件产出」的工具：含其中之一就算多步轮，即使轮内只跨了 2 个环节——
+# 读+改是典型的两环节改造，不该因为种类少被漏判。
+_PLAN_WRITE_TOOLS = {"code_edit", "code_create_file", "code_append",
+                     "code_patch", "code_undo_turn"}
 
 
-def _plan_miss_note(streak: int, tool_calls: int, used_plan: bool) -> tuple:
+def _plan_miss_note(streak: int, tool_calls: int, used_plan: bool,
+                    call_names: list = None) -> tuple:
     """更新「多步轮未提清单」计数，返回 (streak, 本轮是否该给反馈)。
 
-    只有「本轮工具调用 >= PLAN_MISS_MIN_CALLS 且没调 plan_update」才累加；
-    提过清单、轮次不够多、纯文本轮一律清零。
+    只有「多步轮且没调 plan_update」才累加；提过清单、轮次不够多、纯文本轮一律清零。
+    call_names 为 None（无明细的老调用方）时退回纯次数判据：宁可多算一轮，不可漏判。
     """
-    if tool_calls >= PLAN_MISS_MIN_CALLS and not used_plan:
+    multi = tool_calls >= PLAN_MISS_MIN_CALLS
+    if multi and call_names is not None:
+        names = set(call_names)
+        multi = (len(names) >= PLAN_MISS_MIN_KINDS
+                 or bool(names & _PLAN_WRITE_TOOLS))
+    if multi and not used_plan:
         streak += 1
         return streak, streak % PLAN_MISS_STREAK_N == 0
     return 0, False
+
+
+# ---- 「多步轮未提清单」streak 的跨进程持久化 ----
+# _plan_miss_streak/_plan_miss_armed 是纯内存字段，进程一重启就归零；而 streak 要
+# 连续 PLAN_MISS_STREAK_N(=2) 个多步轮才置位 armed —— 实测 journalctl 120 分钟内
+# 8 次热更新重启（每次都是「热更新守护已启动」），计数永远攒不满 → plan_hints 恒 0
+# → 审计读数 rules:plan_rate 卡在 33%（达标线 50%）。病根与历史视图/技能激活集
+# 一样：把「进程生命周期」当成了「会话边界」。
+PLAN_MISS_STATE_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "data", "plan_miss_state.json")
+# 过期阈值：状态跨进程复用，但隔太久（换会话/隔夜）就不该再算「连续 N 轮」。
+PLAN_MISS_STATE_TTL = 3600.0
+
+
+def _plan_miss_persist_enabled() -> bool:
+    """自检/探针（tag=test）不读写真实状态文件：合成样本绝不能污染现场。"""
+    return _trace_tag() != "test"
+
+
+def _load_miss_state(path, sid, ttl) -> tuple:
+    """通用读：读回 (streak, armed)。sid 不一致或已过期就当没有。
+
+    任何异常一律降级为 (0, False) —— 优化/持久化代码绝不能弄挂主路径。
+    清单提示与验证提示两个检查点各有一份盘上状态，读写逻辑共用一份。
+    """
+    if not sid or not _plan_miss_persist_enabled():
+        return 0, False
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            st = json.load(f)
+        if str(st.get("sid") or "") != str(sid):
+            return 0, False
+        if time.time() - float(st.get("at") or 0) > ttl:
+            return 0, False
+        streak = int(st.get("streak") or 0)
+        armed = bool(st.get("armed"))
+        return (streak, armed) if streak > 0 else (0, False)
+    except Exception:
+        return 0, False
+
+
+def _save_miss_state(path, sid, streak, armed) -> None:
+    """通用写：原子落盘（先写 .tmp 再 replace）——半截文件比没有文件更糟。"""
+    if not sid or not _plan_miss_persist_enabled():
+        return
+    try:
+        tmp = path + ".tmp"
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"sid": str(sid), "streak": int(streak), "armed": bool(armed),
+                       "at": time.time()}, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def _load_plan_miss_state(sid) -> tuple:
+    """清单检查点的读（路径与 TTL 是本检查点自己的，逻辑走通用实现）。"""
+    return _load_miss_state(PLAN_MISS_STATE_PATH, sid, PLAN_MISS_STATE_TTL)
+
+
+def _save_plan_miss_state(sid, streak, armed) -> None:
+    """清单检查点的写（原子落盘由通用实现负责）。"""
+    _save_miss_state(PLAN_MISS_STATE_PATH, sid, streak, armed)
+
+
+# ---- 「改码轮没同轮验证」检查点：与「多步轮未提清单」同一套三件套 ----
+# 判据：一轮里调过写工具（_VERIFY_EDIT_TOOLS）却一次验证工具（_VERIFY_TOOLS）都没调
+# ＝这个改码轮在审计里算「未验证」。两个集合必须与 tools/prompt_rules_audit.py 的
+# _EDIT_TOOLS / _VERIFY_TOOLS 逐字同源（tests/test_verify_miss_streak.py 有防分叉断言）
+# ——口径一分叉，提示就会打偏，埋点也和审计对不上账（清单提示踩过同一个坑）。
+# 实测背景：审计 trend 最近 3 天加权，158 个改码轮里只有 48% 同轮验证（达标线 60%）；
+# 规则区「改完就验」这条抽象要求改不动行为，得在模型刚改完的那一刻给事实反馈。
+_VERIFY_EDIT_TOOLS = {"code_edit", "code_create_file", "code_append"}
+_VERIFY_TOOLS = {"code_verify", "code_test", "code_smoke"}
+# shell 命令级的验证信号。call_names 只到工具名一层，而 94% 的轮都在用 shell_run——
+# 「改完码跑 pytest」在只看工具名的旧口径里和「改完码 ls 一下」一模一样，都被算成没
+# 验证。实测代价（data/turn_metrics.jsonl 采样 6 轮）：4 个被判「未验证」的改码轮里
+# 每一轮都用 shell_run 跑过 pytest 或实发探针，18 次提示全是假警；更糟的是提示措辞
+# 把模型推向 code_verify（只做 py_compile），比它本来跑的 pytest 更弱——指标腐化。
+# 只认「能证伪改动」的强信号：编译检查与测试运行。跑台账脚本（lesson_add /
+# long_horizon / self_iterate）不算——那是写状态，不是验证。
+_VERIFY_CMD_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:pytest|py_compile|compileall|unittest|py\.test)(?![A-Za-z0-9_])",
+    re.I)
+
+
+def _is_verify_call(tool_name: str, arguments=None) -> bool:
+    """这次工具调用算不算「验证」。与 tools/prompt_rules_audit.py 的同名函数逐字
+    同源（tests/test_verify_miss_streak.py 有防分叉断言）——口径一分叉，提示就会打偏。
+    """
+    name = str(tool_name or "")
+    if name in _VERIFY_TOOLS:
+        return True
+    if name not in _SHELL_TOOLS:
+        return False
+    cmd = ""
+    if isinstance(arguments, dict):
+        cmd = str(arguments.get("command") or arguments.get("cmd") or "")
+    return bool(cmd and _VERIFY_CMD_RE.search(cmd))
+
+
+# 跨轮反馈的阈值：连续 VERIFY_MISS_STREAK_N 个改码轮没验证，提示里才带上
+# 「你已经连续 N 轮改完不验」。同轮那条提示（改完那一刻发的）不受它限制——验证要
+# 赶在本轮结束前把模型拉回来，晚一轮就晚了。
+VERIFY_MISS_STREAK_N = 2
+VERIFY_MISS_STATE_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "data", "verify_miss_state.json")
+VERIFY_MISS_STATE_TTL = 3600.0
+
+
+def _verify_miss_note(streak: int, call_names: list = None, verified: bool = None) -> tuple:
+    """更新「改码轮没同轮验证」的跨轮计数，返回 (streak, 本轮是否该给跨轮反馈)。
+
+    只有「调过写工具且一次验证都没跑」才累加；验过的轮、没改码的轮一律清零。
+    call_names 为 None（无明细的老调用方）返回 (0, False)：验证这一类没有次数兜底
+    ——「调了几个工具」推不出「改没改码」，宁可不判，也不假警。
+    verified：本轮是否验证过（含 shell 里的 pytest）。工具名判不出 shell 命令的内容，
+    所以有它就以它为准；为 None 时才退回只看工具名（老调用方 / 无参数明细）。
+    """
+    if call_names is None:
+        return 0, False
+    names = set(call_names)
+    did_verify = (bool(names & _VERIFY_TOOLS) if verified is None else bool(verified))
+    if names & _VERIFY_EDIT_TOOLS and not did_verify:
+        streak += 1
+        return streak, streak % VERIFY_MISS_STREAK_N == 0
+    return 0, False
+
+
+def _load_verify_miss_state(sid) -> tuple:
+    """验证检查点的读（路径与 TTL 是本检查点自己的，逻辑走通用实现）。"""
+    return _load_miss_state(VERIFY_MISS_STATE_PATH, sid, VERIFY_MISS_STATE_TTL)
+
+
+def _save_verify_miss_state(sid, streak) -> None:
+    """验证检查点的写：armed 是轮级标记（不跨轮），盘上只留 streak。"""
+    _save_miss_state(VERIFY_MISS_STATE_PATH, sid, streak, False)
 
 
 def _get_tool_cache():
@@ -2676,7 +2828,7 @@ def _clip_lesson(text, n: int = 150) -> str:
     return _clip(s, 120)
 
 
-def _harness_lessons_block(cap: int = 6) -> str:
+def _harness_lessons_block(cap: int = 1) -> str:
     """读 harness 经验库（跨任务踩坑记录），生成对话层可注入的经验段；无经验返回空串。
 
     背景（2026-09-12）：harness/tasks.py:732 的 _remember_lesson / _lessons_prompt 早已
@@ -2702,7 +2854,10 @@ def _harness_lessons_block(cap: int = 6) -> str:
         pick = _gene_pick(ls, cap)
         lines = "\n".join(f"- {_clip_lesson(x)}" for x in pick)
         _gene_touch([("lesson", str(x)) for x in pick])
-        return "【历史经验（此前踩过的坑/成功路径，来自 harness 经验库）】\n" + lines
+        return ("【历史经验（此前踩过的坑/成功路径，来自 harness 经验库）】\n" + lines
+                + f"\n（库内共 {len(ls)} 条，这里只放最该看的 {len(pick)} 条；"
+                '读索引 context_read("lessons")，读单条 '
+                'context_read("lessons", "<序号|hash前缀>")）')
     except Exception:
         return ""
 
@@ -2732,7 +2887,7 @@ def _harness_balance_block() -> str:
 
 
 
-def _harness_longterm_block(cap: int = 3, cap_q: int = 3) -> str:
+def _harness_longterm_block(cap: int = 1, cap_q: int = 1) -> str:
     """读长期事业台账，生成「未完成的事业」注入段；无进行中项目返回空串。
 
     背景（2026-09-12）：大白的每轮对话都是新生，任务做完即焚——没有跨会话的目标、
@@ -2766,14 +2921,16 @@ def _harness_longterm_block(cap: int = 3, cap_q: int = 3) -> str:
                 head += f" 价值：{_clip(x['value'], 60)}"
             out.append(head)
             if x.get("next"):
-                out.append(f"  下一步（上一轮留的接力棒）：{x['next']}")
+                out.append(f"  下一步（上一轮留的接力棒）：{_clip(x['next'], 90)}")
             lg = x.get("log") or []
             if lg:
                 out.append(f"  最近：{lg[0].get('t', '')} {_clip(lg[0].get('what', ''), 60)}")
         if qs:
             out.append("悬而未决（创新燃料，遇到相关信息就碰一下）：")
-            out.extend(f"- {_clip(x.get('text', ''), 80)}" for x in qs[:cap_q])
+            out.extend(f"- {_clip(x.get('text', ''), 50)}" for x in qs[:cap_q])
         out.append(
+            "全量（未截断的 next、验收判据、完整 log）：context_read(\"long_horizon\")；"
+            "单项 context_read(\"long_horizon\", \"<id>\")。"
             "推进了就立刻落盘：`venv/bin/python tools/long_horizon.py log <id> \"做了什么\" --ev 证据`；"
             "收工前把 next 改写成下一轮能直接开跑的原子动作。\n"
         )
@@ -2783,7 +2940,7 @@ def _harness_longterm_block(cap: int = 3, cap_q: int = 3) -> str:
         return ""
 
 
-def _harness_conviction_block(cap: int = 4) -> str:
+def _harness_conviction_block(cap: int = 1) -> str:
     """读主体性台账（信条 + 最近拒绝），生成对话层可注入段；空则返回空串。
 
     背景（2026-09-12）：规则是「别人要我怎么做」，信条是「我自己判断该怎么做」。
@@ -2814,8 +2971,9 @@ def _harness_conviction_block(cap: int = 4) -> str:
         for c in picked:
             out.append(f"- {c.get('text', '')}")
         if vs:
-            out.append("最近拒绝过（主体性的直接证据）：")
-            out.extend(f"- {_clip(v.get('claim', ''), 60)}" for v in vs[:2])
+            out.append(f"最近拒绝过（共 {len(vs)} 条，主体性的直接证据）：")
+            out.extend(f"- {_clip(v.get('claim', ''), 60)}" for v in vs[:1])
+        out.append('全量信条与拒绝理由：context_read("conviction")。')
         _gene_touch([("conviction", str(c.get("text", ""))) for c in picked])
         return "\n".join(out)
     except Exception:
@@ -2863,7 +3021,7 @@ def _harness_peer_call_block() -> str:
         return ""
 
 
-def _harness_peer_block(preview: int = 2) -> str:
+def _harness_peer_block(preview: int = 0) -> str:
     """联邦收件箱未读 + 没挂断的通话；都没有返回空串。
 
     背景（2026-09-18）：联邦实时电话已上线，但收件箱只有我主动调 peer_inbox 才看得见——
@@ -2878,12 +3036,13 @@ def _harness_peer_block(preview: int = 2) -> str:
         s = pm.unread_summary(preview=preview)
         n = int(s.get("count") or 0)
         if n > 0:
-            out = [f"【联邦来信】未读 {n} 条。联邦已收进 MCP、默认关闭 —— 要读全文先管理员授权"
-                   f"（python peer_admin.py grant --scope read --ttl 600 --why \"…\"）再用 mcp 调 "
+            out = [f"【联邦来信】未读 {n} 条。要读内容：context_read(\"peer\")（正文在本机）；"
+                   "读信动作需管理员授权"
+                   "（python peer_admin.py grant --scope read --ttl 600 --why \"…\"）再用 mcp 调 "
                    f"peer(action=inbox)。没授权就别动它。"]
             for m in s.get("items") or []:
                 when = _t.strftime("%m-%d %H:%M", _t.localtime(m.get("ts", 0)))
-                out.append(f"- [{m.get('from', '?')} {when}] {_clip(str(m.get('text', '')), 60)}")
+                out.append(f"- [{m.get('from', '?')} {when}] {_clip(str(m.get('text', '')), 40)}")
             blocks.append("\n".join(out))
     except Exception:
         pass
@@ -3304,6 +3463,15 @@ class AIAgent:
         # 提醒绝不进 sys_prompt——首条一变，整条前缀（含全部历史）白付一次全价。
         self._plan_miss_streak = 0
         self._plan_miss_armed = False   # 已判定该给反馈，由下一轮结果构造处消费
+        # 盘上状态所属 sid：进程重启后由 _restore_plan_miss 接回（进程重启 ≠ 换会话）。
+        self._plan_miss_sid = None
+        # 「改码轮没同轮验证」检查点的状态：streak 跨轮（落盘），其余三个是轮级标记。
+        self._verify_miss_streak = 0
+        self._verify_miss_sid = None
+        self._verify_round_edit = False       # 本轮到此刻改过码
+        self._verify_round_verified = False   # 本轮到此刻验过码
+        self._verify_miss_armed = False       # 本轮该提醒（改完那一刻置位，提醒一次即解除）
+        self._verify_shell_hits = 0           # 本轮 shell 里跑验证命令的次数（口径埋点）
         # 实例标识：写进诊断日志，用来区分「视图被清」和「换了实例」
         # （真实样本里同一 sid 反复 reset_sid，只有这个能证伪）。
         self._inst_tag = f"{os.getpid()}-{id(self) & 0xFFFF:04x}"
@@ -3544,6 +3712,12 @@ class AIAgent:
         """
         try:
             restored = self._restore_skills()
+            # 同一类「进程重启 ≠ 换会话」的状态，挂在同一个每轮入口上：
+            # 否则 streak 每次重启归零，plan_hints 一辈子攒不满 2 轮。
+            self._restore_plan_miss()
+            # 验证检查点同样挂在每轮入口：计数从盘上接回来、轮级标记清零。
+            self._restore_verify_miss()
+            self._reset_verify_watch()
             if not self._base_tools:
                 self._base_tools = self._filtered_tools()
             self._all_tools = list(self._base_tools)
@@ -4452,6 +4626,35 @@ class AIAgent:
             f"（{names}）。只读调用之间无冲突、同一轮可以并行发出——"
             "下次需要多个只读信息时请一次发完，每省一轮就省一次秒级往返。")
 
+    def _restore_plan_miss(self) -> None:
+        """重启后把上一进程的 streak/armed 接回来（同 sid 才恢复）。
+
+        纯内存的 streak 一重启就归零，要连中 2 个多步轮才置位 armed；实测
+        120 分钟 8 次热更新重启，计数永远攒不满 → plan_hints 恒 0，这是
+        plan_rate 停在 33% 的真实卡点（不是 eff_tool_calls 口径）。
+        只恢复状态、不改判据：恢复后仍由 _plan_miss_note 与审计同一口径消费。
+        """
+        sid = getattr(getattr(self, "memory", None), "session_id", None)
+        if not sid or getattr(self, "_plan_miss_sid", None) == sid:
+            return
+        self._plan_miss_sid = sid
+        streak, armed = _load_plan_miss_state(sid)
+        self._plan_miss_streak = streak
+        self._plan_miss_armed = armed
+        if streak or armed:
+            logger.info(f"重启后恢复清单漏提计数: streak={streak} armed={armed}")
+
+    def _persist_plan_miss(self) -> None:
+        """把当前 streak/armed 落盘，供下一次重启接回（sid 由 memory 给出）。"""
+        try:
+            sid = getattr(getattr(self, "memory", None), "session_id", None)
+            if not sid:
+                return
+            _save_plan_miss_state(sid, getattr(self, "_plan_miss_streak", 0),
+                                  getattr(self, "_plan_miss_armed", False))
+        except Exception:
+            pass
+
     def _plan_miss_hint(self) -> str:
         """「多步轮未提清单」的事实反馈，只加给 LLM 那份结果（UI 与记忆库保持原样）。
 
@@ -4462,11 +4665,92 @@ class AIAgent:
         if not self._plan_miss_armed:
             return ""
         self._plan_miss_armed = False
+        # 消费即落盘：不落盘的话「已经提醒过」活不过一次重启，重启后 armed 仍为
+        # True → 同一句提示被反复注入（提示要一次，不要每轮重放）。
+        self._persist_plan_miss()
         return (
             f"\n\n【清单提示】你已连续 {self._plan_miss_streak} 轮调用 "
             f"{PLAN_MISS_MIN_CALLS} 个以上工具却没提过工作清单。多步任务（≥3 步或跨轮）"
             "开工前先 plan_update 提交整份清单：漏提最容易漏的是收尾项，"
             "而且用户看不到你的进度。")
+
+    # ---- 「改码轮没同轮验证」检查点：纯函数计数(_verify_miss_note) + armed + 结果注入 ----
+
+    def _restore_verify_miss(self) -> None:
+        """重启后把上一进程的「改码未验证」计数接回来（同 sid 才恢复）。
+
+        同清单提示的教训：计数是内存字段，进程一重启就归零；而提示要说的
+        「你已经连续 N 轮改完不验」正是跨轮信息——不接回来，这句永远说成 0。
+        """
+        sid = getattr(getattr(self, "memory", None), "session_id", None)
+        if not sid or getattr(self, "_verify_miss_sid", None) == sid:
+            return
+        self._verify_miss_sid = sid
+        self._verify_miss_streak = _load_verify_miss_state(sid)[0]
+
+    def _persist_verify_miss(self) -> None:
+        """把当前 streak 落盘，供下一次重启接回。"""
+        try:
+            sid = getattr(getattr(self, "memory", None), "session_id", None)
+            if not sid:
+                return
+            _save_verify_miss_state(sid, getattr(self, "_verify_miss_streak", 0))
+        except Exception:
+            pass
+
+    def _reset_verify_watch(self) -> None:
+        """每轮入口清空轮级标记：没改过码、没验过码、还没提醒过。
+
+        armed 按轮清零而不是跨轮保留：验证的价值就在同轮——上一轮的提醒对着
+        已经收工的那一轮毫无意义，跨轮残留只会让下一轮一开工就喊。
+        """
+        self._verify_round_edit = False
+        self._verify_round_verified = False
+        self._verify_miss_armed = False
+        self._verify_shell_hits = 0
+
+    def _watch_verify_tool(self, tool_name: str, arguments=None) -> None:
+        """登记本轮此刻调用的工具：改了码就 arm（还没验的话），验了码就 disarm。
+
+        arguments 是给 shell_run 用的：跑 pytest 和跑 ls 在工具名上分不出来，只看
+        工具名会把真验证记成没验证，提示于是变成假警（采样 6 轮里 18 次全是假警）。
+        """
+        try:
+            name = str(tool_name or "")
+            if name in _VERIFY_EDIT_TOOLS:
+                self._verify_round_edit = True
+                if not getattr(self, "_verify_round_verified", False):
+                    # armed 在「改完的那一刻」置位：提示必须紧跟这次改动，本轮还来
+                    # 得及跑验证；等本轮结束再提醒，改的上下文已经散了。
+                    self._verify_miss_armed = True
+            elif _is_verify_call(name, arguments):
+                self._verify_round_verified = True
+                self._verify_miss_armed = False
+                if name in _SHELL_TOOLS:
+                    self._verify_shell_hits = int(
+                        getattr(self, "_verify_shell_hits", 0) or 0) + 1
+        except Exception:
+            pass
+
+    def _verify_miss_hint(self) -> str:
+        """「本轮改了码、到此还没验证」的事实反馈，只加给 LLM 那份结果。
+
+        为什么必须同轮给：验证的全部价值在于改完立刻跑（改动还在上下文里，失败能
+        当场回退）。推到下一轮，改动已经收工，只会补一次形式化验证。规则区那句
+        「改完就验」实测 158 个改码轮只有 48% 同轮验证（达标线 60%）——抽象要求改不
+        动行为，事实反馈才有埋点能验（与清单提示同一个结论）。
+        """
+        if not self._verify_miss_armed:
+            return ""
+        self._verify_miss_armed = False   # 一轮只提醒一次：每轮重放等于刷屏
+        streak = int(getattr(self, "_verify_miss_streak", 0) or 0)
+        tail = f"（你已经连续 {streak} 轮改完码没验证）" if streak >= 1 else ""
+        return (
+            "\n\n【验证提示】你本轮已经改了代码，到这个工具调用为止还没跑过验证。"
+            "改完码要在**同一轮里**跑一次验证：code_verify / code_test / code_smoke，"
+            "或者 shell_run 跑 pytest / py_compile（这两种也算，审计口径认命令内容）。"
+            "跨轮再补不算。" + tail +
+            "没验的改动里藏着的是没过语法、没过测试、没被证据支持的改动。")
 
     def _remember_cross_fp(self, fp: str) -> None:
         """登记工具调用指纹，供跨轮重复统计（只统计，不拦截）。
@@ -4572,6 +4856,22 @@ class AIAgent:
             except Exception:
                 pass
         yield _outcome
+
+    async def _tool_stream_isolated(self, tool_name: str, arguments: dict):
+        """工具执行流的异常隔离层：非取消异常一律降级成 (错误文案, False)。
+
+        工具自身的异常已由 harness.supervise_tool 兜住；这一层挡的是「兜底本身出问题」
+        （心跳/缓存/生成器机制抛错）以及流结束却没产出结果——一个工具的异常
+        不该掀掉整轮对话。
+        """
+        try:
+            async for ev in self._supervised_tool_stream(tool_name, arguments):
+                yield ev
+        except (asyncio.CancelledError, GeneratorExit):
+            raise
+        except BaseException as e:
+            logger.exception("[Tool] %s 执行流异常（已隔离）", tool_name)
+            yield (f"工具 '{tool_name}' 执行异常（已隔离，本轮其它工具不受影响）: {e!r}", False)
 
     # ==================== 流式对话（带工具调用） ====================
 
@@ -5437,6 +5737,10 @@ class AIAgent:
         eff_mergeable = 0       # 本轮「本该合并成一次调用」的多余调用数（并行度优化的尺子）
         eff_single_ro = 0       # 本轮注入的「连续单发只读」反馈次数（跨轮串行埋点）
         eff_plan_hints = 0      # 本轮注入的「多步轮未提清单」反馈次数（准则段埋点）
+        eff_verify_hints = 0    # 本轮注入的「改完码没同轮验证」反馈次数（准则段埋点）
+        # 本轮 shell 里跑验证命令（pytest/py_compile）的次数：没有它，「改了码跑 pytest」
+        # 与「改了码 ls 一下」在 turn_metrics 里长得一样，审计只能按工具名误判成没验证。
+        eff_verify_shell = 0
         eff_img_ops = 0         # 本轮画图工具调用数（规则区「画图」埋点）
         eff_music_ops = 0       # 本轮 music_* 调用数（规则区「音乐」埋点）
         eff_delete_ops = 0      # 本轮删除类操作数（规则区「删除」埋点）
@@ -5625,8 +5929,17 @@ class AIAgent:
             # 会被误算成连续两轮。
             self._plan_miss_streak, _plan_armed_now = _plan_miss_note(
                 self._plan_miss_streak, eff_tool_calls,
-                "plan_update" in eff_call_names)
+                "plan_update" in eff_call_names, eff_call_names)
             self._plan_miss_armed = self._plan_miss_armed or _plan_armed_now
+            self._persist_plan_miss()
+            # 「改码轮没同轮验证」的跨轮计数：同清单提示一样必须排在 tool_round 早退之前
+            # ——纯文本轮 eff_call_names 为空，会走到这里把 streak 清零。
+            # armed（本轮该不该提醒）不从这里下发：它在轮内改完那一刻由 _watch_verify_tool
+            # 置位，同轮提示必须紧跟改动，等轮末再提醒已经晚了。
+            self._verify_miss_streak, _ = _verify_miss_note(
+                self._verify_miss_streak, eff_call_names, self._verify_round_verified)
+            self._persist_verify_miss()
+            eff_verify_shell = int(getattr(self, "_verify_shell_hits", 0) or 0)
             if tool_round <= 0:
                 return
             try:
@@ -5643,6 +5956,8 @@ class AIAgent:
                     "mergeable_calls": eff_mergeable,
                     "single_ro_hints": eff_single_ro,
                     "plan_hints": eff_plan_hints,
+                    "verify_hints": eff_verify_hints,
+                    "verify_shell_hits": eff_verify_shell,
                     # 规则区「删除/画图/音乐」三条的行为暴露量：0 次 ≠ 规则没用，
                     # 只说明这段时间没被触发过——审计工具据此区分「无据可删」与「有作用面」。
                     "img_gen_calls": eff_img_ops,
@@ -6166,6 +6481,10 @@ class AIAgent:
                 eff_tool_calls += 1
                 if tool_name not in eff_call_names:
                     eff_call_names.append(tool_name)
+                # 验证检查点登记：必须排在结果构造之前，改完码的那一次调用才能当场带出提示。
+                # 参数要传：shell_run 跑 pytest 与跑 ls 只差在命令内容里。
+                self._watch_verify_tool(
+                    tool_name, cleaned_args if cleaned_args is not None else arguments)
                 if not success:
                     eff_tool_errors += 1
                     eff_err_names.append(tool_name)
@@ -6197,6 +6516,10 @@ class AIAgent:
                 if _plan_hint:
                     _llm_result = str(_llm_result) + _plan_hint
                     eff_plan_hints += 1
+                _verify_hint = self._verify_miss_hint()
+                if _verify_hint:
+                    _llm_result = str(_llm_result) + _verify_hint
+                    eff_verify_hints += 1
                 self._remember_cross_fp(_fp)
 
                 tool_call_results.append({
@@ -6348,11 +6671,14 @@ class AIAgent:
 
                         def _make_runner(tn: str, args: dict, i: int):
                             async def _run():
-                                async for ev in self._supervised_tool_stream(tn, args):
+                                async for ev in self._tool_stream_isolated(tn, args):
                                     if isinstance(ev, ToolCallProgress):
                                         progress_buf.append(ev)
                                     else:
                                         return i, ev
+                                # 流没产出结果就结束了：补一个失败结果，别让 t.result() 返回 None
+                                # （解包 None 会抛 TypeError，直接掀掉整轮）
+                                return i, (f"工具 '{tn}' 未返回结果（已隔离）", False)
                             return _run()
 
                         tasks = [asyncio.create_task(_make_runner(tn, args, i))
@@ -6374,7 +6700,7 @@ class AIAgent:
                 else:
                     # 顺序执行（同样带心跳），保持原有串行语义
                     for i, tn, args in pending:
-                        async for ev in self._supervised_tool_stream(tn, args):
+                        async for ev in self._tool_stream_isolated(tn, args):
                             if isinstance(ev, ToolCallProgress):
                                 yield ev
                             else:
@@ -6422,6 +6748,8 @@ class AIAgent:
                     eff_tool_calls += 1
                     if tool_name not in eff_call_names:
                         eff_call_names.append(tool_name)
+                    # 验证检查点登记：两条工具执行分支同增同减（有防漏挂的源码级断言）。
+                    self._watch_verify_tool(tool_name, arguments)
                     if not success:
                         eff_tool_errors += 1
                         eff_err_names.append(tool_name)
@@ -6459,6 +6787,19 @@ class AIAgent:
                     if _ro_hint:
                         _llm_result = str(_llm_result) + _ro_hint
                         eff_single_ro += 1
+                    # 清单提示必须和并行提示一样挂在**两条**工具执行分支上。原生工具调用
+                    # （下面的 else 分支）才是常态路径，文本协议只在模型报「不支持 function
+                    # calling」之后才启用。原先只挂在文本分支上：streak 照常累加、armed 照常
+                    # 置位、埋点照常落盘，但提示永远没有出口——15 个采样轮 plan_hints 全 0，
+                    # 清单率因此卡在 33%。判据没坏，出口挂了。
+                    _plan_hint = self._plan_miss_hint()
+                    if _plan_hint:
+                        _llm_result = str(_llm_result) + _plan_hint
+                        eff_plan_hints += 1
+                    _verify_hint = self._verify_miss_hint()
+                    if _verify_hint:
+                        _llm_result = str(_llm_result) + _verify_hint
+                        eff_verify_hints += 1
                     self._remember_cross_fp(_fp)
 
                     tool_call_results.append({

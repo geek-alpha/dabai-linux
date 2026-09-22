@@ -126,6 +126,8 @@ BACKGROUNDS_DIR = BASE_DIR / "backgrounds"
 # 聊天附件（用户发来的图片/文件）：按用户隔离、按天分目录，入口见 /api/upload
 UPLOADS_DIR = BASE_DIR / "data" / "uploads"
 SERVER_PORT = 8000
+# nginx 前置 TLS 终结模式（settings.json harness.http_only=true）下的回源端口
+HTTP_ONLY_PORT = 8001
 AUDIO_DIR.mkdir(exist_ok=True)
 MODELS_DIR.mkdir(exist_ok=True)
 BACKGROUNDS_DIR.mkdir(exist_ok=True)
@@ -217,18 +219,25 @@ async def lifespan(app: FastAPI):
     # 定时任务调度器（长任务自动化）：到期任务派发为通用子智能体后台执行，
     # 完成/出错自动记录到 data/scheduled_tasks.json 并沿子智能体汇报链路转述
     try:
-        from scheduler import start_scheduler, record_result
+        from scheduler import release_running, start_scheduler, record_result
 
         async def _fire_scheduled_job(job: dict) -> None:
             # 定时任务从出生起就与连接解耦：广播代理 + 常驻状态——
             # 页面从未打开/已全部关闭时照样派发、执行、汇报（后台完成，落库）
             state = await _get_resident_state()
-            _self_iterate_tick(job)
+            si = _self_iterate_tick(job)
+            if si is not None and not si.get("running"):
+                # 已停（环境阻塞/预算/连续无效）就别再派 —— 派出去的子智能体必然秒失败，
+                # 白烧一次请求还给主人发一条「出错」汇报。release 不计 runs：这轮没跑。
+                logger.info("[Scheduler] 自我迭代已停（%s），本轮不派发", si.get("stop_reason"))
+                release_running(job.get("id"),
+                                          "自我迭代已停：%s" % si.get("stop_reason"))
+                return
             worker = await _get_sub_agents().spawn(
                 _BROADCAST_WS, state,
                 str(job.get("task") or job.get("name") or ""),
                 title=("定时·" + str(job.get("name") or "任务"))[:60],
-                extra={"job_id": job.get("id")},
+                extra={"job_id": job.get("id"), **_scheduled_user_inputs(job)},
                 profile=str(job.get("profile") or ""),
             )
             logger.info("[Scheduler] 已派发定时任务《%s》[%s] → [%s]",
@@ -236,8 +245,16 @@ async def lifespan(app: FastAPI):
 
         asyncio.ensure_future(start_scheduler(_fire_scheduled_job))
         logger.info("[Scheduler] 定时任务调度器已启动")
+        _self_iterate_reconcile()
     except Exception as e:
         logger.warning(f"[Scheduler] 定时任务调度器启动失败: {e}")
+    # 自我迭代看门狗：与调度器启动解耦 —— 调度器起不来时更需要有人盯着循环
+    try:
+        asyncio.ensure_future(_self_iterate_watchdog())
+        logger.info("[SelfIterate] 强制唤醒看门狗已启动（每 %ds 扫描）",
+                    SELF_ITERATE_WATCHDOG_SEC)
+    except Exception as e:
+        logger.warning(f"[SelfIterate] 看门狗启动失败: {e}")
     # 确认卡审计清账：上一轮进程留下的未决卡，内存状态已丢、点不动（confirm 会 404），
     # 审计里不能继续显示「等你决定」——那是让用户等一个不会到来的决定。
     try:
@@ -2853,21 +2870,66 @@ async def task_center_clear():
 SELF_ITERATE_INTERVAL_SEC = 2400
 
 
-def _self_iterate_tick(job: dict) -> None:
+def _self_iterate_tick(job: dict):
     """自我迭代的派发计数：由调度器写，不依赖执行体自觉。
 
     为什么必须由调度器写：执行体忘了/挂了/卡住时不调 record，轮次就不涨，
     预算永远耗不完 —— 无人值守时这就是无限烧钱。
+
+    返回状态字典（只对自我迭代任务；其他任务返回 None）。调用方靠它判断该不该派。
     """
     try:
-        from tools.self_iterate import JOB_NAME, tick
+        from tools.self_iterate import ENV_BLOCK_MAX, JOB_NAME, tick
         if str(job.get("name") or "") != JOB_NAME:
-            return
+            return None
         st = tick()
-        logger.info("[SelfIterate] 派发计数 %s/%s", st.get("dispatched"),
-                    st.get("budget_rounds"))
+        logger.info("[SelfIterate] 派发计数 %s/%s（环境阻塞 %s/%s）",
+                    st.get("dispatched"), st.get("budget_rounds"),
+                    st.get("env_blocked") or 0, ENV_BLOCK_MAX)
+        return st
     except Exception as e:
         logger.warning(f"[SelfIterate] 派发计数失败: {e}")
+        return None
+
+
+def _self_iterate_note_result(job_id: str, text: str) -> None:
+    """子智能体汇报回来时给自我迭代记账：环境阻塞（402/401）当场退预算、必要时停派发。
+
+    为什么在结局处做而不是下次派发时：断轮看门狗把「派发了没记账」当被重启掐掉的轮，
+    20 分钟后立刻补派一次 —— 402 空转既吃预算又每 20 分钟白派一次。
+    """
+    try:
+        import scheduler
+        from tools.self_iterate import note_dispatch_result
+        job = _self_iterate_job()
+        if not job or str(job.get("id")) != str(job_id or ""):
+            return
+        st = note_dispatch_result(text)
+        if not st.get("running") and str(st.get("stop_kind") or "") == "env":
+            # 外部条件（余额/鉴权）没恢复前每 40 分钟派一次只是刷屏：停掉调度任务。
+            # 恢复后由 _self_iterate_reconcile 自动拉起（resume_plan 认 env 停因）。
+            scheduler.set_enabled(job.get("id"), False)
+            logger.warning("[SelfIterate] 环境阻塞已停派发并停用调度任务：%s",
+                           st.get("stop_reason"))
+    except Exception as e:
+        logger.warning(f"[SelfIterate] 环境阻塞记账失败: {e}")
+
+
+def _scheduled_user_inputs(job: dict) -> dict:
+    """定时任务要带的「用户端输入」：自我迭代轮把批判人格的指引按用户指令下发。
+
+    走 extra.user_inputs → sub_agents 追加成独立 user 消息（见 _inject_user_inputs）。
+    不拼进任务书文本：拼进去它退回成背景参考，模型一句「本轮优先级不高」就能绕过。
+    """
+    try:
+        if str(job.get("name") or "") != _self_iterate_job_name():
+            return {}
+        from tools.self_iterate import user_input_block
+        txt = user_input_block()
+        return {"user_inputs": [txt]} if txt else {}
+    except Exception as e:
+        logger.warning(f"[SelfIterate] 批判人格用户端输入组装失败（本轮不带）: {e}")
+        return {}
 
 
 def _self_iterate_task_text() -> str:
@@ -2891,6 +2953,111 @@ def _self_iterate_job():
 def _self_iterate_job_name() -> str:
     from tools.self_iterate import JOB_NAME
     return JOB_NAME
+
+
+def _self_iterate_worker_alive(job_id: str) -> bool:
+    """这个调度任务的执行体还在不在。running 标记挂着、执行体却没了 = 悬挂。
+
+    查不出来时按「还在跑」处理：宁可多等一轮，也不能重复派发烧双份预算。
+    """
+    try:
+        for w in _get_sub_agents().active():
+            if str((getattr(w, "extra", None) or {}).get("job_id") or "") == str(job_id):
+                return True
+    except Exception as e:
+        logger.warning(f"[SelfIterate] 执行体存活检查失败（按在跑处理）: {e}")
+        return True
+    return False
+
+
+SELF_ITERATE_RESTART_GRACE_SEC = 90   # 重启宽限：进程抖动重启不该立刻烧掉一轮
+
+
+def _self_iterate_reconcile() -> None:
+    """启动对账：状态文件说要跑，就必须有启用的调度任务。
+
+    重启后「它不动了」有三个各自独立的原因，缺一件都表现为停了：
+    ① 悬挂的 running 标记 —— 执行体已随进程死，但 _sweep_stale 要等 2 小时；
+    ② 调度任务被禁用或不存在 —— 用户按过停止的，就保持停；
+    ③ next_run_at 已过期 —— 没有宽限的话，改一次代码重启就烧掉一轮。
+    不调 start()：那会重置 epoch_start，等于每次重启白送一整份预算。
+    """
+    try:
+        import scheduler
+        from tools.self_iterate import JOB_NAME, resume_plan
+    except Exception as e:
+        logger.warning(f"[SelfIterate] 启动对账不可用: {e}")
+        return
+    job = _self_iterate_job()
+    if job:
+        scheduler.release_running(job.get("id"), "服务重启：上一轮执行体已随进程终止")
+        job = _self_iterate_job()
+    plan = resume_plan()
+    if not plan["resume"]:
+        if job and job.get("enabled"):
+            scheduler.set_enabled(job.get("id"), False)
+        logger.info("[SelfIterate] 不恢复：%s", plan["reason"])
+        return
+    err = None
+    if job is None:
+        job, err = scheduler.add_job(JOB_NAME, _self_iterate_task_text(),
+                                     SELF_ITERATE_INTERVAL_SEC)
+    elif not job.get("enabled"):
+        job, err = scheduler.set_enabled(job.get("id"), True)
+    if err or not job:
+        logger.warning(f"[SelfIterate] 恢复失败：{err}")
+        return
+    # 任务书自愈：文本在创建时就固化了，脚本改了流程旧任务不会跟着变（实测漏掉第 5 步
+    # 轮末批判），每次启动对账时刷一遍，免得「流程升级了但没人执行」。
+    _, terr = scheduler.set_task(job.get("id"), _self_iterate_task_text())
+    if terr:
+        logger.warning(f"[SelfIterate] 任务书刷新失败：{terr}")
+    scheduler.defer_job(job.get("id"), SELF_ITERATE_RESTART_GRACE_SEC)
+    logger.info("[SelfIterate] 已恢复：%s（下次执行推后 %ds）",
+                plan["reason"], SELF_ITERATE_RESTART_GRACE_SEC)
+
+
+SELF_ITERATE_WATCHDOG_SEC = 60   # 看门狗扫描间隔：断轮后最多等 1 分钟就补派发
+
+
+async def _self_iterate_watchdog() -> None:
+    """自我迭代的强制唤醒：循环停摆就把它拉起来，不等下一个 40 分钟周期。
+
+    为什么必须有它：调度器的宽限只保证「不早于 now+N」，排期一旦落在 40 分钟后，
+    改一次代码重启就等于白丢一个周期；而重启会杀掉正在执行的轮 —— 那一轮的
+    dispatched 已经扣了预算、record 却没落，成了断轮。没有外力补，循环就停在
+    「状态说在跑、实际不动」上，一晚上只迭代两三轮。
+    """
+    while True:
+        try:
+            await asyncio.sleep(SELF_ITERATE_WATCHDOG_SEC)
+            from tools.self_iterate import note_wake, stall_plan
+            import scheduler
+            plan = stall_plan(job=_self_iterate_job())
+            act = str(plan.get("action") or "none")
+            if act == "none":
+                continue
+            logger.warning("[SelfIterate] 看门狗：%s（%s）", act, plan.get("reason"))
+            note_wake(act, str(plan.get("reason") or ""))
+            if act == "resume":
+                _self_iterate_reconcile()
+                continue
+            job = _self_iterate_job()
+            if not job:
+                continue
+            if act == "release":
+                scheduler.release_running(job.get("id"), str(plan.get("reason") or ""))
+            # 白名单：不认识的动作不许静默走到「立即派发」——那是真花钱的动作
+            if act not in ("release", "wake"):
+                logger.warning("[SelfIterate] 看门狗动作不认识，跳过：%s", act)
+                continue
+            # wake / release 之后都要立刻把下一轮拉到眼前：
+            # 只清标记不派发，仍然是在等下一个 40 分钟。
+            _j, err = scheduler.run_now(job.get("id"))
+            if err:
+                logger.info("[SelfIterate] 看门狗立即派发被拒：%s", err)
+        except Exception as e:
+            logger.warning(f"[SelfIterate] 看门狗异常（忽略）: {e}")
 
 
 @app.get("/api/self-iterate/status")
@@ -2939,6 +3106,20 @@ async def self_iterate_start(payload: dict | None = None):
                                      SELF_ITERATE_INTERVAL_SEC)
     if err:
         return JSONResponse({"ok": False, "message": err}, status_code=400)
+    # 已存在且已启用的任务走 set_enabled 分支，不碰 next_run_at —— 点启动却要干等上一个
+    # 周期的排期（实测 09:56:36 启动、next_run_at 停在 10:16:26，界面说「运行中」实际不动）。
+    # 显式启动就是要立刻跑：排到眼前，下个 15s 扫描派发；正在跑的话 run_now 会拒绝。
+    _, rerr = scheduler.run_now(job.get("id"))
+    if rerr:
+        if _self_iterate_worker_alive(job.get("id")):
+            logger.info("[SelfIterate] 立即派发被拒（上一轮仍在跑）: %s", rerr)
+        else:
+            # 标记挂着、执行体已经不在（崩溃 / 被停）时 run_now 会一直拒绝，
+            # 点启动后最长要等 _sweep_stale 的 2 小时才派发 —— 用户看到的就是「点了没反应」。
+            scheduler.release_running(job.get("id"),
+                                      "启动时发现运行标记悬挂（执行体已不在）")
+            _, rerr = scheduler.run_now(job.get("id"))
+            logger.info("[SelfIterate] 已清悬挂标记并重排下一轮：%s", rerr or "ok")
     logger.info("[SelfIterate] 已启动，调度任务 %s（每 %s 秒）",
                 job.get("id"), SELF_ITERATE_INTERVAL_SEC)
     return {"ok": True, "job_id": job.get("id"), "status": si_status()}
@@ -2956,6 +3137,10 @@ async def self_iterate_stop():
     job = _self_iterate_job()
     if job and job.get("enabled"):
         scheduler.set_enabled(job.get("id"), False)
+    if job and job.get("running") and not _self_iterate_worker_alive(job.get("id")):
+        # 停止时顺手清悬挂标记：不清的话任务中心一直显示「正在执行」，
+        # 下次点启动也会被 run_now 拒掉。
+        scheduler.release_running(job.get("id"), "停止时发现运行标记悬挂（执行体已不在）")
     logger.info("[SelfIterate] 已停止")
     return {"ok": True, "status": si_status()}
 
@@ -5578,6 +5763,7 @@ async def _deliver_sub_agent_report(worker, message: str) -> None:
             record_result(job_id, ok, message[:600])
         except Exception as e:
             logger.warning(f"[Scheduler] 记录定时任务结果失败（忽略）: {e}")
+        _self_iterate_note_result(job_id, message)
     ws = getattr(worker, "ws", None)
     state = getattr(worker, "owner", None)
     if ws is None:
@@ -6432,6 +6618,14 @@ async def handle_user_message_stream(ws: WebSocket, user_text: str, history: lis
         return
 
     full_text = full_text.strip()
+    # 一轮对话的结束点是「文本输出完成」，不是「语音播报完成」：audio_end 得等
+    # TTS 队列把所有分片发完才补发（见 _tts_finalize），前端把轮收尾挂在它上面，
+    # TTS 一慢或一挂整轮就悬着——状态不复位、工具期保护不解除、结算不落。
+    await safe_send_json(ws, {
+        "type": "turn_text_done",
+        "session_id": session_id,
+        "tool_calls": tool_calls_made if tool_calls_made else None,
+    })
     # 语音播放独立化：audio_end 交给后台任务等所有音频发完再补发，
     # 这里立刻收尾本轮（历史/状态），不再等语音全部播放完。
     asyncio.create_task(_tts_finalize())
@@ -8301,6 +8495,10 @@ if __name__ == "__main__":
         use_https = False
     else:
         use_https = cert_file.exists() and key_file.exists()
+    # 技能/插件的自请求（如 workspace_impl 调 /api/workspace*）要知道真实回源地址，
+    # 不能各自硬编码 8000 —— http_only 时 8000 无人监听
+    _os.environ["DABAI_SELF_BASE"] = "%s://127.0.0.1:%d" % (
+        "https" if use_https else "http", HTTP_ONLY_PORT if _http_only else SERVER_PORT)
 
     ipv6 = get_global_ipv6()
     has_ipv6 = bool(ipv6)  # 仅在有真实全局 IPv6 地址时才启用双栈
@@ -8455,4 +8653,4 @@ if __name__ == "__main__":
         _run_server(SERVER_PORT, str(cert_file), str(key_file))
     else:
         # nginx 前置 TLS 终结模式：回源端口 8001，对外仍由 nginx 提供 8000 HTTPS
-        _run_server(8001 if _http_only else SERVER_PORT)
+        _run_server(HTTP_ONLY_PORT if _http_only else SERVER_PORT)

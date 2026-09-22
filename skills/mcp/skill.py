@@ -132,6 +132,10 @@ def do_connect(args: dict) -> str:
         return f"连接失败：{e}"
     except Exception as e:
         return f"连接失败：{e.__class__.__name__}: {e}"
+    if allow_heavy:
+        # 显式确认过重资源就落盘（spec 可能来自 servers.json 而非本次参数）：
+        # 否则 mcp_call 掉线自动重连时不带 allow_heavy，会被自己的闸门拦死
+        spec = {**(spec or mc.load_specs().get(name) or {}), "heavy": True}
     if spec:
         mc.save_spec(name, spec)  # 连上了才落盘：被闸门拦下的配置不该留在 servers.json 里
     head = (f"已连接 {name}：{srv.describe()}"

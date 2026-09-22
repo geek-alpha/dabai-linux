@@ -8,7 +8,7 @@
 判据（刻意分开报，不混成一个「修好了」）：
   A 类「尚未注册」——该错误与参数无关，属主能加载就该消失；参数被截断的记录也能判。
   参数完整的那部分另算「直接校验通过」，这才是「这一次本来能跑成」的证据。
-  C 类「期望数组」——必须参数完整才可判，截断的不计入。
+  C 类「类型错」——必须参数完整才可判，截断的不计入。
 """
 import glob
 import json
@@ -17,10 +17,14 @@ import sys
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, BASE)
+# 同目录兄弟模块（err_recidivism）：直接跑本脚本时脚本目录本就在 sys.path，
+# 但被 importlib 按路径加载时不在——只靠 BASE 会 ModuleNotFoundError。
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import agent  # noqa: E402
+import err_recidivism as er  # noqa: E402
 import harness  # noqa: E402
-from tool_validation import find_tool_spec  # noqa: E402
+from tool_validation import find_tool_spec, normalize_arguments  # noqa: E402
 
 # 真 _activate_skill 会写会话技能状态和 tools 流水——重放跑一次就往真实统计里塞假的
 # 「激活」，后续观测（gene_fitness/tools_trace）全被污染。两个落盘副作用在这里掐掉。
@@ -29,7 +33,14 @@ agent._trace_tools_change = lambda *a, **k: None
 
 TRACES = os.path.join(BASE, "data", "longrun", "traces")
 UNREGISTERED = "尚未注册"
-ARRAY_MISMATCH = "期望数组"
+# 判定串必须覆盖全部类型错原文，不能只认「期望数组」：search_batch 那条报的是
+# 「期望 string，实际是 list」，漏掉它会把 5 次类型错算成 4 次 → self_iterate 的
+# total<count 判据永远成立 → 该类 feasible 钉在 1.0，修好了也不退出选题。
+TYPE_MISMATCH = ("期望数组", "类型不符")
+# 类别归口不在此处自己写特征串，统一问 err_recidivism.classify ——
+# 两处各写一套 needle 就会各算一套分母（历史上 C 类 9 vs 5），
+# 而 self_iterate 的可行性判据直接拿两边数字比大小。
+JUDGED_CLASSES = (("A", "技能未加载"), ("C", "参数类型错"), ("F", "必填参数缺失"))
 
 
 class _Stub:
@@ -61,15 +72,13 @@ def _cold_stub():
 
 
 def _unwrap(raw):
-    """ToolCallStart.arguments 有两种记录形状：直接是 args，或包一层 {"arguments": {...}}。
+    """钩子：重放端**不再**自己剥 arguments 信封。
 
-    后者实测 11/1027 次（集中在 shell_run），是写入端两种格式并存，不是模型传错参数。
-    按 key 集合精确识别——「有 arguments 键就剥」会误伤真带 arguments 参数的工具。
+    剥法只留运行时的 validate_arguments → normalize_arguments 那一份。重放端的职责
+    是「拿当时的原始参数、走现在的校验层」，自己先剥一层就等于把要验证的修复抄进
+    验证器里：读数会显示 gone，运行时却照旧报错（假读数）。原先这里的私有一份
+    剥法只认 dict 内层，恰好也是 envelope-str 那 7 次一直没盖住的原因。
     """
-    if not isinstance(raw, dict):
-        return None
-    if set(raw.keys()) == {"arguments"} and isinstance(raw.get("arguments"), dict):
-        return raw["arguments"]
     return raw
 
 
@@ -122,50 +131,131 @@ def replay(tool, args):
     return err is None, err
 
 
-def main():
+def _row_shape(r: dict) -> str:
+    """一行失败调用的参数形状，只用于报告（判定不看它）。
+
+    envelope-* 是本轮修的形态：参数被包进单键 arguments（内层 dict 或 JSON 字符串）。
+    """
+    if not r["args_ok"]:
+        return "truncated"
+    args = r["args"]
+    if isinstance(args, dict) and list(args.keys()) == ["arguments"]:
+        return "envelope-dict" if isinstance(args["arguments"], dict) else "envelope-str"
+    return "flat"
+
+
+def _envelope_changed(r: dict) -> bool:
+    """这行的参数是否**会被**本轮的信封归一改变。
+
+    判据是机械的：把归一函数作用一遍，看参数是否真变了。变了 = 本轮修的机制对它
+    生效（这类行如果重放仍报同类错，说明修复没起作用，必须拦住 feasible）；
+    没变 = 模型传的是另一回事（如 code_read 收到 skill_name），校验层治不了它，
+    不能拿它把 feasible 钉在 1.0——那正是历史上「修好了也退不出选题」的死循环。
+    """
+    args = r["args"]
+    if not r["args_ok"] or not isinstance(args, dict):
+        return False
+    return normalize_arguments(None, args)[1] == "arguments_envelope"
+
+
+def collect():
+    """重放一次并汇总。文本输出与 --json 共用同一份读数，避免两处各算一遍。"""
     rows, shapes = load_failures()
-    a_rows = [r for r in rows if UNREGISTERED in r["err"]]
-    c_rows = [r for r in rows if ARRAY_MISMATCH in r["err"]]
-    other = [r for r in rows if r not in a_rows and r not in c_rows]
+    groups = {code: [] for code, _ in JUDGED_CLASSES}
+    other = []
+    for r in rows:
+        code = er.classify(r["err"])
+        if code in groups:
+            groups[code].append(r)
+        else:
+            other.append(r)
 
-    print("trace 参数形状：直接 %d / 包一层 %d / 截断不可还原 %d"
-          % (shapes["flat"], shapes["wrapped"], shapes["truncated"]))
-    print("失败调用 %d 次：A 技能未加载 %d / C 数组类型 %d / 其他 %d"
-          % (len(rows), len(a_rows), len(c_rows), len(other)))
-
-    for label, group, needle in (("A 技能未加载", a_rows, UNREGISTERED),
-                                 ("C 数组类型", c_rows, ARRAY_MISMATCH)):
-        if not group:
-            continue
-        gone, still, clean = 0, 0, 0
+    classes = {}
+    for code, label in JUDGED_CLASSES:
+        group = groups[code]
+        gone, still, clean, still_fixable = 0, 0, 0, 0
+        unjudgeable = 0
         detail = []
         for r in group:
+            if not r["args_ok"]:
+                # 参数被写入端截断（超长 content/old），无法还原 → 结构上判不了，
+                # 既不记 still（会把 feasible 钉死）也不记 gone（那是假读数）。
+                unjudgeable += 1
+                continue
             ok, err = replay(r["tool"], r["args"])
             if ok:
                 gone += 1
                 clean += 1
                 continue
-            if needle in err:
+            if er.classify(err) == code:
                 still += 1
-            else:
-                gone += 1
-                if r["args_ok"]:
-                    detail.append("%s(%s) → %s" % (r["tool"], r["file"], err[:64]))
-        full = sum(1 for r in group if r["args_ok"])
-        print("\n[%s] 重放 %d 次（参数完整可判 %d / 截断仅判错误类型 %d）"
-              % (label, len(group), full, len(group) - full))
-        print("  原错误消失 %d / 仍报同类错 %d；其中参数完整者直接校验通过 %d"
-              % (gone, still, clean))
-        for t in detail[:6]:
-            print("    仍被拦（转为其他错误）: %s" % t)
+                if _envelope_changed(r):
+                    still_fixable += 1
+                continue
+            gone += 1
+            detail.append({"tool": r["tool"], "file": r["file"], "shape": _row_shape(r),
+                           "err": err[:64]})
+        classes[code] = {
+            "label": label,
+            "total": len(group),
+            "args_full": sum(1 for r in group if r["args_ok"]),
+            "gone": gone,
+            "still": still,
+            "still_fixable": still_fixable,
+            "unjudgeable": unjudgeable,
+            "clean": clean,
+            "shapes": {s: sum(1 for r in group if _row_shape(r) == s)
+                       for s in sorted({_row_shape(r) for r in group})},
+            "detail": ["%s(%s)[%s] → %s" % (d["tool"], d["file"], d["shape"], d["err"])
+                       for d in detail],
+        }
 
-    print("\n其他 %d 次（本次未修，仅列分布）：" % len(other))
-    seen = {}
+    kinds = {}
     for r in other:
         key = r["err"][:60].replace("\n", " ")
-        seen[key] = seen.get(key, 0) + 1
-    for k, v in sorted(seen.items(), key=lambda kv: -kv[1]):
+        kinds[key] = kinds.get(key, 0) + 1
+    return {
+        "shapes": shapes,
+        "failures": len(rows),
+        "classes": classes,
+        "other": {"total": len(other),
+                  "kinds": sorted(kinds.items(), key=lambda kv: -kv[1])},
+    }
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    data = collect()
+    if "--json" in argv:
+        print(json.dumps(data, ensure_ascii=False, indent=1))
+        return 0
+
+    shapes = data["shapes"]
+    cls = data["classes"]
+    a, c, f = cls["A"], cls["C"], cls["F"]
+    print("trace 参数形状：直接 %d / 包一层 %d / 截断不可还原 %d"
+          % (shapes["flat"], shapes["wrapped"], shapes["truncated"]))
+    print("失败调用 %d 次：A 技能未加载 %d / C 参数类型错 %d / F 必填参数缺失 %d / 其他 %d"
+          % (data["failures"], a["total"], c["total"], f["total"], data["other"]["total"]))
+
+    for code, label in JUDGED_CLASSES:
+        k = cls[code]
+        if not k["total"]:
+            continue
+        print("\n[%s] 重放 %d 次（参数完整可判 %d / 截断不可判 %d）"
+              % (label, k["total"], k["args_full"], k["unjudgeable"]))
+        print("  原错误消失 %d / 仍报同类错 %d（其中本机制可覆盖 %d）；参数完整者直接校验通过 %d"
+              % (k["gone"], k["still"], k["still_fixable"], k["clean"]))
+        if k["shapes"]:
+            print("  参数形状：%s"
+                  % "、".join("%s×%d" % (s, n) for s, n in sorted(k["shapes"].items())))
+        for t in k["detail"][:6]:
+            print("    仍被拦（转为其他错误）: %s" % t)
+
+    print("\n其他 %d 次（本次未修，仅列分布）：" % data["other"]["total"])
+    for k, v in data["other"]["kinds"]:
         print("  %2d× %s" % (v, k))
+    return 0
 
 
 if __name__ == "__main__":

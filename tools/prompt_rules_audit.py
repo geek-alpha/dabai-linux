@@ -47,6 +47,13 @@ AGENT_PY = BASE / "agent.py"
 METRICS = BASE / "data" / "turn_metrics.jsonl"
 SUBAGENTS = BASE / "data" / "sub_agents.jsonl"
 
+# 「本进程加载快照」：热更新守护每次启动写盘，at = 这批代码进内存的时刻。
+# 判据为什么不用进程启动时间（/proc starttime）：自动重启走 os.execv 自替换，
+# PID 与 starttime 都不变（hot_reload.py 文档已写明，实测 04:02:37 那次重启
+# PID 384891 的 starttime 仍报 03:56:54）——同一条判据会把上一代进程的轮次
+# 算进这一代，把「重启清零」误读成「机制没触发」。
+HOT_STATE = BASE / "data" / "hot_reload_state.json"
+
 # 坏行为率低于此值 → 该规则针对的问题实测几乎不发生
 LOW_RATE = 0.01
 
@@ -63,10 +70,52 @@ EXPLORE_MIN_RATIO = 0.5
 PLAN_MISS_STREAK_N = 2
 SINGLE_RO_STREAK_N = 3
 
+# 多步轮判据的两个门槛，与 agent.py 的 _plan_miss_note 同源（有测试防分叉）。
+PLAN_MISS_MIN_CALLS = 3
+PLAN_MISS_MIN_KINDS = 3
+# 「有文件产出」的工具：含其中之一就算多步轮，即使轮内只跨了 2 个环节。
+_WRITE_TOOLS = {"code_edit", "code_create_file", "code_append",
+                "code_patch", "code_undo_turn"}
+
 # 工具名分组：只用于「这一轮里该行为出现过没有」。粒度是轮不是次——
 # 把一轮里调 10 次算成 10 轮，占比会直接超过 100%。
 _EDIT_TOOLS = {"code_edit", "code_create_file", "code_append"}
 _VERIFY_TOOLS = {"code_verify", "code_test", "code_smoke"}
+# shell 命令级的验证信号：与 agent.py 的同名常量/函数逐字同源（tests/test_verify_miss_streak.py
+# 有防分叉断言）。只认「能证伪改动」的强信号；跑台账脚本（lesson_add / long_horizon /
+# self_iterate）不算——那是写状态，不是验证。
+_SHELL_TOOLS = {"shell_run", "run_shell", "shell", "bash", "sh"}
+_VERIFY_CMD_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:pytest|py_compile|compileall|unittest|py\.test)(?![A-Za-z0-9_])",
+    re.I)
+
+
+def _is_verify_call(tool_name: str, arguments=None) -> bool:
+    """这次工具调用算不算「验证」。与 agent.py 的同名函数逐字同源——口径一分叉，
+    提示就会打偏，埋点也和审计对不上账。
+    """
+    name = str(tool_name or "")
+    if name in _VERIFY_TOOLS:
+        return True
+    if name not in _SHELL_TOOLS:
+        return False
+    cmd = ""
+    if isinstance(arguments, dict):
+        cmd = str(arguments.get("command") or arguments.get("cmd") or "")
+    return bool(cmd and _VERIFY_CMD_RE.search(cmd))
+
+
+def _round_verified(r: dict) -> bool:
+    """轮级判定：工具名命中，或 shell 命令里跑了 pytest/py_compile。
+
+    turn_metrics 只存工具名与命令里提取的脚本名，不存命令原文（隐私/体积），所以这里
+    读 agent 侧的轮级埋点 verify_shell_hits；老数据没这个字段时退化成纯工具名判定
+    （= 旧口径），不会把「没埋点」读成「验过了」。
+    """
+    if set(r.get("call_names") or []) & _VERIFY_TOOLS:
+        return True
+    return int(r.get("verify_shell_hits") or 0) > 0
+
 _EXPLORE_TOOLS = {"code_search", "code_read", "symbols", "code_locate", "read_lines",
                   "read_json", "find_file", "search_text", "list_files", "sys_find",
                   "sys_recent", "sys_locate", "search_web", "search_extract"}
@@ -191,6 +240,19 @@ def extract_work_rules() -> dict:
             "raw": sum(len(m) for m in lits), "lines": [start + 1, end + 1]}
 
 
+def loaded_at() -> float:
+    """当前运行进程「模块状态」的诞生时刻（epoch 秒）。
+
+    拿不到（守护没起过/文件缺失/写盘中途）返回 0.0 = 未知，调用方必须退化成
+    「不知道起点」，绝不能当成 0 起点——那等于把跨进程的轮次也算进来。
+    """
+    try:
+        d = json.loads(HOT_STATE.read_text(encoding="utf-8"))
+        return float(d.get("at") or 0.0)
+    except Exception:
+        return 0.0
+
+
 def load_metrics() -> list[dict]:
     if not METRICS.exists():
         return []
@@ -217,18 +279,61 @@ def load_subagents() -> list[dict]:
     return out
 
 
+def is_multi_round(r: dict) -> bool:
+    """多步轮判据，与 agent.py 的 _plan_miss_note 同源（有测试防分叉）。
+
+    光看 tool_calls>=3 会把「一轮里并行读 3 个文件」「连跑 3 条 grep」算成多步任务：
+    实测这类轮 40 个（占 15%）、0 次列清单，只会把清单率读数和提示可信度一起稀释。
+    """
+    if (r.get("tool_calls") or 0) < PLAN_MISS_MIN_CALLS:
+        return False
+    names = set(r.get("call_names") or [])
+    return len(names) >= PLAN_MISS_MIN_KINDS or bool(names & _WRITE_TOOLS)
+
+
+def plan_hint_expect(rows: list[dict], since: float) -> dict:
+    """按 agent._plan_miss_note 的状态机重放，算「本该触发几次清单提示」。
+
+    为什么必须有它：光看「采样 N 轮、触发 0 次」分不清是样本不够还是机制坏了，
+    而这两者的下一步动作相反（等数据 vs 查判据/出口）。重放给出对照组。
+
+    为什么起点必须是本进程加载时刻而不是数据文件开头：streak 是 AIAgent 的内存
+    字段，进程一重启就归零（`_plan_miss_streak = 0`），所以只有从一个干净起点
+    重放才和运行时一致。跨进程重放会得到「应触发 2 次却 0 次」这种假警报——
+    本工具 2026-09-22 就是这样把一轮时间指去查一个没坏的判据的。
+
+    since <= 0（拿不到进程起点）时 expect 返回 None：宁可不判，也不假警。
+    """
+    if since <= 0:
+        return {"expect": None, "rounds": 0}
+    replay = [r for r in rows
+              if "plan_hints" in r and float(r.get("ts") or 0) >= since]
+    streak = 0
+    expect = 0
+    for r in replay:
+        if is_multi_round(r) and "plan_update" not in (r.get("call_names") or []):
+            streak += 1
+            if streak % PLAN_MISS_STREAK_N == 0:
+                expect += 1
+        else:
+            streak = 0
+    return {"expect": expect, "rounds": len(replay)}
+
+
 def call_stats(rows: list[dict]) -> dict:
     """轮级行为指标：从 call_names / script_names 明细算，不是数值字段求和。
 
     totals() 只能加数字字段；而「这条规则有没有作用面」问的是「多少轮里出现过
     该行为」，粒度是轮。两者混用会把一轮里调 10 次算成 10 轮。
     """
+    _since = loaded_at()
+    _pe = plan_hint_expect(rows, _since)
     named = [r for r in rows if r.get("call_names")]
 
     def has(r: dict, names: set) -> bool:
         return bool(set(r["call_names"]) & names)
 
-    multi = [r for r in named if (r.get("tool_calls") or 0) >= 3]
+    multi = [r for r in named if is_multi_round(r)]
     edits = [r for r in named if has(r, _EDIT_TOOLS)]
     scripts: Counter = Counter()
     for r in rows:
@@ -238,7 +343,16 @@ def call_stats(rows: list[dict]) -> dict:
         "multi_rounds": len(multi),
         "plan_rounds": sum(1 for r in multi if "plan_update" in r["call_names"]),
         "edit_rounds": len(edits),
-        "verified_edit_rounds": sum(1 for r in edits if has(r, _VERIFY_TOOLS)),
+        "verified_edit_rounds": sum(1 for r in edits if _round_verified(r)),
+        # 旧口径（只看工具名）留作对照读数：两个一起报，口径变化才可分辨——静默换
+        # 口径会让「读数上升」分不清是行为变了还是尺子变了。
+        "verified_edit_rounds_toolonly": sum(1 for r in edits if has(r, _VERIFY_TOOLS)),
+        # 新口径真正生效的轮：只有带 verify_shell_hits 字段的轮才分得出「跑 pytest」
+        # 与「跑 ls」，老数据里这两者长得一样，分子被系统性低估（低估多少不可知）。
+        # 判缺口要用覆盖轮上的读数：拿被污染的全量读数派任务，派的是测不准的东西。
+        "covered_edit_rounds": sum(1 for r in edits if "verify_shell_hits" in r),
+        "covered_verified_edit_rounds": sum(
+            1 for r in edits if "verify_shell_hits" in r and _round_verified(r)),
         "explore_rounds": sum(1 for r in named if has(r, _EXPLORE_TOOLS)),
         "script_rounds": sum(1 for r in rows if r.get("script_names")),
         "scripts": dict(scripts.most_common(40)),
@@ -247,11 +361,28 @@ def call_stats(rows: list[dict]) -> dict:
         "hint_sampled_rounds": sum(1 for r in rows if "plan_hints" in r),
         "plan_hint_turns": sum(1 for r in rows if (r.get("plan_hints") or 0) > 0),
         "plan_hint_total": sum(int(r.get("plan_hints") or 0) for r in rows),
+        # 0 触发的对照组：状态机重放算「本该触发几次」。起点限定本进程加载时刻
+        # （见 plan_hint_expect），否则跨进程重放会造出假警报。
+        "plan_hint_expect": _pe.get("expect"),
+        "plan_hint_expect_rounds": _pe.get("rounds", 0),
+        "plan_hint_since": _since,
         # 第二种运行时提醒（连续单发只读）单独记账：它的可累加轮是「本轮恰好 1 个
         # 只读工具」，与多步轮不是同一批轮，共用一个采样数会让样本判断错位。
         "ro_hint_sampled_rounds": sum(1 for r in rows if "single_ro_hints" in r),
         "ro_hint_turns": sum(1 for r in rows if (r.get("single_ro_hints") or 0) > 0),
         "ro_hint_total": sum(int(r.get("single_ro_hints") or 0) for r in rows),
+        # 第三种运行时提醒（改完码没同轮验证）单独记账：它挂在「改完那一刻」，
+        # 可触发轮与多步轮/单发只读轮都不是同一批，共用一个采样数会让样本判断错位。
+        # verify_hint_expect 是它的对照组，且是触发次数的**下界**：提示在改完那一刻就发
+        # （那时还不知道本轮后面会不会补验），所以最终验过的轮也可能触发过；而没验的
+        # 轮必然触发过——实际触发数只会 ≥ 它，低于它只能是出口或口径断了。
+        "verify_hint_sampled_rounds": sum(1 for r in rows if "verify_hints" in r),
+        "verify_hint_turns": sum(1 for r in rows if (r.get("verify_hints") or 0) > 0),
+        "verify_hint_total": sum(int(r.get("verify_hints") or 0) for r in rows),
+        "verify_hint_expect": sum(
+            1 for r in rows
+            if "verify_hints" in r and r.get("call_names")
+            and has(r, _EDIT_TOOLS) and not _round_verified(r)),
     }
 
 
@@ -275,11 +406,48 @@ def hint_note(calls: dict, kind: str = "plan") -> str:
         return f"；{label}尚无采样（埋点 2026-09-22 加，重启后才落盘）"
     n, turns = calls.get(total_key, 0), calls.get(turns_key, 0)
     if n <= 0:
-        if sampled < streak_n:
-            return (f"；{label}采样 {sampled} 轮，未达最小触发轮数 {streak_n}"
-                    "——0 次触发是必然，样本不足，再攒")
-        return f"；{sampled} 轮已采样但{label} 0 次触发——先查 streak 判据，别调阈值"
+        # 对照组只对清单提示成立：并行提示的可累加轮是「本轮恰好 1 个只读工具」，
+        # 与多步轮不是同一批（本工具没有只读名单，重放不了），拿它的 expect 判
+        # 并行提示等于换了人的体检报告。
+        expect = calls.get("plan_hint_expect") if kind == "plan" else None
+        if expect is None:
+            # 拿不到对照组（老调用方/进程起点未知）：退回粗判，宁可喊查判据。
+            if sampled < streak_n:
+                return (f"；{label}采样 {sampled} 轮，未达最小触发轮数 {streak_n}"
+                        "——0 次触发是必然，样本不足，再攒")
+            return f"；{sampled} 轮已采样但{label} 0 次触发——先查 streak 判据，别调阈值"
+        rounds = calls.get("plan_hint_expect_rounds", sampled)
+        if expect <= 0:
+            return (f"；{label}本进程窗口 {rounds} 轮，状态机重放应触发 0 次"
+                    "——0 次触发是必然，样本不足，再攒（重启会清零 streak，只数本进程内的轮）")
+        return (f"；{label}已采样 {sampled} 轮且 0 次触发，但本进程窗口 {rounds} 轮"
+                f"重放应触发 {expect} 次——判据与出口之间断了，去查 streak 判据"
+                "（别动阈值）")
     return f"；{label}已触发 {n} 次（{turns} 轮）"
+
+
+def verify_hint_note(calls: dict) -> str:
+    """同轮验证提示的触发情况。
+
+    同 hint_note 的道理：读数不动时，先分清「机制从未触发」（查出口）与「触发了
+    但没用」（换做法）。对照组是带埋点那批轮里「改了码却没同轮验证」的轮数——
+    每个这种轮必然触发过一次（提示在改完那一刻就发），所以它是触发次数的**下界**：
+    实际触发数只会 ≥ 它；低于它就不可能是「样本不足」，而是出口或口径断了。
+    """
+    sampled = calls.get("verify_hint_sampled_rounds", 0)
+    if not sampled:
+        return "；验证提示尚无采样（埋点 2026-09-22 加，重启后才落盘）"
+    total = int(calls.get("verify_hint_total") or 0)
+    turns = int(calls.get("verify_hint_turns") or 0)
+    expect = int(calls.get("verify_hint_expect") or 0)
+    if total < expect:
+        return (f"；采样轮里至少 {expect} 个改码轮没同轮验证（必然触发过），"
+                f"而提示只触发 {total} 次——出口或口径断了，先查提示是不是两条工具"
+                "执行分支都挂上了，别调阈值")
+    if total <= 0:
+        return (f"；验证提示采样 {sampled} 轮 0 次触发，但这批轮里没有「改了码没同轮"
+                "验证」的轮——0 次是必然，样本不足，再攒")
+    return f"；验证提示已触发 {total} 次（{turns} 轮；下界 {expect} 次）"
 
 
 def delegation_stats(subs: list[dict]) -> dict:
@@ -394,7 +562,8 @@ def judge(kind: str, metric: str | None, agg: dict, subs: list[dict],
         c = calls or {}
         n, m = c.get("plan_rounds", 0), c.get("multi_rounds", 0)
         if m < 10:
-            return "INSUFFICIENT", f"多步轮（tool_calls>=3）仅 {m} 轮，样本不足"
+            return "INSUFFICIENT", (f"多步轮（>=3 次调用且跨 3 类工具或有文件改动）"
+                                    f"仅 {m} 轮，样本不足")
         r = n / m
         tag = "MEASURED_OK" if r >= PLAN_MIN_RATIO else "MEASURED_GAP"
         return tag, (f"多步轮 {m} 中 {n} 轮先提交了清单（{r:.0%}，"
@@ -404,10 +573,22 @@ def judge(kind: str, metric: str | None, agg: dict, subs: list[dict],
         n, e = c.get("verified_edit_rounds", 0), c.get("edit_rounds", 0)
         if e < 10:
             return "INSUFFICIENT", f"改码轮仅 {e} 轮，样本不足"
-        r = n / e
-        tag = "MEASURED_OK" if r >= VERIFY_MIN_RATIO else "MEASURED_GAP"
-        return tag, (f"改码轮 {e} 中 {n} 轮同轮跑了验证（{r:.0%}，"
-                     f"暂定达标线 {VERIFY_MIN_RATIO:.0%}）")
+        # 判据优先用「新口径真正生效的轮」：老数据里跑 pytest 与跑 ls 分不出来，
+        # 全量读数被系统性低估且低估量不可知——拿它判缺口，派下去的是测不准的任务。
+        cn = c.get("covered_verified_edit_rounds", 0)
+        ce = c.get("covered_edit_rounds", 0)
+        if ce < 10:
+            return "INSUFFICIENT", (
+                f"改码轮 {e} 轮里只有 {ce} 轮带 shell 验证埋点（2026-09-22 加，"
+                f"需 10 轮才能判）——旧数据分不出「跑 pytest」与「跑 ls」，"
+                f"现读数 {n / e:.0%} 不可信，先攒埋点再派任务")
+        cr = cn / ce
+        tag = "MEASURED_OK" if cr >= VERIFY_MIN_RATIO else "MEASURED_GAP"
+        old = c.get("verified_edit_rounds_toolonly", 0)
+        return tag, (f"埋点覆盖轮 {ce} 中 {cn} 轮同轮跑了验证（{cr:.0%}，"
+                     f"暂定达标线 {VERIFY_MIN_RATIO:.0%}；全量旧口径 {n}/{e}="
+                     f"{n / e:.0%}、只看工具名 {old} 轮——差值就是 shell 里跑的"
+                     f"pytest/py_compile）" + verify_hint_note(c))
     if metric == "explore":
         c = calls or {}
         n, t = c.get("explore_rounds", 0), c.get("turns", 0)
@@ -524,7 +705,16 @@ def build() -> dict:
                       "plan_rate": (c["plan_rounds"] / c["multi_rounds"]
                                     if c["multi_rounds"] else None),
                       "verify_rate": (c["verified_edit_rounds"] / c["edit_rounds"]
-                                      if c["edit_rounds"] else None)})
+                                      if c["edit_rounds"] else None),
+                      "verify_rate_toolonly": (
+                          c["verified_edit_rounds_toolonly"] / c["edit_rounds"]
+                          if c["edit_rounds"] else None),
+                      # 判缺口用的读数：只在埋点覆盖轮上算（见 call_stats 的说明）。
+                      # 当天没覆盖轮时给 None——self_iterate 的 merged() 会自动跳过。
+                      "covered_edit_rounds": c["covered_edit_rounds"],
+                      "verify_rate_covered": (
+                          c["covered_verified_edit_rounds"] / c["covered_edit_rounds"]
+                          if c["covered_edit_rounds"] else None)})
 
     return {
         "rules_total_chars": all_chars,
@@ -584,6 +774,8 @@ def render(rep: dict) -> str:
     if c.get("turns"):
         out.append(f"准则段实测（粒度=轮）：多步轮 {c['multi_rounds']} 中清单 {c['plan_rounds']}；"
                    f"改码轮 {c['edit_rounds']} 中同轮验证 {c['verified_edit_rounds']}；"
+                   f"埋点覆盖轮 {c['covered_edit_rounds']} 中验证 "
+                   f"{c['covered_verified_edit_rounds']}；"
                    f"含脚本调用 {c['script_rounds']} 轮")
     out.append(f"{'规则':<22}{'字符':>5}{'占比':>7}  判定 / 实测")
     out.append("-" * 68)

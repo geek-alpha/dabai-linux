@@ -100,12 +100,55 @@ def _archive(texts, ts):
     os.replace(tmp, ARCHIVE)
 
 
+def _read_cmd(argv) -> int:
+    """按需读取入口：注入段只放摘要，全文从这里取。
+
+    背景（2026-09-22）：注入段每轮常驻，把 77 条经验全塞进去就是拿上下文换安全感——
+    摘要 + 按需读全文多一次工具调用，但常态只留 3 条。
+    """
+    try:
+        data = json.loads(FILE.read_text(encoding="utf-8")) if FILE.exists() else {}
+    except Exception as e:
+        print(f"经验库读取失败：{e.__class__.__name__}: {e}")
+        return 1
+    ls = data.get("lessons") if isinstance(data, dict) else None
+    ls = [str(x) for x in ls] if isinstance(ls, list) else []
+    if not ls:
+        print("经验库为空")
+        return 0
+    if argv[0] == "list":
+        limit = int(argv[1]) if len(argv) > 1 and argv[1].isdigit() else 20
+        print(f"共 {len(ls)} 条（最新在前）：")
+        for i, t in enumerate(ls[:limit], 1):
+            print(f"{i:>3}. [{_key(t)}] {t[:80]}")
+        if len(ls) > limit:
+            print(f"…（还有 {len(ls) - limit} 条）")
+        return 0
+    key = argv[1] if len(argv) > 1 else ""
+    if not key:
+        print("用法：python tools/lesson_add.py show <序号|hash前缀>")
+        return 2
+    if key.isdigit() and 1 <= int(key) <= len(ls):
+        t = ls[int(key) - 1]
+    else:
+        hit = [t for t in ls if _key(t).startswith(key)]
+        if len(hit) != 1:
+            print(f"匹配 {len(hit)} 条，换个更长的 hash 前缀" if hit else "没有匹配")
+            return 3
+        t = hit[0]
+    print(f"[{_key(t)}]\n{t}")
+    return 0
+
+
 def main() -> int:
     argv = [a for a in sys.argv[1:] if a != "--force"]
     force = len(argv) != len(sys.argv[1:])
+    if argv and argv[0] in ("list", "show"):
+        return _read_cmd(argv)
     text = " ".join(argv).strip()
     if not text:
-        print('用法：python tools/lesson_add.py "教训文本"（--force 跳过写入闸门）')
+        print('用法：python tools/lesson_add.py "教训文本"（--force 跳过写入闸门）'
+              '\n       python tools/lesson_add.py list [N] ｜ show <序号|hash前缀>')
         return 2
     hard, soft = _screen(text)
     if hard and not force:

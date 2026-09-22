@@ -60,6 +60,12 @@ TRACES = RUN_DIR / "traces"  # 按轮次的原始 trace（可下钻）
 PROMPT_HEAD = 400         # trace 里 prompt 摘要保留的头/尾字符数
 WS_ROOT = RUN_DIR / "ws"  # worker 独立工作区：产出落这里，不脏主项目
 REPORT = RUN_DIR / "report.md"   # 给主人看的人话汇报（每轮重写，不是 append）
+# ⚠ 这组常量全是 RUN_DIR 派生的。测试要把运行数据搬进 tmp_path，只 patch 其中几个
+# 就会漏掉没 patch 的那个，而漏掉的那个指向真目录 —— 2026-09-22 实测：
+# tests/test_longrun_view.py::test_one_cycle_writes_drillable_trace 跑完，
+# data/longrun/report.md 被改写成「累计 1 轮 / 演示目标 / 没有等你决定的事」，
+# 把主人唯一那份「引擎干了什么、要你决定什么」的汇报覆盖成了假话。
+# 搬目录请用 _run_dir_derived()，别手写清单。
 REPORT_ROUNDS = 5         # 汇报里保留最近几轮
 REPORT_FILES = 8          # 产出清单最多列几个
 # 接力棒里出现这些词 = 这轮动作在等主人，引擎自己推不动
@@ -97,6 +103,36 @@ def write_atomic(path: Path, data) -> None:
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
+
+
+_RUN_DIR_CONSTS = ("JOURNAL", "STATE", "STOP", "HEARTBEAT",
+                   "TRACES", "WS_ROOT", "REPORT")
+
+
+def _run_dir_derived() -> dict:
+    """{常量名: 相对 RUN_DIR 的路径}——从当前值现算，不手抄文件名。
+
+    存在的理由：这些常量是各自独立写死的（REPORT = RUN_DIR / "report.md"），
+    把 RUN_DIR 搬走不会连带搬走它们。测试隔离必须按这张表整体搬，否则漏掉的那个
+    会原地指向真目录 —— 那正是 report.md 被测试改写的原因。
+    相对路径从值现算：常量改了文件名，这张表自动跟着变，不会漂移。
+    """
+    out = {}
+    for name in _RUN_DIR_CONSTS:
+        val = globals().get(name)
+        if not isinstance(val, Path):
+            raise RuntimeError(
+                f"{name} 不是 Path（{val!r}）：_RUN_DIR_CONSTS 里的名字必须是 RUN_DIR 派生常量")
+        try:
+            out[name] = val.relative_to(RUN_DIR)
+        except ValueError:
+            # 静默跳过 = 下一个调用方会静默重现 report.md 被改写那类泄漏，
+            # 所以这里宁可响：搬常量必须先取相对路径、再改 RUN_DIR。
+            raise RuntimeError(
+                f"{name}={val} 不在 RUN_DIR={RUN_DIR} 下 —— 调用方大概先 patch 了 "
+                f"RUN_DIR 才来搬常量。先取相对路径再搬（见 "
+                f"tests/test_longrun_view.py:_isolate_runner）") from None
+    return out
 
 
 def load_state() -> dict:

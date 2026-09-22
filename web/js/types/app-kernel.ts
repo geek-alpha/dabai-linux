@@ -1040,6 +1040,8 @@ export interface AppKernel {
   /* 本轮已进入工具执行（tool_call_start 置真，回合结束/被取消置假）：
      语音在此状态下不打断本轮，只排队 */
   _turnInTools: boolean;
+  /** 本轮是否已按「文本输出完成」收尾（turn_text_done 置真，新轮 thinking 置假） */
+  _turnTextDone: boolean;
   noteTurnActivity: () => void;
   clearStuckHint: () => void;
   maybeWarnStuck: () => void;

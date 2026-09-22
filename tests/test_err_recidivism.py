@@ -24,10 +24,11 @@ def _res(tool, ok, result=""):
             "success": ok, "result": result}
 
 
-def test_classify_five_classes():
+def test_classify_six_classes():
     assert er.classify("工具 'shell_run' 属于技能 code_ops，但尚未注册。请先调用 skill_help") == "A"
     assert er.classify("工具 'read_file' 不存在或未注册，请先通过 skill_help 确认") == "B"
     assert er.classify("工具参数校验失败：queries: 类型不符，期望 string") == "C"
+    assert er.classify("工具参数校验失败：缺少必填参数: command") == "F"
     assert er.classify("该工具不属于当前技能") == "D"
     assert er.classify("执行超时（>120.0s）") == "E"
 

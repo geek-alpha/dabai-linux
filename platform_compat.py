@@ -269,11 +269,46 @@ def kill_pid(pid: int, force: bool = True) -> bool:
         return False
 
 
-def terminate_tree(pid: int, timeout: int = 15) -> tuple[bool, str]:
-    """整树终止进程（Windows: taskkill /T /F；POSIX: 先进程组后单进程兜底）。
+def _group_alive_pids(pgid: int) -> list:
+    """进程组里仍活着（非僵尸）的成员 pid 清单。
 
-    返回 (是否成功, 说明)。POSIX 上优先 killpg（配合 start_new_session=True 的
-    独立进程组），失败再逐层 kill，最后 SIGKILL 兜底。
+    为什么按「组」验收而不是看直接子进程：shell=True 时直接子进程只是最外层 /bin/sh，
+    孙进程可能继承了 SIG_IGN（`trap "" TERM`），SIGTERM 对它无效；只看直接子进程
+    会得出「终止成功」的假结论，命令其实还在跑（2026-09-22 实测：返回后进程仍存活）。
+    为什么排除僵尸：已退出但没被 wait() 回收的成员仍占着进程组，不排除会把
+    「杀干净了」误判成「没杀掉」，进而白等满 grace 才升级 SIGKILL。
+    """
+    if pgid <= 0:
+        return []
+    proc = Path("/proc")
+    if proc.is_dir():
+        alive = []
+        for entry in proc.iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                rest = (entry / "stat").read_text(
+                    encoding="utf-8", errors="replace").rsplit(")", 1)[-1].split()
+                state, pgrp = rest[0], int(rest[2])
+            except (OSError, IndexError, ValueError):
+                continue
+            if pgrp == pgid and state != "Z":
+                alive.append(int(entry.name))
+        return alive
+    import signal
+    try:  # 没有 /proc 的罕见容器：只能探测组是否存在（区分不了僵尸）
+        os.killpg(pgid, 0)
+        return [pgid]
+    except OSError:
+        return []
+
+
+def terminate_tree(pid: int, timeout: int = 15) -> tuple[bool, str]:
+    """整树终止进程（Windows: taskkill /T /F；POSIX: 进程组 SIGTERM → SIGKILL）。
+
+    返回 (是否成功, 说明)。「成功」的判据是**整个进程组里没有非僵尸成员**，
+    不是直接子进程死了就算数 —— 否则 trap "" TERM 这类孙进程会活下来。
+    timeout 是 SIGTERM 的宽限期，之后无条件升级 SIGKILL（再等 1.5s 验收）。
     """
     if not pid or pid <= 0:
         return False, "pid 无效"
@@ -294,30 +329,38 @@ def terminate_tree(pid: int, timeout: int = 15) -> tuple[bool, str]:
     import signal
     import time
     pid = int(pid)
-    sent = False
     try:
-        os.killpg(os.getpgid(pid), signal.SIGTERM)
-        sent = True
+        pgid = os.getpgid(pid)
     except OSError:
-        pass
-    if not sent:
+        pgid = pid          # start_new_session 的进程组 == 组长 pid，取不到就按它算
+    if not _group_alive_pids(pgid):
+        return (True, "进程已退出") if not pid_alive(pid) else (False, "无法定位进程组")
+
+    def _signal(sig) -> bool:
         try:
-            os.kill(pid, signal.SIGTERM)
-            sent = True
-        except OSError as e:
-            return (True, "进程已退出") if not pid_alive(pid) else (False, f"终止失败：{e}")
+            os.killpg(pgid, sig)
+            return True
+        except OSError:
+            try:
+                os.kill(pid, sig)
+                return True
+            except OSError:
+                return False
+
+    _signal(signal.SIGTERM)
     deadline = time.time() + max(1, timeout)
     while time.time() < deadline:
-        if not pid_alive(pid):
+        if not _group_alive_pids(pgid):
             return True, "SIGTERM 终止成功"
         time.sleep(0.2)
-    try:
-        os.killpg(os.getpgid(pid), signal.SIGKILL)
-    except OSError:
-        pass
-    kill_pid(pid)
-    time.sleep(0.3)
-    return (True, "SIGKILL 兜底终止成功") if not pid_alive(pid) else (False, "进程仍存活（可能需 root 权限）")
+    _signal(signal.SIGKILL)
+    deadline = time.time() + 1.5
+    while time.time() < deadline:
+        if not _group_alive_pids(pgid):
+            return True, "SIGTERM 无效，SIGKILL 终止成功"
+        time.sleep(0.1)
+    left = _group_alive_pids(pgid)
+    return False, f"SIGKILL 后仍有 {len(left)} 个进程存活（可能已 setsid 脱离进程组）：{left[:5]}"
 
 
 def list_processes() -> list[dict]:

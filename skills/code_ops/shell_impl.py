@@ -14,6 +14,8 @@ import json
 import os
 import re
 import subprocess
+import threading
+import time
 from typing import Optional   # 注解里用到（文件有 future annotations，运行时本不需要，
                               # 但显式导入让 pyflakes / 类型检查器都干净）
 
@@ -41,13 +43,45 @@ def _decode(b: bytes) -> str:
     return b.decode("utf-8", errors="replace")
 
 
-def _run_shell_cmd(cmd: str, timeout: int, argv, cwd) -> str:
-    """执行命令：自成进程组，超时杀整棵树并带回超时前的部分输出。
+# 正在跑的 shell 进程登记表：run_id → Popen。用途只有一个 —— 上层放弃时（超时 /
+# 用户点停止）仍能把这棵树杀掉，绝不留孤儿进程。
+_RUNNING: dict = {}
+_RUNNING_LOCK = threading.Lock()
+_CANCELLED: set = set()
+_KILL_GRACE = 1          # SIGTERM 宽限期（秒），到期无条件升级 SIGKILL
+_DRAIN_GRACE = 0.5       # 杀完之后最多再等多久收残余输出
+_EXTRA_BUDGET = 6        # 外层 wait_for 比 timeout 多给的余量（覆盖杀树 + 收尾）
 
-    与 codex_runner.Executor.run_sync 的改进保持同一行为（那边服务网页 /cmd）。
-    为什么杀整棵树：shell=True 时直接子进程只是 /bin/sh，curl/编译等孙进程若只杀
-    shell 会变孤儿继续占网络与资源——「命令超时了机器还一直慢」的来源。
+
+def kill_running(run_id: str) -> bool:
+    """按 run_id 终止还在跑的命令树；进程还没起来就登记为「待取消」。
+
+    为什么要登记而不是直接返回：杀的动作可能先于 Popen 到达，_run_shell_cmd
+    起进程前后各查一次取消标记，堵住「杀完了才起进程」这个竞态窗口。
     """
+    with _RUNNING_LOCK:
+        p = _RUNNING.pop(run_id, None)
+        if p is None:
+            _CANCELLED.add(run_id)
+            return False
+    pc.terminate_tree(p.pid, timeout=_KILL_GRACE)
+    return True
+
+
+def _run_shell_cmd(cmd: str, timeout: int, argv, cwd, run_id: str = "") -> str:
+    """执行命令，硬保证「到点必断」：超时按进程组 SIGTERM → SIGKILL 整树终止。
+
+    两处刻意不用 subprocess.communicate（实测会拖时间、留孤儿）：
+    - 输出交给后台读取线程，主线程只等**直接子进程**退出：孙进程占着继承来的管道时，
+      communicate 会一直等管道 EOF，命令明明已经跑完还得白等到超时；
+    - 超时后不再 communicate(timeout=5) 收尾，只给读取线程 0.5s：整组杀掉后管道自然
+      关闭，收不到的残输出就是不收，不为它再拖 5 秒（原实现超支 5s 就出在这）。
+    """
+    if run_id:
+        with _RUNNING_LOCK:
+            if run_id in _CANCELLED:
+                _CANCELLED.discard(run_id)
+                return f'$ {cmd}\n[已取消：命令未启动]'
     kw = pc.spawn_kwargs(new_group=True)
     try:
         if argv:
@@ -58,25 +92,59 @@ def _run_shell_cmd(cmd: str, timeout: int, argv, cwd) -> str:
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kw)
     except Exception as e:
         return f'$ {cmd}\n[异常] {e}'
-    try:
-        out_b, err_b = p.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        _, note = pc.terminate_tree(p.pid, timeout=15)
+    if run_id:
+        with _RUNNING_LOCK:
+            _RUNNING[run_id] = p
+            raced = run_id in _CANCELLED
+            _CANCELLED.discard(run_id)
+        if raced:      # 上层在我起进程之前就放弃了：这里补杀，不留孤儿
+            pc.terminate_tree(p.pid, timeout=_KILL_GRACE)
+    buf = {1: bytearray(), 2: bytearray()}
+
+    def _reader(stream, key):
         try:
-            out_b, err_b = p.communicate(timeout=5)
-        except Exception:
-            out_b, err_b = b'', b''
-        got = (_decode(out_b or b'').strip() + '\n'
-               + _decode(err_b or b'').strip()).strip()
+            while True:
+                chunk = (stream.read1(8192) if hasattr(stream, "read1")
+                         else stream.read(8192))
+                if not chunk:
+                    break
+                buf[key] += chunk
+        except (OSError, ValueError):
+            pass
+
+    readers = []
+    for stream, key in ((p.stdout, 1), (p.stderr, 2)):
+        t = threading.Thread(target=_reader, args=(stream, key), daemon=True)
+        t.start()
+        readers.append(t)
+    try:
+        p.wait(timeout=timeout)
+        timed_out = False
+    except subprocess.TimeoutExpired:
+        timed_out = True
+    note = ""
+    if timed_out:
+        _, note = pc.terminate_tree(p.pid, timeout=_KILL_GRACE)
+    deadline = time.time() + _DRAIN_GRACE
+    for t in readers:
+        t.join(max(0.05, deadline - time.time()))
+    if run_id:
+        with _RUNNING_LOCK:
+            _RUNNING.pop(run_id, None)
+    out = _decode(bytes(buf[1])).strip()
+    err = _decode(bytes(buf[2])).strip()
+    if timed_out:
+        got = (out + "\n" + err).strip()
         snippet = f'\n[超时前输出] …{got[-500:]}' if got else ''
-        return (f'$ {cmd}\n[超时：超过{timeout}秒，已终止整棵进程树（{note}）]'
-                f'{snippet}')
-    text = _decode(out_b)
-    err = _decode(err_b)
-    if err.strip():
+        return f'$ {cmd}\n[超时：超过{timeout}秒，已终止整棵进程树（{note}）]{snippet}'
+    text = out
+    if err:
         text += '\n[stderr]\n' + err
     text = text.strip() or '(无输出)'
-    return f'$ {cmd}\n[exit={p.returncode}]\n{text}'
+    tail = ''
+    if any(t.is_alive() for t in readers):
+        tail = '\n[提示] 命令已结束，但仍有后台进程持有输出管道（未清理，需要时自行 pkill）'
+    return f'$ {cmd}\n[exit={p.returncode}]\n{text}{tail}'
 
 
 async def shell_run(args: dict) -> str:
@@ -97,11 +165,17 @@ async def shell_run(args: dict) -> str:
             argv, cwd = _sb.wrap_shell(actor, cmd, work)
     except Exception as e:  # noqa: BLE001
         return f"沙箱拒绝：{e}"
+    run_id = f"shell-{time.monotonic_ns()}"
     try:
         out = await asyncio.wait_for(
-            asyncio.to_thread(_run_shell_cmd, cmd, timeout, argv, cwd), timeout=timeout + 10)
+            asyncio.to_thread(_run_shell_cmd, cmd, timeout, argv, cwd, run_id),
+            timeout=timeout + _EXTRA_BUDGET)
     except TimeoutError:
+        kill_running(run_id)     # 兜底：外层放弃时也不能留下还在跑的进程
         return f"命令超时（>{timeout}s），已终止：{cmd}"
+    except asyncio.CancelledError:
+        kill_running(run_id)     # 用户点停止 / 上层取消：同样必须断
+        raise
     except Exception as e:
         return f"执行失败：{e.__class__.__name__}: {e}"
     ok = "[exit=0]" in out

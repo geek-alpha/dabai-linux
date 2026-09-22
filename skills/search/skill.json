@@ -60,8 +60,8 @@
           "type": "object",
           "properties": {
             "queries": {
-              "type": "string",
-              "description": "JSON 数组，如 [{\"query\":\"AAPL\"},{\"query\":\"GOOG\"}]；每项支持 query/domain/sub_domain/sub_domain_params/max_results"
+              "type": ["string", "array"],
+              "description": "多个查询：传 JSON 数组字符串（如 [{\"query\":\"AAPL\"},{\"query\":\"GOOG\"}]），或直接传字符串数组（[\"AAPL\",\"GOOG\"] 亦可）；每项支持 query/domain/sub_domain/sub_domain_params/max_results"
             },
             "query": {
               "type": "array",

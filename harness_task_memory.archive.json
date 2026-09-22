@@ -1,0 +1,17 @@
+{
+ "lessons": [
+  "闲鱼 PC 端有完整的商品发布/编辑能力，接口在 p_publish-index.js 里：mtop.idle.pc.idleitem.editDetail（data={itemId} 读全字段）、mtop.idle.pc.idleitem.edit（改标题/价/图，需带 uniqueCode+sourceId+bizcode=pcMainPublish+publishScene=pcMainPublish）、preget、prepublish.check。编辑页 URL = https://www.goofish.com/publish?itemId=xxx（HTTP 200 已验证）。改标题/图会触发重新审核，可能下架，自动提交前必须让主人授权。",
+  "闲鱼 mtop.idle.pc.idleitem.edit 三个硬坑：①payload 必须带 itemId（接口 data 里没有它，服务端找不到商品只回含糊的 FAIL_BIZ_IDLEITEM_UNKNOWN_THROWABLE）②priceInCent 是【分】的整数 6360，传字符串 \"63.6\" 回 FAIL_BIZ_JSON_ERROR、传数字 63.6 会被当成改价 ③payload 约 4KB 用 GET 塞 query 会回 HTTP 431，必须改表单 POST（requests.post(data=params)）。另外前端 JSON.stringify 会丢 undefined，Python 重建 payload 时 None 字段要 prune 掉。",
+  "闲鱼改标题：只传 itemTextDTO.title 会回 SUCCESS 但标题纹丝不动（itemTextDTO.titleDescSeparate=false 时，服务端拿【描述第一行】当标题）。正确做法是把新标题写成 desc 的第一行（新标题+换行+原描述），改完 editDetail 读回才是新标题。改图和改标题的生效时机不同：图立刻生效，标题走这条 desc 通道。",
+  "闲鱼商品参加「无忧卖」活动时禁止改价/减库存/改规格/下架，接口回 FAIL_BIZ_MARKET_ITEM_CHANGE_FORBIDDEN（文案：商品正在参与无忧卖活动，为了保证流量推荐效果，不允许改动商品价格、减少库存、编辑商品规格、下架商品等）。标题和图片仍可改。想改价得先退出活动。",
+  "闲鱼发新商品走 mtop.idle.pc.idleitem.publish：data = 商品 payload（照抄一件在卖商品的 editDetail，但必须删掉 itemId）+ uniqueCode（= Date.now() 拼 0-999 随机数，不补零）+ sourceId/bizcode/publishScene='pcMainPublish'。字段形状照抄已有商品就不会被拒；发布前用 prepublish.check 探限流（limited 字段）。发完 itemId 要从 mtop.idle.web.xyh.item.list 重新拉列表才拿得到。",
+  "闲鱼标题硬上限 30 字符：超长会被服务端静默截断（传 33 字，读回 30 字尾词全丢，接口照样回 SUCCESS）。改标题前先量 len()，中文按 1 字算。",
+  "闲鱼改标题偶发「假 SUCCESS」：edit 回 SUCCESS 但 title 纹丝不动。原因是 itemTextDTO.desc 第一行与当前 title 不一致（比如上次改标题被截断到 30 字、desc 首行还留着 33 字完整版），此时工具不替换 desc 首行 → 只传 title 字段 → titleDescSeparate=false 时服务端忽略 title。修法：显式传 desc 且首行写新标题，别只传 title。",
+  "闲鱼 PC 端编辑有类目白名单：实测可改=智能机器人/智能眼镜头盔/田径运动鞋；不可改=电子阅览器·电纸书/软件·程序·网站开发/AI语音工具·服务，回 FAIL_BIZ_PC_NOT_SUPPORT_PUBLISH_OR_EDIT。同一个 catId 50023914 下不同 catName 一个能改一个不能，判据是细类目不是大类。",
+  "闲鱼 IM 会话列表：API=mtop.taobao.idlemessage.pc.session.sync，版本必须走 URL 路径（call(...,v='3.0')），写进 data 里会回 API_NOT_FOUNDED；data 必须带 fetchNum，缺了回 FAIL_SYS_BIZPARAM_MISSED::缺少业务参数fetchNum。返回 sessions[]，userInfo.type=10 是系统消息，真人会话要按 sessionType 过滤。",
+  "闲鱼商品首图横图（1440x1080）在列表页会被裁成方图，主体容易被切；二手实拍图普遍偏暗（实测亮度 78/255、暗部占 41%），白底列表页里不显眼，提亮到 110-120 明显改善。但有些原图已自带营销文案，再叠文字条会重叠打架——加工前先看图。",
+  "算二手行情做定价建议时必须按成色分组：闲鱼同款'全新'与'非全新'是两个价带（实测小智AI 全新中位¥65 / 非全新¥60，按关键词拉180件样本、标题含'全新|未拆|未使用'分组）。混在一起算会得出'你的价偏高、建议降价'的错误结论，把全新品当二手甩。",
+  "edit_item.py 改标题的 desc 首行同步只在'desc首行 == 当前title'时触发；标题曾被截断到30字的商品首行对不上 → 服务端拿 desc 首行当标题，回 SUCCESS 但标题纹丝不动（假 SUCCESS）。修法：显式 --desc 传全文、把首行换成新标题，改完必须 editDetail 读回核对 len(title)。"
+ ],
+ "ts": {}
+}

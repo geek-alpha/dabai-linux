@@ -238,6 +238,24 @@ def _note_round(recent_rounds: list, fps: list, results: dict, order) -> bool:
     return False
 
 
+def _fit_result(tool_name: str, text) -> str:
+    """子智能体侧的工具结果截断：与主智能体同口径，且必须自描述。
+
+    为什么不能裸砍：原实现是 `str(result)[:8000]`，砍完不留一个字。worker 读
+    skills/code_ops/skill.json（25268 字符）时，8000 之后的 shell_run / code_append
+    定义被整段丢掉，模型却以为「文件就长这样」——于是反复重跑同一条命令，
+    4 轮同指纹触发原地打转检测被硬停，整轮零产出（2026-09-22 第 15 轮实测）。
+    复用主智能体的 _fit_tool_result：长结果工具放宽到 16000、普通工具 2000，
+    截断处写明缺了多少、怎么拿剩下的。
+    """
+    try:
+        from agent import _fit_tool_result
+        return _fit_tool_result(str(text or ""), tool_name)
+    except Exception:
+        return str(text or "")[:8000]
+
+
+
 def _load_profile(pid: str) -> Optional[dict]:
     """读智能体档案。未指定 / 不存在 / 读盘失败 → None（退回全能力通用执行者）。
 
@@ -272,6 +290,17 @@ def _tool_timeout(tool_name: str) -> float:
 _LLM_TIMEOUT = 180.0
 
 
+def _reasoning_placeholder(messages: list) -> list:
+    """给 assistant 消息补非空 reasoning_content 占位。
+
+    为什么还需要第二级：报错文本要求的是必须 passed back，空串未必被上游算作
+    「回传」。占位文本会进 prompt（白付一点 token），所以只在补空串仍被拒时才用。
+    """
+    return [{**m, "reasoning_content": "（历史思考已省略）"}
+            if isinstance(m, dict) and m.get("role") == "assistant" else m
+            for m in messages]
+
+
 def _record_usage(resp) -> None:
     """把子智能体的 LLM 用量记进 harness 台账（渠道 sub_agent）。
 
@@ -297,6 +326,24 @@ def _record_usage(resp) -> None:
         runtime.record_usage("sub_agent", p, c, t, cache_hit=ch, cache_miss=cm)
     except Exception:
         pass
+
+
+def _inject_user_inputs(messages: list, extra: Optional[dict]) -> int:
+    """把 extra["user_inputs"] 逐条追成独立的 user 消息，返回注入条数。
+
+    为什么不能拼进 worker.task：拼进去它就退回成「任务书里的一段背景」，
+    模型可以把它当参考绕过（实测就是被当参考）。独立 user 消息才与主人原话同级。
+    """
+    if not isinstance(extra, dict):
+        return 0
+    n = 0
+    for item in (extra.get("user_inputs") or []):
+        txt = str(item or "").strip()
+        if not txt:
+            continue
+        messages.append({"role": "user", "content": txt})
+        n += 1
+    return n
 
 
 SUB_SYSTEM = (
@@ -537,6 +584,10 @@ class SubAgentManager:
             {"role": "system", "content": sys_content},
             {"role": "user", "content": worker.task},
         ]
+        _ui_n = _inject_user_inputs(messages, worker.extra)
+        if _ui_n:
+            logger.info("[SubAgent] 用户端输入已注入《%s》[%s]：%d 条",
+                        worker.title, worker.id, _ui_n)
         rounds = 0
         max_rounds = _max_rounds()          # 0 = 不限制（与主智能体一致）
         max_est_tokens = _max_est_tokens()
@@ -545,6 +596,7 @@ class SubAgentManager:
         # 只看调用会把合理轮询误杀（详见 LOOP_SAME_ROUNDS 处的说明）。
         recent_rounds: list = []
         loop_warned = False
+        empty_retried = False
         while max_rounds <= 0 or rounds < max_rounds:
             rounds += 1
             await self._mirror_log(worker, f"第 {rounds} 轮思考…")
@@ -571,6 +623,19 @@ class SubAgentManager:
             tool_calls = choice.tool_calls or []
 
             if not tool_calls:
+                # 空正文不是「没结论」，是上游只回了思考没回正文。直接 return 会让整轮
+                # （分钟级、几十次调用）在账本上记成「无产出」，却查不出原因。
+                # 补一次点名要结论的重试，只补一次——模型持续空回时不能无限循环。
+                if not content and not empty_retried:
+                    empty_retried = True
+                    logger.warning("[SubAgent] 模型返回空正文（无 tool_calls），补一次要结论的重试：《%s》",
+                                   worker.title)
+                    messages.append({
+                        "role": "user",
+                        "content": "上一轮没有任何文字输出。请直接用文字给出结论：做了什么、"
+                                   "证据是什么、下一步是什么，不要再调用工具。",
+                    })
+                    continue
                 return content or "（子智能体没有给出结论）"
 
             # 记录本轮工具调用（OpenAI 格式：assistant 消息必须带 tool_calls 原样回传）
@@ -669,7 +734,7 @@ class SubAgentManager:
             hit = cache.get(name, args)
             if hit is not None:
                 await self._mirror_log(worker, f"命中缓存 {name} {str(args)[:50]}")
-                return str(hit[0])[:8000]
+                return _fit_result(name, hit[0])
 
         await self._mirror_log(worker, f"调用工具 {name} {str(args)[:60]}")
         timeout = _tool_timeout(name)
@@ -694,7 +759,7 @@ class SubAgentManager:
             except Exception:
                 pass
 
-        text = str(result)[:8000]
+        text = _fit_result(name, result)
         await self._mirror_log(worker, f"  {name} → {text[:120]}")
         return text
 
@@ -737,10 +802,11 @@ class SubAgentManager:
         except Exception:
             budget = 4096
 
-        async def _one(max_tokens: int):
+        async def _one(max_tokens: int, msgs=None):
             return await asyncio.wait_for(
                 client.chat.completions.create(
-                    model=model, messages=messages, tools=tools, tool_choice="auto",
+                    model=model, messages=messages if msgs is None else msgs,
+                    tools=tools, tool_choice="auto",
                     max_tokens=max_tokens, temperature=0.3, stream=False),
                 timeout=_LLM_TIMEOUT)
 
@@ -748,14 +814,47 @@ class SubAgentManager:
             from harness.core import retry_async
             resp = await retry_async(lambda: _one(budget), attempts=3, backoff=2.0)
         except Exception as e:
-            # 重试耗尽后的最后一搏：降 max_tokens 再试一次。
-            # 必须留日志——否则「这次结论为什么只有半截」永远查不出来
-            # （1024 tokens 很容易把结论截断，而失败原因被完全吞掉）。
-            logger.warning("[SubAgent] LLM 调用重试耗尽（%s: %s），降级为单次小预算调用",
-                           e.__class__.__name__, e)
-            resp = await _one(1024)
+            from agent import _is_reasoning_echo_error
+            if _is_reasoning_echo_error(e):
+                # thinking 渠道要求 assistant 回传 reasoning_content，而子智能体自产的
+                # assistant 从不带该字段（_run_loop 里 messages.append 只写 content +
+                # tool_calls）→ 整轮 400。400 不是瞬态错误，原来会直接抛，把一轮几十次
+                # 调用的任务判死；与主智能体同构自愈：补空串 → 仍拒则补非空占位。
+                resp = await self._retry_reasoning_echo(_one, budget, messages, e)
+            else:
+                from harness.core import is_transient_error
+                if not is_transient_error(e):
+                    # 确定性错误（402 余额不足 / 401 鉴权 / 400 参数）降 max_tokens 再试必然
+                    # 同样失败，只是白烧一次请求，还把真因埋进「重试耗尽」的日志里——
+                    # 实测 402 读起来像网络抖动，排查时被误导。
+                    raise
+                # 重试耗尽后的最后一搏：降 max_tokens 再试一次。
+                # 必须留日志——否则「这次结论为什么只有半截」永远查不出来
+                # （1024 tokens 很容易把结论截断，而失败原因被完全吞掉）。
+                logger.warning("[SubAgent] LLM 调用重试耗尽（%s: %s），降级为单次小预算调用",
+                               e.__class__.__name__, e)
+                resp = await _one(1024)
         _record_usage(resp)
         return resp
+
+    async def _retry_reasoning_echo(self, one, budget: int, messages, err):
+        """reasoning_content 回传缺失的自愈：补空串 → 仍被拒则补非空占位。
+
+        两级都试过仍被拒才把原错抛出：绝不吞掉别的 400（判据由
+        agent._is_reasoning_echo_error 统一持有，避免两处口径漂移）。
+        """
+        from agent import _ensure_reasoning_echo, _is_reasoning_echo_error
+        for patched, label in ((_ensure_reasoning_echo(messages), "补空串"),
+                               (_reasoning_placeholder(messages), "补占位文本")):
+            try:
+                logger.warning("[SubAgent] thinking 渠道要求回传 reasoning_content，%s后重发: %s",
+                               label, err)
+                return await one(budget, patched)
+            except Exception as e:
+                if not _is_reasoning_echo_error(e):
+                    raise
+                err = e
+        raise err
 
     def _get_client(self, profile: Optional[dict] = None):
         from agent import _build_llm_client, load_config
@@ -771,7 +870,13 @@ class SubAgentManager:
         return self._client, (override or self._client_model)
 
     def _tools_base(self) -> list:
-        """全量工具（排除 sub_agent_* 自身，防无限递归下发）。"""
+        """全量工具（排除 sub_agent_* 自身，防无限递归下发）。
+
+        必须绕过渐进披露：开启时 collect_tool_specs() 只返回 skill_help（实测
+        load_local_tools() 产出 count=1），而 skill_help 的动态注册只作用于主智能体
+        —— 子智能体的工具表在请求时就冻结了，读说明书也补不回来。
+        实测代价：定时·自我迭代循环的 worker 只有 skill_help，一条命令都跑不了。
+        """
         if self._tools is None:
             try:
                 from agent import load_local_tools
@@ -782,6 +887,18 @@ class SubAgentManager:
             except Exception as e:
                 logger.warning("[SubAgent] 工具列表加载失败: %s", e)
                 self._tools = []
+            try:
+                from harness import get_harness
+                seen = {str((t.get("function") or {}).get("name") or "") for t in self._tools}
+                for t in (get_harness().skills.tool_specs() or []):
+                    n = str((t.get("function") or {}).get("name") or "")
+                    if n.startswith("sub_agent_"):
+                        continue
+                    if n and n not in seen:
+                        seen.add(n)
+                        self._tools.append(t)
+            except Exception as e:
+                logger.warning("[SubAgent] 技能工具 schema 补齐失败: %s", e)
         return self._tools
 
     def _tool_defs(self, profile: Optional[dict] = None) -> list:

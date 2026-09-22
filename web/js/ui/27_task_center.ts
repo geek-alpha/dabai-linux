@@ -84,8 +84,8 @@ export default (function init(App: AppKernel) {
       b.title = dead
         ? '⚠️ 状态在跑但没有调度任务 —— 实际不会再有下一轮，点一下重新启动'
         : (siRunning
-            ? `第 ${(st.spent || 0) + 1}/${st.budget || 0} 轮｜有效 ${st.good || 0}/${st.rounds || 0}｜连续无效 ${st.streak || 0}/${st.max_streak || 0}`
-            : '启动后按评估器读数自动找缺口 → 修一处 → 留证据；连续无效自动停');
+            ? `第 ${(st.spent || 0) + 1}/${st.budget || 0} 轮｜有效 ${st.good || 0}/${st.rounds || 0}｜连续无效 ${st.streak || 0}/${st.max_streak || 0}｜重启自动续跑`
+            : '启动后按评估器读数自动找缺口 → 修一处 → 留证据；重启/重开机自动续跑，只有点「停止」才真正停下');
       if (dead) b.classList.add('dead'); else b.classList.remove('dead');
     }
   }
@@ -113,8 +113,8 @@ export default (function init(App: AppKernel) {
       paintIterate(d.status);
       if (App.showToast) {
         App.showToast(siRunning
-          ? '♾ 自我迭代已启动：按评估器读数推进，连续无效自动停'
-          : '已停止自我迭代');
+          ? '♾ 自我迭代已启动：重启/重开机自动续跑，连续无效自动停'
+          : '已停止：重启也不会自动恢复，要跑得手动再启动');
       }
       fetchList();
     }).catch(() => {
@@ -137,7 +137,7 @@ export default (function init(App: AppKernel) {
       '<div class="task-center-body">' +
         '<div class="task-center-side">' +
           '<div class="task-center-toolbar">' +
-            '<button id="task-center-iterate" class="task-center-iterate" title="启动后按评估器读数自动找缺口 → 修一处 → 留证据；连续无效自动停">♾ 自我迭代</button>' +
+            '<button id="task-center-iterate" class="task-center-iterate" title="启动后按评估器读数自动找缺口 → 修一处 → 留证据；重启/重开机自动续跑，只有点「停止」才真正停下">♾ 自我迭代</button>' +
             '<button id="task-center-clear" class="task-center-clear">🗑 清除已完成</button>' +
           '</div>' +
           '<div id="task-center-list" class="task-center-list"></div>' +

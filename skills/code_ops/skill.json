@@ -109,7 +109,7 @@
       "type": "function",
       "function": {
         "name": "code_read",
-        "description": "批量读取文件内容：一次读多个文件，支持 路径:行号 或 路径:起-止 指定区间，自动识别 UTF-8/GBK 编码并带行号。读代码上下文、看配置、查某段实现都用它。",
+        "description": "批量读取文件内容：一次读多个文件，支持 路径:行号 或 路径:起-止 指定区间，自动识别 UTF-8/GBK 编码并带行号。读代码上下文、看配置、查某段实现都用它。\n调用示例（照抄，参数都是顶层键，不要再包一层 arguments）：{\"files\": \"src/a.py:10-40\"} 或 {\"files\": \"a.py,b.py\", \"max_lines\": 200}。required 就是顶层键 files——写成 {\"arguments\": {\"files\": ...}} 会被判「缺少必填参数: files」。",
         "parameters": {
           "type": "object",
           "properties": {
@@ -373,7 +373,7 @@
       "type": "function",
       "function": {
         "name": "code_append",
-        "description": "追加内容到文件末尾。写长文件必须用它分块写：一次生成 2000 行会撞输出上限被截断（参数 JSON 失效或文件只写一半），分块追加每块都小、永不截断；配合「先 code_create_file 写骨架、再逐块填内容」可保证文件在任何中途时刻都语法合法。",
+        "description": "追加内容到文件末尾。写长文件必须用它分块写：一次生成 2000 行会撞输出上限被截断（参数 JSON 失效或文件只写一半），分块追加每块都小、永不截断；配合「先 code_create_file 写骨架、再逐块填内容」可保证文件在任何中途时刻都语法合法。\n调用示例（照抄，参数都是顶层键，不要再包一层 arguments）：{\"path\": \"src/out.py\", \"content\": \"import os\"}。required 是顶层键 path 与 content——写成 {\"arguments\": {\"path\": ...}} 会被判「缺少必填参数: path, content」。",
         "parameters": {
           "type": "object",
           "properties": {
@@ -702,7 +702,7 @@
       "type": "function",
       "function": {
         "name": "shell_run",
-        "description": "执行一条本机 shell 命令并返回输出（Windows 走 cmd，Linux/macOS 走 sh）。适合快速本机操作：打开程序/文件、列目录、看进程、读小文件等。引用用户文件时必须使用真实存在的完整路径，不确定先用 find_file 查找。大型编码/项目任务不要用本工具，改用 delegate_agent_task 委派。",
+        "description": "执行一条本机 shell 命令并返回输出（Windows 走 cmd，Linux/macOS 走 sh）。适合快速本机操作：打开程序/文件、列目录、看进程、读小文件等。引用用户文件时必须使用真实存在的完整路径，不确定先用 find_file 查找。大型编码/项目任务不要用本工具，改用 delegate_agent_task 委派。\n调用示例（照抄，参数都是顶层键，不要再包一层 arguments）：{\"command\": \"ls -la\"} 或 {\"command\": \"df -h\", \"timeout\": 120}。required 就是顶层键 command——写成 {\"arguments\": {\"command\": ...}} 会被判「缺少必填参数: command」。",
         "parameters": {
           "type": "object",
           "properties": {

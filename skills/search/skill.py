@@ -124,6 +124,13 @@ def search_batch(args: dict) -> str:
         return err
     cmd = [sys.executable, _ANYSEARCH_CLI, "batch_search"]
     if queries:
+        # 模型常把数组直接塞进 queries（schema 已声明 str|array）。必须走 json.dumps：
+        # str(list) 是 Python repr（单引号不是合法 JSON），CLI 的 json.loads 会失败，
+        # 整串落到「按分隔符切分」分支，把 JSON 文本当成一个查询词静默搜错。
+        if isinstance(queries, dict):
+            queries = [queries]
+        if isinstance(queries, (list, tuple)):
+            queries = json.dumps(list(queries), ensure_ascii=False)
         cmd += ["--queries", str(queries)]
     if qlist:
         if isinstance(qlist, str):

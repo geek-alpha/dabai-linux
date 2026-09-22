@@ -21,12 +21,29 @@ import json
 import os
 import ssl
 import urllib.parse
+from pathlib import Path
 
 import aiohttp
 
-# 与 server.py 的 SERVER_PORT 保持一致（server.py:79 SERVER_PORT = 8000）
-# server 实际以 HTTPS 运行（cert.pem/key.pem 存在即 use_https=True，server.py:5754）
-SERVER_BASE = "https://127.0.0.1:8000"
+
+# 自请求基址不能硬编码：nginx 前置 TLS 终结模式下（settings.json harness.http_only=true
+# 或 env DABAI_HTTP_ONLY=1）server 只监听回源端口 8001，本机 8000 无人监听。
+# 实测 09-22 硬编码 https://127.0.0.1:8000 导致 workspace_* 全部报 Cannot connect。
+_SETTINGS_PATH = Path(__file__).resolve().parents[2] / "settings.json"
+
+
+def _server_base() -> str:
+    """server 自身基址：优先用 server 启动时写入的 env，其次按 settings.json 推导。"""
+    env = (os.environ.get("DABAI_SELF_BASE") or "").strip()
+    if env:
+        return env.rstrip("/")
+    try:
+        cfg = json.loads(_SETTINGS_PATH.read_text(encoding="utf-8"))
+        http_only = os.environ.get("DABAI_HTTP_ONLY") == "1" or bool(
+            cfg.get("harness", {}).get("http_only", False))
+    except Exception:
+        http_only = False
+    return "http://127.0.0.1:8001" if http_only else "https://127.0.0.1:8000"
 
 # 自签名证书：默认校验证书会抛 SSL 错误，这里显式不校验（与前端浏览器访问一致）
 _SSL_CTX = ssl.create_default_context()
@@ -36,7 +53,7 @@ _SSL_CTX.verify_mode = ssl.CERT_NONE
 
 async def _req(method: str, path: str, payload: dict | None = None, timeout: float = 10.0) -> dict:
     """异步请求 server 的 /api/workspace* 接口（不阻塞 uvicorn 事件循环）。"""
-    url = SERVER_BASE + path
+    url = _server_base() + path
     try:
         connector = aiohttp.TCPConnector(ssl=_SSL_CTX)
         async with aiohttp.ClientSession(connector=connector) as session:

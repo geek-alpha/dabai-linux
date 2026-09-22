@@ -308,6 +308,30 @@ SKILL_HELP_TOOL = {
     }
 }
 
+# 内置 context_read 工具：常驻状态段的「按需读全文」入口（与 skill_help 同构）。
+# 长期事业/经验库/信条/联邦来信四段不再把截断正文每轮常驻，只留一行摘要；
+# 要看具体判据/命令时按需拉。渲染在 harness/self_state.py（只读，不写台账）。
+CONTEXT_READ_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "context_read",
+        "description": ("按需读取跨会话状态段的全文（system prompt 里只有一行摘要）："
+                        "long_horizon=长期事业台账（可带项目 id）、lessons=经验库索引"
+                        "（可带序号或 hash 前缀取单条全文）、conviction=信条与拒绝、"
+                        "peer=联邦未读来信。要引用某段的具体判据、命令或接力棒前先读它。"),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string",
+                         "description": "状态段名：long_horizon / lessons / conviction / peer"},
+                "key": {"type": "string",
+                        "description": "可选：单条定位（long_horizon 传项目 id，lessons 传序号或 hash 前缀）"},
+            },
+            "required": ["name"],
+        },
+    },
+}
+
 # 渐进披露模式下注入 system prompt 的引导语
 PROGRESSIVE_HINT = (
     "【渐进式技能说明】部分技能采用按需加载：摘要已在上面列出。当你想使用某技能的工具时，"
@@ -601,6 +625,8 @@ class Harness:
         names = {(t.get("function") or {}).get("name") for t in tools}
         if "skill_help" not in names:
             tools.append(SKILL_HELP_TOOL)
+        if "context_read" not in names:
+            tools.append(CONTEXT_READ_TOOL)
         return tools
 
     def skill_tool_specs(self, skill_name: str) -> list:
@@ -648,6 +674,11 @@ class Harness:
             if text is None:
                 return f"技能 {skill_name} 不存在或未加载（可用技能见 system prompt 的技能摘要）", "harness"
             return text, "harness"
+        if tool_name == "context_read":
+            from harness import self_state as _self_state
+
+            return _self_state.read(str(arguments.get("name") or ""),
+                                    str(arguments.get("key") or "")), "harness"
         owner = self.tool_owner(tool_name)
         if owner is None:
             return None, ""
