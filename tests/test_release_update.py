@@ -57,14 +57,16 @@ def make_package(
     *,
     tamper: tuple | None = None,
     extra_manifest_paths: list | None = None,
+    modes: dict | None = None,
 ):
     """造一个发行包。tamper=(路径, 新内容) 时包内内容与清单哈希故意不符。"""
+    modes = modes or {}
     entries, blobs = [], {}
     for rel, content in files.items():
         data = content.encode() if isinstance(content, str) else content
         blobs[rel] = data
         entries.append({"path": rel, "sha256": hashlib.sha256(data).hexdigest(),
-                        "size": len(data), "mode": 0o644})
+                        "size": len(data), "mode": modes.get(rel, 0o644)})
     for rel in (extra_manifest_paths or []):
         data = b"PWNED\n"
         blobs[rel] = data
@@ -85,7 +87,7 @@ def make_package(
             if tamper and rel == tamper[0]:
                 data = tamper[1]
             ti = tarfile.TarInfo(rel)
-            ti.size, ti.mtime, ti.mode = len(data), 0, 0o644
+            ti.size, ti.mtime, ti.mode = len(data), 0, modes.get(rel, 0o644)
             tar.addfile(ti, io.BytesIO(data))
         blob = (json.dumps(man, ensure_ascii=False, indent=1) + "\n").encode()
         ti = tarfile.TarInfo("MANIFEST.json")
@@ -260,6 +262,52 @@ def test_update_writes_code_and_spares_experience(tmp_path):
     assert (root / "agent.py").read_text() == "NEW AGENT\n"
     for rel, data in before.items():
         assert (root / rel).read_bytes() == data, f"经历文件被动了：{rel}"
+
+
+def test_package_exec_bit_survives_install(tmp_path):
+    """包内 755 的文件落地后必须还是 755。
+
+    解包写暂存区时不恢复 tar 里的权限位，而 apply_writes 的 chmod 读的正是暂存区
+    文件的 mode —— 少这一次 chmod，包内 57 个 755 全变 644，./dabai 直接
+    permission denied。修前这条必红。
+    """
+    root = make_instance(tmp_path)
+    tar, _man, _d = make_package(
+        tmp_path,
+        {"server.py": "NEW SERVER\n", "tools/run.sh": "#!/bin/sh\necho hi\n"},
+        modes={"tools/run.sh": 0o755},
+    )
+    rc, out = run_update(apply_args(root, tmp_path / "state", tar))
+    assert rc == 0, out
+    assert (root / "tools/run.sh").stat().st_mode & 0o777 == 0o755
+    assert (root / "tools/run.sh").read_text() == "#!/bin/sh\necho hi\n"
+
+
+def test_memory_archive_is_experience_not_code():
+    """归档属于经历，不属于代码。
+
+    它一度不在经历清单里 → 被当代码打进包、每次更新覆盖本机归档，把新记忆吞掉。
+    改回去这条就红。
+    """
+    rel = "harness_task_memory.archive.json"
+    assert paths.classify(rel) == paths.EXPERIENCE
+    assert update.is_forbidden(rel)
+    assert rel not in paths.code_files(REPO)
+
+
+def test_refuses_package_carrying_memory_archive(tmp_path):
+    """发布方仍把归档打进包时，整包作废。宁可更新失败，不许吞记忆。"""
+    root = make_instance(tmp_path)
+    before = (root / "server.py").read_bytes()
+    tar, _man, _d = make_package(
+        tmp_path,
+        {"server.py": "NEW SERVER\n"},
+        extra_manifest_paths=["harness_task_memory.archive.json"],
+    )
+    rc, out = run_update(apply_args(root, tmp_path / "state", tar))
+    assert rc != 0, out
+    assert "受保护路径" in out, out
+    assert (root / "server.py").read_bytes() == before
 
 
 def test_dry_run_writes_nothing(tmp_path):

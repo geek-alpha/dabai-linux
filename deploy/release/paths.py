@@ -59,6 +59,8 @@ EXPERIENCE_GLOBS: tuple[str, ...] = (
     # 任务系统运行态：断点续跑状态，覆盖 = 丢掉正在跑的活
     "harness_tasks.json",
     "harness_task_memory.json",
+    # 归档与 .json 是同一份记忆的两个文件：曾被当代码打进包，每升一次版就吞掉本机新归档的条目
+    "harness_task_memory.archive.json",
     "harness_state.json",
     "harness_bridge.json",
     "codex_runtime.json",
@@ -173,6 +175,7 @@ FLOOR_GLOBS: tuple[str, ...] = (
     "agent_profiles.json",
     "harness_tasks.json",
     "harness_task_memory.json",
+    "harness_task_memory.archive.json",
     "harness_state.json",
     "harness_bridge.json",
     "codex_runtime.json",

@@ -80,7 +80,8 @@ FLOOR_GLOBS: Tuple[str, ...] = (
     "world_model.json", "music_playlists.json", "video_favorites.json",
     "video_history.json", "video_sources.json", "workspace_saved.json",
     "role_card_users.json", "agent_profiles.json", "harness_tasks.json",
-    "harness_task_memory.json", "harness_state.json", "harness_bridge.json",
+    "harness_task_memory.json", "harness_task_memory.archive.json",
+    "harness_state.json", "harness_bridge.json",
     "codex_runtime.json",
     "settings.json", "codex_config.json", "stt_config.json", "tts_config.json",
     "cards.json", "character_cards.json", "nodes.json",
@@ -653,6 +654,9 @@ def extract_package(tar_path: Path, dest: Path) -> Dict[str, Any]:
                 raise SystemExit(f"✘ 读不出包内文件：{member.name}")
             with open(target, "wb") as out:
                 shutil.copyfileobj(src, out)
+            # 权限位必须从 tar 恢复：打包机把它写进了 member.mode，而 apply_writes
+            # 的 chmod 读的是暂存区文件的 mode —— 漏掉这行，包内每个 755 都落地成 644。
+            os.chmod(target, (member.mode or 0o644) & 0o777)
     if man is None:
         raise SystemExit("✘ 包里没有 MANIFEST.json")
     return man
