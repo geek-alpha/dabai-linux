@@ -12,6 +12,9 @@ harness_tasks.json
 harness_tasks.json.tmp
 harness_task_memory.json
 harness_task_memory.json.tmp
+# 溢出归档同属运行态记忆：只忽略上面两个时它被长期跟踪，每次推送都要先 stash，
+# 且随公开仓库外泄记忆正文。
+harness_task_memory.archive.json
 
 # 编译探针残留（调试会话产生的重命名 .pyc，无运行价值）
 *.pyc-check
