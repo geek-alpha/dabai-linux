@@ -95,6 +95,8 @@ _TOOL_TIMEOUT_OVERRIDES = {
 MID_TURN_MAX_TOKENS = 262144
 TOOL_RESULT_RETRO_CAP = 250
 ASSISTANT_RETRO_CAP = 150
+# 轮内压缩滞回比例（见 _compact_hysteresis）：超预算时压到 budget×它。
+COMPACT_HYSTERESIS = 0.65
 KEEP_NEWEST_TOOL_ROUNDS = 1
 # 单条工具结果的 token 上限（轮内压缩的第二条触发线，见 _single_result_max_tokens）。
 SINGLE_RESULT_MAX_TOKENS = 5000
@@ -495,9 +497,25 @@ def _single_result_max_tokens() -> int:
         v = int(load_config().get("agent", {}).get(
             "single_result_max_tokens", SINGLE_RESULT_MAX_TOKENS)
             or SINGLE_RESULT_MAX_TOKENS)
-        return max(1000, v)
+        return max(100, v)
     except Exception:
-        return SINGLE_RESULT_MAX_TOKENS
+        return TOOL_RESULT_RETRO_CAP
+
+
+def _compact_hysteresis() -> float:
+    """轮内压缩的滞回比例：超预算时压到 budget×它，而不是刚好压回 budget。
+
+    实测（tools/compact_hysteresis_cost.py，65 轮真实会话重放）：0.65 把前缀作废量
+    砍掉 2/3、缓存计价成本指数 -53%，而压掉的正文只多 3.8%——多压的正是「下一轮
+    反正又要压一次」的那部分。再往下收益递减：0.5 相对 0.65 只再省 2.9%。
+    """
+    try:
+        v = float(load_config().get("agent", {}).get(
+            "compact_hysteresis", COMPACT_HYSTERESIS) or COMPACT_HYSTERESIS)
+    except Exception:
+        return COMPACT_HYSTERESIS
+    return max(0.1, min(1.0, v))
+
 
 
 # ==================== 图片注入：工具结果 → 多模态请求体 ====================
@@ -730,7 +748,8 @@ def _strip_img_for_disk(messages: list) -> list:
 
 
 def _compact_tool_history(messages: list, budget: int = None,
-                          keep_rounds: int = None) -> list:
+                          keep_rounds: int = None,
+                          hysteresis: float = None) -> list:
     """轮内工具历史压缩：把旧工具轮的庞杂结果压成小片段，绑定轮内上下文总量。
 
     只在总量超预算时动手（平时零开销、逐字节不变，不破坏前缀缓存）；
@@ -744,6 +763,14 @@ def _compact_tool_history(messages: list, budget: int = None,
     except Exception:
         return messages
     budget = budget or _mid_turn_max_tokens()
+    # 滞回：超预算时一次压到 budget×hysteresis，而不是刚好压回 budget。
+    # 每压一次，被改消息之后的整段前缀就作废一次（从命中价升回全价重发）。
+    # 压到刚好，下一轮新增一条结果又超、又作废一次：实测一个会话 30 分钟内
+    # 触发 29 次压缩，每次回本要 60 轮 —— 永远回不了本。多压一点换后续
+    # 十几轮不再触发，作废次数从 N 次降到 1 次。
+    if hysteresis is None:
+        hysteresis = _compact_hysteresis()
+    target = max(1, int(budget * max(0.1, min(1.0, float(hysteresis)))))
     keep_rounds = KEEP_NEWEST_TOOL_ROUNDS if keep_rounds is None else max(0, int(keep_rounds))
     retro_cap = _tool_result_retro_cap()
 
@@ -821,7 +848,7 @@ def _compact_tool_history(messages: list, budget: int = None,
                             "budget" if over_budget else "oversize")
             elif m.get("role") == "assistant" and over_budget:
                 _shrink(m, k, ASSISTANT_RETRO_CAP, "…", "budget")
-        if over_budget and total <= budget:
+        if over_budget and total <= target:
             break
 
     # 1.5) 仍超预算：降级最老的多模态消息，只留最近 _IMG_KEEP_NEWEST 张。
@@ -6419,7 +6446,9 @@ class AIAgent:
                         self._loop_warn_count += 1
                         messages.append({"role": "system", "content":
                             f"【循环提醒】{lh}。请立即停止重复：先回顾用户最初的目标，"
-                            "换一种方法/工具/参数再试；如果确认卡住无法推进，"
+                            "换一种方法/工具/参数再试；若你是因为上次结果被历史压缩、"
+                            "看不到中段才重试，改用 `文件:起-止` 精确读那一小段——"
+                            "结果还在，重发原命令只会被砍在同一处；如果确认卡住无法推进，"
                             "直接向用户说明卡点和可选方向并请求决策，不要继续重复同样的工具调用。"})
                     else:
                         full_text = f"（检测到工具循环：{lh}，已停止；建议换一种方法或把任务拆小再试）"
@@ -6594,7 +6623,9 @@ class AIAgent:
                         self._loop_warn_count += 1
                         messages.append({"role": "system", "content":
                             f"【循环提醒】{lh}。请立即停止重复：先回顾用户最初的目标，"
-                            "换一种方法/工具/参数再试；如果确认卡住无法推进，"
+                            "换一种方法/工具/参数再试；若你是因为上次结果被历史压缩、"
+                            "看不到中段才重试，改用 `文件:起-止` 精确读那一小段——"
+                            "结果还在，重发原命令只会被砍在同一处；如果确认卡住无法推进，"
                             "直接向用户说明卡点和可选方向并请求决策，不要继续重复同样的工具调用。"})
                     else:
                         full_text = f"（检测到工具循环：{lh}，已停止；建议换一种方法或把任务拆小再试）"

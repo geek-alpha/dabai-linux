@@ -9,6 +9,7 @@
 """
 import asyncio
 import functools
+import hashlib
 import json
 import logging
 import sqlite3
@@ -105,6 +106,12 @@ SHORT_TERM_MAX_CHARS_PER_ROUND = 1200    # 单轮历史最大字符（超出截�
 # 2026-08-31 修复「前两轮就忘」：短期窗口对最近 N 个用户轮「保底保留」——
 # token 预算只约束更旧轮，保证最近几轮对话绝不被工具长文挤掉。
 SHORT_TERM_MIN_ROUNDS = 6                # 短期窗口保底轮数（最近用户轮必保留）
+# 2026-09-22「最近几段用户的输入要留原话」：保底轮里的 user 消息不再跟 assistant
+# 共用 1200 字上限——用户原话是上下文里唯一不可再生的部分（工具结果库里能召回、
+# AI 结论能重推，用户说的话丢了就是丢了）。4000 字覆盖正常对话的 100%（实测用户
+# 消息中位 30 字、p99 < 300）。为什么不干脆无上限：保底轮 ignore_budget=True，
+# 不受 token 预算约束，无上限等于给「粘贴一整份日志」开了一条撑爆窗口的后门。
+SHORT_TERM_USER_GUARANTEED_CAP = 4000
 # 单条工具结果在短期窗口的最大字符：工具轮单条结果常达上万字（整轮几千 token），
 # 若全部保留，3000 token 预算只装得下 2~3 轮。截断后仍保留要点（完整结果在库中可召回）。
 SHORT_TERM_MAX_CHARS_PER_TOOL = 500
@@ -133,6 +140,15 @@ SHORT_TERM_KEEP_LAST_TOOLS = 3           # 单轮保留最近 N 次工具交互�
 SHORT_TERM_KEEP_LAST_TOOLS_NEWEST = 10
 # 0 = 继承 SHORT_TERM_MAX_CHARS_PER_TOOL（实测单独放宽它是负收益，见上）
 SHORT_TERM_MAX_CHARS_PER_TOOL_NEWEST = 0
+# 2026-09-23 实测（tools/spill_pointer_cost.py，87 轮 / 10 会话真实重放）：超阈值的工具
+# 结果整条换成一行落盘指针（正文全量落盘）。每轮 token 只省 7.8%——窗口本就饱和在预算
+# 上，省下的体积立刻被更旧的轮次填满；真正的账在「视图重建次数」上：窗口更慢顶到
+# HIST_VIEW_MAX_TOKENS，重建 17→11 次、装入轮次 2.6→3.4，按缓存计价成本 −26%
+# （重建一次 = 整个前缀全价重发）。阈值 2000 字只拿到 −5.6%，所以阈值取 per_tool 同量级。
+# 代价：最新一轮的结论从「直接看见」变成「花一次 read_lines 读回」，只能靠回读率判——
+# 回读率用 tools/spill_pointer_cost.py --readback 从库里实测，不靠感觉。
+TOOL_POINTER_ONLY = True
+TOOL_POINTER_MIN_CHARS = SHORT_TERM_MAX_CHARS_PER_TOOL
 SUMMARY_MAX_TOKENS = 800                 # 长期摘要块预算（累计式摘要自包含，最新一条优先全量）
 SUMMARY_MAX_CHARS_PER_ITEM = 600         # 单条摘要最大字符（与累计摘要 600 字上限一致）
 LONG_TERM_MAX_TOKENS = 300               # 常驻长期记忆块预算
@@ -242,6 +258,52 @@ def _clean_summary_noise(text: str) -> str:
     return "\n".join(kept).strip() or "(摘要内容缺失)"
 
 
+def _norm_summary(text: str) -> str:
+    """摘要归一化（只用于判重）：去掉全部空白字符，标点差异不抹平。"""
+    return "".join(str(text or "").split())
+
+
+_SUMMARY_DEDUPE_MIN_LEN = 20
+
+
+def _summary_is_redundant(prev: str, new: str) -> bool:
+    """新摘要是否只是旧摘要的重复（没有新增信息）。
+
+    _llm_summarize 的提示词明确允许「新对话没有新信息就原样复用旧摘要」，
+    而复用同样走 INSERT——实测同一句话在 summaries 表里连写了 6 条，
+    组装上下文时被「；」拼成三遍相同的话塞进提示词。
+    判定取严（宁可多存一条也不丢信息）：归一化后完全相同，或新摘要是旧摘要的
+    子串（信息更少，留旧的那条）。
+    短摘要（<20 字）不参与判重：库里实测有 6 条短于 20 字的摘要（最短 6 字），
+    这种长度下「相同」多半是巧合而非真冗余，误删的代价远大于多存一条。
+    """
+    a, b = _norm_summary(prev), _norm_summary(new)
+    if not a or not b:
+        return False
+    if len(a) < _SUMMARY_DEDUPE_MIN_LEN or len(b) < _SUMMARY_DEDUPE_MIN_LEN:
+        return False
+    return a == b or b in a
+
+
+def _dedupe_summaries(texts: list) -> list:
+    """按信息量去重（输入新→旧，输出保持原序）。
+
+    累计式摘要的最新一条自包含覆盖全会话，因此更旧的条目通常被它整段包含——
+    包含关系下丢弃旧条零信息损失，还省掉一份重复 token。
+    短摘要（<20 字）一律保留，理由同 _summary_is_redundant。
+    """
+    kept, seen = [], []
+    for t in texts:
+        n = _norm_summary(t)
+        if not n:
+            continue
+        if len(n) >= _SUMMARY_DEDUPE_MIN_LEN and any(n == s or n in s for s in seen):
+            continue
+        kept.append(t)
+        seen.append(n)
+    return kept
+
+
 def _recency_factor(ts: float, half_life_days: float) -> float:
     """按距今天数计算指数衰减系数：half_life 天后权重减半。"""
     age_days = max(0.0, (time.time() - float(ts or 0)) / 86400.0)
@@ -260,6 +322,285 @@ def _truncate_chars(text: str, max_chars: int) -> str:
     if not text or max_chars <= 0 or len(text) <= max_chars:
         return text
     return text[:max_chars] + '…'
+
+
+# 工具结果被历史压缩时追加的说明。为什么不写「中间省略 N 字」就完事：
+# 模型读到裸省略标记时无法区分「命令失败了」和「历史压缩砍了中段」，
+# 最自然的反应是重发同一条命令（2026-09-22 实测：同一 sed 命令连发 4 轮，
+# 每轮都被砍在同一处，4 轮后撞 SAME_RESULT_GUARD 硬停，整个任务中断）。
+# 标记里直接给出「命令已成功 + 怎么拿回中段」这两条事实，把重发这条路堵死。
+# 但只给「用 文件:起-止 读」还不够——那对 shell 命令的输出根本不成立（sed/rg 的
+# 输出没存在任何文件里）。所以截断时把全文落盘，标记里给路径：任何被压缩过的
+# 工具结果都能用 read_lines 按行读回来，模型不需要、也没理由重跑命令。
+_TOOL_TRUNC_NOTE = "（历史压缩，命令本身已成功；要看中段请用 文件:起-止 精确读，别重发原命令）"
+
+# 被截断的工具结果全文落盘目录。上限双保险（文件数 + 总字节），SD 卡上不能不管。
+_TOOL_SPILL_DIR = BASE_DIR / "data" / "tool_spill"
+_TOOL_SPILL_MAX_FILES = 200
+_TOOL_SPILL_MAX_BYTES = 16 * 1024 * 1024
+
+# 落盘索引（2026-09-22）：只有哈希文件名时，找不到文件就等于没有文件——路径要么活在
+# 上下文里，要么随摘要一起滚走。索引把「一次性路径」变成可检索的工作记忆：
+# 按时间列最近落盘、按工具名过滤、按预览文字认领。
+# 与正文同目录，_prune_tool_spill 必须显式跳过它，否则索引先于正文被当成垃圾删掉。
+_TOOL_SPILL_INDEX = _TOOL_SPILL_DIR / "index.jsonl"
+_TOOL_SPILL_INDEX_MAX_LINES = 600
+_TOOL_SPILL_PREVIEW_CHARS = 120
+_spill_lock = threading.Lock()
+
+
+def _tool_names_by_call_id(msgs: list) -> dict:
+    """tool_call_id → 工具名。tool 消息本身不带工具名（OpenAI 格式里名字挂在前一条
+    assistant 的 tool_calls 上），不建这张映射，索引里的 tool 字段就永远是空的。"""
+    out = {}
+    for m in msgs or []:
+        if not isinstance(m, dict):
+            continue
+        for tc in (m.get('tool_calls') or []):
+            if not isinstance(tc, dict):
+                continue
+            fn = tc.get('function')
+            name = fn.get('name') if isinstance(fn, dict) else ''
+            if tc.get('id') and name:
+                out[tc['id']] = name
+    return out
+
+
+def _tool_names_in_order(msgs: list) -> dict:
+    """id(消息对象) → 工具名。
+
+    为什么不能只靠 tool_call_id：DB 的 messages 表没有这一列，工具结果入库只存了
+    content（背景见 _normalize_tool_rounds），从记忆库恢复的历史里每条 tool 消息都
+    不带 id——索引的 tool 字段于是永远是空的（实测 55/55 为空）。
+    兜底规则与 _normalize_tool_rounds 同一套：assistant(tool_calls) 之后按序的 tool
+    消息，逐个对应 tool_calls 里的名字。
+    """
+    by_id = _tool_names_by_call_id(msgs)
+    pending = []
+    out = {}
+    for m in msgs or []:
+        if not isinstance(m, dict):
+            continue
+        for tc in (m.get('tool_calls') or []):
+            fn = tc.get('function') if isinstance(tc, dict) else None
+            name = (fn or {}).get('name') if isinstance(fn, dict) else ''
+            if name:
+                pending.append(name)
+        if m.get('role') == 'tool':
+            direct = _tool_name_of(m, by_id)
+            out[id(m)] = direct or (pending.pop(0) if pending else '')
+    return out
+
+
+def _tool_name_of(m: dict, names: dict = None) -> str:
+    """取工具消息的工具名（字段名各入口不一致，取不到就留空——索引靠预览也能认领）。"""
+    if not isinstance(m, dict):
+        return ""
+    fn = m.get('function')
+    direct = (m.get('name') or m.get('tool_name')
+              or (fn.get('name') if isinstance(fn, dict) else "") or "")
+    if direct:
+        return direct
+    return (names or {}).get(m.get('tool_call_id') or '', '') or ''
+
+
+def _spill_index_path() -> Path:
+    """索引路径每次现算：写死的模块常量会让「改了 _TOOL_SPILL_DIR 的测试」把条目
+    写进真实索引（实测留了 1 条指向不存在正文的死指针）。"""
+    return _TOOL_SPILL_DIR / "index.jsonl"
+
+
+def _spill_index_append(entry: dict) -> None:
+    """追加一条落盘记录。索引写失败不影响正文可用，只吞掉。"""
+    try:
+        with _spill_lock:
+            with open(_spill_index_path(), 'a', encoding='utf-8') as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            lines = _spill_index_path().read_text(encoding='utf-8').splitlines()
+            if len(lines) > _TOOL_SPILL_INDEX_MAX_LINES:
+                keep = lines[-_TOOL_SPILL_INDEX_MAX_LINES:]
+                tmp = _spill_index_path().with_suffix('.tmp')
+                tmp.write_text("\n".join(keep) + "\n", encoding='utf-8')
+                tmp.replace(_spill_index_path())
+    except Exception:
+        pass
+
+
+def _spill_index_drop(names: set) -> None:
+    """正文被剪枝时同步清索引：留着的死指针比没有指针更坏（读它只会拿到空）。"""
+    if not names:
+        return
+    try:
+        with _spill_lock:
+            if not _spill_index_path().exists():
+                return
+            keep = []
+            for line in _spill_index_path().read_text(encoding='utf-8').splitlines():
+                try:
+                    if json.loads(line).get('file') in names:
+                        continue
+                except Exception:
+                    continue  # 坏行直接丢，别让它卡住整条索引
+                keep.append(line)
+            tmp = _spill_index_path().with_suffix('.tmp')
+            tmp.write_text("\n".join(keep) + ("\n" if keep else ""), encoding='utf-8')
+            tmp.replace(_spill_index_path())
+    except Exception:
+        pass
+
+
+def _prune_tool_spill() -> None:
+    """按「文件数 / 总字节」双上限清理最旧的落盘结果，超限从最旧的开始删。"""
+    try:
+        files = [(p.stat().st_mtime, p.stat().st_size, p)
+                 for p in _TOOL_SPILL_DIR.iterdir()
+                 if p.is_file() and p.name != _TOOL_SPILL_INDEX.name
+                 and not p.name.endswith('.tmp')]
+    except Exception:
+        return
+    files.sort()
+    total = sum(f[1] for f in files)
+    dropped = set()
+    while files and (len(files) > _TOOL_SPILL_MAX_FILES or total > _TOOL_SPILL_MAX_BYTES):
+        _, size, path = files.pop(0)
+        try:
+            path.unlink()
+            total -= size
+            dropped.add(path.name)
+        except OSError:
+            break
+    _spill_index_drop(dropped)
+
+
+def _spill_tool_text(text: str, tool_name: str = "") -> str:
+    """把被截断的工具结果全文落盘，返回路径（失败返回空串，绝不因此中断打包）。
+
+    按内容哈希命名：同一条命令重复执行不会堆出一堆重复文件。
+    """
+    try:
+        _TOOL_SPILL_DIR.mkdir(parents=True, exist_ok=True)
+        path = _TOOL_SPILL_DIR / f"{hashlib.sha1(text.encode('utf-8', 'ignore')).hexdigest()[:10]}.txt"
+        if not path.exists():
+            path.write_text(text, encoding='utf-8')
+            _spill_index_append({
+                'ts': time.time(),
+                'file': path.name,
+                'chars': len(text),
+                'tool': tool_name or '',
+                'preview': " ".join(text[:_TOOL_SPILL_PREVIEW_CHARS].split()),
+            })
+            _prune_tool_spill()
+        return str(path)
+    except Exception:
+        return ""
+
+
+# 摘要里的原文索引（2026-09-22）：摘要覆盖的工具结果一旦滚出短期窗口，正文就只剩
+# 摘要里这一行指针可寻址（库里还躺着，但没有工具能翻）。路径由代码拼接、不经 LLM——
+# LLM 会改写哈希，指针就断了。索引放摘要**开头**：组装上下文时单条摘要按
+# SUMMARY_MAX_CHARS_PER_ITEM 从尾部截断，放尾部等于白落盘。
+_SPILL_INDEX_MAX_ITEMS = 6
+_SPILL_INDEX_MIN_CHARS = 500   # 与 SHORT_TERM_MAX_CHARS_PER_TOOL 同量级：超过就可能被截
+_SPILL_INDEX_HEAD = f"【工具结果原文·read_lines 读（路径相对 {BASE_DIR}）】"
+
+
+def _spill_index_for(messages: list) -> str:
+    """把摘要区间内的超长工具结果落盘，返回索引块（无则空串）。
+
+    与 _truncate_head_tail 共用同一份目录和哈希命名：同一条结果不会写两份。
+    """
+    items = []
+    names = _tool_names_in_order(messages)
+    for m in messages:
+        if m.get("role") != "tool":
+            continue
+        text = (m.get("content") or "").strip()
+        if len(text) <= _SPILL_INDEX_MIN_CHARS:
+            continue
+        path = _spill_tool_text(text, names.get(id(m), ''))
+        if path:
+            items.append(f"{Path(path).name}({len(text)}字)")
+    if not items:
+        return ""
+    return _SPILL_INDEX_HEAD + "；".join(items[-_SPILL_INDEX_MAX_ITEMS:])
+
+
+def _merge_spill_index(prev_index: str, new_index: str) -> str:
+    """累计索引：旧条目在前、新条目追加（同名去重），总条数封顶。"""
+    items = []
+    for block in (prev_index, new_index):
+        if not block:
+            continue
+        body = block[len(_SPILL_INDEX_HEAD):] if block.startswith(_SPILL_INDEX_HEAD) else block
+        for it in body.split("；"):
+            it = it.strip()
+            name = it.split("(", 1)[0]
+            if not it or any(x.split("(", 1)[0] == name for x in items):
+                continue
+            items.append(it)
+    if not items:
+        return ""
+    return _SPILL_INDEX_HEAD + "；".join(items[-_SPILL_INDEX_MAX_ITEMS:])
+
+
+def _split_spill_index(text: str) -> tuple:
+    """把摘要文本拆成 (正文, 索引块)。索引块是开头一行，历史摘要没有它。"""
+    t = str(text or "")
+    if not t.startswith(_SPILL_INDEX_HEAD):
+        return t, ""
+    nl = t.find("\n")
+    if nl < 0:
+        return "", t
+    return t[nl + 1:].strip(), t[:nl]
+
+
+def _pointer_line(text: str, tool_name: str = "") -> str:
+    """把整条工具结果正文换成一行落盘指针（正文全量落盘；落盘失败返回空串）。
+
+    指针必须是 (正文, 工具名) 的纯函数：同一份内容在任何轮次下都得打包成同一个样子，
+    前缀才不会因为「这一轮从最新变成历史」而失效（实测两套打包规则会把重建 18→21）。
+    """
+    path = _spill_tool_text(text, tool_name)
+    if not path:
+        return ""
+    try:
+        rel = Path(path).relative_to(BASE_DIR)
+    except ValueError:
+        rel = Path(path)
+    return (f"【工具结果原文已落盘 {rel}（{len(text)}字）"
+            f"· 用 read_lines 读它，别重跑命令】")
+
+
+def _truncate_head_tail(text: str, max_chars: int, head_ratio: float = 0.6,
+                        note: str = "", spill: bool = False, spill_name: str = "") -> str:
+    """留头留尾截断：头 60% + 尾 40%，中间标出省略了多少字。
+
+    为什么工具结果不能只留头：结论全在尾部——shell 的退出码、最后一行报错、
+    rg 的命中总数、code_verify 的 ✅/✘。只留头会把「命令到底跑没跑成」整个砍掉，
+    下一轮只能重跑一遍（实测相邻轮重复操作同一文件占 18.0%）。
+    头部保留用于认出「这是哪个文件/哪条命令的结果」。
+    """
+    if not text or max_chars <= 0 or len(text) <= max_chars:
+        return text
+    if spill:
+        path = _spill_tool_text(text, spill_name)
+        note = (f"（历史压缩：全文 {len(text)} 字已落盘 {path}，用 read_lines 读指定行，别重发原命令）"
+                if path else _TOOL_TRUNC_NOTE)
+    # 省略标记本身要占位，而且它的长度取决于省略了多少字、省略字数又取决于标记占
+    # 多少位——互相依赖，但 cut 只跟 len(str(cut)) 有关，迭代三次必然收敛。
+    # 填满到上限（不超）：上限是上界，但没理由白扔十几个字符。
+    def _marker(cut: int) -> str:
+        return f"…【中间省略 {cut} 字{note}】…"
+
+    keep = max(32, max_chars - len(_marker(0)) - len(str(len(text))))
+    for _ in range(3):
+        nxt = max_chars - len(_marker(len(text) - keep))
+        if nxt == keep:
+            break
+        keep = nxt
+    head = max(1, int(keep * head_ratio))
+    tail = max(1, keep - head)
+    return f"{text[:head]}{_marker(len(text) - head - tail)}{text[-tail:]}"
 
 
 def _pack_by_token_budget(texts: list, budget_tokens: int,
@@ -381,7 +722,10 @@ def _pack_history_records(records: list, budget_tokens: int,
                           max_chars_per_tool_call: int = 0,
                           keep_last_tools: int = 0,
                           max_chars_per_tool_newest: int = 0,
-                          keep_last_tools_newest: int = 0) -> list:
+                          keep_last_tools_newest: int = 0,
+                          user_guaranteed_cap: int = 0,
+                          pointer_only: bool = False,
+                          pointer_min_chars: int = 0) -> list:
     """按「轮」打包短期窗口历史（新→旧挑选，输出恢复旧→新）。
 
     records: 旧→新的消息列表 [{"role","content", tool_calls?, tool_results?}...]。
@@ -417,7 +761,10 @@ def _pack_history_records(records: list, budget_tokens: int,
             max_chars_per_tool=per_tool,
             ignore_budget=guaranteed,
             max_chars_per_tool_call=max_chars_per_tool_call,
-            keep_last_tools=keep_tools)
+            keep_last_tools=keep_tools,
+            pointer_only=pointer_only,
+            pointer_min_chars=pointer_min_chars,
+            user_cap=user_guaranteed_cap)
         packed = _drop_dangling_tail(packed)
         if not packed:
             continue
@@ -454,7 +801,10 @@ def _pack_one_round(rnd: list, cap: int, budget_tokens: int,
                     is_newest: bool, max_chars_per_tool: int = 0,
                     ignore_budget: bool = False,
                     max_chars_per_tool_call: int = 0,
-                    keep_last_tools: int = 0) -> tuple:
+                    keep_last_tools: int = 0,
+                    user_cap: int = 0,
+                    pointer_only: bool = False,
+                    pointer_min_chars: int = 0) -> tuple:
     """打包单轮消息，返回 (packed, tokens)。
 
     cap>0 时截断 user/assistant 纯文本；max_chars_per_tool>0 时截断 tool 结果
@@ -464,15 +814,32 @@ def _pack_one_round(rnd: list, cap: int, budget_tokens: int,
     ignore_budget=True（保底轮）时不因预算丢消息，只按字符上限截断；
     最新一轮单条超预算时按剩余预算硬截断，旧轮超预算即停（由调用方决定整轮跳过）。
     """
+    names = _tool_names_in_order(rnd)   # id(消息对象)→工具名：DB 恢复的 tool 消息不带 id
     if keep_last_tools:
         rnd = _limit_round_tools(rnd, keep_last_tools)
     packed, used = [], 0
     for m in rnd:
         content = m.get('content') or ''
-        if m.get('role') in ('user', 'assistant') and cap:
+        role = m.get('role')
+        if role == 'tool' and max_chars_per_tool:
+            ptr = ""
+            if pointer_only and pointer_min_chars and len(content) > pointer_min_chars:
+                ptr = _pointer_line(content, names.get(id(m), ''))
+                # 指针自己比上限还长时退回截断：被截断的地址不是地址
+                if len(ptr) >= max_chars_per_tool:
+                    ptr = ""
+            if ptr:
+                content = ptr
+            else:
+                # 工具结果留头留尾（尾部才是结论，见 _truncate_head_tail）
+                content = _truncate_head_tail(content, max_chars_per_tool, spill=True,
+                                               spill_name=names.get(id(m), ''))
+        elif role == 'user' and cap and ignore_budget and user_cap:
+            # 保底轮的 user 原话：不跟 assistant 共用单轮上限。
+            # cap 为 0（最新一轮）时不进这里——最新一轮本来就整段保留。
+            content = _truncate_head_tail(content, user_cap)
+        elif role in ('user', 'assistant') and cap:
             content = _truncate_chars(content, cap)
-        elif m.get('role') == 'tool' and max_chars_per_tool:
-            content = _truncate_chars(content, max_chars_per_tool)
         out = {**m, 'content': content}
         if max_chars_per_tool_call and out.get('tool_calls'):
             out['tool_calls'] = _cap_tool_calls(out['tool_calls'],
@@ -1672,10 +2039,13 @@ class ChatMemory:
             else:
                 dialog_text += f"{role_tag}: {content[:200]}\n"
 
-        # 获取前一次摘要，传递给 LLM 做增量式补充
+        # 获取前一次摘要，传递给 LLM 做增量式补充。剥掉原文索引块：它是给模型的
+        # 指针、不是摘要内容，混进去只会被 LLM 当正文改写（哈希一改指针就断了）。
         prev_summary = ""
+        prev_index = ""
         if self._llm_client and self._llm_model:
-            prev_summary = await self._get_latest_summary_text()
+            prev_body, prev_index = _split_spill_index(await self._get_latest_summary_text())
+            prev_summary = prev_body
 
         # 优先使用 LLM 生成语义摘要
         if self._llm_client and self._llm_model:
@@ -1686,10 +2056,31 @@ class ChatMemory:
         # 截断过长摘要（累计式摘要上限：自包含覆盖全会话，单条可容 600 字）
         if len(summary) > 600:
             summary = summary[:597] + "..."
+        # 原文索引（2026-09-22）：本批超长工具结果落盘，指针累计进摘要。索引块与
+        # 正文分开算预算——指针不占正文的 600 字，也不会被组装时的尾部截断吃掉。
+        index_block = _merge_spill_index(prev_index, _spill_index_for(messages))
+        if index_block:
+            summary = f"{index_block}\n{summary}"
 
         @_with_db_lock
         def _save():
             conn = _get_db()
+            # 去重写入（2026-09-22）：LLM 被允许「无新信息就原样复用旧摘要」，
+            # 而复用也走 INSERT——实测同一句话连写 6 条，组装上下文时被拼成
+            # 三遍相同的话。冗余就不写，省的是每一轮都要付的 token。
+            prev = conn.execute(
+                "SELECT summary_text FROM summaries WHERE session_id=? "
+                "ORDER BY created_at DESC LIMIT 1",
+                (self.session_id,),
+            ).fetchone()
+            # 判重只看正文：正文没变但索引新增时仍须入库，否则新落盘的结果永远
+            # 进不了摘要，成了没人知道路径的孤儿文件。
+            if prev:
+                _p_body, _p_idx = _split_spill_index(prev["summary_text"])
+                _n_body, _n_idx = _split_spill_index(summary)
+                if _summary_is_redundant(_p_body, _n_body) and _n_idx == _p_idx:
+                    logger.info(f"会话 {self.session_id} 摘要无新增信息，不重复入库")
+                    return
             conn.execute(
                 "INSERT INTO summaries (session_id, summary_text, range_start, range_end, created_at) "
                 "VALUES (?, ?, ?, ?, ?)",
@@ -1831,7 +2222,8 @@ class ChatMemory:
                     (self.session_id, MAX_SUMMARIES),
                 ).fetchall()
                 if summary_rows:
-                    summary_texts = [s["summary_text"] for s in summary_rows]
+                    summary_texts = _dedupe_summaries(
+                        [s["summary_text"] for s in summary_rows])
                     # 合并多条摘要，限制总长度避免浪费 token
                     combined = "；".join(summary_texts)
                     if len(combined) > 600:
@@ -2151,11 +2543,14 @@ class ChatMemory:
             'short_term_max_tokens': SHORT_TERM_MAX_TOKENS,
             'short_term_max_chars_per_round': SHORT_TERM_MAX_CHARS_PER_ROUND,
             'short_term_min_rounds': SHORT_TERM_MIN_ROUNDS,
+            'short_term_user_guaranteed_cap': SHORT_TERM_USER_GUARANTEED_CAP,
             'short_term_max_chars_per_tool': SHORT_TERM_MAX_CHARS_PER_TOOL,
             'short_term_max_chars_per_tool_call': SHORT_TERM_MAX_CHARS_PER_TOOL_CALL,
             'short_term_keep_last_tools': SHORT_TERM_KEEP_LAST_TOOLS,
             'short_term_keep_last_tools_newest': SHORT_TERM_KEEP_LAST_TOOLS_NEWEST,
             'short_term_max_chars_per_tool_newest': SHORT_TERM_MAX_CHARS_PER_TOOL_NEWEST,
+            'tool_pointer_only': TOOL_POINTER_ONLY,
+            'tool_pointer_min_chars': TOOL_POINTER_MIN_CHARS,
             'summary_max_tokens': SUMMARY_MAX_TOKENS,
             'summary_max_chars_per_item': SUMMARY_MAX_CHARS_PER_ITEM,
             'long_term_max_tokens': LONG_TERM_MAX_TOKENS,
@@ -2166,7 +2561,8 @@ class ChatMemory:
         out = {}
         for k, default in defaults.items():
             v = mem.get(k, default)
-            out[k] = bool(v) if k in ('hierarchical_packing', 'record_stats') else int(v)
+            out[k] = bool(v) if k in ('hierarchical_packing', 'record_stats',
+                                     'tool_pointer_only') else int(v)
         return out
 
     async def recall_memories(self, query: str, limit: int = None,
@@ -2442,7 +2838,7 @@ class ChatMemory:
         def _read():
             conn = _get_db()
             srows = conn.execute(
-                "SELECT summary_text FROM summaries WHERE session_id=? "
+                "SELECT summary_text, range_end FROM summaries WHERE session_id=? "
                 "ORDER BY created_at DESC LIMIT ?",
                 (self.session_id, MAX_SUMMARIES),
             ).fetchall()
@@ -2463,18 +2859,40 @@ class ChatMemory:
         srows, mrows, mem_rows = await asyncio.to_thread(_read)
 
         # ---- 摘要层 ----
-        summary_texts = [_clean_summary_noise(r["summary_text"]) for r in srows]
+        # 去重（2026-09-22）：库里同一句话可能连续存了多条（LLM 被允许「无新信息
+        # 就复用旧摘要」），不去重就会被「；」拼成三遍相同的话塞进提示词。
+        # 索引块与正文分开处理（2026-09-22）：索引是程序化指针，混在正文里会让
+        # 「新摘要包含旧摘要」的判定失效（指针行夹在中间，包含关系断掉），去重失效
+        # 就等于每轮多付一份重复正文的 token。合并成一行、只留一份。
+        _bodies, _idx_blocks = [], []
+        for _r in srows:
+            _b, _i = _split_spill_index(_clean_summary_noise(_r["summary_text"]))
+            _bodies.append(_b)
+            if _i:
+                _idx_blocks.append(_i)
+        _merged_idx = ""
+        for _i in reversed(_idx_blocks):      # srows 是新→旧，按旧→新累计
+            _merged_idx = _merge_spill_index(_merged_idx, _i)
+        summary_texts = _dedupe_summaries(_bodies)
+        # 时效锚点（2026-09-22）：摘要只覆盖到 range_end 那条消息为止，之后的状态
+        # 可能已经变了（任务做完、决定推翻）。不标出来，模型会把摘要里的「进行中」
+        # 当成当前事实，与后面的「最近任务执行」层自相矛盾。
+        _s_end = max((r[1] or 0) for r in srows) if srows else 0
+        _stale_hint = (f"（这些摘要覆盖到第 {_s_end} 条消息为止；"
+                       f"之后若有变化，以「最近任务执行」和最近对话为准）\n") if _s_end else ""
         if enabled:
             kept_s, _ = _pack_by_token_budget(
                 summary_texts, hcfg['summary_max_tokens'], hcfg['summary_max_chars_per_item'])
             n_summaries = len(kept_s)
-            summary_block = ("以下是之前的对话摘要：\n" + "；".join(kept_s)) if kept_s else None
+            summary_block = ("以下是之前的对话摘要：\n" + (f"{_merged_idx}\n" if _merged_idx else "")
+                             + _stale_hint + "；".join(kept_s)) if (kept_s or _merged_idx) else None
         else:
             combined = "；".join(summary_texts)
             if len(combined) > 600:
                 combined = combined[:597] + "..."
             n_summaries = len(summary_texts)
-            summary_block = ("以下是之前的对话摘要：\n" + combined) if combined else None
+            summary_block = ("以下是之前的对话摘要：\n" + (f"{_merged_idx}\n" if _merged_idx else "")
+                             + _stale_hint + combined) if (combined or _merged_idx) else None
 
         # ---- 常驻长期记忆层 ----
         mem_lines = [f"- {m['memory_text']}" for m in mem_rows[:hcfg['long_term_top_k']]]
@@ -2550,7 +2968,13 @@ class ChatMemory:
                     SHORT_TERM_MAX_CHARS_PER_TOOL_NEWEST),
                 keep_last_tools_newest=hcfg.get(
                     'short_term_keep_last_tools_newest',
-                    SHORT_TERM_KEEP_LAST_TOOLS_NEWEST))
+                    SHORT_TERM_KEEP_LAST_TOOLS_NEWEST),
+                user_guaranteed_cap=hcfg.get(
+                    'short_term_user_guaranteed_cap',
+                    SHORT_TERM_USER_GUARANTEED_CAP),
+                pointer_only=hcfg.get('tool_pointer_only', TOOL_POINTER_ONLY),
+                pointer_min_chars=hcfg.get('tool_pointer_min_chars',
+                                           TOOL_POINTER_MIN_CHARS))
         else:
             history = raw_records
         n_rounds = sum(1 for m in history if m.get("role") == "user")
