@@ -499,7 +499,7 @@ def _single_result_max_tokens() -> int:
             or SINGLE_RESULT_MAX_TOKENS)
         return max(100, v)
     except Exception:
-        return TOOL_RESULT_RETRO_CAP
+        return SINGLE_RESULT_MAX_TOKENS
 
 
 def _compact_hysteresis() -> float:
