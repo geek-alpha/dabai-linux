@@ -149,6 +149,31 @@ SHORT_TERM_MAX_CHARS_PER_TOOL_NEWEST = 0
 # 回读率用 tools/spill_pointer_cost.py --readback 从库里实测，不靠感觉。
 TOOL_POINTER_ONLY = True
 TOOL_POINTER_MIN_CHARS = SHORT_TERM_MAX_CHARS_PER_TOOL
+# 读型工具：它们的输出就是「模型主动要看的正文」。对它们做指针化是自我否定——指针写着
+# 「用 read_lines 读它」，而 read_lines 的结果又被换成新指针，于是每轮读到的都是指针本身。
+# 2026-09-23 实测：读回落盘判据连走 8 轮（137b1bc7e4→e03778f5e3→4a4f912942→…），
+# 每轮生成一个新 .txt（read_lines 加的行号前缀让内容哈希变化，按内容去重失效），
+# 判据一个字节都没进上下文。所以读型结果永不指针化，改用截断控体积。
+_READ_TOOL_NAMES = frozenset({'read_lines', 'read_file', 'code_read', 'read_json', 'cat'})
+# 最新一轮的读型结果给更宽的上限：读回正文本来就是「下一轮唯一必读的上下文」，
+# 砍到 500 字等于让「读回」这个动作无效（判据多在正文头部几行）。历史轮不放宽，越旧越该丢。
+_READ_TOOL_MAX_CHARS = 2000
+# 指针文本本身永不落盘：它的全部价值是指向别处的地址，埋进文件只会再造一条读回链。
+_POINTER_MARK = "【工具结果原文已落盘"
+# 读型工具的产物有固定形状：每行 `   123│ 内容`（read_lines / code_read 的行号前缀）。
+# 靠形状识别而不靠工具名：摘要区间切在中间时 pending 队列为空，工具名还原不出（实测落盘
+# 记录 tool 字段全为空），名字一空豁免就失效、套娃链照样成立。
+_READBACK_LINE_RE = re.compile(r'(?m)^\s{0,6}\d{1,6}│ ')
+
+
+def _is_readback_text(text: str) -> bool:
+    """这条工具结果是不是「把已落盘的正文读回来」的产物。
+
+    读它 → 输出带行号 → 内容哈希再变（按内容去重失效）→ 又落盘成新文件，
+    于是每轮读到的都是指针本身。所以读取产物一律不再落盘。
+    只看前 4000 字：判据是「有行号前缀」，采样足够且不随文件变大而变慢。
+    """
+    return len(_READBACK_LINE_RE.findall(text[:4000])) >= 3
 SUMMARY_MAX_TOKENS = 800                 # 长期摘要块预算（累计式摘要自包含，最新一条优先全量）
 SUMMARY_MAX_CHARS_PER_ITEM = 600         # 单条摘要最大字符（与累计摘要 600 字上限一致）
 LONG_TERM_MAX_TOKENS = 300               # 常驻长期记忆块预算
@@ -477,6 +502,8 @@ def _spill_tool_text(text: str, tool_name: str = "") -> str:
 
     按内容哈希命名：同一条命令重复执行不会堆出一堆重复文件。
     """
+    if _POINTER_MARK in text or _is_readback_text(text):
+        return ""
     try:
         _TOOL_SPILL_DIR.mkdir(parents=True, exist_ok=True)
         path = _TOOL_SPILL_DIR / f"{hashlib.sha1(text.encode('utf-8', 'ignore')).hexdigest()[:10]}.txt"
@@ -514,10 +541,13 @@ def _spill_index_for(messages: list) -> str:
     for m in messages:
         if m.get("role") != "tool":
             continue
+        tool_name = names.get(id(m), '')
         text = (m.get("content") or "").strip()
+        if tool_name in _READ_TOOL_NAMES or _is_readback_text(text):
+            continue   # 读型结果不落盘，索引里也就不该出现指向它的指针
         if len(text) <= _SPILL_INDEX_MIN_CHARS:
             continue
-        path = _spill_tool_text(text, names.get(id(m), ''))
+        path = _spill_tool_text(text, tool_name)
         if path:
             items.append(f"{Path(path).name}({len(text)}字)")
     if not items:
@@ -822,18 +852,26 @@ def _pack_one_round(rnd: list, cap: int, budget_tokens: int,
         content = m.get('content') or ''
         role = m.get('role')
         if role == 'tool' and max_chars_per_tool:
+            tool_name = names.get(id(m), '')
+            # 名字可能还原不出（见 _is_readback_text），所以再用产物形状兜一层
+            is_read = tool_name in _READ_TOOL_NAMES or _is_readback_text(content)
             ptr = ""
-            if pointer_only and pointer_min_chars and len(content) > pointer_min_chars:
-                ptr = _pointer_line(content, names.get(id(m), ''))
+            if (pointer_only and pointer_min_chars and len(content) > pointer_min_chars
+                    and not is_read):
+                ptr = _pointer_line(content, tool_name)
                 # 指针自己比上限还长时退回截断：被截断的地址不是地址
                 if len(ptr) >= max_chars_per_tool:
                     ptr = ""
             if ptr:
                 content = ptr
+            elif is_read:
+                # 读型结果不落盘（落盘就套娃，见 _READ_TOOL_NAMES），只截断
+                limit = max(max_chars_per_tool, _READ_TOOL_MAX_CHARS if is_newest else 0)
+                content = _truncate_head_tail(content, limit)
             else:
                 # 工具结果留头留尾（尾部才是结论，见 _truncate_head_tail）
                 content = _truncate_head_tail(content, max_chars_per_tool, spill=True,
-                                               spill_name=names.get(id(m), ''))
+                                               spill_name=tool_name)
         elif role == 'user' and cap and ignore_budget and user_cap:
             # 保底轮的 user 原话：不跟 assistant 共用单轮上限。
             # cap 为 0（最新一轮）时不进这里——最新一轮本来就整段保留。
