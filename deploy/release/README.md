@@ -128,6 +128,11 @@ python deploy/release/watch_release.py v1.0.0
 
 （`publish.py` 第 ⑥ 步跑的就是它。）
 
+run 转 completed 不等于资产已经能查到：`releases/tags/{tag}` 端点有缓存延迟，刚建好的
+release 在它那儿可能还是 404（v1.1.19 首发实测：同一时刻按 id 查已见 2 个资产、按 tag 查是空）。
+脚本拿到 release id 后改按 id 查，并在 `--assets-window`（默认 180s）内继续等资产齐 ——
+「窗口内资产始终不齐」判失败（1），「release 压根没建出来」算超时（2）。
+
 只读观察者，不产生任何发布能力——建 release 的仍是 CI 的 publish 步骤，不违背
 「发布只能有一个实现」。
 

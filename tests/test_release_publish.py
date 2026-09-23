@@ -13,6 +13,7 @@ import json
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -269,6 +270,101 @@ def test_wait_run_returns_immediately_on_hit(monkeypatch):
     run, err = watch.wait_run("o/r", "abc", "tok", window=30, interval=5)
     assert run == {"id": 7}
     assert len(calls) == 1
+
+
+# --- watch_release：run 成功 ≠ 资产已可读 ---
+#
+# v1.1.19 首发实测：run 转 completed 的同一时刻，releases/{id} 已见 2 个资产、
+# releases/tags/{tag} 还是空 —— by-tags 有缓存延迟，而资产本身也是逐个上传的。
+# 查一次就判「缺资产」退出 1 是假失败；「release 压根没建出来」是超时（2），不是失败（1）。
+
+
+def _seq_api(monkeypatch, replies):
+    """按调用顺序返回预设响应；用完后一直重复最后一个。"""
+    calls = []
+
+    def fake(url, token, timeout=30):
+        calls.append(url)
+        return replies[min(len(calls) - 1, len(replies) - 1)]
+
+    monkeypatch.setattr(watch, "api_get", fake)
+    return calls
+
+
+def _quiet(*a, **k):
+    return None
+
+
+def test_wait_assets_switches_to_id_endpoint(monkeypatch):
+    """by-tags 只用来换 id，之后按 id 查 —— 资产逐个上传时也不能第一次就返回。"""
+    calls = _seq_api(monkeypatch, [
+        (200, {"id": 77, "assets": []}),
+        (200, {"id": 77, "assets": [{"name": "a.tar.gz"}]}),
+        (200, {"id": 77, "assets": [{"name": "a.tar.gz"}, {"name": "a.tar.gz.sha256"}]}),
+    ])
+    rel_id, assets = watch.wait_assets(
+        "o/r", "v1.0.0", "tok", ("a.tar.gz", "a.tar.gz.sha256"),
+        deadline=time.time() + 5, interval=0.01, log=_quiet)
+    assert (rel_id, assets) == (77, ["a.tar.gz", "a.tar.gz.sha256"])
+    assert calls[0].endswith("/releases/tags/v1.0.0")
+    assert "/releases/77" in calls[1]
+
+
+def test_wait_assets_waits_out_tag_endpoint_lag(monkeypatch):
+    """by-tags 还在 404 时别放弃：缓存一过期拿到 id，就按 id 查出资产。"""
+    _seq_api(monkeypatch, [
+        (404, {}),
+        (404, {}),
+        (200, {"id": 5, "assets": [{"name": "a.tar.gz"}, {"name": "a.tar.gz.sha256"}]}),
+    ])
+    rel_id, assets = watch.wait_assets(
+        "o/r", "v1.0.0", "tok", ("a.tar.gz", "a.tar.gz.sha256"),
+        deadline=time.time() + 5, interval=0.01, log=_quiet)
+    assert rel_id == 5
+    assert assets == ["a.tar.gz", "a.tar.gz.sha256"]
+
+
+def test_wait_assets_reports_partial_after_deadline(monkeypatch):
+    """窗口耗尽时把「已建出来但资产不全」如实交回，由调用方判 1。"""
+    _seq_api(monkeypatch, [(200, {"id": 9, "assets": [{"name": "a.tar.gz"}]})])
+    rel_id, assets = watch.wait_assets(
+        "o/r", "v1.0.0", "tok", ("a.tar.gz", "a.tar.gz.sha256"),
+        deadline=time.time() - 1, interval=0.01, log=_quiet)
+    assert (rel_id, assets) == (9, ["a.tar.gz"])
+
+
+def test_wait_assets_none_id_when_release_absent(monkeypatch):
+    """release 一直没建出来：id 为 None —— 调用方据此报超时（2），不是失败（1）。"""
+    _seq_api(monkeypatch, [(404, {})])
+    rel_id, assets = watch.wait_assets(
+        "o/r", "v1.0.0", "tok", ("a.tar.gz",),
+        deadline=time.time() - 1, interval=0.01, log=_quiet)
+    assert rel_id is None
+    assert assets == []
+
+
+def _wire_watch_main(monkeypatch, wait_result):
+    monkeypatch.setattr(watch, "get_token", lambda: "tok")
+    monkeypatch.setattr(watch, "tag_commit", lambda root, tag: "abc123")
+    monkeypatch.setattr(watch, "wait_run", lambda *a, **k: (
+        {"id": 42, "display_title": "release", "status": "completed"}, None))
+    monkeypatch.setattr(watch, "api_get", lambda *a, **k: (
+        200, {"status": "completed", "conclusion": "success"}))
+    monkeypatch.setattr(watch, "wait_assets", lambda *a, **k: wait_result)
+
+
+def test_main_exit2_when_release_never_appears(monkeypatch):
+    """workflow 成功但 release 没建出来 = 还没落地（超时），退出码 2 —— 不是失败。"""
+    _wire_watch_main(monkeypatch, (None, []))
+    monkeypatch.setattr(sys, "argv", ["watch_release.py", "v1.0.0", "--assets-window", "0"])
+    assert watch.main() == 2
+
+
+def test_main_exit1_when_release_truly_missing_assets(monkeypatch):
+    """release 建出来了但资产真缺 —— 这才是失败，退出码 1。"""
+    _wire_watch_main(monkeypatch, (9, ["dabai-1.0.0.tar.gz"]))
+    monkeypatch.setattr(sys, "argv", ["watch_release.py", "v1.0.0", "--assets-window", "0"])
+    assert watch.main() == 1
 
 
 # --- 发布端不碰联邦：更新归每台机器自己的定时器 ---

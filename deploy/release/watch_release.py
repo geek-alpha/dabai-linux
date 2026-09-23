@@ -8,8 +8,8 @@
 
 退出码：
   0  release 已落地（tar.gz + sha256 资产齐全）
-  1  workflow 失败 / 被取消
-  2  超时未落地 / 参数或凭证问题
+  1  workflow 失败 / 被取消 / release 建出来了但资产真缺
+  2  超时未落地（含资产同步超出窗口）/ 参数或凭证问题
 
 设计原则：只读观察者。不产生任何发布能力，不违反
 「发布只能有一个实现」（deploy/release/README.md）——
@@ -116,12 +116,52 @@ def pending_approvals(repo: str, run_id: int, token: str) -> list:
     return d if isinstance(d, list) else []
 
 
-def release_assets(repo: str, tag: str, token: str):
-    """release 资产名列表；release 不存在返回 None。"""
+def release_by_tag(repo: str, tag: str, token: str):
+    """release 详情；不存在返回 None。"""
     st, d = api_get(f"https://api.github.com/repos/{repo}/releases/tags/{tag}", token)
+    return d if st == 200 else None
+
+
+def release_assets(repo: str, tag: str, token: str, release_id=None):
+    """release 资产名列表；release 不存在返回 None。
+
+    给了 release_id 就走 by-id 端点：by-tags 有缓存延迟，刚建出来的 release
+    在它那儿可能还是 404。
+    """
+    url = (f"https://api.github.com/repos/{repo}/releases/{release_id}"
+           if release_id else f"https://api.github.com/repos/{repo}/releases/tags/{tag}")
+    st, d = api_get(url, token)
     if st != 200:
         return None
     return [a.get("name") for a in d.get("assets", [])]
+
+
+def wait_assets(repo: str, tag: str, token: str, names, deadline: float,
+                interval: int = 10, sleep=time.sleep, log=print):
+    """等 release 资产齐，返回 (release_id, 资产名列表)。
+
+    为什么不能查一次就判死：run 转 completed 与「release 资产查得到」之间有一段
+    同步延迟，by-tags 端点尤其明显 —— v1.1.19 首发实测同一时刻 by-id 已见 2 个资产、
+    by-tags 还是空，脚本当场报「缺资产」退出 1，几秒后资产其实齐了。
+    所以拿到 release id 就改走 by-id 绕开缓存；资产没齐继续等，等到 deadline 为止。
+    返回的 release_id 为 None 表示窗口内 release 压根没建出来。
+    """
+    rel_id = None
+    assets: list = []
+    while True:
+        if rel_id is None:
+            rel = release_by_tag(repo, tag, token)
+            if rel:
+                rel_id = rel.get("id")
+                assets = [a.get("name") for a in rel.get("assets", [])]
+        else:
+            got = release_assets(repo, tag, token, release_id=rel_id)
+            if got is not None:
+                assets = got
+        if all(n in assets for n in names) or time.time() >= deadline:
+            return rel_id, assets
+        log(f"  … release {tag} 资产未齐（现有 {len(assets)} 个），{interval}s 后重查")
+        sleep(interval)
 
 
 def failed_steps(repo: str, run_id: int, token: str) -> str:
@@ -144,6 +184,8 @@ def main() -> int:
     ap.add_argument("--root", default="/home/wxf/dabai")
     ap.add_argument("--timeout", type=int, default=1800, help="总超时秒数，默认 1800")
     ap.add_argument("--interval", type=int, default=30, help="轮询间隔秒数，默认 30")
+    ap.add_argument("--assets-window", type=int, default=180,
+                    help="run 成功后等 release 资产同步的最长秒数，默认 180")
     args = ap.parse_args()
 
     token = get_token()
@@ -176,13 +218,16 @@ def main() -> int:
         conclusion = d.get("conclusion")
         if status == "completed":
             if conclusion == "success":
-                assets = release_assets(args.repo, args.tag, token)
-                if assets is None:
-                    print(f"✘ workflow 成功但 release {args.tag} 还没建出来（可能刚完成，稍后再看）")
-                    return 1
-                missing = [n for n in (f"dabai-{args.tag[1:]}.tar.gz",
-                                       f"dabai-{args.tag[1:]}.tar.gz.sha256")
-                           if n not in assets]
+                names = (f"dabai-{args.tag[1:]}.tar.gz",
+                         f"dabai-{args.tag[1:]}.tar.gz.sha256")
+                rel_id, assets = wait_assets(
+                    args.repo, args.tag, token, names,
+                    deadline=min(time.time() + args.assets_window, deadline),
+                    interval=min(args.interval, 10), log=print)
+                if rel_id is None:
+                    print(f"✘ workflow 成功，但 {args.assets_window}s 内 release {args.tag} 仍未建出来")
+                    return 2
+                missing = [n for n in names if n not in assets]
                 if missing:
                     print(f"✘ release 缺资产：{missing}")
                     print(f"   现有：{assets}")
