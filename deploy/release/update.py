@@ -30,13 +30,23 @@
 from __future__ import annotations
 
 import argparse
-import grp
+import concurrent.futures
 import gzip
 import hashlib
 import json
 import os
-import pwd
 import re
+
+# Windows 上没有 pwd / grp（那是 POSIX 的账户库）。它们只在「解析安装目录属主」和
+# 「桌面通知」两处用到，都在 POSIX 分支里；这里留空占位，好让模块在 Windows 上也能
+# import —— 否则更新器连启动都做不到，报出来的还是 ImportError，看着像包坏了。
+IS_WINDOWS = os.name == "nt"
+if IS_WINDOWS:
+    pwd = None  # type: ignore[assignment]
+    grp = None  # type: ignore[assignment]
+else:
+    import grp
+    import pwd
 import shutil
 import socket
 import subprocess
@@ -51,15 +61,20 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 SCHEMA_VERSION = 1
 MANIFEST_NAME = "MANIFEST.json"
-# 交给独立 unit 时打的标记：调用方（peer_autoupdate）靠它区分「已移交」和「已装好」
+# 交给独立 unit 时打的标记：拉起它的脚本靠它区分「已移交」和「已装好」
 DETACH_MARK = "[detached]"
 
 # ── 配置默认值（可被 /etc/dabai/update.conf 或命令行覆盖）──────────────────
+# 平台默认值。Linux 按 FHS 放 /var/lib、SERVICE 给 systemd 单元名；Windows 放
+# %LOCALAPPDATA%（用户级，装更新不需要管理员）、SERVICE 给计划任务名。
+# 两边都能被配置文件覆盖，这里只是「什么都没配时」的合理起点。
+_LOCALAPPDATA = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
 DEFAULTS = {
-    "ROOT": "/home/wxf/dabai",
-    "STATE": "/var/lib/dabai-update",
+    "ROOT": str(Path.home() / "dabai") if IS_WINDOWS else "/home/wxf/dabai",
+    "STATE": str(Path(_LOCALAPPDATA) / "dabai-update") if IS_WINDOWS
+             else "/var/lib/dabai-update",
     "REPO": "geek-alpha/dabai-linux",
-    "SERVICE": "myservice",
+    "SERVICE": "DabaiServer" if IS_WINDOWS else "myservice",
     "PORT": "8000",
     "ENTRY": "server.py",
     "KEEP_BACKUPS": "3",
@@ -181,9 +196,18 @@ def safe_join(base: Path, rel: str) -> Path:
 
 
 # ── 配置与凭证 ───────────────────────────────────────────────────────────
-CONF_FILE = Path("/etc/dabai/update.conf")
-USER_CONF = Path.home() / ".config" / "dabai" / "update.conf"
-SECRET_FILES = (Path("/etc/dabai/secrets.env"), Path.home() / ".config" / "dabai" / "secrets.env")
+# Windows 没有「系统级 + 用户级」两份配置的传统，统一放 %APPDATA%\dabai\。
+# 配置本身不含密钥，密钥在同目录的 secrets.env，两边都不进仓库。
+if IS_WINDOWS:
+    _APPDATA = Path(os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming"))
+    CONF_FILE = _APPDATA / "dabai" / "update.conf"
+    USER_CONF = CONF_FILE
+    SECRET_FILES = (_APPDATA / "dabai" / "secrets.env",)
+else:
+    CONF_FILE = Path("/etc/dabai/update.conf")
+    USER_CONF = Path.home() / ".config" / "dabai" / "update.conf"
+    SECRET_FILES = (Path("/etc/dabai/secrets.env"),
+                    Path.home() / ".config" / "dabai" / "secrets.env")
 
 
 def load_conf() -> Dict[str, str]:
@@ -191,7 +215,9 @@ def load_conf() -> Dict[str, str]:
     for p in (CONF_FILE, USER_CONF):
         if not p.is_file():
             continue
-        for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+        # utf-8-sig：Windows 记事本 / PowerShell Set-Content 存 UTF-8 会带 BOM，
+        # 按 utf-8 读会让第一个键变成 "\ufeffROOT"，配置静默失效。
+        for line in p.read_text(encoding="utf-8-sig", errors="replace").splitlines():
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
@@ -208,7 +234,7 @@ def get_token() -> str:
         if not p.is_file():
             continue
         try:
-            for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+            for line in p.read_text(encoding="utf-8-sig", errors="replace").splitlines():
                 if line.startswith("GITHUB_TOKEN="):
                     return line.split("=", 1)[1].strip().strip('"').strip("'")
         except OSError:
@@ -229,6 +255,8 @@ def _probe_writable(d: Path) -> bool:
 
 
 def state_candidates(cfg: Dict[str, str]) -> Tuple[Path, ...]:
+    if IS_WINDOWS:
+        return (Path(cfg["STATE"]), Path(_LOCALAPPDATA) / "dabai-update")
     return (Path(cfg["STATE"]), Path.home() / ".local" / "state" / "dabai-update")
 
 
@@ -249,10 +277,12 @@ def state_dir(cfg: Dict[str, str]) -> Path:
         if all(_probe_writable(cand / sub) for sub in ("staging", "backups")):
             return cand
     tried = "、".join(str(c) for c in state_candidates(cfg))
+    hint = ("   换一个 --state 路径，或删掉那个目录再试" if IS_WINDOWS
+            else f"   若是历史遗留的 root 属主目录，原地修：sudo chown -R $(id -u):$(id -g) {cfg['STATE']}")
     raise SystemExit(
         "✘ 找不到可写的状态目录（staging/backups 至少得能写）\n"
         f"   试过：{tried}\n"
-        f"   若是历史遗留的 root 属主目录，原地修：sudo chown -R $(id -u):$(id -g) {cfg['STATE']}"
+        f"{hint}"
     )
 
 
@@ -343,15 +373,74 @@ def detect_proxy() -> Optional[str]:
 # 有代理走代理直连；没代理时 GitHub 直连是国内最慢的一段（60KB/s 量级，26MB
 # 要 6 分钟还常超时），自动切 ghproxy 类国内加速前缀。环境变量 DABAI_GITHUB_MIRROR
 # 可显式指定（如 https://ghproxy.net/，部署时写进 /etc/dabai/proxy.env 或 export）。
-# 候选逐个轻量探测，第一个能用的锁住；全挂回退直连 —— 没镜像的机器行为不变。
+# 候选并发探测，按优先级取第一个能用的；全挂回退直连 —— 没镜像的机器行为不变。
+#
+# 探测结论落盘缓存：定时器每次都是新进程，不缓存就是每次检查都重付一遍探测。
+# 串行探测最坏 3×8s = 24s（没代理的机器上这是常态），并发+缓存后是秒级。
 MIRROR_PREFIXES = (
     "https://ghproxy.net/",
     "https://gh-proxy.com/",
     "https://mirror.ghproxy.com/",
 )
-MIRROR_PROBE_TIMEOUT = 8
+MIRROR_PROBE_TIMEOUT = 4
+MIRROR_CACHE_TTL = 6 * 3600
 _mirror_cache: Optional[str] = None
 _mirror_probed = False
+NET_CACHE_NAME = "net_probe.json"
+
+
+def _net_cache_file() -> Optional[Path]:
+    """探测结论落盘位置 —— 用状态目录，仓库之外（更新器不往被更新物里写东西）。"""
+    for cand in state_candidates(DEFAULTS):
+        if _probe_writable(cand):
+            return cand / NET_CACHE_NAME
+    return None
+
+
+def _cached_mirror() -> Tuple[bool, Optional[str]]:
+    """(有没有命中缓存, 镜像前缀)。「直连」也是一个要缓存的结论，过期即作废。"""
+    f = _net_cache_file()
+    if not f or not f.is_file():
+        return False, None
+    try:
+        d = json.loads(f.read_text(encoding="utf-8"))
+        if time.time() - float(d.get("ts") or 0) > MIRROR_CACHE_TTL:
+            return False, None
+    except (OSError, ValueError, TypeError):
+        return False, None
+    m = d.get("mirror")
+    return True, (str(m) if m else None)
+
+
+def _save_mirror(prefix: Optional[str]) -> None:
+    f = _net_cache_file()
+    if not f:
+        return
+    try:
+        f.write_text(json.dumps({"mirror": prefix, "ts": time.time()}), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _probe_mirror(prefix: str) -> Optional[str]:
+    try:
+        probe = urllib.request.Request(
+            prefix + "https://api.github.com/rate_limit",
+            headers={"User-Agent": "dabai-update"})
+        with urllib.request.urlopen(probe, timeout=MIRROR_PROBE_TIMEOUT) as r:
+            return prefix if r.status < 500 else None
+    except Exception:
+        return None
+
+
+def _probe_mirrors() -> Optional[str]:
+    """并发探测，按 MIRROR_PREFIXES 的顺序取第一个能用的 —— 总耗时 = 最慢那个，不是三个相加。"""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(MIRROR_PREFIXES)) as pool:
+        results = list(pool.map(_probe_mirror, MIRROR_PREFIXES))
+    for prefix, hit in zip(MIRROR_PREFIXES, results):
+        if hit:
+            return hit
+    return None
 
 
 def mirror_prefix() -> Optional[str]:
@@ -366,18 +455,13 @@ def mirror_prefix() -> Optional[str]:
     if override:
         _mirror_cache = override + "/"
         return _mirror_cache
-    for prefix in MIRROR_PREFIXES:
-        try:
-            probe = urllib.request.Request(
-                prefix + "https://api.github.com/rate_limit",
-                headers={"User-Agent": "dabai-update"})
-            with urllib.request.urlopen(probe, timeout=MIRROR_PROBE_TIMEOUT) as r:
-                if r.status < 500:
-                    _mirror_cache = prefix
-                    return _mirror_cache
-        except Exception:
-            continue
-    return None
+    hit, cached = _cached_mirror()
+    if hit:
+        _mirror_cache = cached
+        return _mirror_cache
+    _mirror_cache = _probe_mirrors()
+    _save_mirror(_mirror_cache)
+    return _mirror_cache
 
 
 def route_url(url: str) -> str:
@@ -831,7 +915,8 @@ def _in_service_cgroup(service: str, cgroup_text: Optional[str] = None) -> bool:
     是的话 systemctl stop 的 KillMode=control-group 会把更新器一起杀掉 ——
     文件没换、服务停着起不来，日志里只剩一行「⑤ 停机」。
     """
-    if not service:
+    if IS_WINDOWS or not service:
+        # Windows 没有 cgroup：停机按端口找进程树，不会波及更新器自己
         return False
     names = {service, service if service.endswith(".service") else service + ".service"}
     if cgroup_text is None:
@@ -850,7 +935,7 @@ def _token_in_file() -> bool:
     """token 能不能只靠文件拿到。能就别从 argv 接 —— argv 同机任何用户可读。"""
     for p in SECRET_FILES:
         try:
-            if p.is_file() and "GITHUB_TOKEN=" in p.read_text(encoding="utf-8", errors="replace"):
+            if p.is_file() and "GITHUB_TOKEN=" in p.read_text(encoding="utf-8-sig", errors="replace"):
                 return True
         except OSError:
             continue
@@ -867,6 +952,9 @@ def _run_user_for(cfg: Dict[str, str]) -> Optional[Tuple[str, str]]:
     实测 2026-09-20 orangepi：✘ Permission denied: /var/lib/dabai-update/staging/…part。
     解析不出属主就返回 None（维持旧行为），调用方负责把这件事记进日志。
     """
+    if IS_WINDOWS:
+        # Windows 没有「属主决定身份」这套：计划任务自带运行账户，这里无事可做
+        return None
     try:
         st = Path(cfg.get("ROOT") or ".").stat()
         return (pwd.getpwuid(st.st_uid).pw_name, grp.getgrgid(st.st_gid).gr_name)
@@ -880,6 +968,10 @@ def detach_self(cfg: Dict[str, str], argv: Sequence[str]) -> int:
     新 unit 与目标服务平级、cgroup 互不相干，stop 目标服务不会再杀掉更新器。
     日志照旧双写 state_dir/update.log，脱离终端不影响取证。
     """
+    if IS_WINDOWS:
+        # Windows 没有 cgroup 牵连：停机按端口找进程树，更新器不在那棵树里，
+        # 不需要「先把自己挪出去」这一步，原进程接着跑就行。
+        return 0
     unit = f"dabai-updater-{int(time.time())}"
     cmd = ["systemd-run", "--unit", unit, "--collect", "--quiet",
            "--property=Type=oneshot",
@@ -898,7 +990,7 @@ def detach_self(cfg: Dict[str, str], argv: Sequence[str]) -> int:
         # 接受它是因为另一种结局更差 —— 新 unit 找不到 token，更新直接失败。
         cmd.append(f"--setenv=GITHUB_TOKEN={tok}")
     cmd += ["--", sys.executable, str(Path(__file__).resolve()), *argv, "--detached"]
-    if os.geteuid() != 0:
+    if not _is_root():
         cmd = ["sudo", "-n"] + cmd
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
@@ -917,11 +1009,131 @@ def detach_self(cfg: Dict[str, str], argv: Sequence[str]) -> int:
     return 0
 
 
+# ── 平台差异（自带，不依赖仓库）────────────────────────────────────────
+# 为什么不 import 仓库里的 platform_compat：仓库正是被更新的对象。更新器跑到一半时
+# 仓库文件正在被替换，那时再去 import 它，等于拿一份读到一半的东西做判据。
+def _is_root() -> bool:
+    """当前进程是不是 root / 管理员。Windows 没有 geteuid。"""
+    if IS_WINDOWS:
+        try:
+            import ctypes
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())  # type: ignore[attr-defined]
+        except Exception:
+            return False
+    try:
+        return os.geteuid() == 0
+    except AttributeError:
+        return False
+
+
+def _server_python(cfg: Dict[str, str]) -> str:
+    """起服务用哪个解释器：优先仓库自己的 venv，其次跑更新器的这个。"""
+    root = Path(cfg["ROOT"])
+    cands = ([root / "venv" / "Scripts" / "python.exe"] if IS_WINDOWS
+             else [root / "venv" / "bin" / "python3", root / "venv" / "bin" / "python"])
+    for c in cands:
+        if c.is_file():
+            return str(c)
+    return sys.executable
+
+
+def _win_listen_pids(port: str) -> List[int]:
+    """监听指定端口的进程 pid（Windows）。走 netstat -ano，不引第三方库。"""
+    if not port:
+        return []
+    try:
+        p = subprocess.run(["netstat", "-ano", "-p", "TCP"], capture_output=True,
+                           text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    want = ":" + str(port)
+    pids: List[int] = []
+    for line in p.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 5 or parts[0].upper() != "TCP":
+            continue
+        if parts[3].upper() != "LISTENING" or not parts[1].endswith(want):
+            continue
+        try:
+            pid = int(parts[4])
+        except ValueError:
+            continue
+        if pid not in pids:
+            pids.append(pid)
+    return pids
+
+
+def _win_stop_service(cfg: Dict[str, str]) -> Tuple[int, str]:
+    """Windows 停机：结束监听体检端口的进程树。
+
+    Windows 没有 systemd，也就没有 KillMode=control-group。以「谁占着端口」定目标
+    而不是按进程名匹配 —— 按名字匹会误杀同名进程，而端口是服务自己声明过的。
+    """
+    pids = _win_listen_pids(cfg.get("PORT", ""))
+    if not pids:
+        return 0, "没有进程在监听体检端口，视为已停"
+    rc, msgs = 0, []
+    for pid in pids:
+        try:
+            p = subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                               capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.SubprocessError) as ex:
+            msgs.append(f"pid {pid}: {ex}")
+            rc = 1
+            continue
+        msgs.append(f"pid {pid}: " + (p.stdout + p.stderr).strip())
+        rc = rc or p.returncode
+    return rc, " / ".join(m for m in msgs if m)
+
+
+def _win_start_service(cfg: Dict[str, str]) -> Tuple[int, str]:
+    """Windows 起服务：优先让计划任务拉起，没装就直接分离启动。
+
+    计划任务优先，是因为它同时承担开机自启与崩溃自愈（见 deploy/windows/）。
+    两条路都要求新进程脱离更新器：否则更新器一退，服务就跟着没了。
+    """
+    task = cfg.get("SERVICE", "")
+    if task:
+        try:
+            p = subprocess.run(["schtasks", "/run", "/tn", task],
+                               capture_output=True, text=True, timeout=60)
+            if p.returncode == 0:
+                return 0, f"已让计划任务 {task} 拉起服务"
+        except (OSError, subprocess.SubprocessError):
+            pass
+    root = Path(cfg["ROOT"])
+    entry = root / cfg.get("ENTRY", "server.py")
+    if not entry.is_file():
+        return 1, f"找不到入口 {entry}"
+    py = _server_python(cfg)
+    try:
+        subprocess.Popen(
+            [py, str(entry)], cwd=str(root),
+            creationflags=0x00000008 | 0x00000200,  # DETACHED_PROCESS | NEW_PROCESS_GROUP
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, close_fds=True)
+    except OSError as ex:
+        return 1, f"启动失败：{ex}"
+    return 0, f"已分离启动 {py} {entry.name}"
+
+
 # ── 服务控制与健康检查 ───────────────────────────────────────────────────
-def svc(action: str, service: str, timeout: int = 120) -> Tuple[int, str]:
-    """控制 systemd 服务。非 root 时走 sudo -n，要求已配窄口径免密规则。"""
+def svc(action: str, service: str, timeout: int = 120,
+        cfg: Optional[Dict[str, str]] = None) -> Tuple[int, str]:
+    """控制服务。Linux 走 systemd（非 root 时 sudo -n，要求已配窄口径免密规则）；
+    Windows 没有 systemd，停/起直接落在进程上（见 _win_stop_service / _win_start_service）。"""
+    if IS_WINDOWS:
+        c = cfg if cfg is not None else load_conf()
+        if action == "stop":
+            return _win_stop_service(c)
+        if action == "start":
+            return _win_start_service(c)
+        if action in ("is-active", "status"):
+            alive = bool(_win_listen_pids(c.get("PORT", "")))
+            return (0, "active") if alive else (3, "inactive")
+        return 2, f"Windows 上不支持的服务动作：{action}"
     cmd = ["systemctl", action, service]
-    if os.geteuid() != 0:
+    if not _is_root():
         cmd = ["sudo", "-n"] + cmd
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -932,7 +1144,9 @@ def svc(action: str, service: str, timeout: int = 120) -> Tuple[int, str]:
     return p.returncode, (p.stdout + p.stderr).strip()
 
 
-def svc_active(service: str) -> str:
+def svc_active(service: str, cfg: Optional[Dict[str, str]] = None) -> str:
+    if IS_WINDOWS:
+        return "active" if svc("is-active", service, cfg=cfg)[0] == 0 else "inactive"
     _rc, out = svc("is-active", service)
     out = out.strip()
     return out.splitlines()[0] if out else "unknown"
@@ -945,9 +1159,12 @@ def health(cfg: Dict[str, str], service: str, port: str, settle: float = 8.0) ->
     任何 <500 的 HTTP 回应都算「服务在答话」：这个端点可能要求鉴权，401/403 也是活的。
     """
     time.sleep(settle)
-    state = svc_active(service)
-    if state != "active":
-        return False, f"systemd 状态 {state!r}（期望 active）"
+    if not IS_WINDOWS:
+        state = svc_active(service, cfg)
+        if state != "active":
+            return False, f"systemd 状态 {state!r}（期望 active）"
+    # Windows 没有 systemd 状态可看，端口与 HTTP 就是全部判据 —— 这两条本来也更强：
+    # 进程活着但端口没起来，对用户就是不可用。
     deadline = time.time() + 40
     last = "还没探到"
     while time.time() < deadline:
@@ -1088,6 +1305,8 @@ def _skipped_path(cfg: Dict[str, str]) -> Path:
 
 def _session_buses(uid: int) -> List[Path]:
     """能拿来发桌面通知的总线：目标用户的、当前会话的，谁在算谁。"""
+    if IS_WINDOWS:
+        return []
     cands: List[Path] = []
     env = os.environ.get("DBUS_SESSION_BUS_ADDRESS", "")
     if env.startswith("unix:path="):
@@ -1104,7 +1323,13 @@ def _session_buses(uid: int) -> List[Path]:
 
 
 def _desktop_notify(cfg: Dict[str, str], title: str, body: str) -> bool:
-    """更新器以 root 跑，通知得落到登录会话的总线上；落不下去就只留日志，不算失败。"""
+    """更新器以 root 跑，通知得落到登录会话的总线上；落不下去就只留日志，不算失败。
+
+    Windows 没有 D-Bus，直接返回 False —— 通知不是更新成败的一环，结果照旧写进
+    update.log；桌面提醒交给 deploy/windows/ 那侧的计划任务。
+    """
+    if IS_WINDOWS:
+        return False
     exe = shutil.which("notify-send") or "/usr/bin/notify-send"
     if not Path(exe).is_file():
         return False
@@ -1122,7 +1347,7 @@ def _desktop_notify(cfg: Dict[str, str], title: str, body: str) -> bool:
         env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={bus}"
         env["XDG_RUNTIME_DIR"] = str(bus.parent)
         cmd = [exe, title, body]
-        if os.geteuid() == 0 and owner != 0 and shutil.which("setpriv"):
+        if _is_root() and owner != 0 and shutil.which("setpriv"):
             cmd = ["setpriv", f"--reuid={owner}", f"--regid={gid}",
                    "--init-groups", *cmd]
         try:
@@ -1204,11 +1429,11 @@ def do_rollback(cfg: Dict[str, str], args) -> int:
     if not args.no_restart and not args.detached and _in_service_cgroup(cfg["SERVICE"]):
         return detach_self(cfg, sys.argv[1:])
     if not args.no_restart:
-        rc, out = svc("stop", cfg["SERVICE"])
+        rc, out = svc("stop", cfg["SERVICE"], cfg=cfg)
         log_line(cfg, f"  停机 rc={rc} {out}")
     problems = restore(j)
     if not args.no_restart:
-        rc, out = svc("start", cfg["SERVICE"])
+        rc, out = svc("start", cfg["SERVICE"], cfg=cfg)
         log_line(cfg, f"  起服务 rc={rc} {out}")
     if problems:
         for p in problems[:10]:
@@ -1275,6 +1500,9 @@ def run(args) -> int:
 
     if getattr(args, "status", False):
         return do_status(cfg, args)
+
+    if getattr(args, "ensure_running", False):
+        return ensure_running(cfg)
 
     if args.rollback:
         return do_rollback(cfg, args)
@@ -1456,7 +1684,7 @@ def run(args) -> int:
     # ── ⑥ 停机 + 经历快照 ───────────────────────────────────────────────
     stopped = False
     if not args.no_restart:
-        rc, out = svc("stop", cfg["SERVICE"])
+        rc, out = svc("stop", cfg["SERVICE"], cfg=cfg)
         log_line(cfg, f"⑤ 停机 rc={rc} {out}")
         stopped = True
     before = witness(root)
@@ -1485,7 +1713,7 @@ def run(args) -> int:
     except Exception as ex:
         log_line(cfg, f"✘ 写入过程出错：{ex}")
         if stopped:
-            svc("start", cfg["SERVICE"])
+            svc("start", cfg["SERVICE"], cfg=cfg)
         return 1
     write_journal(cfg, {
         "from_version": cur,
@@ -1508,22 +1736,22 @@ def run(args) -> int:
             log_line(cfg, f"   {d}")
         restore(read_journal(cfg) or {})
         if stopped:
-            svc("start", cfg["SERVICE"])
+            svc("start", cfg["SERVICE"], cfg=cfg)
         return 1
     log_line(cfg, f"⑧ 经历复核通过：{len(before)} 个文件哈希逐个未变")
 
     # ── ⑨ 起服务 + 体检 ─────────────────────────────────────────────────
     if not args.no_restart:
-        rc, out = svc("start", cfg["SERVICE"])
+        rc, out = svc("start", cfg["SERVICE"], cfg=cfg)
         log_line(cfg, f"⑨ 起服务 rc={rc} {out}")
         ok_h, detail = health(cfg, cfg["SERVICE"], cfg["PORT"])
         if not ok_h:
             log_line(cfg, f"✘ 体检未通过：{detail} —— 自动回滚")
-            svc("stop", cfg["SERVICE"])
+            svc("stop", cfg["SERVICE"], cfg=cfg)
             problems = restore(read_journal(cfg) or {})
             for p in problems[:5]:
                 log_line(cfg, f"   ! 回滚问题：{p}")
-            svc("start", cfg["SERVICE"])
+            svc("start", cfg["SERVICE"], cfg=cfg)
             ok2, detail2 = health(cfg, cfg["SERVICE"], cfg["PORT"], settle=6.0)
             log_line(cfg, f"{'✔ 回滚后服务恢复' if ok2 else '✘ 回滚后仍不正常，需要人工介入'}：{detail2}")
             return 1
@@ -1543,16 +1771,40 @@ def run(args) -> int:
     return 0
 
 
+def ensure_running(cfg: Dict[str, str], settle: float = 6.0) -> int:
+    """服务没在跑就拉起来 —— 自愈入口。
+
+    Windows 上由计划任务每几分钟调一次（systemd 那边是 Restart=always，不需要它）。
+    两条判据都用「端口有没有监听」：进程活着但端口没起来，对用户就是不可用。
+    """
+    port = cfg.get("PORT", "")
+    if IS_WINDOWS:
+        alive = bool(_win_listen_pids(port))
+    else:
+        alive = svc_active(cfg.get("SERVICE", ""), cfg) == "active"
+    if alive:
+        return 0
+    log_line(cfg, f"服务没在跑（端口 {port} 无监听），拉起")
+    rc, out = svc("start", cfg["SERVICE"], cfg=cfg)
+    log_line(cfg, f"拉起 rc={rc} {out}")
+    ok, detail = health(cfg, cfg["SERVICE"], port, settle=settle)
+    log_line(cfg, ("✔ 已恢复：" if ok else "✘ 拉起后仍不通，需要人工看：") + detail)
+    return 0 if ok else 1
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="大白节点侧自动更新器")
     ap.add_argument("--root", default="", help="安装目录")
     ap.add_argument("--state", default="", help="状态/备份目录")
     ap.add_argument("--repo", default="", help="GitHub 仓库 owner/name")
-    ap.add_argument("--service", default="", help="systemd 服务名")
+    ap.add_argument("--service", default="",
+                    help="服务名：Linux 是 systemd 单元名，Windows 是计划任务名")
     ap.add_argument("--port", default="", help="服务端口")
     ap.add_argument("--check", action="store_true", help="只看有没有新版（默认行为）")
     ap.add_argument("--status", action="store_true",
                     help="看本机版本/上次更新/有没有「有新版没装上」")
+    ap.add_argument("--ensure-running", action="store_true",
+                    help="服务没在跑就拉起来（自愈，给计划任务/看门狗调）")
     ap.add_argument("--dry-run", action="store_true", help="全流程演练：不写盘、不重启")
     ap.add_argument("--apply", action="store_true", help="真更新")
     ap.add_argument("--rollback", action="store_true", help="回滚到上一版")

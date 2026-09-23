@@ -1,37 +1,16 @@
 # 大白 Linux / macOS 依赖清单
 #
-# 与 requirements.txt 的差异（逐条说明为什么剔除）：
-#   bpy / bmesh / mathutils / addon_utils / rna_prop_ui
-#       → Blender 内嵌 Python 才有的模块，PyPI 上装不了；Linux 请装系统 Blender
-#         并用环境变量 DABAI_BLENDER 指向它（模型转换技能会读这个变量）。
-#   imp → Python 3.12 起已从标准库移除，安装即失败。
-#   TodoService / amazing_agent_dingding / dabai_ears / dabai_voice /
-#   fuctions_all_you_need_base / google → 本机私有包，PyPI 上不存在。
-#   pyautogui → 截屏/自动化用；Linux 需 python3-xlib，装不上也不影响（截屏走 mss）。
+# 内容已收敛到 requirements-core.txt（跨平台唯一权威）—— 这份文件留着是为了不破坏
+# 已有脚本与文档里的引用，装出来的东西完全一样。为什么不用 requirements.txt，
+# 见 requirements-core.txt 顶部说明。
+#
+# Linux 特有提醒：
+#   - Blender 相关（bpy / bmesh / mathutils）请装系统 Blender，用 DABAI_BLENDER 指过去
+#   - netifaces 需要 python3-dev / gcc；编译失败可跳过，它只用于本机 IP 展示
 #
 # 安装：pip install -r requirements-linux.txt
-#   若某个包编译失败（如 netifaces 需要 python3-dev/gcc），可跳过它：
-#   Linux 上 netifaces 只用于本机 IP 展示，缺失会自动降级。
 
-Pillow
-aiohttp
-anthropic
-certifi
-edge-tts
-fastapi
-gradio_client
-httpx
-mss
-netifaces
-numpy
-openai
-playwright
-python-dotenv
-requests
-starlette
-tree_sitter
-uvicorn
-yt_dlp
+-r requirements-core.txt
 
 # ---- 可选（装不上不影响核心对话/3D/技能）----
 # pyautogui

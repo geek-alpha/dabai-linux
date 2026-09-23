@@ -16,10 +16,16 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parents[2]
+if str(BASE) not in sys.path:
+    sys.path.insert(0, str(BASE))
+
+import platform_compat as pc  # noqa: E402
+
 RUN_DIR = BASE / "data" / "longrun"
 STATE = RUN_DIR / "state.json"
 JOURNAL = RUN_DIR / "journal.jsonl"
@@ -33,6 +39,11 @@ LEDGER = BASE / "long_horizon.json"
 TASK_ID = "longrun-engine"
 UNIT = "dabai-longrun.service"
 WATCHDOG = "dabai-longrun-watchdog.timer"
+# Windows 没有 systemd：引擎和看门狗各是一个计划任务（名字由 install-windows.ps1 注册）
+WIN_TASK = "DabaiLongrun"
+# systemctl is-active 可能吐出的状态词；不在这张表里的一律算「取不到」
+KNOWN_STATES = {"active", "activating", "reloading", "inactive", "failed",
+                "deactivating", "dead"}
 
 # 一轮跑几分钟是常态，心跳只在一轮的头尾更新，所以「滞后」阈值取单轮上限量级；
 # 超过它才算可疑，避免把正常长轮误报成卡死。
@@ -103,13 +114,15 @@ def owner_todos() -> list:
 
 def _proc_alive(pid: int) -> bool:
     """PID 是否活着且确实是 runner（防 PID 复用误判）。"""
-    if not pid:
+    if not pid or not pc.pid_alive(pid):
         return False
-    try:
-        cmd = (Path("/proc") / str(pid) / "cmdline").read_bytes().decode("utf-8", "replace")
-    except Exception:
-        return False
-    return "longrun/runner.py" in cmd
+    for p in pc.process_tree():
+        if p.get("pid") != pid:
+            continue
+        # Windows 的 CommandLine 用反斜杠，统一成正斜杠再匹配
+        cmd = (p.get("cmdline") or "").replace("\\", "/")
+        return "longrun/runner.py" in cmd
+    return False
 
 
 def engine_pid() -> int:
@@ -122,6 +135,8 @@ def engine_pid() -> int:
 
 
 def _systemctl(*args: str, timeout: float = 4.0):
+    if pc.IS_WINDOWS:
+        return 127, "Windows 没有 systemctl（服务控制走计划任务，见 _win_task_state）"
     env = dict(os.environ)
     env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
     try:
@@ -132,13 +147,51 @@ def _systemctl(*args: str, timeout: float = 4.0):
         return 127, f"{type(e).__name__}: {e}"
 
 
+def _wd():
+    """同目录的看门狗模块 = 服务控制层（启停/重启都在它那里，别在两边各写一套）。"""
+    try:
+        from tools.longrun import watchdog
+    except ImportError:            # 以脚本方式直接跑本文件时（tests 里有这种用法）
+        import watchdog
+    return watchdog
+
+
+def _win_task_state() -> str:
+    """Windows 用计划任务状态顶替 systemctl is-active。
+
+    取 State 枚举名（Ready/Running/Disabled）而不是 schtasks 的文本状态：后者随系统
+    语言变，中文系统上写作「就绪」，按文本匹配等于把判据绑死在语言上。
+    """
+    script = f"(Get-ScheduledTask -TaskName '{WIN_TASK}' -ErrorAction SilentlyContinue).State"
+    try:
+        p = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                           capture_output=True, text=True, timeout=10,
+                           creationflags=pc.no_window_flags())
+    except Exception:
+        return "unknown"
+    lines = [ln.strip() for ln in (p.stdout or "").splitlines() if ln.strip()]
+    st = lines[0] if lines else ""
+    if st == "Running":
+        return "active"
+    if st in ("Ready", "Disabled", "Queued"):
+        return "inactive"
+    return "unknown"
+
+
 def unit_state(refresh: bool = False) -> str:
     global _UNIT_CACHE
     ts, val = _UNIT_CACHE
     if not refresh and val and time.time() - ts < _UNIT_TTL:
         return val
-    rc, out = _systemctl("is-active", UNIT)
-    val = out.splitlines()[0].strip() if out else ("unknown" if rc else "unknown")
+    if pc.IS_WINDOWS:
+        val = _win_task_state()
+    else:
+        rc, out = _systemctl("is-active", UNIT)
+        # 只看 rc==0 的输出：systemctl 报错时 stdout 里是「Failed to connect to bus」
+        # 这类文本，拿它当状态用会原样显示到任务中心
+        val = out.splitlines()[0].strip() if rc == 0 and out else "unknown"
+        if val not in KNOWN_STATES:
+            val = "unknown"
     _UNIT_CACHE = (time.time(), val or "unknown")
     return _UNIT_CACHE[1]
 
@@ -267,18 +320,31 @@ def service_action(action: str) -> tuple:
             STOP.unlink(missing_ok=True)
         except Exception:
             pass
+        if pc.IS_WINDOWS:
+            ok, msg = _wd().start_service()
+            unit_state(refresh=True)
+            return ok, (f"长跑引擎已启动（{msg}）" if ok else f"启动失败：{msg}")
         rc1, o1 = _systemctl("start", UNIT)
         rc2, o2 = _systemctl("start", WATCHDOG)
         unit_state(refresh=True)
         ok = rc1 == 0
         return ok, (f"长跑引擎已启动（{o1 or 'ok'}）" if ok else f"启动失败：{o1}")
     if action in ("stop", "pause"):
+        if pc.IS_WINDOWS:
+            ok, msg = _wd().stop_service()
+            unit_state(refresh=True)
+            return ok, (f"长跑引擎已停止（{msg}）" if ok else f"停止失败：{msg}")
         # 先停 watchdog：它按心跳判活，会立刻把刚停掉的服务拉起来。
         _systemctl("stop", WATCHDOG)
         rc, out = _systemctl("stop", UNIT)
         unit_state(refresh=True)
         return rc == 0, (f"长跑引擎已停止（{out or 'ok'}）" if rc == 0 else f"停止失败：{out}")
     if action == "restart":
+        if pc.IS_WINDOWS:
+            wd = _wd()
+            ok, msg = wd.restart_service(wd.runner_pids())
+            unit_state(refresh=True)
+            return ok, (f"长跑引擎已重启（{msg}）" if ok else f"重启失败：{msg}")
         _systemctl("stop", WATCHDOG)
         rc, out = _systemctl("restart", UNIT)
         _systemctl("start", WATCHDOG)

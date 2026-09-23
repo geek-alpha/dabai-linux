@@ -55,6 +55,25 @@ journalctl -u myservice.service -f   # 日志在这里，不在文件里
 
 两条经验（2026-09-13 实测）：① 不要自己 kill + spawn —— systemd 会在 3 秒后自己拉起，脚本再起的第二个实例只会 bind 失败；② 进程的 stdout 接的是 journald socket，所以「日志文件为空」不代表没日志，先看 `journalctl -u <unit>`。判断谁在托管只需一条命令：`cat /proc/<pid>/cgroup`。
 
+### 命令行调用（与网页输入框同一条路）
+
+服务在跑时，`./dabai "任务"` 会**接入**正在运行的服务，不另起独立会话——和用户在
+网页输入框里敲下同一句话走的是同一条路：同一个 Agent、同一份短期记忆、同一个
+session，网页端实时看到「用户气泡 + 工具链 + 流式回复」，终端看到同一份事件流。
+身份默认取 settings.json 的 `agent.unified_user_id`（= 网页端身份）。
+
+```bash
+./dabai "把 README 里的错别字改掉"      # 服务在跑 → 接入；没跑 → 本地独立会话
+./dabai --local "..."                  # 强制进程内（独立会话，user=cli）
+./dabai --remote "..."                 # 服务没跑就报错退出，不偷偷降级
+./dabai --user alice "..."             # 指定身份（普通用户则收敛到自己的沙箱）
+```
+
+`--json` 与 `--namespace` 默认走本地：长跑引擎按前者的稳定事件格式解析，后者要的是
+独立会话（接进服务会污染网页那条对话线）。端到端验证：
+`venv/bin/python tools/cli_remote_selftest.py` —— 真开两条 WebSocket，断言「网页」
+那条收到完整一轮（user_message 回显 → thinking → stream_text → turn_text_done）。
+
 ## 📁 项目结构
 
 ```text

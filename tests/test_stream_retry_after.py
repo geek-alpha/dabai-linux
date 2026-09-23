@@ -91,4 +91,7 @@ def test_流式重试循环的调用点接上了():
              if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "_stream_retry_delay"]
     assert len(calls) == 1, f"流式重试循环必须调用 _stream_retry_delay，实际 {len(calls)} 处"
     names = [a.id for a in calls[0].args if isinstance(a, ast.Name)]
-    assert names == ["stream_attempt", "e"], names
+    # 只认「裸变量」不认具体名字：重试计数改名（stream_attempt → attempt）不该让守卫红，
+    # 但换成算式（min(2.0 * attempt, 15.0)）会少一个 Name，必须红
+    assert len(names) == 2, names
+    assert names[0].endswith("attempt") and names[1] == "e", names

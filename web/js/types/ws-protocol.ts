@@ -122,6 +122,9 @@ export type ServerMessage =
   | { type: 'ready' }
   | { type: 'pong' }
   | { type: 'user_set'; user_id?: string; history?: ChatHistoryItem[] }
+  /** 外部注入的用户消息（CLI / 外部工具）：服务端代为回显，
+   *  前端按「用户自己发的」渲染——网页本地发消息时不会收到这条。 */
+  | { type: 'user_message'; text?: string; atts?: any[]; origin?: string; user_id?: string }
   | { type: 'thinking'; session_id?: string | null; text?: string; resume?: boolean }
   | { type: 'thinking_text'; session_id?: string; text?: string }
   | { type: 'reasoning'; session_id?: string; text?: string }
@@ -182,7 +185,15 @@ export type ClientMessage =
   | { type: 'set_avatar'; name: string }
   | { type: 'set_background'; name: string }
   | { type: 'ping' }
-  | { type: 'text'; content: string; attachments?: unknown[] }
+  | { type: 'text'; content: string; attachments?: unknown[];
+      /** true = 外部注入（CLI/外部工具），服务端会广播 user_message 让网页端回显 */
+      external?: boolean;
+      /** 发起端标识：回显事件带回，发起方自己过滤掉 */
+      client_id?: string;
+      /** true = 无界面的注入连接：不抢「最近活动连接」的汇报通道 */
+      headless?: boolean;
+      /** true = 界面自动上报的消息，不进短期记忆、不打断进行中的回复 */
+      ui?: boolean }
   | { type: 'list_sessions'; q?: string; include_archived?: boolean }
   | { type: 'search_sessions'; q?: string }
   | { type: 'new_session' }

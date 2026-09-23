@@ -9,7 +9,7 @@
 - 只依赖标准库，不引入第三方包。
 
 对外接口速查：
-    进程：pid_alive / process_exit_code / kill_pid / terminate_tree / list_processes
+    进程：pid_alive / process_exit_code / kill_pid / terminate_tree / list_processes / process_tree
     系统：list_listening_ports / disk_free / find_executable
     路径：home / user_dir / search_roots / project_root
     子进程：no_window_flags / spawn_kwargs
@@ -35,6 +35,7 @@ __all__ = [
     "project_root", "home", "user_dir", "search_roots", "browse_roots",
     "no_window_flags", "spawn_kwargs",
     "pid_alive", "process_exit_code", "kill_pid", "terminate_tree", "list_processes",
+    "process_tree",
     "list_listening_ports", "disk_free", "find_executable",
     "lock_file", "unlock_file", "console_utf8",
 ]
@@ -411,6 +412,95 @@ def list_processes() -> list[dict]:
             if len(parts) >= 2 and parts[0].isdigit():
                 out.append({"pid": int(parts[0]), "name": parts[1],
                             "cmdline": parts[2] if len(parts) > 2 else ""})
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return out
+
+
+def process_tree() -> list[dict]:
+    """进程清单（含父进程与命令行）：[{pid, ppid, name, cmdline}]。
+
+    list_processes() 是给「看看有什么在跑」用的：它拿不到 ppid，Windows 侧连 cmdline
+    都是空的。要判断「谁的父进程已经死了」（孤儿清扫、看门狗）就必须有 ppid，所以单列。
+    注意两个平台的「孤儿」语义不同 —— Windows 不会把死掉父进程的子进程重新挂到 pid 1，
+    ppid 仍指向一个已不存在的 pid；调用方别写死 ``ppid == 1``。
+    """
+    out: list[dict] = []
+    if IS_WINDOWS:
+        script = ("Get-CimInstance Win32_Process | "
+                  "Select-Object ProcessId,ParentProcessId,Name,CommandLine | "
+                  "ConvertTo-Json -Compress")
+        try:
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                capture_output=True, timeout=60, creationflags=no_window_flags())
+            text = r.stdout.decode("utf-8", "replace").strip()
+        except (OSError, subprocess.SubprocessError):
+            return out
+        if not text:
+            return out
+        try:
+            import json as _json
+            rows = _json.loads(text)
+        except ValueError:
+            return out
+        if isinstance(rows, dict):        # 只有一个进程时 ConvertTo-Json 给的是对象
+            rows = [rows]
+        for row in rows:
+            try:
+                out.append({
+                    "pid": int(row.get("ProcessId") or 0),
+                    "ppid": int(row.get("ParentProcessId") or 0),
+                    "name": str(row.get("Name") or ""),
+                    "cmdline": str(row.get("CommandLine") or ""),
+                })
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    # Linux：/proc 里同时有 ppid 与 cmdline，比调 ps 快且无依赖
+    proc_root = Path("/proc")
+    if proc_root.is_dir():
+        for entry in proc_root.iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                raw = (entry / "stat").read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            # 格式：pid (comm) state ppid ...，comm 可能含空格与右括号，从最后一个 ')' 切
+            cut = raw.rfind(")")
+            if cut < 0:
+                continue
+            tail = raw[cut + 1:].split()
+            if len(tail) < 2:
+                continue
+            try:
+                ppid = int(tail[1])
+            except ValueError:
+                continue
+            cmdline = ""
+            try:
+                cmdline = ((entry / "cmdline").read_bytes()
+                           .replace(b"\x00", b" ").decode("utf-8", "replace").strip())
+            except OSError:
+                pass
+            name = raw[raw.find("(") + 1:cut] or cmdline.split(" ")[0]
+            out.append({"pid": int(entry.name), "ppid": ppid, "name": name,
+                        "cmdline": cmdline})
+        if out:
+            return out
+
+    # 其它 POSIX（macOS / 无 /proc 的 Linux）：ps 一次拿全，args 放最后便于切分
+    try:
+        r = subprocess.run(["ps", "-eo", "pid=,ppid=,comm=,args="], capture_output=True,
+                           text=True, timeout=30)
+        for line in r.stdout.splitlines():
+            parts = line.strip().split(None, 3)
+            if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+                out.append({"pid": int(parts[0]), "ppid": int(parts[1]),
+                            "name": parts[2] if len(parts) > 2 else "",
+                            "cmdline": parts[3] if len(parts) > 3 else ""})
     except (OSError, subprocess.SubprocessError):
         pass
     return out

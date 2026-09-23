@@ -1,3 +1,8 @@
+# ⚠ 历史清单，不要用它装新机器 —— 里面混了 Blender 内嵌模块（bpy/bmesh/mathutils）、
+# 已从标准库移除的 imp、以及本机私有包（TodoService / dabai_ears / dabai_voice 等），
+# PyPI 上装不到，pip 会成片失败。跨平台可用的那份是 requirements-core.txt。
+# 保留本文件只为记录那台机器上当时装了什么。
+
 Pillow
 TodoService
 addon_utils

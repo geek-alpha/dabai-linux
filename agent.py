@@ -1357,6 +1357,106 @@ async def _watchdog_stream(stream, *, first_byte_timeout: float, idle_timeout: f
         yield chunk
 
 
+async def _stream_with_retry(stream, create_stream, *, max_retries: int):
+    """流式读取 + 中途断网自动重试（瞬时错误）。
+
+    产出 (kind, payload)：
+    - "reasoning" / "text"：可直接转发的增量文本
+    - "status"：重连提示文案
+    - "done"：流正常结束，payload 为 (last_usage, finish_reason)
+
+    重试语义：尚未发出文本时安全重放；已发出文本时用 _dedup_stream_text
+    跳过重新生成内容中与已播报重叠的前缀，只补发尾巴。工具调用参数只在流
+    完整结束后才执行，中途失败可安全丢弃重来。
+    """
+    attempt = 0
+    delivered_text = ""
+    skip_prefix_len = 0
+    while True:
+        last_usage = None
+        finish_reason = None
+        assistant_content = ""
+        tool_calls_buffer = {}
+        has_tool_calls = False
+        try:
+            # 静默看门狗包裹每次读取：首包/块间隔分档计时，卡死
+            # 提前到 45s 发现（httpx read timeout 120s 兜底不再是一刀切）
+            async for chunk in _watchdog_stream(
+                    stream,
+                    first_byte_timeout=_stream_first_byte_timeout(),
+                    idle_timeout=_stream_idle_timeout(),
+            ):
+                # 兼容 openai 1.65.5：AsyncStream 无 .usage 属性，
+                # 需在迭代中手动捕获最后一个带 usage 的 chunk
+                if getattr(chunk, "usage", None) is not None:
+                    last_usage = chunk.usage
+                # 结束原因：流式最后一个 chunk 带 finish_reason（delta 常为空），
+                # 必须在「无 choices 跳过」之前捕获，否则 length 截断无从感知
+                if (chunk.choices
+                        and getattr(chunk.choices[0], "finish_reason", None)):
+                    finish_reason = _normalize_finish_reason(
+                        chunk.choices[0].finish_reason)
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+
+                # 真实思维链（DeepSeek 等模型的 reasoning_content）：
+                # 独立于正文流式返回，实时推给思考段（展示 + 语音）
+                rc = getattr(delta, "reasoning_content", None)
+                if not rc:
+                    rc = getattr(delta, "reasoning", None)
+                if rc:
+                    yield "reasoning", _strip_think_markers(str(rc))
+
+                # 处理文本内容（重试时做前缀去重，避免重复播报）
+                if delta.content:
+                    (assistant_content, delivered_text,
+                     skip_prefix_len, to_yield) = _dedup_stream_text(
+                        assistant_content, delta.content,
+                        delivered_text, skip_prefix_len)
+                    if to_yield:
+                        yield "text", to_yield
+
+                # 处理工具调用
+                if delta.tool_calls:
+                    has_tool_calls = True
+                    for tc in delta.tool_calls:
+                        idx = tc.index
+                        if idx not in tool_calls_buffer:
+                            tool_calls_buffer[idx] = {
+                                "id": tc.id or "",
+                                "name": tc.function.name if tc.function else "",
+                                "arguments": "",
+                            }
+                        if tc.id:
+                            tool_calls_buffer[idx]["id"] = tc.id
+                        if tc.function and tc.function.name:
+                            tool_calls_buffer[idx]["name"] = tc.function.name
+                        if tc.function and tc.function.arguments:
+                            tool_calls_buffer[idx]["arguments"] += tc.function.arguments
+            yield "done", (last_usage, finish_reason, assistant_content,
+                           tool_calls_buffer, has_tool_calls)
+            return
+        except Exception as e:
+            if attempt >= max_retries or not _is_transient_stream_error(e):
+                raise
+            attempt += 1
+            # 丢弃本轮已累积的工具调用参数（尚未执行，安全）
+            tool_calls_buffer.clear()
+            has_tool_calls = False
+            assistant_content = ""
+            # 已发出的文本保留去重标记：重建流时跳过已播报前缀
+            skip_prefix_len = len(delivered_text)
+            _delay = _stream_retry_delay(attempt, e)
+            logger.warning(
+                "流式输出中途断网（%s），%.0fs 后第 %d/%d 次重建流",
+                e, _delay, attempt, max_retries)
+            # 状态提示：让用户知道是网络波动、正在自动重连，而非卡死
+            yield "status", _stream_retry_notice(attempt, _delay)
+            await asyncio.sleep(_delay)
+            stream = await create_stream()
+
+
 def _dedup_stream_text(assistant_content: str, chunk: str,
                        delivered_text: str, skip_prefix_len: int):
     """流式重试时的文本前缀去重。
@@ -5909,6 +6009,38 @@ class AIAgent:
         # 长短污染的总体命中率——短轮次永远显得比长轮次差，无法横向对比。
         first_miss = -1
         usage_emitted = False
+        def _accumulate_usage(u, usage_obj):
+            """累计一次 LLM 调用的用量与 Δ 归因（纯观测，不参与决策）。
+
+            非流式与流式两条分支记同一套账，抄两遍迟早漏改其中一处。
+            """
+            nonlocal pending_chars, _msg_all, _msg_mark, rounds, last_prompt
+            nonlocal sum_prompt, sum_completion, sum_total
+            nonlocal cache_reported, first_miss, sum_cache_hit, sum_cache_miss
+            _raw = sum(_msg_prompt_chars(_m) for _m in messages[_msg_mark:])
+            call_trace.append({
+                "p": u[0],
+                "d": (u[0] - last_prompt) if last_prompt else 0,
+                # 实长对账：直接从 messages 切片求和，字段默认计入。
+                # 与 chars 不等 = 有字段没登记（图片走 token 当量，已知例外）
+                "chars_raw": _raw,
+                "chars_all": _msg_all + _raw,
+                "chars": pending_chars,
+            })
+            pending_chars = 0
+            _msg_all += _raw
+            _msg_mark = len(messages)
+            rounds += 1
+            last_prompt = u[0]
+            sum_prompt += u[0]
+            sum_completion += u[1]
+            sum_total += u[2]
+            ch, cm = self._read_cache(usage_obj)
+            cache_reported = cache_reported or self._cache_field_present(usage_obj)
+            if first_miss < 0:
+                first_miss = cm
+            sum_cache_hit += ch
+            sum_cache_miss += cm
 
         # 分层记忆量化统计：本轮 raw/packed 估算与 LLM 返回的真实 prompt 用量落库
         async def _record_stats():
@@ -6140,31 +6272,7 @@ class AIAgent:
                     # 非流式：resp.usage 天然可用，直接累计（含前缀缓存命中口径）
                     u = self._read_usage(resp)
                     if u:
-                        _raw = sum(_msg_prompt_chars(_m) for _m in messages[_msg_mark:])
-                        call_trace.append({
-                            "p": u[0],
-                            "d": (u[0] - last_prompt) if last_prompt else 0,
-                            # 实长对账：直接从 messages 切片求和，字段默认计入。
-                            # 与 chars 不等 = 有字段没登记（图片走 token 当量，已知例外）
-                            "chars_raw": _raw,
-                            "chars_all": _msg_all + _raw,
-                            "chars": pending_chars,
-                        })
-                        pending_chars = 0
-                        _msg_all += _raw
-                        _msg_mark = len(messages)
-                        rounds += 1
-                        last_prompt = u[0]
-                        sum_prompt += u[0]
-                        sum_completion += u[1]
-                        sum_total += u[2]
-                        _usage_obj = getattr(resp, "usage", None)
-                        ch, cm = self._read_cache(_usage_obj)
-                        cache_reported = cache_reported or self._cache_field_present(_usage_obj)
-                        if first_miss < 0:
-                            first_miss = cm
-                        sum_cache_hit += ch
-                        sum_cache_miss += cm
+                        _accumulate_usage(u, getattr(resp, "usage", None))
                 else:
                     async def _create_stream():
                         _normalize_tool_rounds(messages)
@@ -6209,123 +6317,29 @@ class AIAgent:
                     # - 已发出文本 → 前缀去重：跳过重新生成内容中与已播报重叠的部分，
                     #   只补发后面的尾巴，避免语音/文字重复；
                     # - 工具调用参数只在流完整结束后才执行，中途失败可安全丢弃重来。
-                    max_stream_retries = _stream_retry_count()
-                    stream_attempt = 0
-                    delivered_text = ""      # 本轮回已通过 TextDelta 发出的文本
-                    skip_prefix_len = 0      # 重试时需跳过的已播报前缀长度
-                    while True:
-                        last_usage = None
-                        try:
-                            # 静默看门狗包裹每次读取：首包/块间隔分档计时，卡死
-                            # 提前到 45s 发现（httpx read timeout 120s 兜底不再是一刀切）
-                            async for chunk in _watchdog_stream(
-                                    stream,
-                                    first_byte_timeout=_stream_first_byte_timeout(),
-                                    idle_timeout=_stream_idle_timeout(),
-                            ):
-                                # 兼容 openai 1.65.5：AsyncStream 无 .usage 属性，
-                                # 需在迭代中手动捕获最后一个带 usage 的 chunk
-                                if getattr(chunk, "usage", None) is not None:
-                                    last_usage = chunk.usage
-                                # 结束原因：流式最后一个 chunk 带 finish_reason（delta 常为空），
-                                # 必须在「无 choices 跳过」之前捕获，否则 length 截断无从感知
-                                if (chunk.choices
-                                        and getattr(chunk.choices[0], "finish_reason", None)):
-                                    finish_reason = _normalize_finish_reason(
-                                        chunk.choices[0].finish_reason)
-                                if not chunk.choices:
-                                    continue
-                                delta = chunk.choices[0].delta
-
-                                # 真实思维链（DeepSeek 等模型的 reasoning_content）：
-                                # 独立于正文流式返回，实时推给思考段（展示 + 语音）
-                                rc = getattr(delta, "reasoning_content", None)
-                                if not rc:
-                                    rc = getattr(delta, "reasoning", None)
-                                if rc:
-                                    # 真实推理步骤：进正文（不被工具轮撤回）+ 语音朗读
-                                    rc = _strip_think_markers(str(rc))
-                                    reasoning_all += rc
-                                    round_reasoning += rc
-                                    yield ReasoningDelta(rc)
-
-                                # 处理文本内容（重试时做前缀去重，避免重复播报）
-                                if delta.content:
-                                    (assistant_content, delivered_text,
-                                     skip_prefix_len, to_yield) = _dedup_stream_text(
-                                        assistant_content, delta.content,
-                                        delivered_text, skip_prefix_len)
-                                    if to_yield:
-                                        # 实时流出：文字边生成边推（展示 + 语音即时跟随）。
-                                        # 工具轮的过程话由服务端在工具开始时转入思考段；
-                                        # 最终回复则直接留在主消息区。
-                                        yield StreamDelta(to_yield)
-
-                                # 处理工具调用
-                                if delta.tool_calls:
-                                    has_tool_calls = True
-                                    for tc in delta.tool_calls:
-                                        idx = tc.index
-                                        if idx not in tool_calls_buffer:
-                                            tool_calls_buffer[idx] = {
-                                                "id": tc.id or "",
-                                                "name": tc.function.name if tc.function else "",
-                                                "arguments": "",
-                                            }
-                                        if tc.id:
-                                            tool_calls_buffer[idx]["id"] = tc.id
-                                        if tc.function and tc.function.name:
-                                            tool_calls_buffer[idx]["name"] = tc.function.name
-                                        if tc.function and tc.function.arguments:
-                                            tool_calls_buffer[idx]["arguments"] += tc.function.arguments
-                            break   # 流正常结束
-                        except Exception as e:
-                            if (stream_attempt >= max_stream_retries
-                                    or not _is_transient_stream_error(e)):
-                                raise
-                            stream_attempt += 1
-                            # 丢弃本轮已累积的工具调用参数（尚未执行，安全）
-                            tool_calls_buffer.clear()
-                            has_tool_calls = False
-                            assistant_content = ""
-                            # 已发出的文本保留去重标记：重建流时跳过已播报前缀
-                            skip_prefix_len = len(delivered_text)
-                            _delay = _stream_retry_delay(stream_attempt, e)
-                            logger.warning(
-                                "流式输出中途断网（%s），%.0fs 后第 %d/%d 次重建流",
-                                e, _delay, stream_attempt, max_stream_retries)
-                            # 状态提示：让用户知道是网络波动、正在自动重连，而非卡死
-                            yield TurnStatus(_stream_retry_notice(stream_attempt, _delay))
-                            await asyncio.sleep(_delay)
-                            stream = await _create_stream()
+                    async for _kind, _payload in _stream_with_retry(
+                            stream, _create_stream,
+                            max_retries=_stream_retry_count()):
+                        if _kind == "reasoning":
+                            # 真实推理步骤：进正文（不被工具轮撤回）+ 语音朗读
+                            reasoning_all += _payload
+                            round_reasoning += _payload
+                            yield ReasoningDelta(_payload)
+                        elif _kind == "text":
+                            # 实时流出：文字边生成边推（展示 + 语音即时跟随）。
+                            # 工具轮的过程话由服务端在工具开始时转入思考段；
+                            # 最终回复则直接留在主消息区。
+                            yield StreamDelta(_payload)
+                        elif _kind == "status":
+                            yield TurnStatus(_payload)
+                        else:
+                            (last_usage, finish_reason, assistant_content,
+                             tool_calls_buffer, has_tool_calls) = _payload
                     # 流式分支结束后读取 usage（优先用迭代中捕获的 usage chunk，
                     # 部分 openai 版本的 AsyncStream 不暴露 .usage）
                     u = self._read_usage(last_usage)
                     if u:
-                        _raw = sum(_msg_prompt_chars(_m) for _m in messages[_msg_mark:])
-                        call_trace.append({
-                            "p": u[0],
-                            "d": (u[0] - last_prompt) if last_prompt else 0,
-                            # 实长对账：直接从 messages 切片求和，字段默认计入。
-                            # 与 chars 不等 = 有字段没登记（图片走 token 当量，已知例外）
-                            "chars_raw": _raw,
-                            "chars_all": _msg_all + _raw,
-                            "chars": pending_chars,
-                        })
-                        pending_chars = 0
-                        _msg_all += _raw
-                        _msg_mark = len(messages)
-                        rounds += 1
-                        last_prompt = u[0]
-                        sum_prompt += u[0]
-                        sum_completion += u[1]
-                        sum_total += u[2]
-                        ch, cm = self._read_cache(last_usage)
-                        cache_reported = cache_reported or self._cache_field_present(last_usage)
-                        if first_miss < 0:
-                            first_miss = cm
-                        sum_cache_hit += ch
-                        sum_cache_miss += cm
+                        _accumulate_usage(u, last_usage)
             except Exception as e:
                 # 模型不支持原生 function calling（如 Ollama 的 draganis/vanessa）：
                 # 自动切换为文本工具协议，保住工具能力的同时避免每次聊天都报错。

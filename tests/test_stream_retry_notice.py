@@ -60,8 +60,11 @@ def test_接线守卫_提示与sleep用同一个_delay():
     tree = _parse_agent()
     notices = _calls(tree, "_stream_retry_notice")
     assert len(notices) == 1, f"流式重试提示必须走 _stream_retry_notice，实际 {len(notices)} 处"
+    # 只认「裸变量」不认具体名字：重试计数改名（stream_attempt → attempt）不该让守卫红，
+    # 但换成算式（attempt * 2）会少一个 Name，必须红
     names = [a.id for a in notices[0].args if isinstance(a, ast.Name)]
-    assert names == ["stream_attempt", "_delay"], names
+    assert len(names) == 2, names
+    assert names[0].endswith("attempt") and names[1] == "_delay", names
 
     func = _enclosing_async_func(tree, notices[0])
     assert func is not None, "提示调用不在任何 async 函数里？"

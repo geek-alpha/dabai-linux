@@ -509,3 +509,42 @@ ln -sf /usr/local/lib/nodejs/node-v24.21.0-linux-x64/bin/{node,npm,npx} /usr/loc
 
 注意：临时 `.bak-<时间戳>` 备份已清理，回滚请依赖 git 历史，不要依赖备份文件。
 行尾已由 `.gitattributes` 固定（`*.sh` = LF），克隆到 Linux 不会出现 `bad interpreter`。
+
+## 8. Windows 侧（双平台对照）
+
+大白在 Windows 上同样要「装一次，之后不用管」。Linux 靠 systemd，Windows 没有 systemd，
+等价物是计划任务。细节见 `deploy/windows/README.md`，这里只放对照表与判据。
+
+| 职责 | Linux | Windows | 共用代码 |
+|---|---|---|---|
+| 启动 | `dabai.sh`（`--setup` / `--check`） | `dabai.bat`（同名参数） | `server.py` + `tools/linux_selfcheck.py` |
+| 开机自启 | `systemd` + `WantedBy=multi-user.target` | 计划任务 `DabaiServer`（登录触发） | — |
+| 崩溃自愈 | `Restart=always` | 任务自带重启 3 次 + `DabaiWatchdog` 每 5 分钟探端口 | `update.py --ensure-running` |
+| 定时更新 | `dabai-update.timer`（开机 2 分钟 + 每小时 :17） | 计划任务 `DabaiUpdate`（每小时） | `update.py --apply` |
+| 停机 / 起服务 | `systemctl stop` / `start`（非 root 走窄口径 sudo） | `taskkill /T /F` 按端口定位进程树 / 计划任务或分离启动 | `update.py` 的 `svc()` 分派 |
+| 更新器副本 | `/usr/local/lib/dabai-update/update.py` | `%LOCALAPPDATA%\dabai-update\update.py` | 同一份 `update.py` |
+| 配置与状态 | `/etc/dabai/update.conf`、`/var/lib/dabai-update` | `%APPDATA%\dabai\update.conf`、`%LOCALAPPDATA%\dabai-update` | 同一份 `load_conf()` |
+| 依赖清单 | `requirements-linux.txt` → `-r requirements-core.txt` | `requirements-core.txt` | 跨平台唯一权威 |
+| 定期体检 | `dabai-health.timer`（30 分钟） | 计划任务 `DabaiHealth`（30 分钟） | `tools/linux_health.py` |
+| 密钥同步 | `deploy/secrets/`（systemd path unit，改完即生效） | 计划任务 `DabaiSecrets`（每 5 分钟轮询，幂等） | `deploy/secrets/sync_secrets.py` |
+| 密钥注入 | systemd `EnvironmentFile=` | `deploy/windows/launch.py` 读进环境再启动 | 同一份 `secrets.env` 格式 |
+| 长跑引擎 | `dabai-longrun.service` | 计划任务 `DabaiLongrun`（`-WithoutLongrun` 可跳过） | `tools/longrun/runner.py` |
+| 长跑心跳看门狗 | `dabai-longrun-watchdog.timer` | 计划任务 `DabaiLongrunWatchdog` | `tools/longrun/watchdog.py` |
+| 发布前密钥闸门 | `deploy/gitguard/safe-push.sh`（薄包装） | 同一份实现 | `deploy/gitguard/safe_push.py` |
+
+**平台差异收敛点**：业务代码走仓库根 `platform_compat.py`；`deploy/` 下的脚本按平台分文件；
+更新器是唯一自带平台判定的地方 —— 它要在仓库之外运行，不能 import 被更新物（理由见
+`deploy/release/update.py` 文件头）。
+
+**Windows 上不需要的东西**（因此比 Linux 侧简单）：sudoers 免密、属主解析（`pwd` / `grp`）、
+cgroup 自脱离（`systemd-run`）、桌面通知总线（D-Bus）。更新器里这几处都有平台分支，
+Windows 走安全空转，不再是「import 就崩」。
+
+**验证口径**：`tests/test_win_update.py` 用同一套用例跑 Windows 语义（把 `os.name` 钉成 `nt`
+再加载更新器），钉住「停/起服务落在进程上、体检只看端口与 HTTP、需要 systemd 的三步安全空转」。
+`tests/test_safe_push.py` 钉住发布闸门的判据（token 来源、硬雷清单、正则对 git 合法），
+以及 `launch.py` 与 `sync_secrets.py` 的 env 解析逐字一致 —— 两者读同一个文件，
+解析不一致会出现「同步器以为写进去了、启动器没注入」这种只在服务侧复现的差异。
+`tools/ps_lint.py` 对 `deploy/windows/*.ps1` 与 `dabai.bat` 做静态体检（括号、引号、
+here-string、goto 目标、cmdlet 拼写）。**真 Windows 机器上的端到端验证还没做** ——
+首次上机按 `deploy/windows/README.md` §5 的六步走。

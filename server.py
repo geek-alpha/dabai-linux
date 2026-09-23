@@ -5217,6 +5217,10 @@ manager = ConnectionManager()
 # 「把汇报投递给用户当前所在的连接」，用这个引用兜底。
 _last_chat_conn: dict = {"ws": None, "state": None}
 
+# 最近一个「真实前端」连接：外部注入（CLI / 外部工具）连上来的是 headless
+# 连接，不进这里——它随时会断，汇报投给它等于丢给空气。见 set_user 分支。
+_front_conn: dict = {"ws": None, "state": None}
+
 # 常驻用户状态：与连接无关的服务端会话状态。定时任务/断点恢复/离线汇报
 # 都用它——页面从未打开或已全部关闭时，后台流程仍能拿到合法 state
 # （绑定全局历史 + active_task 追踪），转述/恢复照样在后台完成并落库。
@@ -5408,6 +5412,26 @@ _BROADCAST_WS = _BroadcastWS()
 # 任务中心事件走同一个广播出口：task_event 原先只推给发起连接，前端一刷新/换设备
 # 就收不到进度（背景见 task_orchestrator.set_broadcast 的注释）。
 set_broadcast(_BROADCAST_WS.send_json)
+
+
+async def _broadcast_user_message(state, text: str, attachments=None,
+                                  origin: str = "") -> None:
+    """把外部注入的用户消息推给该用户的所有连接，让网页端显示成用户自己发的。
+
+    网页端自己发消息时气泡是本地插入的（前端 submitText 先 addUserMsg 再
+    send），所以只有外部来源才需要这条回显——两边都插就会出两个气泡。
+    origin = 发起端的 client_id：发起方自己已经回显过输入，按它过滤即可，
+    服务端不必知道哪条连接是谁。
+    """
+    uid = getattr(state, "user_id", "") or ""
+    data = {"type": "user_message", "text": text,
+            "atts": attachments or [], "origin": str(origin or ""),
+            "user_id": uid}
+    for w in manager.targets(uid):
+        try:
+            await safe_send_json(w, data)
+        except Exception:
+            continue
 
 
 # ---------- 联邦来电 → 管理员级执行 ----------
@@ -7026,6 +7050,18 @@ async def websocket_endpoint(ws: WebSocket):
                 )
                 manager.bind_user(ws, state.user_id)
                 _TURN_UID.set(state.user_id)
+                # 外部注入连接（CLI/外部工具）：不参与「最近活动连接」的竞争。
+                # 它随时会断开，抢走汇报通道会让定时任务/子智能体的汇报丢在
+                # 一条死连接上，网页端反而看不到。
+                if msg.get("headless") is True:
+                    if _last_chat_conn.get("ws") is ws:
+                        _last_chat_conn["ws"] = _front_conn["ws"]
+                        _last_chat_conn["state"] = _front_conn["state"]
+                else:
+                    _front_conn["ws"] = ws
+                    _front_conn["state"] = state
+                    _last_chat_conn["ws"] = ws
+                    _last_chat_conn["state"] = state
                 # 预初始化该用户的 Agent
                 agent = await get_shared_agent(state.user_id)
                 # 绑定当前活动角色卡片的记忆命名空间（角色卡片独立记忆空间）
@@ -7388,6 +7424,11 @@ async def websocket_endpoint(ws: WebSocket):
                     continue
                 # ui=True 的系统点击消息不进短期记忆（由记忆系统按 auto 处理）
                 ui_auto = msg.get("ui") is True
+                # 外部注入（CLI / 外部工具）：网页端要像用户在输入框里敲的一样显示。
+                # 只对 external 来源回显，理由见 _broadcast_user_message 的注释。
+                if msg.get("external") is True:
+                    await _broadcast_user_message(
+                        state, text, msg.get("attachments"), msg.get("client_id"))
                 # 自然语言统一交给主 Agent（harness 底座）；斜杠命令通道已移除
                 state.last_user_message_time = time.time()
                 state.last_response_done = time.time() + 86400

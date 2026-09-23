@@ -463,6 +463,20 @@ export default (function init(App: AppKernel) {
       case 'listening':
         App.setState(App.State.LISTENING);
         break;
+      case 'user_message':
+        // 外部注入的用户消息（CLI / 外部工具）：服务端代为回显，效果要等同
+        // 用户在输入框敲下这句话——动作必须与 submitText 提交后一致。
+        App.removeTyping();
+        App.addUserMsg(msg.text || '', false, msg.atts);
+        App.setState(App.State.THINKING);
+        App.showTyping();
+        // 记录用户活跃时间（RL 统一状态取数 + 自主说话抑制都读它）
+        App._lastUserMessageTime = Date.now();
+        App._lastUserInteractTime = Date.now();
+        if (App._engagementRL) App._engagementRL.notifyUserMessage();
+        if (App._datingSystem) App._datingSystem.notifyUserMessage(msg.text || '');
+        if (App._expressionRL) App._expressionRL.notifyUserMessage();
+        break;
       case 'transcript':
         App.removeTyping();
         App.addUserMsg(msg.text, true);

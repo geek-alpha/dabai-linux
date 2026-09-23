@@ -820,3 +820,64 @@ def test_mirror_prefix_proxy_wins(monkeypatch):
     monkeypatch.setattr(update, "detect_proxy", lambda: "http://127.0.0.1:7890")
     monkeypatch.setenv("DABAI_GITHUB_MIRROR", "https://mirror.example.com")
     assert update.mirror_prefix() is None
+
+
+# ── 探测缓存：检查要快，靠的是「同一个结论只探一次」 ─────────────────────
+def _wire_net_cache(monkeypatch, tmp_path):
+    """把探测结论的落盘位置挪到临时目录 —— 否则会读写真实状态目录，用例之间互相污染。"""
+    _reset_mirror(monkeypatch)
+    monkeypatch.setattr(update, "_net_cache_file", lambda: tmp_path / "net_probe.json")
+    return tmp_path / "net_probe.json"
+
+
+def test_mirror_probe_result_is_cached(monkeypatch, tmp_path):
+    """探一次写盘，下次新进程直接读 —— 定时器每轮都是新进程，省掉的正是每轮的探测。"""
+    f = _wire_net_cache(monkeypatch, tmp_path)
+    monkeypatch.setattr(update, "detect_proxy", lambda: None)
+    monkeypatch.delenv("DABAI_GITHUB_MIRROR", raising=False)
+    calls = []
+    monkeypatch.setattr(update, "_probe_mirrors",
+                        lambda: (calls.append(1), "https://ghproxy.net/")[1])
+    assert update.mirror_prefix() == "https://ghproxy.net/"
+    assert len(calls) == 1 and f.is_file()
+
+    _reset_mirror(monkeypatch)          # 新进程：内存缓存没了，只剩磁盘缓存
+    monkeypatch.setattr(update, "_probe_mirrors", lambda: (calls.append(1), None)[1])
+    assert update.mirror_prefix() == "https://ghproxy.net/"
+    assert len(calls) == 1
+
+
+def test_mirror_cache_expires(monkeypatch, tmp_path):
+    """过期的结论必须重新探 —— 镜像换掉之后，缓存不能变成永久错误路由。"""
+    f = _wire_net_cache(monkeypatch, tmp_path)
+    monkeypatch.setattr(update, "detect_proxy", lambda: None)
+    monkeypatch.delenv("DABAI_GITHUB_MIRROR", raising=False)
+    f.write_text(json.dumps({"mirror": "https://ghproxy.net/", "ts": 0}), encoding="utf-8")
+    monkeypatch.setattr(update, "_probe_mirrors", lambda: None)
+    assert update.mirror_prefix() is None
+
+
+def test_direct_connection_is_also_cached(monkeypatch, tmp_path):
+    """「全挂、走直连」也是结论，同样要缓存 —— 否则没代理又没镜像的机器每轮都白等一次探测。"""
+    _wire_net_cache(monkeypatch, tmp_path)
+    monkeypatch.setattr(update, "detect_proxy", lambda: None)
+    monkeypatch.delenv("DABAI_GITHUB_MIRROR", raising=False)
+    calls = []
+    monkeypatch.setattr(update, "_probe_mirrors", lambda: (calls.append(1), None)[1])
+    assert update.mirror_prefix() is None
+    _reset_mirror(monkeypatch)
+    assert update.mirror_prefix() is None
+    assert len(calls) == 1
+
+
+def test_probe_mirrors_keeps_priority_order(monkeypatch):
+    """三个候选并发探，选中结果仍按优先级取 —— 并发不该把「优先用哪个」变成随机。"""
+    seen = []
+
+    def fake_probe(prefix):
+        seen.append(prefix)
+        return prefix if prefix == update.MIRROR_PREFIXES[2] else None
+
+    monkeypatch.setattr(update, "_probe_mirror", fake_probe)
+    assert update._probe_mirrors() == update.MIRROR_PREFIXES[2]
+    assert sorted(seen) == sorted(update.MIRROR_PREFIXES)

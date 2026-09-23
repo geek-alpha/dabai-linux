@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """更新器自脱离（self-detach）的对抗测试。
 
-背景：update.py 被耳朵（peer_autoupdate）拉起时跑在 dabai.service 的 cgroup 里，
+背景：update.py 被定时器（dabai-update.timer）拉起时跑在 dabai.service 的 cgroup 里，
 而 apply 流程第 ⑤ 步是 systemctl stop 这个服务 —— KillMode=control-group 会把
 更新器自己一起杀掉：文件没换、服务停着起不来，update.log 里只剩一行「⑤ 停机」。
 修法是动手前用 systemd-run 把自己挪进独立 unit。

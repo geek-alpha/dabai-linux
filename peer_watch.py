@@ -13,8 +13,8 @@
   kind=say    → 响铃，不回话（留言就该是留言）
   kind=task   → 响铃，不回话；对面 server 已经把它变成一次性定时任务派给子智能体，
                 耳朵不执行任何东西（shell 不进耳朵——联邦消息只凭密钥认证）
-  kind=release→ 交给 peer_autoupdate：唤醒本机更新器去查 GitHub。装哪个版本由更新器
-                自己判定+校验+回滚，留言只当闹钟，默认关（settings.json → peer.auto_update）
+  kind=release→ 不再由耳朵处理：自动更新归每台机器自己的 dabai-update.timer
+                （定时查 GitHub → 校验 → 装到最新版），不依赖联邦、不需要谁喊一嗓子
 
 回话用的是本机 LLM 档位（跟大白同一个模型配置）配本机实时状态，
 所以「你那边怎么样」这种问题是真答得上来的。
@@ -43,7 +43,6 @@ if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
 import peer_mesh  # noqa: E402
-import peer_autoupdate  # noqa: E402
 import peer_social  # noqa: E402
 
 LOG_FILE = BASE_DIR / "data" / "peer_watch.log"
@@ -262,10 +261,6 @@ def handle(entry: Dict[str, Any], auto_reply: bool, do_notify: bool,
         title = {"call": f"大白来电 · {frm}",
                  "task": f"联邦派活 · {frm}"}.get(kind, f"联邦留言 · {frm}")
         notify(title, text)
-
-    if kind == "release":
-        peer_autoupdate.handle(entry)
-        return
 
     # 同伴留言（回执/进展）不能响完铃就完 —— 派出去的活得有人接着办。
     # 只接 say：reply 是电话的回声（主对话当场已拿到），task 由对面 server 转成

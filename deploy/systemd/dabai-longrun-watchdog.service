@@ -5,7 +5,7 @@ Description=大白长跑引擎心跳看门狗（卡死即重启）
 [Service]
 Type=oneshot
 WorkingDirectory=/home/wxf/dabai
-ExecStart=/bin/sh /home/wxf/dabai/tools/longrun/watchdog.sh
+ExecStart=/home/wxf/dabai/venv/bin/python /home/wxf/dabai/tools/longrun/watchdog.py
 SyslogIdentifier=dabai-longrun-watchdog
 CPUWeight=10
 IOSchedulingClass=idle

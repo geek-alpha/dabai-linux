@@ -50,11 +50,41 @@ VERSION = "1.0.0"
 
 # ---------- 路径 ----------
 
-TARGET = Path(os.environ.get("DABAI_SECRETS_FILE") or "/etc/dabai/secrets.env")
+IS_WINDOWS = os.name == "nt"
+
+# Windows 没有 /etc，也没有 POSIX 权限位 —— 派生文件改放用户配置目录，
+# 权限靠 NTFS ACL（%APPDATA% 默认只有本人可读）。两个平台都可用环境变量覆盖。
+_USER_ROAMING = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+_USER_LOCAL = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+
+
+def _default_target() -> str:
+    if IS_WINDOWS:
+        return str(Path(_USER_ROAMING) / "dabai" / "secrets.env")
+    return "/etc/dabai/secrets.env"
+
+
+def _default_snapshot_dir() -> str:
+    if IS_WINDOWS:
+        return str(Path(_USER_LOCAL) / "dabai" / "configs-snapshots")
+    return "/var/backups/dabai-configs"
+
+
+def _default_snapshot_state() -> str:
+    if IS_WINDOWS:
+        return str(Path(_USER_LOCAL) / "dabai" / "configs-snapshot.sha256")
+    return "/var/lib/dabai-configs-snapshot.sha256"
+
+
+TARGET = Path(os.environ.get("DABAI_SECRETS_FILE") or _default_target())
 TARGET_DIR = TARGET.parent
 TARGET_MODE = 0o640
 TARGET_DIR_MODE = 0o750
 TARGET_GROUP = os.environ.get("DABAI_SECRETS_GROUP") or "wxf"
+
+# os.chmod 在 Windows 上只动只读位，NTFS 权限走 ACL —— 拿 0640 去比对会永远对不上，
+# 于是把「权限正常」常年报成问题。权限的校验与修正只在 POSIX 上做。
+CHECK_POSIX_PERMS = not IS_WINDOWS
 
 BEGIN = "# >>> DABAI MANAGED >>> 由 dabai-secrets sync 自动生成；手改会在下次同步被覆盖"
 END = "# <<< DABAI MANAGED <<<"
@@ -87,10 +117,10 @@ SOURCES = ("settings.json", "codex_config.json", "stt_config.json")
 # settings.json / nodes.json 这类文件既含密钥又未被 git 跟踪 —— git 救不了它们。
 # 实测事故：一条 `>` 重定向覆盖 + 一次 rm，settings.json 就彻底没了。
 # 所以每次同步顺带做一份滚动快照。
-SNAPSHOT_DIR = Path(os.environ.get("DABAI_SNAPSHOT_DIR") or "/var/backups/dabai-configs")
+SNAPSHOT_DIR = Path(os.environ.get("DABAI_SNAPSHOT_DIR") or _default_snapshot_dir())
 SNAPSHOT_KEEP = 20
 SNAPSHOT_STATE = Path(
-    os.environ.get("DABAI_SNAPSHOT_STATE") or "/var/lib/dabai-configs-snapshot.sha256"
+    os.environ.get("DABAI_SNAPSHOT_STATE") or _default_snapshot_state()
 )
 SNAPSHOT_FILES = (
     "settings.json", "codex_config.json", "stt_config.json", "tts_config.json",
@@ -351,15 +381,16 @@ def atomic_write(content: str) -> None:
             fh.write(content)
             fh.flush()
             os.fsync(fh.fileno())
-        os.chmod(tmp, TARGET_MODE)
-        try:
-            import grp
+        if CHECK_POSIX_PERMS:
+            os.chmod(tmp, TARGET_MODE)
+            try:
+                import grp
 
-            gid = grp.getgrnam(TARGET_GROUP).gr_gid
-            os.chown(tmp, 0, gid)
-        except (KeyError, PermissionError, ImportError):
-            # 组不存在或无权限改属主：保持当前属主，仅靠 0640 保护
-            pass
+                gid = grp.getgrnam(TARGET_GROUP).gr_gid
+                os.chown(tmp, 0, gid)
+            except (KeyError, PermissionError, ImportError):
+                # 组不存在或无权限改属主：保持当前属主，仅靠 0640 保护
+                pass
         os.replace(tmp, TARGET)
     except BaseException:
         try:
@@ -381,6 +412,8 @@ def apply_perms() -> list[str]:
     更重要，权限问题由 check 子命令报出来。
     """
     notes: list[str] = []
+    if not CHECK_POSIX_PERMS:
+        return notes
     if not TARGET.is_file():
         return notes
 
@@ -453,12 +486,14 @@ def snapshot_sources(repo: Path, *, quiet: bool = False) -> dict:
     dest = SNAPSHOT_DIR / (time.strftime("%Y%m%d-%H%M%S") + "-" + cur[:8])
     try:
         SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
-        os.chmod(SNAPSHOT_DIR, 0o700)
+        if CHECK_POSIX_PERMS:
+            os.chmod(SNAPSHOT_DIR, 0o700)
         dest.mkdir(mode=0o700, exist_ok=True)
         for name, data in files.items():
             f = dest / name
             f.write_bytes(data)
-            os.chmod(f, 0o600)
+            if CHECK_POSIX_PERMS:
+                os.chmod(f, 0o600)
         SNAPSHOT_STATE.parent.mkdir(parents=True, exist_ok=True)
         SNAPSHOT_STATE.write_text(cur, encoding="utf-8")
     except OSError as exc:
@@ -546,6 +581,9 @@ def mask(value: str) -> str:
 
 
 def require_root(action: str) -> None:
+    if IS_WINDOWS:
+        # Windows 无 root 概念；写不进去由 _assert_writable 报出可执行的提示
+        return
     if os.geteuid() != 0:
         raise SecretError(
             f"{action} 需要 root（要写 {TARGET}）。\n"
@@ -657,17 +695,18 @@ def cmd_check(args) -> int:
         if desired != existing:
             problems.append("文件内容与当前配置不同步（跑一次 sync 即可）")
 
-        st = TARGET.stat()
-        if st.st_mode & 0o777 != TARGET_MODE:
-            problems.append(f"{TARGET} 权限为 {oct(st.st_mode & 0o777)}，应为 {oct(TARGET_MODE)}")
-        try:
-            import grp
+        if CHECK_POSIX_PERMS:
+            st = TARGET.stat()
+            if st.st_mode & 0o777 != TARGET_MODE:
+                problems.append(f"{TARGET} 权限为 {oct(st.st_mode & 0o777)}，应为 {oct(TARGET_MODE)}")
+            try:
+                import grp
 
-            want_gid = grp.getgrnam(TARGET_GROUP).gr_gid
-            if st.st_gid != want_gid:
-                problems.append(f"{TARGET} 属组不是 {TARGET_GROUP}")
-        except (KeyError, ImportError):
-            pass
+                want_gid = grp.getgrnam(TARGET_GROUP).gr_gid
+                if st.st_gid != want_gid:
+                    problems.append(f"{TARGET} 属组不是 {TARGET_GROUP}")
+            except (KeyError, ImportError):
+                pass
 
     print(f"配置源：{repo}")
     print(f"目标文件：{TARGET}")

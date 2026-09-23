@@ -11,14 +11,16 @@
     python deploy/release/publish.py --tag-only                 # VERSION 已升好，只补推 tag
     python deploy/release/publish.py -m "改了啥" --no-tests     # 紧急跳过测试（会明确警告）
 
-七步，任何一步不过就停，不留半成品：
+六步，任何一步不过就停，不留半成品：
     ① 前置闸门   工作区 / 分支 / 是否落后远端 / VERSION 与最新 tag 是否对齐 / token
     ② 打包回验   build_release.py --bump（内含解包回验：sha256 全对、包内无受保护路径）
     ③ 跑测试     默认全量，不过就不发
     ④ 提交       VERSION（或 --commit-all 时的全部改动）并 push main
     ⑤ 打 tag     推 tag —— 这一步触发 CI
     ⑥ 盯落地     watch_release.py 轮询到 release 资产齐全才返回 0
-    ⑦ 通知联邦   给地址簿里其它实例留言「新版可拉」（只在 ⑥ 成功后才发）
+
+节点侧不靠留言通知：每台机器自己的 dabai-update.timer 定时查 GitHub，
+按版本号判定后自动装到最新版 —— 不依赖联邦，没入联邦的机器同样更新。
 
 为什么推了 tag 还不等于发布：
     真正的 release 由 CI 的 publish 作业创建，而它挂在 environment: release 的
@@ -34,7 +36,6 @@ from __future__ import annotations
 
 import argparse
 import base64
-import concurrent.futures
 import json
 import os
 import subprocess
@@ -308,56 +309,6 @@ def _publisher() -> str:
     return str((me or {}).get("node_id") or "")
 
 
-def _peer_nodes() -> list:
-    """地址簿里的同伴，剔除自己。读不到就返回空 —— 通知不是发布的必要环节。"""
-    try:
-        nodes = json.loads((ROOT / "data" / "peers.json").read_text(encoding="utf-8"))
-        me = json.loads((ROOT / "data" / "node.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return []
-    mine = (me or {}).get("node_id", "")
-    return [n for n in sorted((nodes or {}).get("nodes", {})) if n != mine]
-
-
-def do_notify(ver: str) -> dict:
-    """给其它实例留言。任何失败都只警告 —— 包已经发出去了，通知失败不能改成发布失败。
-
-    为什么只在 ⑥ 成功后才发：tag 推完不等于 release 建出来了（CI 要管理员 Approve）。
-    提前喊「可以拉」会让对面去拉一个还不存在的资产，比不通知更坏。
-    """
-    _p("⑦ 通知联邦其它实例")
-    nodes = _peer_nodes()
-    if not nodes:
-        warn("地址簿里没有别的实例（data/peers.json），跳过")
-        return {"notified": [], "failed": []}
-
-    text = (f"v{ver} 已发布：dabai-{ver}.tar.gz + .sha256 资产齐全，可以拉。"
-            f"开了 peer.auto_update 的机器会自己去查新版；否则手工：python deploy/release/update.py")
-    sent, failed = [], []
-
-    def _say(n: str):
-        cmd = [_python(), str(ROOT / "peer_mesh.py"), "say", n, text, "--kind", "release"]
-        try:
-            return n, _run(cmd, timeout=30)
-        except subprocess.TimeoutExpired:
-            return n, None
-
-    # 并行通知：每节点一个线程，总耗时 = max(单节点) 而非 sum(单节点)。
-    # 走 _run 而不是裸 Popen —— 它会给子进程带上 netproxy 代理环境（peer_mesh 要出网）。
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(nodes)) as pool:
-        results = list(pool.map(_say, nodes))
-    for n, cp in results:
-        if cp is not None and cp.returncode == 0:
-            sent.append(n)
-            ok(f"{n}：已留言")
-        else:
-            failed.append(n)
-            out = ((cp.stdout or "") + (cp.stderr or "")) if cp is not None else ""
-            last = out.strip().splitlines()
-            warn(f"{n}：留言失败 —— {last[-1] if last else ('超时' if cp is None else '无输出')}")
-    return {"notified": sent, "failed": failed}
-
-
 def do_log(entry: dict) -> None:
     try:
         RELEASE_LOG.parent.mkdir(parents=True, exist_ok=True)
@@ -387,7 +338,6 @@ def main() -> int:
                     help="把当前未提交改动一起提交（默认拒绝脏工作区）")
     ap.add_argument("--no-tests", action="store_true", help="跳过测试（不推荐）")
     ap.add_argument("--no-watch", action="store_true", help="不盯 CI 落地，推完就返回")
-    ap.add_argument("--no-notify", action="store_true", help="不通知联邦其它实例")
     ap.add_argument("--tests-timeout", type=int, default=1800, help="测试超时秒数（默认 1800）")
     ap.add_argument("--watch-timeout", type=int, default=1800, help="盯落地超时秒数（默认 1800）")
     ap.add_argument("--watch-interval", type=int, default=10, help="CI 轮询间隔秒数（默认 10）")
@@ -450,22 +400,11 @@ def main() -> int:
         else:
             rc = do_watch(ver, args.watch_timeout, args.watch_interval)
 
-        note = {"notified": [], "failed": []}
-        if rc != 0:
-            _p("⑦ 不通知联邦：release 还没落地")
-            _p("   （等 CI 跑完/点了 Approve 之后，重跑 watch_release.py 确认，再手工通知）")
-        elif args.no_notify:
-            _p("⑦ 已跳过联邦通知（--no-notify）")
-        else:
-            note = do_notify(ver)
-
         do_log({
             "phase": "outcome",
             "version": ver,
             "at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "watch_rc": rc,
-            "notified": note["notified"],
-            "notify_failed": note["failed"],
             "seconds": round(time.time() - t0, 1),
         })
 
@@ -478,7 +417,8 @@ def main() -> int:
             _p(f"  python deploy/release/watch_release.py v{ver}")
         _p(f"  Actions: https://github.com/{REPO_DEFAULT}/actions")
         _p(f"  Release: https://github.com/{REPO_DEFAULT}/releases/tag/v{ver}")
-        _p("  其它机器更新：python deploy/release/update.py")
+        _p("  其它机器更新：各自的 dabai-update.timer 每小时自己查一次并装上；")
+        _p("  要立刻装：python deploy/release/update.py --apply")
         return rc
 
     except Fail as exc:

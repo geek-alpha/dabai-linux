@@ -186,7 +186,7 @@ run install -m 0644 "$REPO_ROOT/deploy/systemd/dabai-update.service" "$UNIT_DIR/
 run install -m 0644 "$REPO_ROOT/deploy/systemd/dabai-update.timer" "$UNIT_DIR/dabai-update.timer"
 run "$SYSTEMCTL" daemon-reload
 run "$SYSTEMCTL" enable --now dabai-update.timer
-ok "定时器已启用（每次启动后 3 分钟查一次，此后每天 04:30 前后随机错开最多 30 分钟）"
+ok "定时器已启用（每次启动后 2 分钟查一次，此后每小时错开最多 5 分钟再查）"
 
 # ── 接线自检 ────────────────────────────────────────────────────────────
 step "⑥ 接线自检"

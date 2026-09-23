@@ -102,7 +102,6 @@ python deploy/release/publish.py --dry-run -m "..."      # 走到打包+测试�
 python deploy/release/publish.py --bump minor -m "..."   # 升 minor 位
 python deploy/release/publish.py -m "..." --commit-all   # 连未提交改动一起提
 python deploy/release/publish.py --tag-only              # VERSION 已升好，只补推 tag
-python deploy/release/publish.py -m "..." --no-notify    # 不通知联邦其它实例
 ```
 
 手工等价于下面四步 —— 手工做容易漏：漏 `--bump` 会拿旧版本号打包（CI 那条 tag
@@ -148,6 +147,10 @@ python deploy/release/watch_release.py v1.0.0
 ## 更新路径
 
 `update.py`，九步。任何一步不过，整包作废，不做部分更新。
+
+谁在什么时候跑它：每台机器自己的 `dabai-update.timer`（开机后 2 分钟一次，此后每小时一次）。
+检查只是读一个版本号（1 个 API 请求，秒级），远端不比本地新就直接返回 —— 不下载、不重启。
+这条路径不经过联邦：没入联邦的机器照样更新，入了联邦但对面离线也一样。
 
 | 步 | 做什么 | 不过怎么办 |
 |---|---|---|
@@ -201,7 +204,7 @@ sudo bash deploy/release/install-update.sh
 ```
 
 脚本会装更新器副本、写配置、写窄口径免密（`visudo` 预校验，写坏就撤回）、
-启用定时器（每天 04:30 前后随机错开），然后跑接线自检，包括**验证免密范围没有越界**
+启用定时器（开机后 2 分钟一次，此后每小时一次、各机错开最多 5 分钟），然后跑接线自检，包括**验证免密范围没有越界**
 （试着重启一个不存在的服务，能成功就说明范围过宽，直接报错退出）。
 
 前置条件：`GITHUB_TOKEN` 得有着落（仓库是私有的，拉发行版必须带）。已有的

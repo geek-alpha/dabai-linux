@@ -24,11 +24,9 @@
 环境变量：LONGRUN_INTERVAL / LONGRUN_TIMEOUT / LONGRUN_MAX_CALLS / LONGRUN_MODEL_USER
 """
 import argparse
-import fcntl
 import hashlib
 import json
 import os
-import signal
 import subprocess
 import sys
 import threading
@@ -37,6 +35,10 @@ from datetime import datetime
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parents[2]
+if str(BASE) not in sys.path:
+    sys.path.insert(0, str(BASE))
+
+import platform_compat as pc  # noqa: E402
 RUN_DIR = BASE / "data" / "longrun"
 JOURNAL = RUN_DIR / "journal.jsonl"
 STATE = RUN_DIR / "state.json"
@@ -44,7 +46,11 @@ STOP = RUN_DIR / "STOP"
 HEARTBEAT = RUN_DIR / "heartbeat"
 LEDGER = BASE / "long_horizon.json"
 CLI = BASE / "dabai_cli.py"
-PY = BASE / "venv" / "bin" / "python"
+# venv 布局随平台变：POSIX 是 bin/python，Windows 是 Scripts\python.exe
+PY = (BASE / "venv" / ("Scripts" if os.name == "nt" else "bin")
+      / ("python.exe" if os.name == "nt" else "python"))
+# 提示词和汇报里给的是相对路径（换机器也能照抄）
+PY_CMD = "venv/" + ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 
 INTERVAL = int(os.environ.get("LONGRUN_INTERVAL", "300"))
 CALL_TIMEOUT = int(os.environ.get("LONGRUN_TIMEOUT", "3600"))
@@ -380,10 +386,10 @@ PROMPT = """你是「长跑引擎」第 {cycle} 轮。上下文全新——磁�
 1. 这一轮只推上面那一个动作，做完就停；不要顺手开新战场。
 2. 说「完成」必须带证据：文件:行号、命令原文+退出码、或工具输出。拿不出证据就别声称完成。
 3. 收工前必须落盘接力棒，否则这一轮等于没发生：
-   {base}/venv/bin/python {base}/tools/long_horizon.py log {gid} "本轮做了什么" --ev "证据" --progress {progress} --next "下一轮的原子动作"
+   {py} {base}/tools/long_horizon.py log {gid} "本轮做了什么" --ev "证据" --progress {progress} --next "下一轮的原子动作"
 4. 卡住了也要落盘：卡点写进 --ev，--next 换成绕过它的动作（缩小范围/换工具/换路径），别把同一个动作原样留给下一轮。
    若卡点只有主人能做（解锁手机、扫码登录、手填数字、点头批补丁），落盘后必须再标记一次，别让引擎为它空烧：
-   {base}/venv/bin/python {base}/tools/long_horizon.py block {gid} --why "卡在主人哪件事"
+   {py} {base}/tools/long_horizon.py block {gid} --why "卡在主人哪件事"
    标记后这个目标退出轮转，直到主人做完并 unblock。重写第十遍文档不会让卡点前进一步。
 5. {safety}
 6. 检索批量做、读文件定点读：code_search 一次能传多个关键词，code_read 一次能读多个区间——同一轮里合并调用。每多一次往返，整段上下文就重发一次（实测单轮 29 次调用烧 166 万 prompt token）。别重读已读过的长文件，先 symbols/code_search 定位再定点读。
@@ -430,7 +436,7 @@ def build_prompt(goal: dict, state: dict) -> str:
             break
     safety, extra = safety_lines(goal)
     return PROMPT.format(
-        ws=goal_ws(gid), base=BASE,
+        ws=goal_ws(gid), base=BASE, py=PY,
         safety=safety,
         extra=extra,
         cycle=state.get("cycle", 0),
@@ -454,9 +460,7 @@ def acquire_lock() -> bool:
     global _LOCK_FH
     RUN_DIR.mkdir(parents=True, exist_ok=True)
     fh = open(RUN_DIR / "runner.lock", "w")
-    try:
-        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
+    if not pc.lock_file(fh, blocking=False):
         fh.close()
         return False
     fh.write(str(os.getpid()))
@@ -473,25 +477,19 @@ def sweep_orphans() -> int:
     """
     killed = 0
     me = os.getpid()
-    for entry in Path("/proc").iterdir():
-        if not entry.name.isdigit() or int(entry.name) == me:
+    for p in pc.process_tree():
+        cmd = p.get("cmdline") or ""
+        if "dabai_cli.py" not in cmd or "longrun_" not in cmd:
             continue
-        try:
-            cmd = (entry / "cmdline").read_bytes().replace(b"\x00", b" ").decode("utf-8", "replace")
-        except Exception:
+        pid, ppid = p.get("pid"), p.get("ppid") or 0
+        if not pid or pid == me or ppid == me:
             continue
-        if "dabai_cli.py" in cmd and "longrun_" in cmd:
-            try:
-                ppid = int((entry / "stat").read_text().split(")", 1)[1].split()[1])
-            except Exception:
-                continue
-            if ppid != 1:
-                continue          # 父进程还活着 = 不是孤儿，别碰
-            try:
-                os.kill(int(entry.name), signal.SIGKILL)
-                killed += 1
-            except Exception:
-                pass
+        # 孤儿的语义两个平台不同：Linux 的父进程被重挂到 pid 1，Windows 的 ppid
+        # 仍指向一个已消失的 pid。统一按「父进程还在不在」判定，别写死 ppid == 1。
+        if ppid not in (0, 1) and pc.pid_alive(ppid):
+            continue          # 父进程还活着 = 不是孤儿，别碰
+        if pc.kill_pid(pid, force=True):
+            killed += 1
     return killed
 
 
@@ -510,7 +508,8 @@ def call_agent(prompt: str, user: str, cycle: int = None, ws: Path = None) -> tu
     if ws:
         env["DABAI_WORKSPACE"] = str(ws)
     p = subprocess.Popen(argv, cwd=str(ws or BASE), env=env, stdout=subprocess.PIPE,
-                         stderr=subprocess.PIPE, text=True, start_new_session=True)
+                         stderr=subprocess.PIPE, text=True,
+                         **pc.spawn_kwargs(new_group=True))
     fh = None
     if cycle:
         append_trace(cycle, {"type": "start", "t": t0, "argv": argv[1:4], "user": user})
@@ -539,7 +538,7 @@ def call_agent(prompt: str, user: str, cycle: int = None, ws: Path = None) -> tu
             break
         if now() - t0 > CALL_TIMEOUT:
             try:
-                os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+                pc.terminate_tree(p.pid)
             except Exception:
                 p.kill()
             p.wait()
@@ -777,11 +776,16 @@ def _engine_alive() -> bool:
         return False
     if not pid:
         return False
-    try:
-        cmd = (Path("/proc") / str(pid) / "cmdline").read_bytes().decode("utf-8", "replace")
-    except Exception:
+    if not pc.pid_alive(pid):
         return False
-    return "longrun/runner.py" in cmd
+    for p in pc.process_tree():
+        if p.get("pid") != pid:
+            continue
+        # Windows 的 CommandLine 用反斜杠、Linux 的 /proc cmdline 是 NUL 分隔——
+        # 先统一成正斜杠再匹配，别按平台各写一套
+        cmd = (p.get("cmdline") or "").replace("\\", "/")
+        return "longrun/runner.py" in cmd
+    return False
 
 
 def _idle_streak() -> int:
@@ -874,7 +878,7 @@ def build_report(state: dict = None) -> str:
                 why = why[:140] + "…"
             out.append(f"{i}. **{title}**{tag}：{why}")
         out += ["", "做完那件事，解除挂起它就重新进轮转：", "", "```sh",
-                "venv/bin/python tools/long_horizon.py unblock <目标id>", "```", ""]
+                f"{PY_CMD} tools/long_horizon.py unblock <目标id>", "```", ""]
     else:
         out += ["## ⚠ 等你决定", "", "没有。引擎自己能推的都推完了。", ""]
 
@@ -899,9 +903,9 @@ def build_report(state: dict = None) -> str:
         out.append("")
 
     out += ["## 怎么回话", "", "```sh",
-            "venv/bin/python tools/long_horizon.py list                # 全部目标与卡点",
-            "venv/bin/python tools/long_horizon.py next <id> \"下一步\"   # 改接力棒",
-            "venv/bin/python tools/long_horizon.py log <id> \"做了什么\" --ev \"证据\"",
+            f"{PY_CMD} tools/long_horizon.py list                # 全部目标与卡点",
+            f"{PY_CMD} tools/long_horizon.py next <id> \"下一步\"   # 改接力棒",
+            f"{PY_CMD} tools/long_horizon.py log <id> \"做了什么\" --ev \"证据\"",
             "```"]
     return "\n".join(out) + "\n"
 

@@ -1,0 +1,40 @@
+# 大白跨平台依赖清单（Windows / Linux / macOS 通用）
+#
+# 为什么单独一份，而不是直接用 requirements.txt：
+#   requirements.txt 是早期那台 Windows 机器上的历史清单，混了三类装不上的东西 ——
+#     bpy / bmesh / mathutils / addon_utils / rna_prop_ui  Blender 内嵌 Python 才有，PyPI 上没有
+#     imp                                                 Python 3.12 起已从标准库移除，安装即失败
+#     TodoService / amazing_agent_dingding / dabai_ears /
+#     dabai_voice / fuctions_all_you_need_base / google   本机私有包，PyPI 上不存在
+#   拿它在新机器上装会成片失败，看着像环境坏了，其实是清单本身不可移植。
+#
+# 这份清单里的每个包在三个平台上都能装。装不上的可选包在末尾用注释列出，
+# 缺了不影响核心能力（对话 / 3D / 技能 / 任务中心）。
+#
+# 安装：
+#   Linux/macOS  ./dabai.sh --setup      （或 tools/linux_setup.sh --venv）
+#   Windows      dabai.bat --setup
+
+Pillow
+aiohttp
+anthropic
+certifi
+edge-tts
+fastapi
+gradio_client
+httpx
+mss
+netifaces
+numpy
+openai
+playwright
+python-dotenv
+requests
+starlette
+tree_sitter
+uvicorn
+yt_dlp
+
+# ---- 可选：装不上不影响核心 ----
+# pyautogui     截屏/自动化兜底；Windows 直接可用，Linux 需 python3-xlib（截屏另有 mss 兜底）
+# sounddevice   麦克风采集；需系统音频库

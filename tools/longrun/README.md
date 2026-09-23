@@ -73,7 +73,7 @@ systemctl --user enable --now dabai-longrun.service dabai-longrun-watchdog.timer
 | 路径 | 作用 |
 |---|---|
 | `tools/longrun/runner.py` | 主循环（stdlib only） |
-| `tools/longrun/watchdog.sh` | 心跳看门狗（心跳过期 → 重启服务） |
+| `tools/longrun/watchdog.py` | 心跳看门狗（心跳过期 → 重启服务；跨平台：Linux 走 systemctl，Windows 走计划任务） |
 | `data/longrun/journal.jsonl` | append-only 事件流（每轮一条，崩溃不丢） |
 | `data/longrun/report.md` | 给主人看的人话汇报（每轮重写，不是 append） |
 | `data/longrun/state.json` | checkpoint：轮次/连续失败/冷却/预算（原子写） |
