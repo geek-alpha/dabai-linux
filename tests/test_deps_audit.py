@@ -259,3 +259,25 @@ def test_deps_gate_reads_real_audit_output(tmp_path):
 
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+def test_uninstalled_env_is_not_mistaken_for_undeclared(monkeypatch):
+    """构建机上没装依赖 ≠ 清单没声明 —— 两件事必须分得开。
+
+    v1.1.22 首发就栽在这：CI 的构建机一个第三方包都没装，
+    packages_distributions() 对每个模块都返回空，「模块名 → 包名」映射不出来，
+    declared 全判 False，闸门在 CI 上永远拒包 —— 而本地装了全套依赖，看不见这个 bug。
+    """
+    audit_mod = _load(AUDIT, "_deps_audit_clean_env")
+    monkeypatch.setattr(audit_mod.md, "packages_distributions", lambda: {})
+    rep = audit_mod.audit()
+
+    assert rep["startup_hard_missing_decl"] == [], (
+        "零安装环境把已声明的启动依赖判成了「清单没声明」：" +
+        "；".join(f"{r['module']} ← {r['lines'][0]}" for r in rep["startup_hard_missing_decl"]))
+    assert rep["startup_not_installed"], (
+        "零安装环境下「启动路径缺包」不能是空的 —— 那说明报告把没装当成了装好")
+    declared = {_norm(pkg) for _m, pkg, *_ in _load(CHECK_DEPS, "_check_deps_clean_env").REQUIRED}
+    leak = [r["package"] for r in rep["redundant"]
+            if r["package"] in declared and r["package"] not in audit_mod.INDIRECT]
+    assert not leak, f"零安装环境下把清单声明当成了「代码零引用」：{leak}"

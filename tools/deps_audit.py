@@ -10,6 +10,10 @@ check_deps.py 单一来源后，清单本身仍是手写的 —— 新增一个 
 字符串形式），用 importlib.metadata.packages_distributions() 做
 「顶层模块名 → 发行包名」的权威映射（不手写对照表），再和 check_deps 的清单对账。
 
+★ 那份映射只认「本机装了的发行包」：构建机上一个第三方包都没装时，它对每个模块都
+返回空 —— 查不到就退回 check_deps 里的模块名→包名对照。声明与否由清单说了算，
+不能让「构建机没装」变成「清单没声明」（v1.1.22 首发就在 CI 上这么被拒的包）。
+
 ★ 启动路径分析：从 server.py 出发沿 import 图递归，切出「缺了 server 就起不来」的
 那批依赖。全项目扫描会把一次性工具脚本的依赖（tools/locate_icon.py 的 cv2、
 screen_shot.py 的 pyautogui）和历史脚本（dabai.py 依赖的本机私有包）一并算进来，
@@ -279,14 +283,27 @@ def _declared() -> dict[str, str]:
     return out
 
 
+@lru_cache(maxsize=1)
+def _mod_to_pkg() -> dict[str, str]:
+    """模块名 → 发行包名，来源是 check_deps 清单本身，与装没装无关。"""
+    out: dict[str, str] = {}
+    for mod, pkg, _ex in check_deps.REQUIRED:
+        out[mod] = pkg
+    for mod, pkg, _what, _ex in check_deps.CAPABILITY:
+        out[mod] = pkg
+    return out
+
+
 def _row(mod: str, info: dict, dmap: dict, declared: dict, startup: bool) -> dict:
     dists = dmap.get(mod)
-    dist = dists[0] if dists else None
+    # 本机没装时退回清单对照：installed 仍按「本机装没装」如实报，
+    # 但 declared 必须按清单判，否则零安装的构建机上全成了漏网。
+    dist = dists[0] if dists else _mod_to_pkg().get(mod)
     files = sorted(info["files"]) if isinstance(info["files"], set) else list(info["files"])
     return {
         "module": mod,
         "package": dist,
-        "installed": dist is not None,
+        "installed": dists is not None,
         "optional": info["guarded"],
         "declared": _norm(dist) in declared if dist else False,
         "on_startup": startup,
@@ -346,7 +363,7 @@ def _export_direct() -> list[str]:
     rows = []
     for mod, info in found.items():
         dists = dmap.get(mod)
-        dist = dists[0] if dists else mod
+        dist = dists[0] if dists else _mod_to_pkg().get(mod, mod)
         rows.append((_norm(dist), dist, info["guarded"], mod in startup_third,
                      mod in NOT_ON_PYPI))
     rows.sort()
