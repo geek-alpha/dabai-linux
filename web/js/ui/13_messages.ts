@@ -790,6 +790,8 @@ export default (function init(App: AppKernel) {
         App.toolChainProgress(e.tool_name, e.elapsed, e.message);
       }
     }
+    // 重放出来的是历史块（都已结束）：直接收起；只有实时运行中的块才展开显示参数
+    if (App.toolChainCollapseAll) App.toolChainCollapseAll();
     if (App.noteTurnActivity) App.noteTurnActivity();
     App.scrollToBottom(true);
     App.notifyFullscreenChat();

@@ -8,6 +8,9 @@ export default (function init(App: AppKernel) {
    *  不叫「工具链」、不编号；完整执行状态仍投递给任务直播大屏。
    * ============================================================ */
 
+  /** 执行结束后停留多久再自动折叠（毫秒）：够看清参数/结果，又不堆屏 */
+  const AUTO_FOLD_MS = 2000;
+
   const TOOL_ICONS: Record<string, string> = {
     web_search: '🌐', search: '🔍', read: '📄', read_image: '🖼️', write: '✏️', edit: '📝',
     glob: '📂', grep: '🔎', pwsh: '💻', run_code: '⚙️',
@@ -50,6 +53,7 @@ export default (function init(App: AppKernel) {
     success: boolean | undefined;
     el: HTMLElement;
     startedAt: number;   // 起始时间戳：交给游戏化层算耗时评级
+    foldTimer?: number;  // 结束后自动折叠的定时器（0/空 = 未排）
   }
 
   let round = 0;                    // 当前轮次（thinking 时 +1）
@@ -70,33 +74,31 @@ export default (function init(App: AppKernel) {
     if (!b) return null;
     if (App.sealTurnSeg) App.sealTurnSeg();
     const d = document.createElement('div');
-    d.className = 'tool-inline ' + status;
+    // 运行中默认展开：参数实时可见，不用点开瞄一眼
+    d.className = 'tool-inline open ' + status;
     d.innerHTML =
-      '<button type="button" class="tool-inline-head" aria-expanded="false">' +
+      '<button type="button" class="tool-inline-head" aria-expanded="true">' +
         '<span class="tool-inline-ic"></span>' +
         '<span class="tool-inline-name"></span>' +
         '<span class="tool-inline-summary"></span>' +
         '<span class="tool-inline-state"></span>' +
-        '<span class="tool-inline-caret">▸</span>' +
+        '<span class="tool-inline-caret">▾</span>' +
       '</button>' +
-      '<div class="tool-inline-body" hidden>' +
-        '<div class="tool-inline-args"></div>' +
-        '<div class="tool-inline-result"></div>' +
+      '<div class="tool-inline-body">' +
+        '<div class="tool-inline-body-in">' +
+          '<div class="tool-inline-args"></div>' +
+          '<div class="tool-inline-result"></div>' +
+        '</div>' +
       '</div>';
     (d.querySelector('.tool-inline-ic') as HTMLElement).textContent = toolIcon(name);
     (d.querySelector('.tool-inline-name') as HTMLElement).textContent = toolLabel(name);
     const state = d.querySelector('.tool-inline-state') as HTMLElement;
     state.innerHTML = '<span class="turn-spin">⟳</span>执行中';
-    // 点击头部展开/收起详细内容
+    // 点击头部展开/收起详细内容；手动开合即接管，不再被自动折叠收走
     const head = d.querySelector('.tool-inline-head') as HTMLElement;
-    const body = d.querySelector('.tool-inline-body') as HTMLElement;
     head.addEventListener('click', () => {
-      const open = !!body.hidden;
-      body.hidden = !open;
-      head.setAttribute('aria-expanded', String(open));
-      d.classList.toggle('open', open);
-      const caret = d.querySelector('.tool-inline-caret') as HTMLElement | null;
-      if (caret) caret.textContent = open ? '▾' : '▸';
+      d.dataset.manualFold = '1';
+      setBodyOpen(d, !d.classList.contains('open'));
     });
     b.appendChild(d);
     return d;
@@ -110,7 +112,10 @@ export default (function init(App: AppKernel) {
     else if (status === 'error') state.textContent = '✗ 失败';
     else if (status === 'ended') state.textContent = '· 已结束';
     else state.innerHTML = '<span class="turn-spin">⟳</span>执行中';
-    st.el.className = 'tool-inline ' + status;
+    // 只换状态类，不动 open：展开与否归 setBodyOpen 管，否则状态一变就被折叠
+    st.el.classList.remove('running', 'done', 'error', 'ended');
+    st.el.classList.add(status);
+    if (status !== 'running') scheduleAutoFold(st);
   }
 
   // ---------- 对外 API ----------
@@ -126,6 +131,7 @@ export default (function init(App: AppKernel) {
 
   /** 会话切换/历史恢复：清空记录 */
   App.toolChainReset = function toolChainReset() {
+    clearFoldTimers();
     steps = [];
     round = 0;
     startAt = 0;
@@ -176,6 +182,16 @@ export default (function init(App: AppKernel) {
     pushToBoard();
   };
 
+  /** 历史恢复：重放出来的块都已结束，直接收起，不占屏 */
+  App.toolChainCollapseAll = function toolChainCollapseAll() {
+    for (let i = 0; i < steps.length; i++) {
+      const st = steps[i];
+      clearFoldTimer(st);
+      st.el.dataset.manualFold = '1';
+      setBodyOpen(st.el, false);
+    }
+  };
+
   /** 委派子任务：下钻入口由任务中心承载，聊天框不再挂载 */
   App.codexLinkTask = function codexLinkTask(_toolName: string, _taskId: string) {};
 
@@ -201,6 +217,38 @@ export default (function init(App: AppKernel) {
   };
 
   // ---------- 内部 ----------
+
+  /** 展开/收起详情：class 管动效，hidden 管兼容 —— 两套信号一起发 */
+  function setBodyOpen(d: HTMLElement, open: boolean) {
+    d.classList.toggle('open', open);
+    // hidden 是旧版折叠契约：CSS 用 grid-template-rows 过渡，但浏览器可能
+    // 混用新旧资源（JS 新 / CSS 旧，或反过来）。两套信号都发，任一套生效都能真的收起来。
+    const body = d.querySelector('.tool-inline-body') as HTMLElement | null;
+    if (body) body.hidden = !open;
+    const head = d.querySelector('.tool-inline-head') as HTMLElement | null;
+    if (head) head.setAttribute('aria-expanded', String(open));
+    const caret = d.querySelector('.tool-inline-caret') as HTMLElement | null;
+    if (caret) caret.textContent = open ? '▾' : '▸';
+  }
+
+  function clearFoldTimer(st: ToolStep) {
+    if (st.foldTimer) { window.clearTimeout(st.foldTimer); st.foldTimer = 0; }
+  }
+
+  function clearFoldTimers() {
+    for (let i = 0; i < steps.length; i++) clearFoldTimer(steps[i]);
+  }
+
+  /** 执行结束的块停留 AUTO_FOLD_MS 再收起（用户手动开合过就不再打扰） */
+  function scheduleAutoFold(st: ToolStep) {
+    clearFoldTimer(st);
+    if (st.el.dataset.manualFold) return;
+    st.foldTimer = window.setTimeout(() => {
+      st.foldTimer = 0;
+      if (st.el.dataset.manualFold) return;
+      setBodyOpen(st.el, false);
+    }, AUTO_FOLD_MS);
+  }
 
   function finalizePrevious() {
     for (let i = 0; i < steps.length; i++) {

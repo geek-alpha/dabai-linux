@@ -2353,9 +2353,36 @@ body.attach-drag::after {
 .tool-inline.done .tool-inline-state { color: #67de8e; }
 .tool-inline.error .tool-inline-state { color: #ff6484; }
 
-/* 展开详情：参数 / 结果，等宽字体，超长时框内滚动 */
+/* 展开详情：参数 / 结果，等宽字体，超长时框内滚动。
+   折叠走 grid-template-rows 0fr↔1fr：内容多高都平滑收放，不留空档。
+   [hidden] 那条是旧版折叠契约（老 JS 切 hidden 属性）的兼容位：显式声明 grid，
+   让高度过渡而不是 display:none 硬切 —— 浏览器混用新旧资源时也不至于点不动。 */
 .tool-inline-body {
+    display: grid;
+    grid-template-rows: 1fr;
+    overflow: hidden;
+    opacity: 1;
+    transition: grid-template-rows 0.3s ease, opacity 0.22s ease;
+}
+/* grid 项默认 min-height:auto，不压到 0 行高就不会塌陷 */
+.tool-inline-body > * { min-height: 0; }
+.tool-inline:not(.open) .tool-inline-body,
+.tool-inline-body[hidden] {
+    display: grid;
+    grid-template-rows: 0fr;
+    opacity: 0;
+}
+/* 0fr 只压内容高，内边距照样撑出 10px 空档 —— 折叠态必须把它一并收掉 */
+.tool-inline:not(.open) .tool-inline-body-in,
+.tool-inline-body[hidden] .tool-inline-body-in {
+    padding-top: 0;
+    padding-bottom: 0;
+}
+.tool-inline-body-in {
+    min-height: 0;
+    overflow: hidden;
     padding: 2px 10px 8px;
+    transition: padding 0.3s ease;
     font-size: 12px;
     color: #cfc9e8;
 }

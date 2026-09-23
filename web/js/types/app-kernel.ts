@@ -1141,6 +1141,8 @@ export interface AppKernel {
   toolChainAbort?: () => void;
   toolChainEndTurn?: () => void;
   toolChainReset?: () => void;
+  /** 历史恢复重放完调用：已完成的工具块直接收起，只有实时运行中的块保持展开 */
+  toolChainCollapseAll?: () => void;
   addToolCallMsg: (toolName: string, args: any, status?: any) => void;
   addToolCallResult: (toolName: string, result: any, success: boolean) => void;
 

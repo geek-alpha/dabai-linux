@@ -175,11 +175,18 @@ def _isolate_runner(tmp_path, monkeypatch):
 
 
 def _dir_fingerprint(root: Path) -> dict:
-    """{相对路径: (是否目录, 大小, mtime_ns)} —— 用来证明一个目录「一个字节没动」。"""
+    """{相对路径: (是否目录, 大小, mtime_ns)} —— 用来证明一个目录「一个字节没动」。
+
+    跳过长跑任务自己的浏览器 profile：ws/<任务>/chromium-profile 由活着的
+    headless chromium 持续写入（Cookies / Cache_Data 每次心跳都变 mtime），
+    跟被测代码无关，纳进指纹只会让这条哨兵随机变红。
+    """
     out = {}
     if not root.exists():
         return out
     for p in sorted(root.rglob("*")):
+        if "chromium-profile" in p.parts:
+            continue
         try:
             st = p.stat()
         except OSError:
