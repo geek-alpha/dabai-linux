@@ -115,6 +115,12 @@ def main() -> int:
     # 原地 exec：不另起进程，Ctrl+C / 退出码 / 信号都直接作用在 server.py 上
     sys.argv = [str(entry)] + args.rest
     os.chdir(ROOT)
+    # runpy.run_path 只对「目录 / zip 形式的 sys.path 条目」插 sys.path，对普通 .py
+    # 文件不插；而 `python server.py` 会把脚本所在目录放进 sys.path[0]。少了这一步，
+    # server.py 里的 `import attach_text` 直接 ModuleNotFoundError —— 且只在走
+    # bat / launch.py 时复现，手动 `python server.py` 一切正常，最难查的那类差异。
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
     runpy.run_path(str(entry), run_name="__main__")
     return 0
 

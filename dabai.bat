@@ -1,18 +1,17 @@
 @echo off
-REM å¤§ç™½ Windows å¯åŠ¨è„šæœ¬ï¼ˆä¸ dabai.sh ç­‰ä»·ï¼‰
+REM ´ó°× Windows Æô¶¯½Å±¾£¨Óë dabai.sh µÈ¼Û£©
 REM
-REM ç”¨æ³•ï¼š
-REM   dabai.bat             å¯åŠ¨ server.pyï¼ˆç» deploy\windows\launch.py æ³¨å…¥å¯†é’¥ï¼‰
-REM   dabai.bat --setup     ä¸€é”®ï¼šå»º venv + è£…ä¾èµ– + å¯åŠ¨ï¼ˆé¦–æ¬¡ç”¨è¿™æ¡ï¼‰
-REM   dabai.bat --check     åªåšç¯å¢ƒè‡ªæ£€ï¼Œä¸å¯åŠ¨
+REM ÓÃ·¨£º
+REM   dabai.bat             Æô¶¯ server.py£¨¾­ deploy\windows\launch.py ×¢ÈëÃÜÔ¿£©
+REM   dabai.bat --setup     Ò»¼ü£º½¨ venv + ×°ÒÀÀµ + Æô¶¯£¨Ê×´ÎÓÃÕâÌõ£©
+REM   dabai.bat --check     Ö»×ö»·¾³×Ô¼ì£¬²»Æô¶¯
 REM
-REM ç¯å¢ƒå˜é‡ï¼š
-REM   DABAI_PYTHON  æŒ‡å®šè§£é‡Šå™¨ï¼ˆé»˜è®¤ï¼švenv\Scripts\python.exe â†’ py -3 â†’ pythonï¼‰
-REM   DABAI_PORT    è¦†ç›–ç«¯å£ï¼ˆé»˜è®¤æ²¿ç”¨ settings.json é…ç½®ï¼‰
+REM »·¾³±äÁ¿£º
+REM   DABAI_PYTHON  Ö¸¶¨½âÊÍÆ÷£¨Ä¬ÈÏ£ºvenv\Scripts\python.exe -> py -3 -> python£©
+REM   DABAI_PORT    ¸²¸Ç¶Ë¿Ú£¨Ä¬ÈÏÑØÓÃ settings.json ÅäÖÃ£©
 REM
-REM ä¸ºä»€ä¹ˆä¸ç”¨ requirements.txtï¼šé‚£é‡Œé¢æœ‰ Blender å†…åµŒæ¨¡å—å’Œæœ¬æœºç§æœ‰åŒ…ï¼ŒPyPI è£…ä¸åˆ°ï¼Œ
-REM ä¼šæˆç‰‡å¤±è´¥ã€‚è·¨å¹³å°çš„é‚£ä»½æ˜¯ requirements-core.txtï¼ˆè§å®ƒçš„æ–‡ä»¶å¤´ï¼‰ã€‚
-chcp 65001 >nul
+REM ÎªÊ²Ã´²»ÓÃ requirements.txt£ºÄÇÀïÃæÓĞ Blender ÄÚÇ¶Ä£¿éºÍ±¾»úË½ÓĞ°ü£¬PyPI ×°²»µ½£¬
+REM »á³ÉÆ¬Ê§°Ü¡£¿çÆ½Ì¨µÄÄÇ·İÊÇ requirements-core.txt£¨¼ûËüµÄÎÄ¼şÍ·£©¡£
 setlocal enabledelayedexpansion
 cd /d "%~dp0"
 set "ROOT=%CD%"
@@ -20,7 +19,7 @@ set "SETUP=0"
 set "CHECKONLY=0"
 set "ARGS="
 
-REM ---- å‚æ•°åˆ†æµï¼š--setup / --check / --help è‡ªå·±å¤„ç†ï¼Œå…¶ä½™åŸæ ·é€ä¼ ç»™ server.py ----
+REM ---- ²ÎÊı·ÖÁ÷£º--setup / --check / --help ×Ô¼º´¦Àí£¬ÆäÓàÔ­ÑùÍ¸´«¸ø server.py ----
 :parse
 if "%~1"=="" goto parsed
 if /i "%~1"=="--setup" ( set "SETUP=1" & shift & goto parse )
@@ -43,14 +42,14 @@ if exist "%VENV_PY%" set "PY=%VENV_PY%"
 if not defined PY if exist "%ROOT%\.venv\Scripts\python.exe" set "PY=%ROOT%\.venv\Scripts\python.exe"
 if not defined PY call :find_python
 if not defined PY (
-  echo [X] æ‰¾ä¸åˆ° Pythonã€‚è¯·è£… Python 3.10+ å¹¶å‹¾é€‰ "Add python.exe to PATH"ï¼Œ
-  echo     æˆ–ç”¨ç¯å¢ƒå˜é‡ DABAI_PYTHON æŒ‡å®šè§£é‡Šå™¨ã€‚
+  echo [X] ÕÒ²»µ½ Python¡£Çë×° Python 3.10+ ²¢¹´Ñ¡ "Add python.exe to PATH"£¬
+  echo     »òÓÃ»·¾³±äÁ¿ DABAI_PYTHON Ö¸¶¨½âÊÍÆ÷¡£
   exit /b 1
 )
 
-REM ---- ç¯å¢ƒè‡ªæ£€ï¼ˆç¼ºä¾èµ–æ—¶ç»™å‡ºå¯æ‰§è¡Œå‘½ä»¤ï¼Œè€Œä¸æ˜¯è®© server å´©åœ¨ importï¼‰----
+REM ---- »·¾³×Ô¼ì£¨È±ÒÀÀµÊ±¸ø³ö¿ÉÖ´ĞĞÃüÁî£¬¶ø²»ÊÇÈÃ server ±ÀÔÚ import£©----
 if "%CHECKONLY%"=="1" (
-  %PY% "%ROOT%\tools\linux_selfcheck.py"
+  %PY% "%ROOT%\tools\selfcheck.py"
   exit /b !errorlevel!
 )
 
@@ -60,23 +59,23 @@ set "MISSING="
 set /p MISSING=<"%MISSFILE%"
 del "%MISSFILE%" >nul 2>nul
 if defined MISSING (
-  echo [X] ç¼ºå°‘ä¾èµ–ï¼š!MISSING!
-  echo     å®‰è£…ï¼š%PY% -m pip install -r "%ROOT%\requirements-core.txt"
-  echo     æˆ–å…ˆè‡ªæ£€ï¼šdabai.bat --check
+  echo [X] È±ÉÙÒÀÀµ£º!MISSING!
+  echo     °²×°£º%PY% -m pip install -r "%ROOT%\requirements-core.txt"
+  echo     »òÏÈ×Ô¼ì£ºdabai.bat --check
   exit /b 1
 )
 
 set PYTHONUTF8=1
 set PYTHONIOENCODING=utf-8
-REM èµ° launch.py è€Œä¸æ˜¯ç›´æ¥è·‘ server.pyï¼šå®ƒå…ˆæŠŠ secrets.env è¯»è¿›ç¯å¢ƒå˜é‡å†å¯åŠ¨ã€‚
-REM Windows çš„è®¡åˆ’ä»»åŠ¡æ²¡æœ‰ EnvironmentFile= ç­‰ä»·ç‰©ï¼Œé è¿™å±‚ä¿è¯ã€Œæ‰‹åŠ¨è·‘ã€å’Œ
-REM ã€ŒæœåŠ¡è·‘ã€æ‹¿åˆ°åŒä¸€å¥—å¯†é’¥ â€”â€” å¦åˆ™ä¼šå‡ºç°åªåœ¨ä¸€ä¾§å¤ç°çš„è¯¡å¼‚å·®å¼‚ã€‚
+REM ×ß launch.py ¶ø²»ÊÇÖ±½ÓÅÜ server.py£ºËüÏÈ°Ñ secrets.env ¶Á½ø»·¾³±äÁ¿ÔÙÆô¶¯¡£
+REM Windows µÄ¼Æ»®ÈÎÎñÃ»ÓĞ EnvironmentFile= µÈ¼ÛÎï£¬¿¿Õâ²ã±£Ö¤¡¸ÊÖ¶¯ÅÜ¡¹ºÍ
+REM ¡¸·şÎñÅÜ¡¹ÄÃµ½Í¬Ò»Ì×ÃÜÔ¿ ¡ª¡ª ·ñÔò»á³öÏÖÖ»ÔÚÒ»²à¸´ÏÖµÄ¹îÒì²îÒì¡£
 %PY% "%ROOT%\deploy\windows\launch.py"!ARGS!
 exit /b !errorlevel!
 
-REM ---- å­è¿‡ç¨‹ ----
+REM ---- ×Ó¹ı³Ì ----
 :bootstrap
-echo == é¦–æ¬¡è¿è¡Œï¼šåˆ›å»ºè™šæ‹Ÿç¯å¢ƒå¹¶å®‰è£…ä¾èµ– ==
+echo == Ê×´ÎÔËĞĞ£º´´½¨ĞéÄâ»·¾³²¢°²×°ÒÀÀµ ==
 set "SYS_PY="
 where py >nul 2>nul
 if %errorlevel% equ 0 set "SYS_PY=py -3"
@@ -85,18 +84,18 @@ if not defined SYS_PY (
   if %errorlevel% equ 0 set "SYS_PY=python"
 )
 if not defined SYS_PY (
-  echo [X] æ‰¾ä¸åˆ° Pythonï¼Œè£…ä¸äº†ç¯å¢ƒã€‚è¯·å…ˆè£… Python 3.10+ å†è·‘ä¸€æ¬¡ã€‚
+  echo [X] ÕÒ²»µ½ Python£¬×°²»ÁË»·¾³¡£ÇëÏÈ×° Python 3.10+ ÔÙÅÜÒ»´Î¡£
   exit /b 1
 )
 %SYS_PY% -m venv "%ROOT%\venv"
 if not exist "%VENV_PY%" (
-  echo [X] åˆ›å»º venv å¤±è´¥ï¼Œçœ‹ä¸Šé¢çš„æŠ¥é”™ã€‚
+  echo [X] ´´½¨ venv Ê§°Ü£¬¿´ÉÏÃæµÄ±¨´í¡£
   exit /b 1
 )
 "%VENV_PY%" -m pip install --upgrade pip
 "%VENV_PY%" -m pip install -r "%ROOT%\requirements-core.txt"
-if errorlevel 1 echo [!] æœ‰ä¾èµ–æ²¡è£…ä¸Šï¼ˆè¯¦è§ä¸Šé¢è¾“å‡ºï¼‰ã€‚æ ¸å¿ƒèƒ½åŠ›é€šå¸¸ä»å¯ç”¨ï¼Œç¼ºå“ªä¸ªè¡¥å“ªä¸ªã€‚
-echo == ç¯å¢ƒå°±ç»ª ==
+if errorlevel 1 echo [!] ÓĞÒÀÀµÃ»×°ÉÏ£¨Ïê¼ûÉÏÃæÊä³ö£©¡£ºËĞÄÄÜÁ¦Í¨³£ÈÔ¿ÉÓÃ£¬È±ÄÄ¸ö²¹ÄÄ¸ö¡£
+echo == »·¾³¾ÍĞ÷ ==
 exit /b 0
 
 :find_python
@@ -107,13 +106,13 @@ if %errorlevel% equ 0 ( set "PY=python" & exit /b 0 )
 exit /b 1
 
 :usage
-echo å¤§ç™½ Windows å¯åŠ¨è„šæœ¬
+echo ´ó°× Windows Æô¶¯½Å±¾
 echo.
-echo   dabai.bat             å¯åŠ¨ server.py
-echo   dabai.bat --setup     ä¸€é”®ï¼šå»º venv + è£…ä¾èµ– + å¯åŠ¨ï¼ˆé¦–æ¬¡ç”¨è¿™æ¡ï¼‰
-echo   dabai.bat --check     åªåšç¯å¢ƒè‡ªæ£€ï¼Œä¸å¯åŠ¨
+echo   dabai.bat             Æô¶¯ server.py
+echo   dabai.bat --setup     Ò»¼ü£º½¨ venv + ×°ÒÀÀµ + Æô¶¯£¨Ê×´ÎÓÃÕâÌõ£©
+echo   dabai.bat --check     Ö»×ö»·¾³×Ô¼ì£¬²»Æô¶¯
 echo.
-echo ç¯å¢ƒå˜é‡ï¼š
-echo   DABAI_PYTHON  æŒ‡å®šè§£é‡Šå™¨ï¼ˆé»˜è®¤ï¼švenv\Scripts\python.exe -^> py -3 -^> pythonï¼‰
-echo   DABAI_PORT    è¦†ç›–ç«¯å£ï¼ˆé»˜è®¤æ²¿ç”¨ settings.json é…ç½®ï¼‰
+echo »·¾³±äÁ¿£º
+echo   DABAI_PYTHON  Ö¸¶¨½âÊÍÆ÷£¨Ä¬ÈÏ£ºvenv\Scripts\python.exe -^> py -3 -^> python£©
+echo   DABAI_PORT    ¸²¸Ç¶Ë¿Ú£¨Ä¬ÈÏÑØÓÃ settings.json ÅäÖÃ£©
 exit /b 0

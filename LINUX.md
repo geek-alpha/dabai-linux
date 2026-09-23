@@ -21,7 +21,7 @@ sudo apt-get install -y python3-venv python3-dev ffmpeg ripgrep
 ./tools/linux_setup.sh --venv
 
 # 2) 环境自检（推荐每次启动前跑）
-./dabai.sh --check        # 或 python3 tools/linux_selfcheck.py
+./dabai.sh --check        # 或 python3 tools/selfcheck.py
 
 # 3) 启动
 ./dabai.sh
@@ -517,7 +517,7 @@ ln -sf /usr/local/lib/nodejs/node-v24.21.0-linux-x64/bin/{node,npm,npx} /usr/loc
 
 | 职责 | Linux | Windows | 共用代码 |
 |---|---|---|---|
-| 启动 | `dabai.sh`（`--setup` / `--check`） | `dabai.bat`（同名参数） | `server.py` + `tools/linux_selfcheck.py` |
+| 启动 | `dabai.sh`（`--setup` / `--check`） | `dabai.bat`（同名参数） | `server.py` + `tools/selfcheck.py` |
 | 开机自启 | `systemd` + `WantedBy=multi-user.target` | 计划任务 `DabaiServer`（登录触发） | — |
 | 崩溃自愈 | `Restart=always` | 任务自带重启 3 次 + `DabaiWatchdog` 每 5 分钟探端口 | `update.py --ensure-running` |
 | 定时更新 | `dabai-update.timer`（开机 2 分钟 + 每小时 :17） | 计划任务 `DabaiUpdate`（每小时） | `update.py --apply` |

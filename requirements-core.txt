@@ -29,6 +29,7 @@ numpy
 openai
 playwright
 python-dotenv
+qrcode
 requests
 starlette
 tree_sitter
@@ -38,3 +39,4 @@ yt_dlp
 # ---- 可选：装不上不影响核心 ----
 # pyautogui     截屏/自动化兜底；Windows 直接可用，Linux 需 python3-xlib（截屏另有 mss 兜底）
 # sounddevice   麦克风采集；需系统音频库
+# uiautomator2  安卓真机 UI 自动化（skills/android）；需连真机 + adb，按需装

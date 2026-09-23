@@ -91,4 +91,4 @@ echo
 echo "== 自检 =="
 VP="$ROOT/venv/bin/python"
 [ -x "$VP" ] || VP="$PY"
-exec "$VP" "$ROOT/tools/linux_selfcheck.py"
+exec "$VP" "$ROOT/tools/selfcheck.py"

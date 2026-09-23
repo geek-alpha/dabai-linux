@@ -52,7 +52,7 @@ fi
 
 # ---- 依赖自检（缺关键包时给出可执行命令，而不是让 server 崩在 import）----
 if [ "${1:-}" = "--check" ]; then
-  exec "$PY" "$ROOT/tools/linux_selfcheck.py"
+  exec "$PY" "$ROOT/tools/selfcheck.py"
 fi
 
 MISSING="$("$PY" - <<'EOF' 2>/dev/null || true

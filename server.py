@@ -8506,6 +8506,23 @@ async def harness_admin_page():
     return resp
 
 
+def _asgi_fast_extras() -> dict:
+    """uvloop / httptools 只是加速项，不是必需项 —— 按可用性给 uvicorn 参数。
+
+    uvloop 在 PyPI 上没有 Windows wheel（0.22.1 的 49 个文件里 0 个 win），
+    httptools 要 C 编译；硬编码 loop="uvloop" 的后果是缺它们的机器启动即崩，
+    连日志都来不及写。缺了就退回 uvicorn 默认的 asyncio + h11。
+    """
+    extras: dict = {}
+    for mod, key in (("uvloop", "loop"), ("httptools", "http")):
+        try:
+            __import__(mod)
+        except Exception:
+            continue
+        extras[key] = mod
+    return extras
+
+
 if __name__ == "__main__":
     # Windows 控制台默认 GBK，emoji 会导致 UnicodeEncodeError 崩溃，强制 utf-8 容错
     try:
@@ -8658,8 +8675,8 @@ if __name__ == "__main__":
     def _run_server(port: int, ssl_certfile=None, ssl_keyfile=None):
         """起服务。用自建 sockets 而不是 uvicorn.run(host=...) —— 后者没法传 socket。"""
         cfg = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="warning",
-                             loop="uvloop", http="httptools",
-                             ssl_certfile=ssl_certfile, ssl_keyfile=ssl_keyfile)
+                             ssl_certfile=ssl_certfile, ssl_keyfile=ssl_keyfile,
+                             **_asgi_fast_extras())
         _socks = _listen_sockets(port)
         for _s in _socks:
             logger.info(f"监听 {_s.getsockname()}")
