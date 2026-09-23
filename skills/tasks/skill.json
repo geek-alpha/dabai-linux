@@ -6,7 +6,7 @@
   "author": "dabai",
   "enabled": true,
   "disclosure": "on_demand",
-  "prompt": "【技能 任务与执行】多步骤长任务用 harness_flow_plan 规划（autostart=true 直接开跑）或 harness_flow_submit 提交后台执行（断点续跑）；批量并行用 harness_batch_submit；进度用 harness_task_status/list 查询，危险步骤用 harness_task_confirm 批准。TODO 清单（**用户**的待办）用 todo_create/plan/list/get/update/subtask/remind/delete；**你自己干活**的步骤清单用 plan_update（整份提交，工具层强制：同时只 1 个 in_progress、不许 pending 跳 completed）/ plan_show / plan_clear / plan_history；要「先想清楚再动手」时用 plan_mode（action=enter）进入只规划模式：改动型工具被闸门拒绝、只读探索放行，收尾交 <proposed_plan>，exit 才恢复可执行（默认 2 小时超时自动退出，不会永久只读）；中途范围变了（拆分/合并/重排）要先 plan_update 再继续干活，别让清单过期，也不许事后一次性批量补完；定时任务用 sched_add/list/run_now/toggle/remove。",
+  "prompt": "【技能 任务与执行】多步骤长任务用 harness_flow_plan 规划（autostart=true 直接开跑）或 harness_flow_submit 提交后台执行（断点续跑）；批量并行用 harness_batch_submit；进度用 harness_task_status/list 查询，危险步骤用 harness_task_confirm 批准。TODO 清单（**用户**的待办）用 todo_create/plan/list/get/update/subtask/remind/delete；**你自己干活**的步骤清单用 plan_update（整份提交，工具层强制：同时只 1 个 in_progress、跳级要带 explanation）/ plan_show / plan_clear / plan_history；要「先想清楚再动手」时用 plan_mode（action=enter）进入只规划模式：改动型工具被闸门拒绝、只读探索放行，收尾交 <proposed_plan>，exit 才恢复可执行（默认 2 小时超时自动退出，不会永久只读）；中途范围变了（拆分/合并/重排）要先 plan_update 再继续干活，别让清单过期，也不许事后一次性批量补完；定时任务用 sched_add/list/run_now/toggle/remove。",
   "tools": [
     {
       "type": "function",
@@ -663,7 +663,7 @@
       "type": "function",
       "function": {
         "name": "plan_update",
-        "description": "提交/更新**你自己**的工作步骤清单（整份提交，非增量）。多步任务开工前先建清单；每推进一步重新提交一次。工具层强制：同时只允许 1 个 in_progress；不许从 pending 直接跳到 completed（必须先经过 in_progress）。注意：这不是用户的待办清单（用户待办用 todo_*）。",
+        "description": "提交/更新**你自己**的工作步骤清单（整份提交，非增量）。多步任务开工前先建清单；每推进一步重新提交一次。工具层强制：同时只允许 1 个 in_progress；从 pending 直接标 completed 要带 explanation 说明（同一轮里一次做完的照常提交，跨轮推进的先置 in_progress）。注意：这不是用户的待办清单（用户待办用 todo_*）。",
         "parameters": {
           "type": "object",
           "properties": {
@@ -695,7 +695,7 @@
             },
             "explanation": {
               "type": "string",
-              "description": "仅当改动计划本身（拆分/合并/重排/放弃某步）时填，一句话说明为什么改"
+              "description": "改动计划本身（拆分/合并/重排/放弃某步）时填，一句话说明为什么改；一轮里一次做完多步、从 pending 直接标 completed 时也要填（写明哪几步是一起做完的）"
             }
           },
           "required": [
@@ -719,10 +719,15 @@
       "type": "function",
       "function": {
         "name": "plan_clear",
-        "description": "清空工作清单（任务收尾或整件事放弃时用；会提示有多少步没完成就被清掉了）。",
+        "description": "清空工作清单（任务收尾时用）。还有步骤没完成时会拒绝：要么先用 plan_update 标 completed，要么带 force=true 表示这件事确实放弃了（history 留痕）。",
         "parameters": {
           "type": "object",
-          "properties": {}
+          "properties": {
+            "force": {
+              "type": "boolean",
+              "description": "有未完成步骤时强制清空（表示放弃这件事，不是做完了）"
+            }
+          }
         }
       }
     },

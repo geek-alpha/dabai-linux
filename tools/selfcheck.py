@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""大白环境自检（Windows / Linux / macOS 通用）—— 启动前跑一遍，把"运行期才会炸的问题"提前暴露。
+"""大白环境自检（Windows / Linux / macOS）—— 启动前跑一遍，把"运行期才会炸的问题"提前暴露。
 
 用法：
     python3 tools/selfcheck.py          # 人类可读报告
     python3 tools/selfcheck.py --json   # 机器可读（CI 用）
 
 退出码：0 = 可启动（可能有警告）；1 = 存在阻塞项。
+
+原名 linux_selfcheck.py；Windows 要跑同一套检查，故去掉平台前缀。
 """
 from __future__ import annotations
 
@@ -15,11 +17,20 @@ import os
 import re
 import shutil
 import socket
+import subprocess
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # 同目录的 check_deps.py
+
+# 独立进程也要同步新旧环境变量名：用户设了 DABAI_BLENDER，下面的 DABAI_* 旧读点
+# 也得看到同一个值（双向同步在 env_compat 里）。
+import install_node  # 同目录：Node 版本下限的单一来源（前端转译依赖它）
+
+
+IS_WINDOWS = sys.platform == "win32"
 
 OK, WARN, FAIL = "OK", "WARN", "FAIL"
 _rows: list[tuple[str, str, str]] = []
@@ -34,40 +45,6 @@ def _has(mod: str) -> bool:
         return importlib.util.find_spec(mod) is not None
     except (ImportError, ValueError):
         return False
-
-
-# PyPI 名 → import 名；不在这张表里的按惯例把 - 换成 _（PEP 503 规范名）
-_IMPORT_NAMES = {
-    "pillow": "PIL",
-    "python-dotenv": "dotenv",
-    "edge-tts": "edge_tts",
-    "yt-dlp": "yt_dlp",
-    "tree-sitter": "tree_sitter",
-}
-
-
-def _required_packages() -> dict[str, str]:
-    """必需依赖以 requirements-core.txt 为唯一事实来源，返回 {PyPI 名: import 名}。
-
-    为什么不在代码里硬编码清单：安装走的是 requirements-core.txt，自检若另存一份，
-    两份清单会慢慢分叉 —— 结果是 --setup 装完仍缺包，自检却报 [ OK ]，
-    假绿灯比没有自检更坏。被注释掉的「可选」区天然解析不到。
-    """
-    try:
-        lines = (ROOT / "requirements-core.txt").read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return {}
-    out: dict[str, str] = {}
-    for raw in lines:
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        name = re.split(r"[<>=!~\[;]", line)[0].strip()
-        if not name:
-            continue
-        key = name.lower()
-        out[name] = _IMPORT_NAMES.get(key, key.replace("-", "_"))
-    return out
 
 
 def main() -> int:
@@ -88,23 +65,36 @@ def main() -> int:
         check("platform_compat 兼容层", FAIL, f"导入失败：{e.__class__.__name__}: {e}")
 
     # 3) 关键文件
-    for rel in ("server.py", "codex_runner.py", "settings.json"):
+    for rel in ("server.py", "codex_runner.py"):
         p = ROOT / rel
         check(f"文件 {rel}", OK if p.is_file() else FAIL, "" if p.is_file() else "缺失")
+    # settings.json 不入仓（含 api_key，在 .gitignore 里），全新 clone 只有 example。
+    # server.py 首次启动会自动生成一份；这里也顺手补，别报一个必然会消失的阻塞项。
+    settings = ROOT / "settings.json"
+    if settings.is_file():
+        check("文件 settings.json", OK, "")
+    else:
+        example = ROOT / "settings.example.json"
+        if example.is_file():
+            settings.write_text(example.read_text(encoding="utf-8"), encoding="utf-8")
+            check("文件 settings.json", OK, "已从 settings.example.json 生成（首次，去设置页填 API Key）")
+        else:
+            check("文件 settings.json", FAIL, "缺失，且找不到 settings.example.json")
     web_index = ROOT / "web" / "index.html"
     check("前端 web/index.html", OK if web_index.is_file() else WARN,
           "" if web_index.is_file() else "缺失（网页界面不可用）")
 
-    # 4) 关键依赖（清单来自 requirements-core.txt，不是硬编码）
-    reqs = _required_packages()
-    if reqs:
-        missing = [p for p, m in reqs.items() if not _has(m)]
-        check("核心依赖", FAIL if missing else OK,
-              f"{len(reqs)} 个包全部就位" if not missing else "缺少：" + ", ".join(missing))
-    else:
-        check("核心依赖", WARN, "读不到 requirements-core.txt，无法核对")
+    # 4) 关键依赖
+    # 清单来自 tools/check_deps.py（与 requirements-core.txt 同源），不在这里再抄一份——
+    # 抄一份的下场就是漏掉 uvloop/httptools/python-multipart 这类「一 import 就崩」的。
+    from check_deps import missing as missing_deps
+    miss = missing_deps()
+    check("核心依赖", FAIL if miss else OK,
+          "缺少：" + ", ".join(p for _, p in miss) if miss else "")
 
-    optional = ["pyautogui", "sounddevice", "uiautomator2"]
+    # 缺了只降级不阻塞：PDF 附件 / 手机配对码 / 证书生成后端
+    optional = ["PIL", "mss", "playwright", "yt_dlp", "netifaces",
+                "cryptography", "pypdf", "qrcode"]
     missing_opt = [m for m in optional if not _has(m)]
     check("可选依赖", WARN if missing_opt else OK,
           "未安装（对应能力降级）：" + ", ".join(missing_opt) if missing_opt else "")
@@ -113,7 +103,30 @@ def main() -> int:
     for tool, why in (("ffmpeg", "音视频处理"), ("git", "代码工程技能"), ("rg", "快速检索（可回退）")):
         p = shutil.which(tool)
         check(f"外部工具 {tool}", OK if p else WARN, p or f"未找到（{why} 受影响）")
+
+    # 前端 .ts 靠常驻 Node worker 实时转译（server.py 的 TSTranspileMiddleware）。
+    # node 缺失时服务照常起，但 /static/*.ts 会原样下发 → 浏览器语法报错 → 页面永远
+    # 停在「连接中…」，而服务端一行错都不报。所以必须在自检里点出来。
+    node = shutil.which("node")
+    if not node:
+        check("Node.js（前端必需）", WARN,
+              "未找到：网页会永远卡在「连接中…」。跑 dabai.bat 会自动装，或手动装 Node.js 22.13+ 后重启服务")
+    else:
+        try:
+            out = subprocess.run([node, "--version"], capture_output=True, text=True, timeout=10)
+            raw = (out.stdout or out.stderr).strip()
+            ok = install_node.is_supported(install_node.parse_version(raw))
+            check("Node.js（前端必需）", OK if ok else WARN,
+                  raw.lstrip("v") if ok else f"{raw} 过低：需要 22.13+ / 23.2+（module.stripTypeScriptTypes 的 Added in 版本），否则网页卡在「连接中…」")
+        except Exception as e:
+            check("Node.js（前端必需）", WARN, f"版本探测失败：{e.__class__.__name__}: {e}")
     blender = shutil.which("blender") or os.environ.get("DABAI_BLENDER", "")
+    if not blender and IS_WINDOWS:
+        base = Path(r"C:\Program Files\Blender Foundation")
+        if base.is_dir():
+            hits = sorted(base.glob("Blender */blender.exe"), reverse=True)
+            if hits:
+                blender = str(hits[0])
     check("Blender（模型转换）", OK if blender else WARN,
           blender or "未找到（PMX→VRM 技能不可用，可设 DABAI_BLENDER）")
     chrome = os.environ.get("DABAI_CHROME", "")
@@ -122,13 +135,23 @@ def main() -> int:
             if shutil.which(name):
                 chrome = shutil.which(name)
                 break
+    if not chrome and IS_WINDOWS:
+        for p in (r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                  r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+                  os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe")):
+            if Path(p).is_file():
+                chrome = p
+                break
     check("Chrome/Chromium（网页深挖）", OK if chrome else WARN,
           chrome or "未找到（JS 页面抓取降级为 requests）")
 
-    # 6) 图形会话（截屏/声音需要）
-    disp = os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
-    check("图形会话", OK if disp else WARN,
-          f"DISPLAY={disp}" if disp else "无 DISPLAY/WAYLAND_DISPLAY（截屏不可用）")
+    # 6) 图形会话（截屏/声音需要）—— Windows 没有 DISPLAY 变量，桌面会话恒存在
+    if IS_WINDOWS:
+        check("图形会话", OK, "Windows 桌面会话")
+    else:
+        disp = os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
+        check("图形会话", OK if disp else WARN,
+              f"DISPLAY={disp}" if disp else "无 DISPLAY/WAYLAND_DISPLAY（截屏不可用）")
     in_container = Path("/.dockerenv").exists()
     if not in_container and Path("/proc/1/cgroup").is_file():
         try:
@@ -185,7 +208,6 @@ def main() -> int:
         except Exception as e:
             check("磁盘空间读取", WARN, f"{e.__class__.__name__}: {e}")
         try:
-            import subprocess
             p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(2)"],
                                  **pc.spawn_kwargs(new_group=True))
             ok, reason = pc.terminate_tree(p.pid, timeout=5)

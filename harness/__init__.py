@@ -28,17 +28,11 @@ def get_harness(base_dir=None):
     return _harness
 
 
-def reset_harness():
-    """重置全局实例（测试/插件开发用）。"""
-    global _harness
-    _harness = None
-
-
 from .skills import Skill, SkillError          # noqa: E402,F401
 from .plugins import Plugin, PluginError       # noqa: E402,F401
 from .runtime import AgentRuntime, RunSpan     # noqa: E402,F401
 from .tasks import TaskSystem, TaskSystemError  # noqa: E402,F401
 
-__all__ = ["get_harness", "reset_harness", "Skill", "SkillError",
+__all__ = ["get_harness", "Skill", "SkillError",
            "Plugin", "PluginError", "AgentRuntime", "RunSpan",
            "TaskSystem", "TaskSystemError"]

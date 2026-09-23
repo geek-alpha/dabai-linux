@@ -1264,16 +1264,24 @@ body.attach-drag::after {
 /* ============================================================
  *  3D 模型管理 UI
  * ============================================================ */
-/* 舞台右上角工具栏 —— 侧边竖排，可上下滚动（可收缩） */
+/* 舞台右上角工具栏 —— 侧边竖排，可上下滚动（可收缩）
+ *
+ * 挂在 #app 下、**#stage 之外**（不是它的子元素）。移回 #stage 内会同时坏两件事：
+ *   1) #stage 带 z-index:1，子树整体被困在那个层叠上下文里 —— 工具栏 z-index 再高
+ *      也压不过聊天面板（.chat-fs 是 80），全屏聊天时按钮点不动；
+ *   2) html.chat-quiet 的「#stage > *:not(#three-canvas) 全藏」会连它一起藏掉，
+ *      全屏时侧边栏直接消失。
+ * 定位用 fixed（#stage 本身是 fixed inset:0，坐标等价），z-index 夹在聊天面板(80)、
+ * 输入栏(81)、聊天按钮(82) 之上，模态(150) 之下。 */
 .stage-tools {
-    position: absolute;
+    position: fixed;
     top: max(12px, env(safe-area-inset-top));
     right: 12px;
     display: flex;
     flex-direction: column;
     align-items: flex-end;      /* 所有子元素右对齐，按钮贴右缘 */
     gap: 6px;
-    z-index: 5;
+    z-index: 83;
     pointer-events: none;
     transition: opacity 0.25s ease, transform 0.25s ease;
 }
@@ -8061,6 +8069,8 @@ html.cast-t2.casting .cf-ring { animation-duration: calc(2s * var(--cf-boost, 1)
  *  刻意不动的：聊天框内的 HUD（热度 / 等级）—— 那是对话本身的一部分。
  * ============================================================ */
 html.chat-quiet #stage > *:not(#three-canvas) { display: none !important; }
+/* 工具栏刻意不在此列：它已挂在 #stage 之外，全屏聊天时要保持可见可点
+ * （用户在大厅里点侧边栏按钮开弹窗，全屏对话时同样要能点）。 */
 html.chat-quiet #stage > #three-canvas { visibility: hidden; }
 /* 挂在 #stage 之外、且 z-index 高于聊天面板的氛围层：全屏时整体移出渲染树。
  * #live-hot / #gfx-hud 用 body > 限定：同一个 HUD 被聊天头部复用时不该被藏掉

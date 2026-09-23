@@ -86,14 +86,6 @@ def english_gloss_for_material(name: str) -> Optional[str]:
     return None
 
 
-def format_material_name_with_english(name: str, gloss: Optional[str] = None) -> Optional[str]:
-    base = strip_english_suffix(name)
-    en = gloss if gloss is not None else english_gloss_for_material(base)
-    if not en:
-        return None
-    return f"{base} ({en})"
-
-
 def _collect_material_names(
     mesh_object_names: Optional[List[str]] = None,
     armature_object_name: Optional[str] = None,

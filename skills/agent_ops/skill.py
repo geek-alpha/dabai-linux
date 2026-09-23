@@ -82,14 +82,6 @@ def delegate_task(args: dict) -> str:
     return delegate(args, "delegate_agent_task")
 
 
-def delegate_alias_dsh(args: dict) -> str:
-    return delegate(args, "call_deepseek_harness")
-
-
-def delegate_alias_codex(args: dict) -> str:
-    return delegate(args, "delegate_codex_task")
-
-
 HANDLERS = {
     "delegate_agent_task": delegate_task,
     "list_agent_tasks": list_tasks,

@@ -5,6 +5,7 @@
 ## 代码工程
 - 摸清项目：code_map（项目全貌：入口点 / 枢纽文件 / 复杂函数 / 改动热点 / TODO 排名）
 - 检索定位：code_search / code_list_files / code_read / code_locate / code_analyze / code_deps
+- 影响面与死代码：code_graph（符号级引用图：改它会炸到谁 / 哪些定义没人用）
 - 修改：code_edit（唯一锚点精准替换；edits 数组一次改多处，自动备份）/ code_create_file / code_append（追加，分块写长文件）/ code_patch（补丁式）
 - 验证：code_verify（语法/测试）/ code_smoke（import 冒烟）/ code_test（pytest）
 - git：code_git_status/diff/log/blame、code_review 自审；git_status/git_diff 只读自查
@@ -25,7 +26,7 @@
 | --- | --- | --- |
 | 入口点 | 文件名 + `__main__` 块 + package.json | 顺调用链走一遍最省 |
 | 枢纽文件 | 入度（被多少文件 import） | 改动影响面最大，先读懂 |
-| 复杂函数 | 函数行数（≥60） | 最该定点读，别整读 |
+| 复杂函数 | 圈复杂度（radon 口径，CC≥11）或行数 ≥60 | 最该定点读，别整读 |
 | 改动热点 | git 提交频次 | 改得最勤 = bug 高发区 |
 | TODO 热点 | 大写 `TODO/FIXME` 注释 | 作者自己标记的隐患 |
 
@@ -53,7 +54,22 @@
 - 删除/清理：用户明确点名的文件/目录直接删；笼统「清理」先列清单确认后删，不再限制文件类型与目录
 - 禁止整读超大文件（先看大小，用 search_text / 读片段）
 
-## AST 结构感知（v2.1 升级）
+## AST 结构感知（v2.4 升级）
 - `code_locate` 对 Python 文件用标准库 `ast` 做真实定义/引用识别：排除注释与字符串里的同名假命中，函数签名自动带出（对标 ast-grep 的结构化搜索，零第三方依赖）
-- `code_analyze` 对 Python 文件输出圈复杂度（if/for/while/except/with/assert/bool 计数）
+- `code_locate` 的定义行带**块起止行**：Python 用 AST 的 `end_lineno`，Go/JS/TS/Rust/Java/C 等用 `{}` 配平（跳过字符串/注释/模板串里的括号），Ruby 用同缩进 `end`——定位完可直接 `code_read 文件:起-止` 读那一段
+- `code_analyze` 输出**逐函数**圈复杂度明细（radon 口径 A~F）：一个数字落到具体函数上才可行动
+- `code_map` 的「复杂函数」按圈复杂度排名，行数只做兜底——行数是代理指标，会漏掉 34 行但 CC 26 的密集决策函数（实测 harness/self_state.py 的 `_long_horizon`）
+- `code_graph` 建符号级引用图：影响面 = 入边（谁调用它），死代码 = 零入边的公开定义（对标 joern CPG / stack-graphs 的简化版）
+- `code_graph` 的**同名消歧**：按 import 图把调用点归属到具体定义（本文件定义优先 → import 来源模块 → 包 re-export），推不出的单列「无法归属」，不猜；同名多定义时影响面按归属拆开统计，避免两个同名函数互相灌水
+- `code_graph` 的**调用口径**：只有裸名调用 `f()`、`self.f()`/`cls.f()`、以及接收者是 import 绑定名的项目内模块调用（`lib.helper()`）才算一次调用；`x.get()`、`re.sub()` 这类接收者不可知或指向外部模块的调用**不计入影响面排名**（实测全仓 2103 处 `.get(` 曾被算给一个同名方法，`re.sub` 39 处曾被算给项目内的 `sub`）——它们仍记进引用集，所以死代码判定不受影响
+- 死代码保守判定：字符串派发（`ns["f"]`、`getattr(x, "f")`）算引用（实测 `apply_fallback_humanoid` 曾被误报）；第三方 vendored 目录（`.pytest_libs`/`site-packages`/`vendor` 等）已排除——不排除时全仓 715 条里几乎全是 pytest/pygments 内部符号；限定 `paths` 时会提示「范围外引用看不见」
 - 语法错误时自动回退正则（至少能给出行号），不中断定位
+
+## 复杂度口径（对标 radon，逐条核实过）
+
+`if`/`IfExp` +1、`for`/`while`/`async for` +1（有 else 再 +1）、`try` +处理分支数（有 else 再 +1）、
+`BoolOp` +(操作数-1)、`Match` +(case 数 - 是否含 `_`)、推导式 +1+if 子句数、
+`assert` +1 **且不递归子节点**（assert 里的 and/or 不再计）。`with` **不计**（旧实现曾计入，是偏差）。基线 1。
+
+验证方式：对 500 个真实文件、1504 个函数与官方 radon 逐一对齐，零不一致。
+来源：https://cdn.jsdelivr.net/gh/rubik/radon@master/radon/visitors.py （generic_visit / visit_Assert）

@@ -109,6 +109,7 @@ FLOOR_GLOBS: Tuple[str, ...] = (
 PACKED_ASSETS: Tuple[str, ...] = (
     "models/白头凤.vrm",
     "models/渡鸦将军.vrm",
+    "models/dabai.vrm",
 )
 
 # 经历见证集：更新前后比对这些文件的哈希，用来证明「经历没被动过」。

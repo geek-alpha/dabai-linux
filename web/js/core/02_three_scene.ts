@@ -1197,13 +1197,13 @@ export default (function init(App: AppKernel) {
 
     if (B) {
       if (B.leftUpperArm) {
-        B.leftUpperArm.rotation.z = App.lerp(B.leftUpperArm.rotation.z || 0, 1.35, 0.07);
+        B.leftUpperArm.rotation.z = App.lerp(B.leftUpperArm.rotation.z || 0, App.armZ(0), 0.07);
         B.leftUpperArm.rotation.x = App.lerp(B.leftUpperArm.rotation.x || 0, leftArmSwing, 0.07);
       }
       if (B.leftLowerArm)
         B.leftLowerArm.rotation.x = App.lerp(B.leftLowerArm.rotation.x || 0, -0.15, 0.07);
       if (B.rightUpperArm) {
-        B.rightUpperArm.rotation.z = App.lerp(B.rightUpperArm.rotation.z || 0, -1.35, 0.07);
+        B.rightUpperArm.rotation.z = App.lerp(B.rightUpperArm.rotation.z || 0, -App.armZ(0), 0.07);
         B.rightUpperArm.rotation.x = App.lerp(B.rightUpperArm.rotation.x || 0, rightArmSwing, 0.07);
       }
       if (B.rightLowerArm)
@@ -1233,9 +1233,9 @@ export default (function init(App: AppKernel) {
 
     function resetFullWalkArms() {
       if (B) {
-        if (B.leftUpperArm)  { B.leftUpperArm.rotation.z = 1.35; B.leftUpperArm.rotation.x = 0; }
+        if (B.leftUpperArm)  { B.leftUpperArm.rotation.z = App.armZ(0); B.leftUpperArm.rotation.x = 0; }
         if (B.leftLowerArm)  B.leftLowerArm.rotation.x = -0.15;
-        if (B.rightUpperArm) { B.rightUpperArm.rotation.z = -1.35; B.rightUpperArm.rotation.x = 0; }
+        if (B.rightUpperArm) { B.rightUpperArm.rotation.z = -App.armZ(0); B.rightUpperArm.rotation.x = 0; }
         if (B.rightLowerArm) B.rightLowerArm.rotation.x = -0.15;
         if (B.leftUpperLeg)  B.leftUpperLeg.rotation.x = 0;
         if (B.leftLowerLeg)  B.leftLowerLeg.rotation.x = 0;
@@ -1476,14 +1476,14 @@ export default (function init(App: AppKernel) {
       }
       const leftArmWave = Math.sin(bt * 2.5) * 0.42 * blend;
       if (B.leftUpperArm) {
-        B.leftUpperArm.rotation.z = App.lerp(B.leftUpperArm.rotation.z, App.ARM_REST_Z + leftArmWave * 0.6, 0.1);
+        B.leftUpperArm.rotation.z = App.lerp(B.leftUpperArm.rotation.z, App.armZ(leftArmWave * 0.6), 0.1);
         B.leftUpperArm.rotation.x = App.lerp(B.leftUpperArm.rotation.x, Math.sin(bt * 2.5 + 0.8) * 0.2 * blend, 0.1);
       }
       if (B.leftLowerArm) {
         B.leftLowerArm.rotation.x = App.lerp(B.leftLowerArm.rotation.x, Math.sin(bt * 2.5 + 1.2) * 0.25 * blend, 0.1);
       }
       if (B.rightUpperArm) {
-        B.rightUpperArm.rotation.z = App.lerp(B.rightUpperArm.rotation.z, -App.ARM_REST_Z - leftArmWave * 0.6, 0.1);
+        B.rightUpperArm.rotation.z = App.lerp(B.rightUpperArm.rotation.z, -App.armZ(leftArmWave * 0.6), 0.1);
         B.rightUpperArm.rotation.x = App.lerp(B.rightUpperArm.rotation.x, Math.sin(bt * 2.5 - 0.8) * 0.2 * blend, 0.1);
       }
       if (B.rightLowerArm) {
@@ -1496,11 +1496,11 @@ export default (function init(App: AppKernel) {
       // 旋转裙舞：双手轻抬外展，像在转裙摆
       const armOut = 0.42 + Math.sin(bt * 3.0) * 0.14 * blend;
       if (B.leftUpperArm) {
-        B.leftUpperArm.rotation.z = App.lerp(B.leftUpperArm.rotation.z, App.ARM_REST_Z + armOut * 0.5, 0.08);
+        B.leftUpperArm.rotation.z = App.lerp(B.leftUpperArm.rotation.z, App.armZ(armOut * 0.5), 0.08);
         B.leftUpperArm.rotation.x = App.lerp(B.leftUpperArm.rotation.x, -0.18 * blend, 0.08);
       }
       if (B.rightUpperArm) {
-        B.rightUpperArm.rotation.z = App.lerp(B.rightUpperArm.rotation.z, -App.ARM_REST_Z - armOut * 0.5, 0.08);
+        B.rightUpperArm.rotation.z = App.lerp(B.rightUpperArm.rotation.z, -App.armZ(armOut * 0.5), 0.08);
         B.rightUpperArm.rotation.x = App.lerp(B.rightUpperArm.rotation.x, -0.18 * blend, 0.08);
       }
       if (B.spine) {
@@ -1512,11 +1512,11 @@ export default (function init(App: AppKernel) {
       const beat2 = Math.sin(bt * 4.2 + Math.PI) * blend;
       if (B.leftUpperArm) {
         B.leftUpperArm.rotation.x = App.lerp(B.leftUpperArm.rotation.x, beat * 0.60, 0.12);
-        B.leftUpperArm.rotation.z = App.lerp(B.leftUpperArm.rotation.z, App.ARM_REST_Z + beat2 * 0.2, 0.12);
+        B.leftUpperArm.rotation.z = App.lerp(B.leftUpperArm.rotation.z, App.armZ(beat2 * 0.2), 0.12);
       }
       if (B.rightUpperArm) {
         B.rightUpperArm.rotation.x = App.lerp(B.rightUpperArm.rotation.x, beat2 * 0.60, 0.12);
-        B.rightUpperArm.rotation.z = App.lerp(B.rightUpperArm.rotation.z, -App.ARM_REST_Z - beat * 0.2, 0.12);
+        B.rightUpperArm.rotation.z = App.lerp(B.rightUpperArm.rotation.z, -App.armZ(beat * 0.2), 0.12);
       }
       if (B.spine) {
         B.spine.rotation.x = App.lerp(B.spine.rotation.x, beat * 0.06, 0.1);
@@ -1538,10 +1538,10 @@ export default (function init(App: AppKernel) {
         B.spine.rotation.y = App.lerp(B.spine.rotation.y, hipY * 0.5, 0.08);
       }
       if (B.leftUpperArm) {
-        B.leftUpperArm.rotation.z = App.lerp(B.leftUpperArm.rotation.z, App.ARM_REST_Z + hipZ * 0.3, 0.08);
+        B.leftUpperArm.rotation.z = App.lerp(B.leftUpperArm.rotation.z, App.armZ(hipZ * 0.3), 0.08);
       }
       if (B.rightUpperArm) {
-        B.rightUpperArm.rotation.z = App.lerp(B.rightUpperArm.rotation.z, -App.ARM_REST_Z - hipZ * 0.3, 0.08);
+        B.rightUpperArm.rotation.z = App.lerp(B.rightUpperArm.rotation.z, -App.armZ(hipZ * 0.3), 0.08);
       }
     } else if (kind.name === 'rhythm') {
       // 腰臀腿律动舞：腰部摆动 + 臀部摇摆 + 双腿交替迈步
@@ -1575,10 +1575,10 @@ export default (function init(App: AppKernel) {
       }
       // 手臂随节奏轻摆
       if (B.leftUpperArm) {
-        B.leftUpperArm.rotation.z = App.lerp(B.leftUpperArm.rotation.z, App.ARM_REST_Z + beat * 0.15, 0.1);
+        B.leftUpperArm.rotation.z = App.lerp(B.leftUpperArm.rotation.z, App.armZ(beat * 0.15), 0.1);
       }
       if (B.rightUpperArm) {
-        B.rightUpperArm.rotation.z = App.lerp(B.rightUpperArm.rotation.z, -App.ARM_REST_Z - beat2 * 0.15, 0.1);
+        B.rightUpperArm.rotation.z = App.lerp(B.rightUpperArm.rotation.z, -App.armZ(beat2 * 0.15), 0.1);
       }
     } else if (kind.name === 'march') {
       // 踏步舞：高抬腿交替踏步 + 对侧摆臂 + 身体微弹
@@ -1617,11 +1617,11 @@ export default (function init(App: AppKernel) {
         B.hips.rotation.y = App.lerp(B.hips.rotation.y, -twist * 0.18, 0.12);
       }
       if (B.leftUpperArm) {
-        B.leftUpperArm.rotation.z = App.lerp(B.leftUpperArm.rotation.z, App.ARM_REST_Z + 0.25, 0.1);
+        B.leftUpperArm.rotation.z = App.lerp(B.leftUpperArm.rotation.z, App.armZ(0.25), 0.1);
         B.leftUpperArm.rotation.x = App.lerp(B.leftUpperArm.rotation.x, twist * 0.15, 0.1);
       }
       if (B.rightUpperArm) {
-        B.rightUpperArm.rotation.z = App.lerp(B.rightUpperArm.rotation.z, -App.ARM_REST_Z - 0.25, 0.1);
+        B.rightUpperArm.rotation.z = App.lerp(B.rightUpperArm.rotation.z, -App.armZ(0.25), 0.1);
         B.rightUpperArm.rotation.x = App.lerp(B.rightUpperArm.rotation.x, -twist * 0.15, 0.1);
       }
       if (B.leftLowerArm) {
@@ -1667,11 +1667,11 @@ export default (function init(App: AppKernel) {
       const c = Math.cos(bt * 1.6) * blend;
       if (B.leftUpperArm) {
         B.leftUpperArm.rotation.x = App.lerp(B.leftUpperArm.rotation.x, c * 0.42, 0.08);
-        B.leftUpperArm.rotation.z = App.lerp(B.leftUpperArm.rotation.z, App.ARM_REST_Z + s * 0.25, 0.08);
+        B.leftUpperArm.rotation.z = App.lerp(B.leftUpperArm.rotation.z, App.armZ(s * 0.25), 0.08);
       }
       if (B.rightUpperArm) {
         B.rightUpperArm.rotation.x = App.lerp(B.rightUpperArm.rotation.x, -c * 0.42, 0.08);
-        B.rightUpperArm.rotation.z = App.lerp(B.rightUpperArm.rotation.z, -App.ARM_REST_Z - s * 0.25, 0.08);
+        B.rightUpperArm.rotation.z = App.lerp(B.rightUpperArm.rotation.z, -App.armZ(s * 0.25), 0.08);
       }
       if (B.leftLowerArm) {
         B.leftLowerArm.rotation.x = App.lerp(B.leftLowerArm.rotation.x, c * 0.25, 0.08);

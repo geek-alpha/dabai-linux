@@ -1877,6 +1877,254 @@ def _tool_fp(name: str, arguments: dict) -> str:
         return f"{name}|{str(arguments)}"
 
 
+# ---- 「改前必读」埋点：编辑目标 vs 本进程读过的范围 ----
+# 为什么要它：规则区「证据优先」501 字符（10.9%，最大块）此前无任何数据源，只能人工
+# 判断留删；而它最硬的一条（改文件前必须读过目标区间）是精确可测的，盲改正是幻觉 bug
+# 的直接来源。与其争论这条规则该不该留，不如先让数据能回答它。
+_READ_TOOLS = {"code_read", "read_lines"}
+_EDIT_TOOLS = {"code_edit", "code_patch", "code_append"}
+_SPAN_RE = re.compile(r":(\d+)(?:-(\d+))?\s*$")
+
+
+def _norm_file(raw) -> str:
+    """路径归一化：剥 `:起-止` 后缀、去引号、补成绝对路径。
+
+    同一文件在参数里可能写成 /home/wxf/dabai/agent.py、agent.py、./agent.py，
+    不归一化的话「读过的」和「要改的」永远对不上，指标直接废掉。
+    """
+    s = str(raw or "").strip().strip("\"'").strip()
+    if not s:
+        return ""
+    m = _SPAN_RE.search(s)
+    if m:
+        s = s[:m.start()].strip()
+    if not s:
+        return ""
+    try:
+        p = Path(s)
+        if not p.is_absolute():
+            p = BASE_DIR / p
+        return os.path.normpath(str(p))
+    except Exception:
+        return s
+
+
+def _read_spans_of(tool_name: str, arguments) -> list:
+    """读类工具 → [(文件, 起, 止)]；止为 None 表示读到文件尾（整读）。"""
+    out = []
+    if not isinstance(arguments, dict):
+        return out
+    if tool_name == "code_read":
+        raw = arguments.get("files")
+        if raw is None:
+            raw = arguments.get("file") or ""
+        for item in re.split(r"[,\n]", str(raw)):
+            item = item.strip()
+            if not item:
+                continue
+            m = _SPAN_RE.search(item)
+            if m:
+                f = _norm_file(item[:m.start()])
+                s = int(m.group(1))
+                e = int(m.group(2)) if m.group(2) else s
+            else:
+                f, s, e = _norm_file(item), None, None
+            if f:
+                out.append((f, s, e))
+    elif tool_name == "read_lines":
+        f = _norm_file(arguments.get("path"))
+        if f:
+            try:
+                s = int(arguments.get("start") or 1)
+            except Exception:
+                s = 1
+            try:
+                n = int(arguments.get("max_lines") or 100)
+            except Exception:
+                n = 100
+            out.append((f, s, s + max(0, n) - 1))
+    return out
+
+
+def _as_span(start, end) -> tuple:
+    """把 line_start/line_end 转成 (int, int|None)；不可解析一律当「无行号」。"""
+    try:
+        s = int(start) if start is not None else None
+    except Exception:
+        s = None
+    try:
+        e = int(end) if end is not None else None
+    except Exception:
+        e = None
+    if s is None:
+        return None, None
+    return s, (e if e is not None else s)
+
+
+def _dedup_spans(items: list) -> list:
+    seen, out = set(), []
+    for it in items:
+        if it in seen:
+            continue
+        seen.add(it)
+        out.append(it)
+    return out
+
+
+def _edit_targets_of(tool_name: str, arguments) -> list:
+    """编辑类工具 → [(文件, 起, 止)]。
+
+    取不到目标就返回空——宁可不判（少算一次分母），也不假警（把新建文件说成盲改）。
+    """
+    out = []
+    if not isinstance(arguments, dict):
+        return out
+    if tool_name == "code_patch":
+        # 目标文件只出现在 diff 文本的 `+++ b/路径` 行里，没有独立参数
+        for line in str(arguments.get("patch") or "").splitlines():
+            if not line.startswith("+++ "):
+                continue
+            raw = line[4:].split("\t")[0].strip()
+            # git diff 的 `+++ b/路径` 前缀必须剥掉，否则和读时的 `路径` 对不上键
+            if raw.startswith("b/"):
+                raw = raw[2:]
+            f = _norm_file(raw)
+            if f and f != "/dev/null":
+                out.append((f, None, None))
+        return _dedup_spans(out)
+    if tool_name == "code_append":
+        f = _norm_file(arguments.get("path"))
+        return [(f, None, None)] if f else []
+    f = _norm_file(arguments.get("file"))
+    if f:
+        s, e = _as_span(arguments.get("line_start"), arguments.get("line_end"))
+        out.append((f, s, e))
+    for item in str(arguments.get("files") or "").split(","):
+        g = _norm_file(item)
+        if g:
+            out.append((g, None, None))
+    for ed in (arguments.get("edits") or []):
+        if not isinstance(ed, dict):
+            continue
+        s, e = _as_span(ed.get("line_start"), ed.get("line_end"))
+        if s is None:
+            continue
+        g = _norm_file(ed.get("file") or arguments.get("file"))
+        if g:
+            out.append((g, s, e))
+    return _dedup_spans(out)
+
+
+def _span_covered(reads: list, start, end) -> bool:
+    """编辑范围是否落在已读范围内（reads 非空 = 该文件此前读过）。
+
+    没给行号（整读 / 文本模式改）时退化为文件级。方向是「宁可认为读过」：
+    少报一次盲改，比误报一次让人去查没坏的东西划算——假警报会把真信号一起埋掉。
+    """
+    if not reads:
+        return False
+    if start is None:
+        return True
+    for rs, re_ in reads:
+        if rs is None:
+            return True
+        hi = re_ if re_ is not None else 10 ** 9
+        if rs <= start <= hi:
+            return True
+        if end is not None and rs <= end <= hi:
+            return True
+    return False
+
+
+# ---- 「注释只写 why」埋点：注入的注释行 vs 占位/残留类注释 ----
+# 规则给了硬判据（「不留改名占位、不留『已移除』注释」），但「有信息量」要语义判断，
+# 不可测。退一步只测可精确判的那半：注入的注释里有多少是「代码已经删了、注释还留着」
+# 的残留。这类注释零误报——正常注释不会写「已移除」。
+_PLACEHOLDER_COMMENT_RE = re.compile(
+    r"(已移除|已删除|已废弃|已下线|已注释|旧实现|旧代码|原实现|原代码|"
+    r"保留占位|占位符|暂时保留|暂时注释|removed|deprecated|placeholder|renamed)",
+    re.I)
+
+
+def _injected_code_lines(tool_name: str, arguments) -> list:
+    """编辑类调用注入的新代码行（只取新增侧，不算被删掉的旧代码）。"""
+    if not isinstance(arguments, dict):
+        return []
+    if tool_name == "code_patch":
+        return [ln[1:] for ln in str(arguments.get("patch") or "").splitlines()
+                if ln.startswith("+") and not ln.startswith("+++")]
+    if tool_name in ("code_append", "code_create_file"):
+        return str(arguments.get("content") or "").splitlines()
+    chunks = [str(arguments.get("new") or "")]
+    for ed in (arguments.get("edits") or []):
+        if isinstance(ed, dict):
+            chunks.append(str(ed.get("new") or ""))
+    return "\n".join(chunks).splitlines()
+
+
+def _comment_stats(lines: list) -> tuple:
+    """(注释行数, 占位/残留注释行数, 非空行数)。
+
+    只认整行注释，不看行尾注释：`x = 1  # noqa` 是工具指令不是解释，混进来会让
+    分母失真。块注释续行（`*`/`/*`）算注释——否则大段注释在指标里是隐形的。
+    """
+    comments = placeholders = total = 0
+    for raw in lines:
+        s = str(raw or "").strip()
+        if not s:
+            continue
+        total += 1
+        if not (s.startswith("#") or s.startswith("//")
+                or s.startswith("/*") or s.startswith("*")):
+            continue
+        if s.startswith("#!") or s.startswith("# -*-"):
+            continue   # shebang / 编码声明是给解释器看的，不是注释
+        comments += 1
+        if _PLACEHOLDER_COMMENT_RE.search(s):
+            placeholders += 1
+    return comments, placeholders, total
+
+
+# 「改前必读」跨重启状态：只存文件级（不存区间）。
+# 为什么必须接回：agent.py 一改就触发进程重启，而重启后 _read_files 为空 →
+# 此后首次改文件按定义算盲改，盲改率会永远贴近 100%，这个指标当场变成假警报。
+# 区间精度只在进程内有效，重启后退化为文件级——方向仍是「宁可认为读过」。
+READ_FILES_STATE_PATH = BASE_DIR / "data" / "read_files_state.json"
+READ_FILES_STATE_TTL = 7 * 24 * 3600
+READ_FILES_MAX = 500
+
+
+def _load_read_files(sid) -> set:
+    """接回「这个会话读过哪些文件」。sid 不符或过期一律当没读过（fail-closed 到判定端）。"""
+    try:
+        if not sid or not READ_FILES_STATE_PATH.exists():
+            return set()
+        with open(READ_FILES_STATE_PATH, encoding="utf-8") as f:
+            d = json.load(f)
+        if str(d.get("sid") or "") != str(sid):
+            return set()
+        if time.time() - float(d.get("at") or 0) > READ_FILES_STATE_TTL:
+            return set()
+        return {str(x) for x in (d.get("files") or []) if str(x)}
+    except Exception:
+        return set()
+
+
+def _save_read_files(sid, files) -> None:
+    """原子落盘（先写 .tmp 再 replace）：半截文件比没有文件更糟。"""
+    try:
+        if not sid:
+            return
+        tmp = str(READ_FILES_STATE_PATH) + ".tmp"
+        os.makedirs(os.path.dirname(str(READ_FILES_STATE_PATH)), exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"sid": str(sid), "files": sorted(files)[-READ_FILES_MAX:],
+                       "at": time.time()}, f, ensure_ascii=False)
+        os.replace(tmp, str(READ_FILES_STATE_PATH))
+    except Exception:
+        pass
+
+
 def _result_fp(result) -> str:
     """工具结果指纹：只判断「结果有没有变化」，不保留原文。
 
@@ -1965,22 +2213,49 @@ _PLAN_WRITE_TOOLS = {"code_edit", "code_create_file", "code_append",
                      "code_patch", "code_undo_turn"}
 
 
+def _plan_round_multi(tool_calls: int, call_names) -> bool:
+    """多步轮判据的唯一实现——运行时提示的触发点和审计的读数都走它。
+
+    两把尺子不同源就会出现够不着的缺口：审计数出 129 个漏提多步轮，而早提示按
+    「动了写工具 + ≥2 次调用」触发，只够到其中 78 个（纯探索轮 50 个一次都不响）。
+    call_names 为 None（无明细的老调用方）时退回纯次数判据：宁可多算一轮，不可漏判。
+    """
+    if tool_calls < PLAN_MISS_MIN_CALLS:
+        return False
+    if call_names is None:
+        return True
+    names = set(call_names)
+    return len(names) >= PLAN_MISS_MIN_KINDS or bool(names & _PLAN_WRITE_TOOLS)
+
+
 def _plan_miss_note(streak: int, tool_calls: int, used_plan: bool,
                     call_names: list = None) -> tuple:
     """更新「多步轮未提清单」计数，返回 (streak, 本轮是否该给反馈)。
 
     只有「多步轮且没调 plan_update」才累加；提过清单、轮次不够多、纯文本轮一律清零。
-    call_names 为 None（无明细的老调用方）时退回纯次数判据：宁可多算一轮，不可漏判。
     """
-    multi = tool_calls >= PLAN_MISS_MIN_CALLS
-    if multi and call_names is not None:
-        names = set(call_names)
-        multi = (len(names) >= PLAN_MISS_MIN_KINDS
-                 or bool(names & _PLAN_WRITE_TOOLS))
-    if multi and not used_plan:
+    if _plan_round_multi(tool_calls, call_names) and not used_plan:
         streak += 1
         return streak, streak % PLAN_MISS_STREAK_N == 0
     return 0, False
+
+
+def _load_agent_plan() -> dict:
+    """读当前工作清单（失败返回 {}）：清单回显的唯一数据入口。
+
+    异常一律吞掉——回显只是提示，读不到清单时静默退化成「没有它」，
+    绝不能因为一份 JSON 读不动就把整轮工具结果搞坏。
+    """
+    import os as _os
+    import sys as _sys
+    try:
+        d = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "skills", "tasks")
+        if d not in _sys.path:
+            _sys.path.insert(0, d)
+        import plan_impl
+        return plan_impl.read_plan() or {}
+    except Exception:
+        return {}
 
 
 # ---- 「多步轮未提清单」streak 的跨进程持久化 ----
@@ -2831,6 +3106,94 @@ def _gene_flush_exposure(metrics: dict | None = None) -> int:
     return n
 
 
+# ---- 交付文本埋点：「说重点 / 克制自我纠正 / 授权与自主」共用的唯一数据源 ----
+# 这三条规则讲的都是「我交付出去的那段文字长什么样」，而它此前不进任何日志：
+# 审计只能标 none，规则留删靠人猜。只落计数与命中的黑名单词，不落原文——
+# 判断有没有套话，不需要把回复抄进磁盘。
+_REPLY_BOILERPLATE = ("重点结论", "深入探讨", "赋能", "善用",
+                      "值得注意的是", "重要的是", "真正地")
+# 「不是 X，而是 Y」是规则点名的对比框架：它是修辞不是信息，说 A 就直接说 A。
+_REPLY_CONTRAST_RE = re.compile(r"不是.{1,30}?而是")
+_REPLY_APOLOGY = ("抱歉", "对不起", "我错了", "是我搞错", "我的错", "重新说一遍")
+# 「结尾征询」= 把决定权推回用户。只看尾巴 80 字符：正文里的问句往往是在讲清事实，
+# 结尾的问句才是「该做不做先问」。
+_REPLY_ASK_WORDS = ("要我", "需要我", "要不要", "你说一声", "你叫我",
+                    "你确认", "等你确认")
+
+# ---- 「交付即停」埋点：范围扩张（本该只回答的轮里动了手）----
+# 这条规则最硬的坏行为是「顺手把结论牵出的下一件事也做掉」，而轮级日志此前没有
+# 「用户要的是什么」这一层，只能标 none。判据取交集：消息里出现只读意图词、且不含
+# 任何写指令词，才算这轮本该只回答——一句话里既有「为什么」又有「修掉它」时，
+# 授权就是修，这种轮里动手不算越界。
+_SCOPE_READONLY_HINTS = ("是什么", "是多少", "多少", "在哪", "为什么", "怎么回事",
+                         "检查一下", "看一下", "查一下", "有没有", "是不是")
+_SCOPE_WRITE_HINTS = ("修", "改", "删", "实现", "优化", "部署", "重启", "创建",
+                      "生成", "安装", "提交", "整理", "升级", "清理", "执行")
+# 明确产出/改动的工具。shell_run 故意不算：只读诊断里跑 ls/cat/df 是常态，把它算成
+# 越界会让读数被误报淹没——宁可漏报，不可把「看日志」判成「动手改」。
+_SCOPE_MUTATING_TOOLS = frozenset({
+    "code_edit", "code_create_file", "code_append", "code_patch", "code_undo_turn",
+    "delegate_agent_task", "sub_agent_spawn", "harness_flow_submit",
+    "image_gen_create", "todo_create", "sched_add", "linux_gpio", "linux_notify"})
+
+
+def _scope_creep_stats(message, call_names) -> tuple:
+    """(只读意图轮, 其中动了手的轮)。纯读，返回两个 0/1。"""
+    try:
+        m = str(message or "")
+        if not m or any(w in m for w in _SCOPE_WRITE_HINTS):
+            return 0, 0
+        if not any(w in m for w in _SCOPE_READONLY_HINTS):
+            return 0, 0
+        return 1, (1 if set(call_names or ()) & _SCOPE_MUTATING_TOOLS else 0)
+    except Exception:
+        return 0, 0
+
+
+def _reply_style_stats(text) -> dict:
+    """把一段交付文本折成三个坏行为计数（纯读，不落原文）。"""
+    t = str(text or "")
+    if not t.strip():
+        return {"chars": 0, "boilerplate": 0, "boilerplate_words": [],
+                "apology": 0, "tail_ask": 0}
+    words = [w for w in _REPLY_BOILERPLATE if w in t]
+    if _REPLY_CONTRAST_RE.search(t):
+        words.append("不是…而是")
+    tail = t[-80:]
+    ask = 1 if (any(w in tail for w in _REPLY_ASK_WORDS)
+                or t.rstrip().endswith(("？", "?"))) else 0
+    return {
+        "chars": len(t),
+        "boilerplate": len(words),
+        # 落词名不为留存原文，是为了让读数可校准：黑名单哪个词在误报，看这里就知道。
+        "boilerplate_words": words[:5],
+        "apology": sum(t.count(w) for w in _REPLY_APOLOGY),
+        "tail_ask": ask,
+    }
+
+
+def _reply_style_flush(text, tool_rounds: int = 0) -> int:
+    """把本轮交付文本的坏行为计数写成一行流水（一轮一行），返回写入行数。
+
+    挂在 _record_turn_metrics 最前面（同 _gene_flush_exposure）：那是「本轮结束」的
+    必经点，且在 tool_round 早退之前——纯文本轮的回复最可能出套话，漏掉它样本会偏。
+    异常一律吞掉：观测绝不能成为故障源。
+    """
+    try:
+        st = _reply_style_stats(text)
+        if not st["chars"]:
+            return 0
+        import json as _json
+        path = _harness_base() / "data" / "reply_style.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        rec = {"ts": time.time(), "tool_rounds": int(tool_rounds or 0), **st}
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(_json.dumps(rec, ensure_ascii=False) + "\n")
+        return 1
+    except Exception:
+        return 0
+
+
 def _learn_mod():
     """加载 tools/learn_nudge.py：复盘计数器与草稿的唯一真源。失败返回 None。"""
     try:
@@ -3590,6 +3953,13 @@ class AIAgent:
         # 提醒绝不进 sys_prompt——首条一变，整条前缀（含全部历史）白付一次全价。
         self._plan_miss_streak = 0
         self._plan_miss_armed = False   # 已判定该给反馈，由下一轮结果构造处消费
+        # 「本轮够多步却还没提清单」的同轮早提示（2026-09-23）：跨轮 armed 要连中 2 轮
+        # 多步才响，实测清单率仍只有 31%——把提示提到「本轮刚够多步」那一刻，
+        # 模型这一轮还来得及补清单。轮级标记，不落盘（同 _verify_round_*）。
+        self._plan_round_used = False    # 本轮已提过清单
+        self._plan_round_calls = 0       # 本轮已开始的工具调用数
+        self._plan_round_names = set()   # 本轮跨过的工具种类（判多步轮，与审计同源）
+        self._plan_early_armed = False   # 本轮该给早提示（刚够多步那一刻置位，一次即解除）
         # 盘上状态所属 sid：进程重启后由 _restore_plan_miss 接回（进程重启 ≠ 换会话）。
         self._plan_miss_sid = None
         # 「改码轮没同轮验证」检查点的状态：streak 跨轮（落盘），其余三个是轮级标记。
@@ -3599,6 +3969,14 @@ class AIAgent:
         self._verify_round_verified = False   # 本轮到此刻验过码
         self._verify_miss_armed = False       # 本轮该提醒（改完那一刻置位，提醒一次即解除）
         self._verify_shell_hits = 0           # 本轮 shell 里跑验证命令的次数（口径埋点）
+        # 「改前必读」埋点（2026-09-23）：规则区「证据优先」是最大一块（501 字符、
+        # 10.9%）却一直没有数据源，只能人工判断留删。读过的范围跨轮累积
+        # （_read_files/_read_spans），盲改计数是轮级的（落 turn_metrics）。
+        self._read_files: set = set()      # 本进程读过的文件（归一化绝对路径）
+        self._read_spans: dict = {}        # 文件 -> [(起, 止)]，止 None = 读到文件尾
+        self._blind_edits = 0              # 本轮：目标范围没读过的编辑次数
+        self._edit_calls = 0               # 本轮：有明确目标的编辑次数（分母）
+        self._read_files_sid = None        # 盘上状态所属 sid（重启接回用）
         # 实例标识：写进诊断日志，用来区分「视图被清」和「换了实例」
         # （真实样本里同一 sid 反复 reset_sid，只有这个能证伪）。
         self._inst_tag = f"{os.getpid()}-{id(self) & 0xFFFF:04x}"
@@ -3845,6 +4223,11 @@ class AIAgent:
             # 验证检查点同样挂在每轮入口：计数从盘上接回来、轮级标记清零。
             self._restore_verify_miss()
             self._reset_verify_watch()
+            self._reset_plan_watch()
+            # 「改前必读」的轮级计数清零（读过的范围不清：跨轮才是它的事实基础）。
+            self._reset_read_edit_watch()
+            # 重启后接回读过的文件集合：不接回则首次改文件全算盲改（假警报）。
+            self._restore_read_edit()
             if not self._base_tools:
                 self._base_tools = self._filtered_tools()
             self._all_tools = list(self._base_tools)
@@ -4825,6 +5208,157 @@ class AIAgent:
         except Exception:
             pass
 
+    def _reset_plan_watch(self) -> None:
+        """每轮入口清空清单早提示的轮级标记（同 _reset_verify_watch 的理由）。
+
+        armed 按轮清零：早提示的价值在「本轮还来得及补清单」，跨轮残留只会让下一轮
+        一开工就喊——那时清单要么已经提过、要么已经晚了。
+        """
+        self._plan_round_used = False
+        self._plan_round_calls = 0
+        self._plan_round_names = set()
+        self._plan_early_armed = False
+        self._plan_recap_done = False
+
+    def _watch_plan_tool(self, tool_name: str) -> None:
+        """登记本轮此刻调用的工具：提过清单就免打扰，本轮刚够「多步」就 arm。
+
+        触发口径与多步轮判据同源（_plan_round_multi）：提示响的那一刻，正是这一轮
+        将要被审计算成「多步轮」的那一刻。之前按「动了写工具 + ≥2 次调用」触发，
+        与审计的「≥3 次且跨 3 类工具或有文件改动」不同源——129 个漏提多步轮里，
+        纯探索轮 50 个一次都不会响，提示够不着目标。
+        """
+        try:
+            name = str(tool_name or "")
+            self._plan_round_calls = int(getattr(self, "_plan_round_calls", 0) or 0) + 1
+            names = getattr(self, "_plan_round_names", None)
+            if names is None:
+                names = self._plan_round_names = set()
+            if name == "plan_update":
+                self._plan_round_used = True
+                self._plan_early_armed = False
+            elif not self._plan_round_used:
+                names.add(name)
+                if _plan_round_multi(self._plan_round_calls, names):
+                    self._plan_early_armed = True
+        except Exception:
+            pass
+
+    # ---- 「改前必读」埋点：读过的范围登记 + 编辑目标覆盖判定 ----
+
+    def _watch_read_edit(self, tool_name: str, arguments) -> None:
+        """登记读过的范围；编辑类调用判定「目标范围此前读过没有」。
+
+        分工：读过的范围跨轮累积（_read_files/_read_spans）——「改前必读」问的是
+        「这个文件的这一段我看过没有」，只在单轮内看会漏掉「第 3 轮读过、第 9 轮改」；
+        盲改计数是轮级的，落 turn_metrics，口径 = 本进程窗口（同 plan_hint 的窗口语义）。
+        """
+        try:
+            name = str(tool_name or "")
+            if name in _READ_TOOLS:
+                for f, s, e in _read_spans_of(name, arguments):
+                    self._read_files.add(f)
+                    spans = self._read_spans.setdefault(f, [])
+                    # 上限只为挡住病态增长（同文件反复换区间读）；真撞到上限时
+                    # 判定退化为文件级，方向仍是「宁可认为读过」，不会假报盲改。
+                    if (s, e) not in spans and len(spans) < 200:
+                        spans.append((s, e))
+                return
+            # 注释埋点含 code_create_file：新建文件本来就不该「先读」，所以它不在
+            # _EDIT_TOOLS 里（不进盲改分母），但它注入的代码要算进注释分母。
+            if name in _EDIT_TOOLS or name == "code_create_file":
+                c, ph, tot = _comment_stats(_injected_code_lines(name, arguments))
+                self._inject_lines = int(getattr(self, "_inject_lines", 0) or 0) + tot
+                self._comment_lines = int(getattr(self, "_comment_lines", 0) or 0) + c
+                self._placeholder_comments = (
+                    int(getattr(self, "_placeholder_comments", 0) or 0) + ph)
+            if name not in _EDIT_TOOLS:
+                return
+            for f, s, e in _edit_targets_of(name, arguments):
+                self._edit_calls = int(getattr(self, "_edit_calls", 0) or 0) + 1
+                if not _span_covered(self._read_spans.get(f) or [], s, e):
+                    self._blind_edits = int(getattr(self, "_blind_edits", 0) or 0) + 1
+        except Exception:
+            pass
+
+    def _reset_read_edit_watch(self) -> None:
+        """每轮入口清零轮级计数（读过的范围不清——那是跨轮的事实）。"""
+        self._blind_edits = 0
+        self._edit_calls = 0
+        self._inject_lines = 0
+        self._comment_lines = 0
+        self._placeholder_comments = 0
+
+    def _restore_read_edit(self) -> None:
+        """重启后接回「本会话读过哪些文件」（同 sid 才接）。
+
+        不接回的后果是具体的：改 agent.py 会触发重启，重启后 _read_files 为空，
+        此后首次改文件就被算成盲改——盲改率贴近 100%，指标当场变假警报。
+        """
+        sid = getattr(getattr(self, "memory", None), "session_id", None)
+        if not sid or getattr(self, "_read_files_sid", None) == sid:
+            return
+        self._read_files_sid = sid
+        restored = _load_read_files(sid)
+        if restored:
+            self._read_files |= restored
+
+    def _persist_read_edit(self) -> None:
+        """轮末落盘读过的文件集合：每轮一次，不在每次读工具时写盘。"""
+        try:
+            sid = getattr(getattr(self, "memory", None), "session_id", None)
+            if not sid:
+                return
+            self._read_files_sid = sid
+            _save_read_files(sid, self._read_files)
+        except Exception:
+            pass
+
+    def _plan_early_hint(self) -> str:
+        """「本轮够多步却还没提清单」的事实反馈，只加给 LLM 那份结果。
+
+        与 _plan_miss_hint 的分工：那个跨轮、连中 2 轮才响，说的是「你连着几轮漏提」；
+        这个同轮、本轮刚够多步那一刻就响，说的是「这一轮还来得及补」。
+        """
+        if not self._plan_early_armed:
+            return ""
+        self._plan_early_armed = False   # 一轮只提醒一次：每轮重放等于刷屏
+        return (
+            "\n\n【开工提示】本轮工具调用已经够「多步」，但还没提过工作清单。"
+            "如果这件事不止一步，现在补一次 plan_update（整份清单，含收尾项）——"
+            "用户看不到你的进度，漏提最容易漏的是收尾。单点小改可忽略本提示。")
+
+    def _plan_recap(self) -> str:
+        """清单状态回显：把账本摊在模型眼前，驱动「逐步更新」。
+
+        为什么必须有它：_plan_early_hint / _plan_miss_hint 的判据都是「没提过清单」，
+        提过一次就双双静默（_plan_round_used 置位、streak 清零）——实测 8 份清单里
+        3 份只提交过 1 次，另有 [3,5,6] 这种「提的时候前 3 步已经干完」的事后补记。
+        账本提交完就离开了注意力，此后没人再提它，直到任务结束。
+
+        每轮只回显一次（_plan_recap_done）：一轮里每次工具调用都挂等于刷屏；而
+        「这步做完就更新」的时机恰恰在工具结果之后，挂在第一条结果上最有效。
+        """
+        if getattr(self, "_plan_recap_done", False):
+            return ""
+        self._plan_recap_done = True
+        plan = (_load_agent_plan().get("plan") or [])
+        if not plan:
+            return ""
+        total = len(plan)
+        done = sum(1 for s in plan if s.get("status") == "completed")
+        if done >= total:
+            return ""
+        running = [s for s in plan if s.get("status") == "in_progress"]
+        head = f"\n\n【清单】{done}/{total}"
+        if running:
+            head += f" · 进行中：{str(running[0].get('step') or '')[:30]}"
+        else:
+            head += " · ⚠️ 没有进行中的步骤"
+        return head + (f" · 还有 {total - done} 步没完成。"
+                       "做完一步就 plan_update 整份提交把它标 completed——"
+                       "清单不更新，用户看到的进度就停在原地。")
+
     def _reset_verify_watch(self) -> None:
         """每轮入口清空轮级标记：没改过码、没验过码、还没提醒过。
 
@@ -5536,33 +6070,23 @@ class AIAgent:
         #   for additional prompts.」
         # 明确「诊断 ≠ 授权修复」。用户说「看看为什么挂了」要的是一份结论，不是让你
         # 顺手重启服务——越权动作会丢现场、中断服务，代价远大于多问一句。
-        # 末条「该问不该问」是决策框架：把模糊判断压成可执行分支（Claude 的
-        # 「提到时间? → 查 recent_chats」式写法），给判据不给形容词。
+        # 【授权与自主】是决策框架：把模糊判断压成可执行分支（Claude 的
         if tools:
             sys_prompt += (
-                "\n【授权边界】先给请求定类，再决定动到哪一层："
-                "①问事实（是什么/多少/在哪）→ 只回答；"
-                "②让看问题（为什么/怎么回事/检查一下）→ 只诊断，给结论和证据，不改动任何东西；"
-                "③明确让改（修/改/重启/部署/删）→ 才动手，且只动被点名的范围；"
-                "④让盯着（持续/自动/一直）→ 先确认触发条件和止损方式再开。"
-                "诊断中发现需要修复时，先用一句话说明「改什么、影响什么」，等用户确认。\n"
-                "【授权持久化】用户已授权的动作跨轮有效——上一轮说过的「删掉/重启/继续」，"
-                "这一轮不必再问一遍；也不要把「本地规则文件这么写的」当成必须请示的理由。\n"
-                "【先做完再问】要用户点头的事，先把授权范围内的工作做成可审阅的成果"
-                "（改好的 diff、跑通的命令、可点的预览），再让审批结果，别拿抽象方案要许可。\n"
-                "【示例】用户说「服务好像挂了，看看」\n"
-                "<bad>直接 systemctl restart</bad>\n"
-                "<good>只读排查，回报「Active: failed，退出码 1，日志第 42 行端口被占；"
-                "要我改端口配置吗」</good>\n"
-                "<rationale>「看看」只授权诊断，不授权修复。</rationale>\n"
-                "【该问不该问】只在三种情况打断用户：①动作不可逆（删除/覆盖/重启/发布）；"
-                "②要越出被点名的范围；③两个方案代价差一个量级、且无法从上下文判断。"
-                "打断前必须能说清两件事：哪条规则/哪个文件要求你问（点名出处）、"
-                "不问会导致什么不可逆后果——拿不出就直接做。"
-                "其余一律自己判断、直接做——像「最近」具体指几天这种不影响结果的细节，别问。"
-                "删除类动手前先列清单（路径+原因）让用户确认，确认后再删。"
-                "【默认倾向】意图不明时，默认你要的是我把东西做出来、不是一份说法："
-                "写/改代码、跑命令、查文件这类自己就能干又低风险的事，直接干，别停在方案层。\n"
+                "\n【授权与自主】动手前先给请求定类：问事实（是什么/多少/在哪）→ 只回答；"
+                "让看问题（为什么/怎么回事/检查一下）→ 只诊断，给结论和证据，不改动；"
+                "明确让改（修/改/重启/部署/删）→ 只动被点名的范围；"
+                "让盯着（持续/自动/一直）→ 先确认触发条件和止损方式再开。"
+                "再过一个闸门，任一成立才打断用户：①有规则或上一轮授权点名要求我问（说得出出处）；"
+                "②不问会造成不可逆后果；③答案我自己查不到。"
+                "三闸都不成立就直接做——「最近」指几天这类不影响结果的细节别问；"
+                "写/改代码、跑命令、查文件这类低风险事直接干，别停在方案层。"
+                "要用户点头的事，先把授权范围内的工作做成可审阅的成果"
+                "（改好的 diff、跑通的命令、可点的预览）再让审批，别拿抽象方案要许可；"
+                "上一轮授权过的「删掉/重启/继续」跨轮有效，不必再问。"
+                "信息够就动手：不重推已确认的事实、不重议用户已定的决定、不罗列你不打算走的方案；"
+                "权衡时给推荐不给穷举。"
+                "收尾时禁止把候选事项摆成问题清单——那是把成本转嫁给用户。\n"
                 "【交付即停】默认「一请求一交付」：把用户这句话对应的这件事做完、给出结论就停下等回应，"
                 "不要顺藤摸瓜把结论牵出的下一件事也自动做掉。「这件事做完了」的标准是用户的问题得到回答"
                 "或目标达成，不是「所有相关可能性都穷尽了」。只有用户明确说「全自动/别停/一直跑/继续挖/"
@@ -5574,15 +6098,13 @@ class AIAgent:
 
         # 取材 Codex 官方 gpt_5_2_prompt.md 与 Claude Code 官方 system-prompts
         # （correction-restraint / act-when-ready / comment-why-only-guidance /
-        # no-compatibility-hacks）。这三条是行为硬约束、不是风格偏好，故与【授权边界】并列常驻。
+        # no-compatibility-hacks）。这三条是行为硬约束、不是风格偏好，故与【授权与自主】并列常驻。
         if tools:
             sys_prompt += (
                 "\n【克制自我纠正】只在错误会改变用户的代码/结论/决定时才纠正，一句话说清就继续干活；"
                 "不改结论的笔误直接改，不解释、不道歉、不写前言、不反复复盘同一处错误。"
                 "用户追问不等于你错了——答被问的那件事，已经准确的话不必重新审计措辞。"
                 "别的智能体报了错，先核事实再采纳，不照单全收。\n"
-                "【够了就动】信息够就动手：不重推已确认的事实、不重议用户已定的决定、"
-                "不罗列你不打算走的方案；要在方案间权衡时给推荐，不给穷举清单。\n"
                 "【注释只写 why】默认不写注释，只在原因非显然时写（隐藏约束、微妙不变量、"
                 "针对特定 bug 的绕法、会让读者意外的行为）。删掉它不会让人困惑，就别写。"
                 "确定无用的代码直接删干净，不留改名占位、不留「已移除」注释。\n"
@@ -5864,6 +6386,7 @@ class AIAgent:
         eff_mergeable = 0       # 本轮「本该合并成一次调用」的多余调用数（并行度优化的尺子）
         eff_single_ro = 0       # 本轮注入的「连续单发只读」反馈次数（跨轮串行埋点）
         eff_plan_hints = 0      # 本轮注入的「多步轮未提清单」反馈次数（准则段埋点）
+        eff_plan_recaps = 0     # 本轮注入的「清单状态回显」次数（驱动逐步更新）
         eff_verify_hints = 0    # 本轮注入的「改完码没同轮验证」反馈次数（准则段埋点）
         # 本轮 shell 里跑验证命令（pytest/py_compile）的次数：没有它，「改了码跑 pytest」
         # 与「改了码 ls 一下」在 turn_metrics 里长得一样，审计只能按工具名误判成没验证。
@@ -5871,6 +6394,11 @@ class AIAgent:
         eff_img_ops = 0         # 本轮画图工具调用数（规则区「画图」埋点）
         eff_music_ops = 0       # 本轮 music_* 调用数（规则区「音乐」埋点）
         eff_delete_ops = 0      # 本轮删除类操作数（规则区「删除」埋点）
+        # 「改前必读」埋点（规则区「证据优先」501 字符的唯一数据源）：
+        # blind_edits/edit_calls = 本轮「改的目标范围此前没读过」的次数 / 有明确目标的编辑次数。
+        # 口径 = 本进程窗口：重启后 _read_files 为空，此时改文件在本进程视角下确实是盲改。
+        eff_blind_edits = 0
+        eff_edit_calls = 0
         eff_script_names: list = []  # 本轮 shell 跑过的 .py 脚本名（准则段埋点）
         # 工具名级明细：只有次数时，106 次报错分不清是哪个工具、哪类错，
         # 「教训写入之后同类错误还犯不犯」就无从对比。纯观测，不干预行为。
@@ -6074,6 +6602,8 @@ class AIAgent:
                 "re_reads": eff_re_reads,
                 "duration_ms": duration_ms,
             })
+            # 交付文本埋点：套话 / 道歉 / 结尾征询（只落计数，不落原文）。
+            _reply_style_flush(full_text, tool_round)
             _reply = ""
             try:
                 for _m in reversed(messages):
@@ -6098,7 +6628,18 @@ class AIAgent:
             self._verify_miss_streak, _ = _verify_miss_note(
                 self._verify_miss_streak, eff_call_names, self._verify_round_verified)
             self._persist_verify_miss()
+            # 读过的文件集合轮末落盘（每轮一次，不在每次读工具时写盘）。
+            self._persist_read_edit()
             eff_verify_shell = int(getattr(self, "_verify_shell_hits", 0) or 0)
+            # 「改前必读」轮级读数（口径 = 本进程窗口，与 turn_metrics 逐轮对照）。
+            eff_blind_edits = int(getattr(self, "_blind_edits", 0) or 0)
+            eff_edit_calls = int(getattr(self, "_edit_calls", 0) or 0)
+            # 「注释只写 why」轮级读数：注入行 / 注释行 / 占位残留注释行。
+            eff_inject_lines = int(getattr(self, "_inject_lines", 0) or 0)
+            eff_comment_lines = int(getattr(self, "_comment_lines", 0) or 0)
+            eff_placeholder_comments = int(getattr(self, "_placeholder_comments", 0) or 0)
+            # 「交付即停」轮级读数：只读意图轮 / 其中动了手（越界做了下一件事）。
+            eff_readonly_round, eff_scope_creep = _scope_creep_stats(message, eff_call_names)
             if tool_round <= 0:
                 return
             try:
@@ -6115,13 +6656,24 @@ class AIAgent:
                     "mergeable_calls": eff_mergeable,
                     "single_ro_hints": eff_single_ro,
                     "plan_hints": eff_plan_hints,
+                    "plan_recaps": eff_plan_recaps,
                     "verify_hints": eff_verify_hints,
                     "verify_shell_hits": eff_verify_shell,
+                    # 「改前必读」：规则区「证据优先」的唯一数据源（分母为 0 时不判）。
+                    "blind_edits": eff_blind_edits,
+                    "edit_calls": eff_edit_calls,
+                    # 「注释只写 why」的唯一数据源：注入行 / 注释行 / 占位残留注释行。
+                    "inject_lines": eff_inject_lines,
+                    "comment_lines": eff_comment_lines,
+                    "placeholder_comments": eff_placeholder_comments,
                     # 规则区「删除/画图/音乐」三条的行为暴露量：0 次 ≠ 规则没用，
                     # 只说明这段时间没被触发过——审计工具据此区分「无据可删」与「有作用面」。
                     "img_gen_calls": eff_img_ops,
                     "music_calls": eff_music_ops,
                     "delete_ops": eff_delete_ops,
+                    # 「交付即停」：只读意图轮数 / 其中动了手的轮数（判越界用比例）
+                    "readonly_rounds": eff_readonly_round,
+                    "scope_creep": eff_scope_creep,
                     # ---- 前缀缓存（纯观测）----
                     "cache_hit": sum_cache_hit,
                     "cache_miss": sum_cache_miss,
@@ -6528,6 +7080,11 @@ class AIAgent:
                 # 参数要传：shell_run 跑 pytest 与跑 ls 只差在命令内容里。
                 self._watch_verify_tool(
                     tool_name, cleaned_args if cleaned_args is not None else arguments)
+                self._watch_plan_tool(tool_name)
+                # 「改前必读」：登记读过的范围 / 判定编辑目标是否读过。
+                # 必须与文本协议分支同挂（有源码级断言测试钉死，漏挂一条立刻红）。
+                self._watch_read_edit(
+                    tool_name, cleaned_args if cleaned_args is not None else arguments)
                 if not success:
                     eff_tool_errors += 1
                     eff_err_names.append(tool_name)
@@ -6555,10 +7112,14 @@ class AIAgent:
                 if _ro_hint:
                     _llm_result = str(_llm_result) + _ro_hint
                     eff_single_ro += 1
-                _plan_hint = self._plan_miss_hint()
+                _plan_hint = self._plan_miss_hint() + self._plan_early_hint()
                 if _plan_hint:
                     _llm_result = str(_llm_result) + _plan_hint
                     eff_plan_hints += 1
+                _recap = self._plan_recap()
+                if _recap:
+                    _llm_result = str(_llm_result) + _recap
+                    eff_plan_recaps += 1
                 _verify_hint = self._verify_miss_hint()
                 if _verify_hint:
                     _llm_result = str(_llm_result) + _verify_hint
@@ -6795,6 +7356,8 @@ class AIAgent:
                         eff_call_names.append(tool_name)
                     # 验证检查点登记：两条工具执行分支同增同减（有防漏挂的源码级断言）。
                     self._watch_verify_tool(tool_name, arguments)
+                    self._watch_plan_tool(tool_name)
+                    self._watch_read_edit(tool_name, arguments)
                     if not success:
                         eff_tool_errors += 1
                         eff_err_names.append(tool_name)
@@ -6837,10 +7400,16 @@ class AIAgent:
                     # calling」之后才启用。原先只挂在文本分支上：streak 照常累加、armed 照常
                     # 置位、埋点照常落盘，但提示永远没有出口——15 个采样轮 plan_hints 全 0，
                     # 清单率因此卡在 33%。判据没坏，出口挂了。
-                    _plan_hint = self._plan_miss_hint()
+                    _plan_hint = self._plan_miss_hint() + self._plan_early_hint()
                     if _plan_hint:
                         _llm_result = str(_llm_result) + _plan_hint
                         eff_plan_hints += 1
+                    # 回显必须和清单提示一样挂在**两条**工具执行分支上：原生工具调用
+                    # （本分支）才是常态路径，只挂文本协议分支等于机制没有出口。
+                    _recap = self._plan_recap()
+                    if _recap:
+                        _llm_result = str(_llm_result) + _recap
+                        eff_plan_recaps += 1
                     _verify_hint = self._verify_miss_hint()
                     if _verify_hint:
                         _llm_result = str(_llm_result) + _verify_hint

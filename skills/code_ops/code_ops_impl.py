@@ -37,6 +37,17 @@ from pathlib import Path
 _SKILL_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SKILL_DIR not in sys.path:
     sys.path.insert(0, _SKILL_DIR)
+
+# 噪音目录名单与 tools/deps_audit.py 同源（tools/scan_scope.py）。以前两处各写一份，
+# 一边排了另一边没排，tools/vendor_ots 的 gitdb/Cryptodome 就混进了影响面 Top12。
+_ROOT_DIR = os.path.dirname(os.path.dirname(_SKILL_DIR))
+_TOOLS_DIR = os.path.join(_ROOT_DIR, "tools")
+if os.path.isdir(_TOOLS_DIR) and _TOOLS_DIR not in sys.path:
+    sys.path.insert(0, _TOOLS_DIR)
+try:
+    import scan_scope as _scan_scope  # noqa: E402
+except ImportError:  # 技能被单独拷出项目：退化成最小集合，项目内以 scan_scope 为准
+    _scan_scope = None
 import shell_impl  # noqa: E402
 import sys_search_impl  # noqa: E402
 import worktree_impl  # noqa: E402
@@ -44,12 +55,21 @@ import worktree_impl  # noqa: E402
 _MAX_OUT = 30000
 _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
-NOISE_DIRS = {
-    ".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build",
-    ".idea", ".vscode", ".ruff_cache", ".pytest_cache", ".mypy_cache",
-    "codex_logs", "audio_cache", "undefined", ".trae-html-share-packages",
-    ".next", ".nuxt", "coverage",
-}
+if _scan_scope is not None:
+    # COMMON（两边都排）+ CODE_EXTRA（只有代码搜索排）。依赖扫描多排 data/ 等目录，
+    # 但用户自己的脚本可能就放在那儿，代码搜索不该挡。
+    NOISE_DIRS = _scan_scope.COMMON_DIRS | _scan_scope.CODE_EXTRA
+    NOISE_PREFIXES = _scan_scope.NOISE_PREFIXES
+else:
+    NOISE_DIRS = frozenset({
+        ".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build",
+        ".pytest_libs", "site-packages", "vendor", "third_party",
+    })
+    NOISE_PREFIXES = ("vendor", "third_party", ".pytest_libs")
+
+
+def _is_noise_dir(name: str) -> bool:
+    return name in NOISE_DIRS or name.startswith(NOISE_PREFIXES)
 
 CODE_EXTS = {
     ".py", ".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs", ".vue", ".svelte",
@@ -256,7 +276,7 @@ def _iter_files(root, exts=None, include_noise=False, max_depth=None,
                     dirnames[:] = []
                     continue
             if not include_noise:
-                dirnames[:] = [d for d in dirnames if d not in NOISE_DIRS]
+                dirnames[:] = [d for d in dirnames if not _is_noise_dir(d)]
             for fn in sorted(filenames):
                 fp = Path(dirpath) / fn
                 try:
@@ -299,6 +319,24 @@ def _inherit_indent(anchor_line: str, new: str) -> str:
         else:
             out.append(ln)
     return "\n".join(out)
+
+
+def _dup_anchor_guard(ins: list, anchor_line: str) -> str:
+    """insert 模式防呆：new 里抄了锚点行 → 文件里多出一份锚点内容，且语法合法、极难发现。
+
+    扫 new 的全部行，而不是只比紧邻锚点的那一端：抄在两端都会产生重复，且中间可能
+    隔着若干行（before 抄首行、after 抄末行都实测漏网），只比紧邻端两头都漏。
+    短锚点豁免：} / else: / pass 这类行在 new 里出现是常态，比不出问题。
+    """
+    a = (anchor_line or "").strip()
+    if not ins or len(a) < 6:
+        return ""
+    for i, ln in enumerate(ins):
+        if ln.strip() == a:
+            return (f"⚠ new 第 {i + 1} 行与锚点行相同（{a[:80]}）：插入后文件里会多出一份"
+                    "锚点内容（重复的 def 是合法语法，py_compile 查不出来），未做任何修改。"
+                    "insert 的 new 只给**新增**的行，别把锚点行抄进去。")
+    return ""
 
 
 def _near_miss_hint(lines: list, anchor: str, max_hits: int = 3) -> str:
@@ -420,6 +458,9 @@ def _rg_globs(exts, include_noise):
     if not include_noise:
         noise = ",".join(sorted(NOISE_DIRS))
         globs += [f"!**/{{{noise}}}/**", f"!{{{noise}}}", "!**/.git/**"]
+        # 前缀变体（vendor_ots 等）单独给 glob：globset 的 {} 里塞通配符易踩坑，分开更稳
+        for p in NOISE_PREFIXES:
+            globs += [f"!**/{p}*/**", f"!{p}*"]
     return globs
 
 
@@ -775,7 +816,7 @@ def _py_sig(node) -> str:
 
 
 def _py_ast_defs(text: str):
-    """用标准库 ast 提取 Python 定义符号表（函数/类，含签名与行号）。
+    """用标准库 ast 提取 Python 定义符号表（函数/类，含签名与起止行号）。
     语法错误返回 None（调用方回退正则）。"""
     try:
         tree = ast.parse(text)
@@ -790,7 +831,8 @@ def _py_ast_defs(text: str):
                 kind, sig = "async def", _py_sig(node)
             else:
                 kind, sig = "def", _py_sig(node)
-            out.append((node.lineno, kind, node.name, sig))
+            out.append((node.lineno, kind, node.name, sig,
+                        getattr(node, "end_lineno", None) or node.lineno))
     return out
 
 
@@ -809,6 +851,187 @@ def _py_ast_refs(text: str, symbol: str):
             ln = node.lineno
             txt = lines[ln - 1].strip()[:90] if 0 < ln <= len(lines) else ""
             out.append((ln, txt))
+    return out
+
+
+# ---------- 非 Python 的块定位（对标 ast-grep 的 outline，纯 stdlib）----------
+# 为什么需要：正则在非 Python 语言里只能给「定义在第几行」，答不了「这个函数
+# 有多长、该读哪段」。块起止行是把 code_locate 的结论直接接上 code_read 的桥。
+
+# 花括号族：块由 {} 配平界定
+_BRACE_EXTS = {
+    ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue", ".svelte",
+    ".go", ".java", ".kt", ".kts", ".rs", ".cs", ".php", ".swift",
+    ".c", ".cc", ".cpp", ".h", ".hpp", ".scala", ".dart", ".sh", ".bash",
+}
+
+
+def _span_tag(span) -> str:
+    """把起止行渲染成输出后缀；单行/未知就不显示（噪音）。"""
+    if not span or span[1] <= span[0]:
+        return ""
+    return f"  → L{span[0]}-{span[1]}（{span[1] - span[0] + 1} 行）"
+
+
+def _brace_span(lines, start: int, suffix: str) -> int:
+    """花括号族：从 start 行往下找块结束行（{} 配平）。
+    字符串、行注释、块注释、模板/raw 字符串里的括号都不算——否则一个带
+    "}" 的字符串字面量就会把块提前截断。"""
+    depth, started = 0, False
+    in_block_comment = in_template = False
+    for i in range(start - 1, len(lines)):
+        line = lines[i]
+        j, n = 0, len(line)
+        while j < n:
+            ch = line[j]
+            if in_block_comment:
+                if ch == "*" and line.startswith("/", j + 1):
+                    in_block_comment = False
+                    j += 2
+                    continue
+                j += 1
+                continue
+            if in_template:
+                if ch == "\\":
+                    j += 2
+                    continue
+                if ch == "`":
+                    in_template = False
+                j += 1
+                continue
+            if ch == "/" and line.startswith("/", j + 1):
+                break                      # 行注释
+            if ch == "/" and line.startswith("*", j + 1):
+                in_block_comment = True
+                j += 2
+                continue
+            if ch == "#" and suffix in (".php", ".sh", ".bash"):
+                break
+            if ch == "`":
+                in_template = True
+                j += 1
+                continue
+            if ch in "\"'":
+                q, j = ch, j + 1
+                while j < n:
+                    if line[j] == "\\":
+                        j += 2
+                        continue
+                    if line[j] == q:
+                        j += 1
+                        break
+                    j += 1
+                continue
+            if ch == "{":
+                depth += 1
+                started = True
+            elif ch == "}":
+                depth -= 1
+                if started and depth <= 0:
+                    return i + 1
+            j += 1
+    return len(lines) if lines else start
+
+
+def _end_span(lines, start: int) -> int:
+    """Ruby 这类以 end 收尾的语言：同缩进的 end 就是块尾，缩进更深的是嵌套块。"""
+    base = len(lines[start - 1]) - len(lines[start - 1].lstrip())
+    for i in range(start, len(lines)):
+        line = lines[i]
+        if not line.strip():
+            continue
+        if len(line) - len(line.lstrip()) <= base:
+            return i + 1 if re.match(r"^\s*end\b", line) else i
+    return len(lines)
+
+
+def _block_span(lines, start: int, suffix: str):
+    """非 Python 的块起止行（1-based，含首尾）；给不出就返回 None。
+    Python 不在这里——AST 的 end_lineno 才是权威口径。"""
+    if not lines or not 1 <= start <= len(lines):
+        return None
+    if suffix in _BRACE_EXTS:
+        return (start, _brace_span(lines, start, suffix))
+    if suffix == ".rb":
+        return (start, _end_span(lines, start))
+    return None
+
+
+# ---------- 圈复杂度（对标 radon）----------
+# 计数规则逐条对齐 radon/visitors.py 的 generic_visit（源码直读，非记忆）：
+# https://cdn.jsdelivr.net/gh/rubik/radon@master/radon/visitors.py
+#   Try                → +处理分支数，有 else 再 +1
+#   BoolOp             → +(操作数 - 1)
+#   If / IfExp         → +1（elif 是嵌套 If，自然各 +1；else 不加）
+#   Match              → +(case 数 - 是否含 `_` 兜底)
+#   For/While/AsyncFor → +1，有 else 再 +1
+#   推导式 comprehension → +1 + if 子句数
+#   Assert             → +1
+# radon 不把 with 计入复杂度——旧实现曾计入，是口径偏差，这里按 radon 校正。
+# 为什么要复杂度而不是行数：行数是代理指标，一个 100 行的顺序装配函数很简单，
+# 一个 35 行的 12 分支 if-elif 极难。radon/lizard 都用 CC 排名，行数会排错。
+
+def _py_cc_of_block(node) -> int:
+    """单个块（函数/类/模块顶层）自身的圈复杂度。
+
+    不进入嵌套函数/类：它们的复杂度独立统计，否则父函数会被子函数连坐。
+    """
+    cc = 1
+    # 只从 body 起算：radon 不把装饰器、参数默认值算进函数复杂度
+    start = getattr(node, "body", None)
+    stack = list(start) if isinstance(start, list) else list(ast.iter_child_nodes(node))
+    while stack:
+        n = stack.pop()
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        t = type(n).__name__
+        if t == "Assert":
+            # radon 的 visit_Assert 只 +1 且不递归子节点：assert 里的 BoolOp/IfExp 不再计
+            cc += 1
+            continue
+        if t in ("Try", "TryExcept"):
+            cc += len(n.handlers) + bool(n.orelse)
+        elif t == "BoolOp":
+            cc += len(n.values) - 1
+        elif t in ("If", "IfExp"):
+            cc += 1
+        elif t == "Match":
+            has_default = any(getattr(c.pattern, "pattern", False) is None
+                              for c in n.cases)
+            cc += max(0, len(n.cases) - has_default)
+        elif t in ("For", "While", "AsyncFor"):
+            cc += bool(n.orelse) + 1
+        elif t == "comprehension":
+            cc += len(n.ifs) + 1
+        stack.extend(ast.iter_child_nodes(n))
+    return cc
+
+
+def _py_cc_rank(cc: int) -> str:
+    """A~F 分级，阈值同 radon/complexity.py 的 cc_rank：1-5 A，6-10 B，
+    11-20 C，21-30 D，31-40 E，41+ F。"""
+    if cc <= 5:
+        return "A"
+    if cc <= 10:
+        return "B"
+    if cc <= 20:
+        return "C"
+    if cc <= 30:
+        return "D"
+    if cc <= 40:
+        return "E"
+    return "F"
+
+
+def _py_func_cc(tree) -> list:
+    """所有函数/方法的圈复杂度明细，按复杂度降序：[(cc, lineno, endline, name, kind)]。"""
+    out = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            kind = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
+            out.append((_py_cc_of_block(node), node.lineno,
+                        node.end_lineno or node.lineno, node.name, kind))
+    out.sort(key=lambda r: (-r[0], r[1]))
     return out
 
 
@@ -862,33 +1085,36 @@ def code_locate(args: dict) -> str:
             # AST 结构感知：真实定义/引用，排除注释与字符串里的同名假命中
             ast_defs = _py_ast_defs(text)
             if ast_defs is not None:
-                for ln, dkind, name, _sig in ast_defs:
+                for ln, dkind, name, _sig, end in ast_defs:
                     if name == symbol:
-                        defs.append((fp, ln, f"{dkind} {name}"))
+                        defs.append((fp, ln, f"{dkind} {name}", (ln, end)))
                 ast_refs = _py_ast_refs(text, symbol)
                 for ln, txt in ast_refs:
-                    if not any(dl == ln for _fp, dl, _t in defs if _fp == fp):
+                    if not any(dl == ln for _fp, dl, _t, _s in defs if _fp == fp):
                         refs.append((fp, ln, txt))
                 continue
             # 语法错误：回退正则（至少能给出行号）
-        for i, line in enumerate(text.splitlines(), 1):
+        lines = text.splitlines()
+        for i, line in enumerate(lines, 1):
             if not re.search(word, line):
                 continue
-            is_def = False
+            is_def, span = False, None
             for p in DEF_PATTERNS.get(suffix, []):
                 m = re.match(p, line)
                 if m and m.group(1) == symbol:
-                    is_def = True
+                    is_def, span = True, _block_span(lines, i, suffix)
                     break
-            (defs if is_def else refs).append((fp, i, line.strip()))
+            (defs if is_def else refs).append(
+                (fp, i, line.strip(), span) if is_def else (fp, i, line.strip()))
     defs.sort(key=lambda x: (str(x[0]), x[1]))
     refs.sort(key=lambda x: (str(x[0]), x[1]))
-    def_lines = {(fp, i) for fp, i, _ in defs}
+    def_lines = {(fp, i) for fp, i, _t, _s in defs}
     refs_only = [(fp, i, t) for fp, i, t in refs if (fp, i) not in def_lines]
     out = [f"符号 {symbol} 的定位结果："]
     if defs:
         out.append(f"定义（{len(defs)} 处）：")
-        out += [f"  {_rel(root, fp)}:{i}  {t[:90]}" for fp, i, t in defs]
+        for fp, i, t, span in defs:
+            out.append(f"  {_rel(root, fp)}:{i}  {t[:90]}{_span_tag(span)}")
     if kind in ("all", "ref") and refs_only:
         shown = refs_only[:limit]
         out.append(f"引用/其余出现（显示 {len(shown)}/{len(refs_only)} 处）：")
@@ -910,23 +1136,17 @@ def _analyze_file(fp: Path, root: Path) -> str:
     imports, defs, todos = [], [], []
     max_indent = 0
     suffix = fp.suffix.lower()
-    ast_complexity = None
+    ast_defs = None
+    func_cc = []
     if suffix == ".py":
-        # AST 结构感知：真实定义（含签名）+ 圈复杂度，对标 ast-grep outline
+        # AST 结构感知：真实定义（含签名）+ 逐函数圈复杂度，对标 ast-grep outline / radon
         ast_defs = _py_ast_defs(text)
         if ast_defs is not None:
-            defs = [(ln, f"{kind} {name}{sig}") for ln, kind, name, sig in ast_defs]
-            try:
-                tree = ast.parse(text)
-                cyc = 1
-                for node in ast.walk(tree):
-                    if isinstance(node, (ast.If, ast.For, ast.While,
-                                        ast.ExceptHandler, ast.With,
-                                        ast.Assert, ast.BoolOp)):
-                        cyc += 1
-                ast_complexity = cyc
-            except SyntaxError:
-                pass
+            defs = [(ln, f"{kind} {name}{sig}")
+                    for ln, kind, name, sig, _end in ast_defs]
+            tree = _parse_py(text, fp)
+            if tree is not None:
+                func_cc = _py_func_cc(tree)
     for i, line in enumerate(lines, 1):
         s = line.strip()
         if not s:
@@ -938,7 +1158,7 @@ def _analyze_file(fp: Path, root: Path) -> str:
         elif suffix in _JS_EXTS:
             for m in re.finditer(r"(?:require\s*\(\s*|from\s+)(['\"])([^'\"]+)\1", line):
                 imports.append((i, m.group(2)))
-        if ast_complexity is None:
+        if ast_defs is None:
             for p in DEF_PATTERNS.get(suffix, []):
                 m = re.match(p, line)
                 if m:
@@ -961,12 +1181,28 @@ def _analyze_file(fp: Path, root: Path) -> str:
     n_funcs = sum(1 for _, name in defs if name)
     blank = sum(1 for ln in lines if not ln.strip())
     avg_len = sum(len(l) for l in lines) // max(len(lines), 1)
-    cyc_txt = f"；圈复杂度约 {ast_complexity}" if ast_complexity else ""
+    worst_txt = ""
+    if func_cc:
+        cc0, _, _, name0, _ = func_cc[0]
+        worst_txt = f"；最复杂函数 {name0} 圈复杂度 {cc0}（{_py_cc_rank(cc0)} 级）"
     out.append(
         f"结构提示：定义数 {n_funcs}；最大缩进深度约 {max_indent // 4} 层"
         f"（缩进 {max_indent} 空格）；空行占比 {blank / max(len(lines), 1):.0%}；"
-        f"平均行长 {avg_len} 字符{cyc_txt}"
+        f"平均行长 {avg_len} 字符{worst_txt}"
     )
+    if func_cc:
+        # 逐函数复杂度：把「哪段代码该拆」从行数代理指标换成真实决策密度
+        # （旧实现给的是整文件求和，一个数字落不到任何函数上，对「改哪里」无用）
+        all_rows = [r for r in func_cc if r[0] >= 6]
+        if all_rows:
+            out.append(f"复杂度明细（≥6 共 {len(all_rows)} 个，显示前 "
+                       f"{min(12, len(all_rows))}，radon 口径 A~F）：")
+            out += [f"  {cc:>3} {_py_cc_rank(cc)}  {ln}-{end}  {kind} {name}"
+                    for cc, ln, end, name, kind in all_rows[:12]]
+        risky = [r for r in func_cc if r[0] >= 11]
+        if risky:
+            out.append(f"⚠ 复杂度 ≥11（C 级以上，最该拆）的函数 {len(risky)} 个："
+                       + "、".join(f"{name}({cc})" for cc, _, _, name, _ in risky[:8]))
     if len(lines) > 800:
         out.append(f"⚠ 文件超过 800 行（{len(lines)}），建议评估拆分。")
     return "\n".join(out)
@@ -1207,6 +1443,407 @@ def code_deps(args: dict) -> str:
     return _trim("\n".join(out))
 
 
+# ---------- 2a. 符号级引用图（影响面 + 死代码）----------
+# 为什么需要它：code_deps 只有「文件级 import 图」，答不了两个最贵的问题——
+# ① 改这个函数会波及哪些调用点？② 哪些定义根本没人用？
+# 这两个问题本质是同一个东西：一张符号引用图。影响面 = 入边数，死代码 = 零入边。
+# 对标 joern 的 CPG 与 GitHub stack-graphs 的简化版：纯 stdlib、零依赖。
+# 精度高于文本搜索：AST 级统计，注释与字符串里的同名不算命中。
+# 已知边界（必须说清）：按「名字」聚合，同名符号会合并；不做类型推导，
+# 所以死代码判定刻意保守——可能漏报，不会乱报（vulture 的痛点是误报太多）。
+# 属性调用的接收者类型不可知时（x.get()、args.get()）不计入影响面排名：
+# 实测全仓 2103 处 .get( 曾被算给一个同名方法，Top1 直接失真；外部模块调用同理
+# （re.sub 39 处、subprocess.run 36 处曾被算给项目内的 sub / run）。
+
+# 这些名字由框架/入口按约定调用，零显式引用也不该报死代码
+_GRAPH_ENTRY_NAMES = {
+    "main", "setup", "teardown", "handler", "run", "app", "cli",
+    "create_app", "lambda_handler", "upgrade", "downgrade",
+    # 框架按约定调用的入口名（实测：skills/*/skill.py 的 execute 由 harness 派发）
+    "execute", "dispatch",
+}
+# 带这些装饰器的定义会被框架回调，零显式引用也不报
+_GRAPH_CALLBACK_DECOS = (
+    "pytest.", "fixture", "route", "task", "command", "click.", "app.",
+    "router.", "on_event", "property", "staticmethod", "classmethod",
+    "abstractmethod", "celery", "receiver", "validator", "field_validator",
+)
+
+
+def _py_dotted(rel: str) -> str:
+    """文件相对路径 → Python 模块点号名（包内 __init__ 归到包名）。"""
+    p = rel.replace("\\", "/")
+    if p.endswith(".py"):
+        p = p[:-3]
+    if p.endswith("/__init__"):
+        p = p[:-len("/__init__")]
+    return p.replace("/", ".")
+
+
+def _py_module_index(rels):
+    """dotted 模块名 → rel 列表：把 import 语句解析回项目内文件。"""
+    idx = {}
+    for rel in rels:
+        idx.setdefault(_py_dotted(rel), []).append(rel)
+    return idx
+
+
+def _resolve_mod(mod: str, idx):
+    """模块名 → 项目内 rel。精确匹配优先，其次后缀匹配（项目根不在 sys.path 时）；
+    同名模块或同层多候选一律返回 None——宁可判歧义也不猜。"""
+    hits = idx.get(mod)
+    if hits:
+        return hits[0] if len(hits) == 1 else None
+    cands = []
+    for dotted, rels in idx.items():
+        if dotted.endswith("." + mod):
+            cands += rels
+    if not cands:
+        return None
+    cands.sort(key=lambda r: (r.count("/"), r))
+    best = cands[0]
+    if sum(1 for c in cands if c.count("/") == best.count("/")) > 1:
+        return None
+    return best
+
+
+def _py_import_map(tree, rel: str) -> dict:
+    """本文件「本地名 → 来源模块」映射，同名消歧的依据。
+
+    只收能确定来源的写法（from X import y / import X as y）。`import a.b` 后调
+    a.b.f() 是属性链，名字不在映射里——这种情况判歧义，不猜。
+    """
+    pkg = _py_dotted(rel)
+    parent = pkg.rsplit(".", 1)[0] if "." in pkg else ""
+    out = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                local = a.asname or a.name.split(".")[0]
+                out[local] = a.name if a.asname else local
+        elif isinstance(node, ast.ImportFrom):
+            base = node.module or ""
+            if node.level:
+                parts = parent.split(".") if parent else []
+                up = node.level - 1
+                if up:
+                    parts = parts[:len(parts) - up] if up <= len(parts) else []
+                base = ".".join([p for p in parts + ([base] if base else []) if p])
+            for a in node.names:
+                if a.name != "*":
+                    out[a.asname or a.name] = base
+    return out
+
+
+def _resolve_owner(rel, name, file_defs, imports, mod_idx, cache=None):
+    """调用点里的 name 指向哪个文件——同名消歧的核心。
+
+    推断链（保守，逐级降级）：本文件定义 → import 来源模块 → 包的 re-export。
+    推不出就返回 None，调用方按「无法归属」单列，不做猜测性归属。
+    """
+    if name in file_defs.get(rel, ()):
+        return rel
+    mod = imports.get(rel, {}).get(name)
+    if not mod:
+        return None
+    if cache is not None and mod in cache:
+        target = cache[mod]
+    else:
+        target = _resolve_mod(mod, mod_idx)
+        if cache is not None:
+            cache[mod] = target
+    if target and name in file_defs.get(target, ()):
+        return target
+    pref = mod.replace(".", "/") + "/"
+    cands = [r for r, names in file_defs.items()
+             if name in names and r.replace("\\", "/").startswith(pref)]
+    return cands[0] if len(cands) == 1 else None
+
+
+def _add_dispatch_ref(refs, rel, node, lineno) -> None:
+    """字符串派发（ns["foo"] / getattr(x, "foo")）也算引用。
+
+    这类调用在 AST 里根本没有名字节点，漏掉就会把动态调用报成死代码。
+    实测踩到过：apply_fallback_humanoid 被 bone_map_ns["..."] 取用，
+    旧实现报成「零引用公开定义」——正是保守判定要防的误报。
+    """
+    if hasattr(ast, "Index") and isinstance(node, ast.Index):
+        node = node.value
+    if isinstance(node, ast.Constant) and isinstance(node.value, str) \
+            and node.value.isidentifier():
+        refs.setdefault(node.value, []).append({"rel": rel, "line": lineno})
+
+
+def _py_graph_scan(tree, rel: str, defs: dict, calls: dict, refs: dict,
+                   import_names=None) -> None:
+    """一次遍历收集：符号定义、调用点、名字引用（AST 级，不含注释/字符串）。
+
+    import_names = 本文件的 {本地名: 来源模块}（mod.f() 的 mod）；self/cls.f() 也一定
+    是本类方法。两者之外的 x.f() 接收者类型未知，记 amb=True 不参与影响面排名。
+    """
+    import_names = import_names or {}
+    stack = [(n, None, None) for n in reversed(list(ast.iter_child_nodes(tree)))]
+    while stack:
+        node, cur_func, cur_class = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            is_cls = isinstance(node, ast.ClassDef)
+            decos = []
+            for d in getattr(node, "decorator_list", []):
+                try:
+                    decos.append(ast.unparse(d))
+                except Exception:
+                    decos.append("?")
+            defs.setdefault(node.name, []).append({
+                "rel": rel, "line": node.lineno,
+                "kind": "class" if is_cls else
+                        ("async def" if isinstance(node, ast.AsyncFunctionDef) else "def"),
+                "method": cur_class is not None, "cls": cur_class, "decos": decos,
+            })
+            nf, nc = (None, node.name) if is_cls else (node.name, cur_class)
+            for c in reversed(list(ast.iter_child_nodes(node))):
+                stack.append((c, nf, nc))
+            continue
+        if isinstance(node, ast.Call):
+            f = node.func
+            name, amb, mod = None, False, None
+            if isinstance(f, ast.Name):
+                name = f.id
+            elif isinstance(f, ast.Attribute):
+                recv = f.value
+                if isinstance(recv, ast.Name) and recv.id in ("self", "cls"):
+                    name = f.attr
+                elif isinstance(recv, ast.Name) and recv.id in import_names:
+                    name, mod = f.attr, import_names[recv.id]
+                else:
+                    name, amb = f.attr, True
+            if name:
+                hit = {"rel": rel, "line": node.lineno, "amb": amb,
+                       "caller": cur_func or cur_class or "<module>"}
+                if mod:
+                    hit["mod"] = mod
+                calls.setdefault(name, []).append(hit)
+                if name == "getattr" and len(node.args) >= 2:
+                    _add_dispatch_ref(refs, rel, node.args[1], node.lineno)
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            refs.setdefault(node.id, []).append({"rel": rel, "line": node.lineno})
+        elif isinstance(node, ast.Attribute):
+            refs.setdefault(node.attr, []).append({"rel": rel, "line": node.lineno})
+        elif isinstance(node, ast.Subscript):
+            _add_dispatch_ref(refs, rel, node.slice, node.lineno)
+        for c in reversed(list(ast.iter_child_nodes(node))):
+            stack.append((c, cur_func, cur_class))
+
+
+def _is_test_file(rel: str) -> bool:
+    name = rel.rsplit("/", 1)[-1]
+    stem = name[:-3] if name.endswith(".py") else name
+    return (stem.startswith("test_") or stem.startswith("_test")
+            or stem.endswith("_test") or "_test_" in stem
+            or "/tests/" in f"/{rel}" or "/test/" in f"/{rel}")
+
+
+def _build_symbol_graph(root: Path, files):
+    """扫描 .py 构建符号图，返回 (defs, calls, refs, 失败数, import 映射, 全部 rel)。"""
+    defs, calls, refs, imports = {}, {}, {}, {}
+    rels, bad = [], 0
+    for fp in files:
+        if fp.suffix.lower() != ".py":
+            continue
+        try:
+            text, _ = _read_text(fp)
+        except OSError:
+            continue
+        tree = _parse_py(text, fp)
+        if tree is None:
+            bad += 1
+            continue
+        rel = _rel(root, fp)
+        rels.append(rel)
+        imports[rel] = _py_import_map(tree, rel)
+        _py_graph_scan(tree, rel, defs, calls, refs, imports[rel])
+    # 外部模块调用（re.sub / subprocess.run / json.load）的接收者是能确定的，确定的
+    # 却是「它属于 stdlib」——这类调用不该算给项目内的同名函数。按项目模块索引回筛。
+    mod_idx = _py_module_index(rels)
+    for hits in calls.values():
+        for h in hits:
+            if h.get("mod") and _resolve_mod(h["mod"], mod_idx) is None:
+                h["amb"] = True
+    return defs, calls, refs, bad, imports, rels
+
+
+def code_graph(args: dict) -> str:
+    """符号级引用图：影响面分析 + 死代码检测。
+
+    为什么不复用 code_deps：那是文件级 import 图，答不了「改这个函数会炸到谁」。
+    本工具建的是符号级图（定义 / 调用点 / 引用），影响面与死代码都是它的查询：
+      · 影响面 = 该符号的入边（谁调用它）
+      · 死代码 = 零入边的公开定义
+    传 symbol 聚焦单个符号（列出调用点、以及它调用了谁）；不传则给项目级排名。
+    """
+    root = _norm_root(args.get("root"))
+    symbol = str(args.get("symbol") or "").strip()
+    if symbol and not re.match(r"^[A-Za-z_]\w*$", symbol):
+        return "错误：symbol 需为合法标识符（字母/数字/下划线，不能以数字开头）"
+    try:
+        limit = max(1, min(int(args.get("limit") or 15), 100))
+    except ValueError:
+        return "错误：limit 需为数字"
+    files = list(_iter_files(root, {".py"}, False,
+                             paths=_norm_paths(args.get("paths")), limit=3000))
+    if not files:
+        return f"目录 {root} 下没有 Python 文件（符号图目前只支持 Python）。"
+    defs, calls, refs, bad, imports, rels = _build_symbol_graph(root, files)
+    # 同名消歧的上下文：每个文件定义了哪些名字 + 每个文件的 import 来源
+    file_defs = {}
+    for name, entries in defs.items():
+        for e in entries:
+            file_defs.setdefault(e["rel"], set()).add(name)
+    mod_idx = _py_module_index(rels)
+    mod_cache = {}
+    out = [f"符号引用图：{root}（{len(files)} 个 .py，AST 级，同名定义按 import 来源归属）"
+           + (f"；{bad} 个文件语法错被跳过" if bad else "")]
+
+    if symbol:
+        d = defs.get(symbol, [])
+        all_c = calls.get(symbol, [])
+        c = [h for h in all_c if not h.get("amb")]
+        amb_n = len(all_c) - len(c)
+        if not d and not all_c:
+            out.append(f"  未找到符号 {symbol} 的定义或调用点。")
+            return _trim("\n".join(out))
+        for h in c:
+            h["owner"] = _resolve_owner(h["rel"], symbol, file_defs, imports,
+                                        mod_idx, mod_cache)
+        grouped, orphan = {}, []
+        for h in c:
+            if h["owner"]:
+                grouped.setdefault(h["owner"], []).append(h)
+            else:
+                orphan.append(h)
+        out.append("")
+        if len(d) <= 1:
+            out.append(f"【定义】{symbol}")
+            if d:
+                e = d[0]
+                deco = f"  @{' @'.join(e['decos'])}" if e["decos"] else ""
+                cls = f"（{e['cls']} 的方法）" if e["method"] else ""
+                out.append(f"  {e['rel']}:{e['line']}  {e['kind']} {symbol}{cls}{deco}")
+            else:
+                out.append("  （项目内没有它的定义，可能是外部/动态定义）")
+            by_file = {}
+            for h in c:
+                by_file.setdefault(h["rel"], []).append(h)
+            out.append("")
+            out.append(f"【被调用】{len(c)} 处，分布在 {len(by_file)} 个文件 —— 这就是改动影响面")
+            if c:
+                for h in c[:limit]:
+                    out.append(f"  {h['rel']}:{h['line']}  in {h['caller']}()")
+                if len(c) > limit:
+                    out.append(f"  ……还有 {len(c) - limit} 处（limit 可调）")
+            else:
+                out.append("  （零调用点：可能是死代码、入口函数，或仅被动态调用）")
+            if amb_n:
+                out.append(f"  （另有 {amb_n} 处形如 x.f() 的调用无法确定接收者类型，未计入影响面）")
+        else:
+            by_rel = {}
+            for e in d:
+                by_rel.setdefault(e["rel"], []).append(e)
+            out.append(f"【定义】{symbol} —— 同名定义 {len(d)} 处，"
+                       "调用点按 import 来源归属如下")
+            for i, (rel, entries) in enumerate(list(by_rel.items())[:20], 1):
+                hits = grouped.get(rel, [])
+                where = "、".join(f"L{e['line']}" for e in entries)
+                out.append(f"  {i}. {rel}（{where}）    ← 归属调用 {len(hits)} 处")
+                for h in hits[:limit]:
+                    out.append(f"       {h['rel']}:{h['line']}  in {h['caller']}()")
+                if len(hits) > limit:
+                    out.append(f"       ……还有 {len(hits) - limit} 处")
+            out.append(f"  合计被调用 {len(c)} 处；无法归属 {len(orphan)} 处"
+                       "（跨包同名或动态派发，不猜）")
+            for h in orphan[:limit]:
+                out.append(f"    {h['rel']}:{h['line']}  in {h['caller']}()")
+        callees = {}
+        for cname, hits in calls.items():
+            for h in hits:
+                if h["caller"] == symbol:
+                    callees.setdefault(cname, []).append(h)
+        out.append("")
+        out.append(f"【它调用了】{len(callees)} 个符号 —— 这是它的依赖面")
+        if callees:
+            for cname, hits in sorted(callees.items(),
+                                      key=lambda kv: (-len(kv[1]), kv[0]))[:limit]:
+                inside = "（项目内）" if cname in defs else ""
+                out.append(f"  {cname}  ×{len(hits)}{inside}")
+        else:
+            out.append("  （没有调用其它函数）")
+        return _trim("\n".join(out))
+
+    rows, amb_only = [], []
+    for name, hits in calls.items():
+        if name not in defs:
+            continue
+        solid = [h for h in hits if not h.get("amb")]
+        if not solid:
+            amb_only.append(name)
+            continue
+        if len(defs[name]) == 1:
+            rows.append((len(solid), len({h["rel"] for h in solid}), name, defs[name][0]))
+            continue
+        # 同名多定义：先归属再统计，否则两个同名函数的调用数会互相灌水
+        per = {}
+        for h in solid:
+            owner = _resolve_owner(h["rel"], name, file_defs, imports,
+                                   mod_idx, mod_cache)
+            per.setdefault(owner, []).append(h)
+        for owner, hs in per.items():
+            e = next((x for x in defs[name] if x["rel"] == owner), defs[name][0])
+            rows.append((len(hs), len({h["rel"] for h in hs}),
+                         name if owner else name + "?", e))
+    rows.sort(key=lambda r: (-r[0], -r[1], r[2]))
+    out.append("")
+    out.append(f"【影响面 Top {limit}】被调用最多的项目内符号 —— 改它们波及面最大")
+    if rows:
+        for i, (n, nf, name, e) in enumerate(rows[:limit], 1):
+            dup = (f"（同名定义 {len(defs[name.rstrip('?')])} 处，已按归属拆开"
+                   f"{'' if not name.endswith('?') else '；? = 归属不明'}）"
+                   if len(defs[name.rstrip('?')]) > 1 else "")
+            out.append(f"  {i}. {name}  {e['rel']}:{e['line']}  被调用 {n} 处 / {nf} 个文件{dup}")
+    else:
+        out.append("  （没有跨函数调用，可能是扁平脚本集合）")
+    if amb_only:
+        out.append(f"  另有 {len(amb_only)} 个定义只被形如 x.f() 的调用引用（接收者类型未知，"
+                   "不计入排名）：" + "、".join(sorted(amb_only)[:8])
+                   + ("…" if len(amb_only) > 8 else ""))
+
+    dead = []
+    for name, entries in defs.items():
+        if name.startswith("_") or name in _GRAPH_ENTRY_NAMES or name.startswith("test_"):
+            continue
+        if calls.get(name) or refs.get(name):
+            continue
+        for e in entries:
+            if e["method"] or e["decos"] or _is_test_file(e["rel"]):
+                continue
+            dead.append((name, e))
+    dead.sort(key=lambda t: (t[1]["rel"], t[1]["line"]))
+    scoped = bool(_norm_paths(args.get("paths")))
+    out.append("")
+    out.append(f"【疑似死代码】{'当前范围内' if scoped else '全项目'}零引用的公开定义 {len(dead)} 个"
+               "（保守判定：已排除私有名、方法、带装饰器、测试文件、入口名）")
+    if scoped:
+        out.append("  ⚠ 已限定 paths：范围外的引用看不见，这份清单不能当删除依据。")
+    if dead:
+        for name, e in dead[:limit]:
+            out.append(f"  {e['rel']}:{e['line']}  {e['kind']} {name}")
+        if len(dead) > limit:
+            out.append(f"  ……还有 {len(dead) - limit} 个")
+        out.append("  提示：删除前用 code_locate 复核一次；已计入 getattr(x, \"f\") 与 "
+                   "ns[\"f\"] 这类字符串派发，但反射/插件式加载仍可能漏网。")
+    else:
+        out.append("  （没有发现零引用的公开定义）")
+    return _trim("\n".join(out))
+
+
 # ---------- 2b. 项目全貌（把「读什么」从猜测变成排名） ----------
 
 # 入口点的文件名证据：程序通常从这些名字开始
@@ -1217,6 +1854,8 @@ _ENTRY_STEMS = {
 
 # 复杂函数阈值：40 行的函数整读也不贵，1200 行的才要命
 _MAP_FUNC_MIN = 60
+# 复杂度阈值：CC≥11 是 radon 的 C 级（中等风险以上），比「60 行」更能抓到真正难读的函数
+_MAP_CC_MIN = 11
 
 
 def _entry_points(root: Path, hits, cap: int = 10):
@@ -1312,7 +1951,7 @@ def code_map(args: dict) -> str:
     从猜测变成排名。五个维度各有硬证据，都不靠感觉：
       · 入口点   ：文件名 + `__main__` 块 + package.json（程序从这里开始）
       · 枢纽文件 ：入度（被多少文件 import）—— 改动影响面最硬的度量
-      · 复杂函数 ：函数行数 —— 最该被拆、也最该被定点读的地方
+      · 复杂函数 ：圈复杂度（radon 口径 A~F）+ 行数 —— 最该被拆、也最该被定点读的地方
       · 改动热点 ：git 提交频次 —— 历史比结构更会说话，改得勤 = bug 高发
       · TODO 热点：作者自己标记的问题
 
@@ -1360,11 +1999,10 @@ def code_map(args: dict) -> str:
         if fp.suffix.lower() == ".py":
             tree = _parse_py(text, fp)
             if tree is not None:
-                for node in ast.walk(tree):
-                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        span = (node.end_lineno or node.lineno) - node.lineno + 1
-                        if span >= _MAP_FUNC_MIN:
-                            funcs.append((span, rel, node.name, node.lineno))
+                for cc, ln, end, name, kind in _py_func_cc(tree):
+                    span = end - ln + 1
+                    if cc >= _MAP_CC_MIN or span >= _MAP_FUNC_MIN:
+                        funcs.append((cc, span, rel, name, ln))
 
     out = [f"项目全貌：{root}",
            f"代码文件 {len(loc_rel)} 个，约 {sum(loc_rel.values())} 行；"
@@ -1391,14 +2029,16 @@ def code_map(args: dict) -> str:
     else:
         out.append("  （没有文件被 2 个以上文件依赖，项目可能是扁平脚本集合）")
 
-    funcs.sort(key=lambda r: (-r[0], r[1]))
+    funcs.sort(key=lambda r: (-r[0], -r[1], r[2]))
     out.append("")
-    out.append(f"【复杂函数 Top {top}】≥{_MAP_FUNC_MIN} 行：最该定点读，别整读")
+    out.append(f"【复杂函数 Top {top}】圈复杂度 ≥{_MAP_CC_MIN} 或 ≥{_MAP_FUNC_MIN} 行："
+               "最该定点读，别整读")
     if funcs:
-        for i, (span, rel, name, ln) in enumerate(funcs[:top], 1):
-            out.append(f"  {i}. {rel}:{ln}  {name}  {span} 行")
+        for i, (cc, span, rel, name, ln) in enumerate(funcs[:top], 1):
+            out.append(f"  {i}. {rel}:{ln}  {name}  CC {cc}({_py_cc_rank(cc)})  {span} 行")
     else:
-        out.append(f"  （没有超过 {_MAP_FUNC_MIN} 行的函数，代码规模健康）")
+        out.append(f"  （没有复杂度 ≥{_MAP_CC_MIN} 或超过 {_MAP_FUNC_MIN} 行的函数，"
+                   "代码规模健康）")
 
     churn = _git_churn(root, commits, top)
     out.append("")
@@ -1528,6 +2168,10 @@ def _edit_text_once(norm: str, e: dict, fp: Path, file_s: str):
             idx = le if e["position"] == "after" else ls - 1
             anchor_line = lines[idx] if idx < len(lines) else ""
             ins = _inherit_indent(anchor_line, new).split("\n")
+            # after 取的 idx 是 le 的下一位，两种 position 的 ins 都落在 anchor_line 之前
+            dup = _dup_anchor_guard(ins, anchor_line)
+            if dup:
+                return None, [dup]
             lines[idx:idx] = ins
         else:
             lines[ls - 1:le] = new.split("\n") if new else []
@@ -1555,6 +2199,9 @@ def _edit_text_once(norm: str, e: dict, fp: Path, file_s: str):
                           "未修改。请给出更长/更唯一的锚点。"]
         idx = hit_idx[0]
         ins = _inherit_indent(lines[idx], new).split("\n")
+        dup = _dup_anchor_guard(ins, lines[idx])
+        if dup:
+            return None, [dup]
         if e["position"] == "before":
             lines[idx:idx] = ins
         else:
@@ -2522,6 +3169,7 @@ HANDLERS = {
     "code_locate": code_locate,
     "code_analyze": code_analyze,
     "code_deps": code_deps,
+    "code_graph": code_graph,
     "code_map": code_map,
     "code_edit": code_edit,
     "code_create_file": code_create_file,

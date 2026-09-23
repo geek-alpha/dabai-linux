@@ -1434,13 +1434,18 @@ export default (function init(App: AppKernel) {
       console.log('[VRM] 碰撞体 API 不兼容，仅靠阻尼+平滑防穿模');
     }
   }; // VRM 放松站姿常量（normalized 空间：人形面向 -Z，+Y 上）
-  // 左臂沿 -X 方向延伸 → 绕 Z 正向旋转使手臂下垂
-  // 右臂沿 +X 方向延伸 → 绕 Z 负向旋转使手臂下垂
+  // 左臂沿 -X 方向延伸 → 绕 Z 正向旋转使手臂下垂；右臂 +X → 负向。
+  // 但 VRM1 模型的左臂在 +X 侧，符号相反，由加载时探测的 App.vrmArmRestSign 决定
   App.ARM_REST_Z = 1.35; // 加载后立即应用放松站姿（消除 T-pose）
+  // 手臂旋转要按模型手性取符号：VRM0 左臂在 -X 侧（+1.35 即下垂），VRM1 左臂在 +X 侧（-1.35 才下垂）。
+  // 偏移量一并乘符号，保证两个模型的摆动方向视觉一致。
+  App.armZ = function armZ(offset) {
+    return (App.ARM_REST_Z + (offset || 0)) * (App.vrmArmRestSign || 1);
+  };
   App.applyVrmRestPose = function applyVrmRestPose() {
     const B = App.vrmBones;
-    if (B.leftUpperArm) B.leftUpperArm.rotation.set(0, 0, App.ARM_REST_Z);
-    if (B.rightUpperArm) B.rightUpperArm.rotation.set(0, 0, -App.ARM_REST_Z);
+    if (B.leftUpperArm) B.leftUpperArm.rotation.set(0, 0, App.armZ(0));
+    if (B.rightUpperArm) B.rightUpperArm.rotation.set(0, 0, -App.armZ(0));
     if (B.leftLowerArm) B.leftLowerArm.rotation.set(-0.15, 0, 0);
     if (B.rightLowerArm) B.rightLowerArm.rotation.set(-0.15, 0, 0);
     if (B.leftHand) B.leftHand.rotation.set(0, 0, 0.1);
@@ -1751,13 +1756,15 @@ export default (function init(App: AppKernel) {
     const idleArmSwing = App.currentState === App.State.IDLE && walkProgress <= 0 ? Math.sin(App.idleEnergy * 0.9) * 0.035 * energy : 0;
     if (B.leftUpperArm) {
       // 摆臂主要用 rotation.x（前后方向），z 保持 rest pose 只做呼吸微动
-      let tz = App.ARM_REST_Z + Math.sin(t * 1.2) * 0.012 + idleArmSwing;
+      let tz = App.armZ(
+        Math.sin(t * 1.2) * 0.012 + idleArmSwing
+        + poseValAxis('leftUpperArm', 'z') * blend
+        + (App.currentState === App.State.SPEAKING ? Math.sin(t * 2.5) * 0.015 : 0)
+      );
       let tx = Math.sin(t * 1.2 + 0.3) * 0.015 + Math.sin(t * 0.7) * 0.008 * energy + leftArmSwing;
-      tz += poseValAxis('leftUpperArm', 'z') * blend;
       tx += poseValAxis('leftUpperArm', 'x') * blend;
       if (App.currentState === App.State.SPEAKING) {
         tx += Math.sin(t * 3) * 0.04;
-        tz += Math.sin(t * 2.5) * 0.015;
       }
       B.leftUpperArm.rotation.z = App.lerp(B.leftUpperArm.rotation.z, tz, 0.07);
       B.leftUpperArm.rotation.x = App.lerp(B.leftUpperArm.rotation.x, tx, 0.07);
@@ -1773,13 +1780,15 @@ export default (function init(App: AppKernel) {
 
     // --- 右臂 + 姿态 + 行走摆臂（与左臂反相） + idle 活力微摆 ---
     if (B.rightUpperArm) {
-      let tz = -App.ARM_REST_Z + Math.sin(t * 1.2 + 0.5) * 0.012 - idleArmSwing;
+      let tz = -App.armZ(
+        -Math.sin(t * 1.2 + 0.5) * 0.012 + idleArmSwing
+        - poseValAxis('rightUpperArm', 'z') * blend
+        + (App.currentState === App.State.SPEAKING ? Math.sin(t * 2.5) * 0.015 : 0)
+      );
       let tx = Math.sin(t * 1.2) * 0.015 + Math.sin(t * 0.65) * 0.008 * energy + rightArmSwing;
-      tz += poseValAxis('rightUpperArm', 'z') * blend;
       tx += poseValAxis('rightUpperArm', 'x') * blend;
       if (App.currentState === App.State.SPEAKING) {
         tx += -Math.sin(t * 3) * 0.04;
-        tz += -Math.sin(t * 2.5) * 0.015;
       }
       B.rightUpperArm.rotation.z = App.lerp(B.rightUpperArm.rotation.z, tz, 0.07);
       B.rightUpperArm.rotation.x = App.lerp(B.rightUpperArm.rotation.x, tx, 0.07);

@@ -129,6 +129,44 @@ def check_quiet_static():
 check_quiet_static()
 
 
+def check_toolbar_overlay():
+    """侧边工具栏必须浮在聊天面板之上，且全屏聊天时不被静默规则藏掉。
+
+    用户反馈的 bug：聊天框一开全屏，右上角侧边栏就点不动了。根因是工具栏当时
+    挂在 #stage 里，而 #stage 带 z-index:1 —— 子树整体被困在那个层叠上下文里，
+    工具栏自己的 z-index 再高也压不过 .chat-fs 的 80。修法是把工具栏移到 #stage
+    之外（#app 下）并抬到 83。这条断言就是那次修复的哨兵：谁把它挪回 #stage，
+    或者把 z-index 调回 80 以下，这里立刻红。
+    """
+    import re
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    css = open(os.path.join(root, "web", "style.css"), encoding="utf-8").read()
+    html = open(os.path.join(root, "web", "index.html"), encoding="utf-8").read()
+
+    def z(sel):
+        m = re.search(re.escape(sel) + r"\s*\{[^}]*?z-index:\s*(\d+)", css)
+        return int(m.group(1)) if m else 0
+
+    panel_z, tools_z = z("#chat-panel.chat-fs"), z(".stage-tools")
+    check("侧边工具栏 z-index 高于聊天全屏面板",
+          tools_z > panel_z, "tools=%s panel=%s" % (tools_z, panel_z))
+    check("侧边工具栏 z-index 低于模态弹窗（弹窗仍能盖住它）",
+          0 < tools_z < z(".modal"), "tools=%s modal=%s" % (tools_z, z(".modal")))
+    # 位置：工具栏必须是 #stage 的兄弟而不是子节点。用「#stage 的闭合标签出现在
+    # 工具栏之前」判断，不依赖缩进（HTML 里缩进随时会被格式化工具改掉）。
+    stage_end = html.find("</section>")
+    tools_at = html.find('id="stage-tools"')
+    check("侧边工具栏挂在 #stage 之外（否则被 #stage 的层叠上下文困住）",
+          0 < stage_end < tools_at, "stage_end=%s tools=%s" % (stage_end, tools_at))
+    # 静默规则只藏 #stage 的直接子元素；工具栏在 #stage 外，天然不受影响。
+    # 这条防的是「有人把工具栏挪回 #stage 内」——那时它会连按钮一起消失。
+    check("聊天全屏静默规则不会藏掉侧边工具栏",
+          "html.chat-quiet #stage > *:not(#three-canvas)" in css and tools_at > stage_end)
+
+
+check_toolbar_overlay()
+
+
 with __import__("playwright.sync_api", fromlist=["sync_playwright"]).sync_playwright() as p:
     browser = p.chromium.launch(**launch_kwargs())
     ctx = browser.new_context(ignore_https_errors=True, viewport={"width": 1280, "height": 800})

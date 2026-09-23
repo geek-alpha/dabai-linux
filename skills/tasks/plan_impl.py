@@ -6,7 +6,7 @@
 
 状态机在工具层强制（codex 只写在提示词里，靠自觉）：
 1. 同时最多 1 个 in_progress；
-2. 不许 pending 直接跳 completed —— 必须先经过 in_progress；
+2. 从 pending 跳到 completed 要带 explanation —— 不是不许跳，是跳了要留痕；
 3. 每次提交整份清单（不是增量），历史快照留痕，可事后审计「有没有事后批量补完」。
 
 整份提交是刻意的：codex 的 UpdatePlanArgs 也是 Vec<PlanItemArg> 全量替换，
@@ -107,8 +107,20 @@ def _normalize(raw) -> tuple:
     return steps, None
 
 
-def _check_transition(prev: list, new: list) -> str | None:
-    """跳级检查：同一位置、同一文本的项不许 pending → completed。"""
+def _check_transition(prev: list, new: list, explanation=None) -> tuple:
+    """跳级检查：同一位置、同一文本的项从 pending 跳到 completed 时要求说明。
+
+    返回 (err, meta)，meta 记录本次提交的变更性质，供 history 留痕与审计：
+    jumps = 跳过的步骤序号（1-based），revised = 步骤被重排/增删/改文本。
+
+    为什么不再硬拦跳级：检查按「同位置同文本」匹配，模型重排或改措辞即豁免
+    （实测历史快照 7 步→10 步、完成 0→8 就是这么过去的）。硬拦拦不住想绕的人，
+    只拦住了照抄文本的老实模型，代价是逼它多提交一次不含新信息的 in_progress
+    快照。改成「跳级要带 explanation」：一轮里真做完的直接提交，不多跑往返；
+    跨轮推进的仍被回显机制盯着逐步走。约束落在留痕上，不落在形式上。
+    """
+    jumps = []
+    revised = len(prev) != len(new)
     for i, item in enumerate(new):
         if i >= len(prev):
             break
@@ -116,12 +128,18 @@ def _check_transition(prev: list, new: list) -> str | None:
         if not isinstance(p, dict):
             continue
         if p.get('step') != item['step']:
+            revised = True
             continue
         if p.get('status') == 'pending' and item['status'] == 'completed':
-            return (f'第 {i + 1} 项「{item["step"][:30]}」从 pending 直接跳到 completed。'
-                    '必须先把状态置 in_progress，做完再置 completed——'
-                    '先提交一次带 in_progress 的清单。')
-    return None
+            jumps.append(i + 1)
+    meta = {'jumps': jumps, 'revised': revised}
+    if jumps and not str(explanation or '').strip():
+        names = '、'.join(f'第 {j} 项' for j in jumps[:3])
+        more = f' 等 {len(jumps)} 步' if len(jumps) > 3 else ''
+        return (f'{names}{more}从 pending 直接标 completed。'
+                '同一轮里一次做完的，带 explanation 说一句（如「这 3 步一轮做完」）'
+                '照常提交即可；跨轮推进的才需要先置 in_progress 再置 completed。', meta)
+    return None, meta
 
 
 def _render(plan: list, explanation=None, title='工作清单') -> str:
@@ -154,15 +172,25 @@ def _do_update(args) -> str:
     with _lock_for(path):
         data = _load(path)
         prev = data.get('plan') or []
-        jump = _check_transition(prev, steps)
+        jump, meta = _check_transition(prev, steps, explanation)
         if jump:
             return jump
         if prev:
-            data.setdefault('history', []).append({
+            entry = {
                 'at': data.get('updated_at') or 0,
                 'plan': prev,
                 'explanation': data.get('explanation'),
-            })
+            }
+            # 变更性质随快照留痕：只看状态序列分不出「一轮做完」和「范围调整」——
+            # 两者都表现为大跨度跳变，审计要能分开读，所以把 meta 落到条目上。
+            if meta.get('jumps'):
+                entry['jumps'] = meta['jumps']
+                # 理由必须跟 jumps 同源：entry['explanation'] 存的是 prev 那一版的说明，
+                # 跟本次提交无关，审计时读不出「为什么跳」，对不上号。
+                entry['why'] = explanation
+            if meta.get('revised'):
+                entry['revised'] = True
+            data.setdefault('history', []).append(entry)
             data['history'] = data['history'][-HISTORY_KEEP:]
         data['plan'] = steps
         data['updated_at'] = time.time()
@@ -214,6 +242,21 @@ def _do_clear(args) -> str:
         if not (data.get('plan') or []):
             return '工作清单本来就是空的。'
         left = [s for s in data['plan'] if s['status'] != 'completed']
+        # 收尾闸门：有活没干完就想清，默认拒绝，必须显式 force。
+        # 「清空」是唯一会让账本消失的动作：误清之后用户看到的进度凭空蒸发，也再
+        # 分不清「做完了」和「没做就抹掉」。实测 8 份清单里 3 份提交一次就再没更新
+        # 过，全靠 clear 抹平——闸门把「没做完就抹」变成一个有意识的动作。
+        if left and not bool((args or {}).get('force')):
+            lines = [f'工作清单还有 {len(left)} 步没完成，先别清空：']
+            for s in left[:5]:
+                lines.append(f'  {_MARK[s["status"]]} {s["step"][:40]}')
+            if len(left) > 5:
+                lines.append(f'  …还有 {len(left) - 5} 步')
+            lines.append('两条出路：① 确实做完了 → plan_update 把它们标 completed'
+                         '（同一轮一次做完的带 explanation 说明，跨轮的先 in_progress '
+                         '再 completed，都整份提交）；'
+                         '② 这件事放弃了 → 带 force=true 再调一次，history 会留痕。')
+            return '\n'.join(lines)
         data.setdefault('history', []).append({
             'at': data.get('updated_at') or 0,
             'plan': data['plan'],
@@ -259,7 +302,15 @@ def _do_history(args) -> str:
         when = f'{datetime.datetime.fromtimestamp(ts):%m-%d %H:%M:%S}' if ts else '?'
         done = sum(1 for s in snap.get('plan') or [] if s.get('status') == 'completed')
         total = len(snap.get('plan') or [])
-        lines.append(f'  {when}  {done}/{total} 完成')
+        tag = ''
+        if snap.get('jumps'):
+            tag = f'  ⚡跳级 {len(snap["jumps"])} 步'
+            why = str(snap.get('why') or '').strip()
+            if why:
+                tag += f' · {why[:30]}'
+        elif snap.get('revised'):
+            tag = '  ✎范围调整'
+        lines.append(f'  {when}  {done}/{total} 完成{tag}')
         for s in snap.get('plan') or []:
             lines.append(f'      {_MARK.get(s.get("status"), "?")} {s.get("step", "")[:40]}')
     return '\n'.join(lines)

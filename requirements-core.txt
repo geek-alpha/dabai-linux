@@ -1,42 +1,60 @@
-# 大白跨平台依赖清单（Windows / Linux / macOS 通用）
+# 大白跨平台依赖清单（Windows / Linux / macOS 通用）—— 唯一权威
 #
-# 为什么单独一份，而不是直接用 requirements.txt：
-#   requirements.txt 是早期那台 Windows 机器上的历史清单，混了三类装不上的东西 ——
-#     bpy / bmesh / mathutils / addon_utils / rna_prop_ui  Blender 内嵌 Python 才有，PyPI 上没有
-#     imp                                                 Python 3.12 起已从标准库移除，安装即失败
-#     TodoService / amazing_agent_dingding / dabai_ears /
-#     dabai_voice / fuctions_all_you_need_base / google   本机私有包，PyPI 上不存在
-#   拿它在新机器上装会成片失败，看着像环境坏了，其实是清单本身不可移植。
+# 为什么不用 requirements.txt：那份是早期那台 Windows 机器上的历史清单，混了三类装不上的东西 ——
+#   bpy / bmesh / mathutils / addon_utils / rna_prop_ui  Blender 内嵌 Python 才有，PyPI 上没有
+#   imp                                                 Python 3.12 起已从标准库移除，安装即失败
+#   TodoService / amazing_agent_dingding / dabai_ears /
+#   dabai_voice / fuctions_all_you_need_base / google   本机私有包，PyPI 上不存在
+# 拿它在新机器上装会成片失败，看着像环境坏了，其实是清单本身不可移植。
+# anthropic / python-dotenv 也是从那份抄过来的，全仓代码零引用 —— 已移出清单（见文末可选段）。
 #
-# 这份清单里的每个包在三个平台上都能装。装不上的可选包在末尾用注释列出，
-# 缺了不影响核心能力（对话 / 3D / 技能 / 任务中心）。
+# 与 tools/check_deps.py 同源：那份是启动前自检的清单，改这里要同步改它
+# （本文件的「启动必需 / 能力依赖」两段与 check_deps.py 的 REQUIRED / CAPABILITY 对应）。
+#
+# 清单完不完整不靠人肉保证 —— tools/deps_audit.py 从 server.py 沿 import 图反推对账：
+#   python3 tools/deps_audit.py           # 报告：启动路径依赖 vs 清单，标出漏网/冗余
+#   python3 tools/deps_audit.py --gate    # 启动路径有漏网或未装 → 退出 1（可挂 CI）
+#   python3 tools/deps_audit.py --export  # 一键导出本机实际依赖（代码 import 反推，带版本）
+#   python3 tools/deps_audit.py --freeze  # 一键导出完整环境锁定（pip freeze 全量）
 #
 # 安装：
 #   Linux/macOS  ./dabai.sh --setup      （或 tools/linux_setup.sh --venv）
 #   Windows      dabai.bat --setup
+#   pip 源慢/超时：python tools/pip_mirror.py -r requirements-core.txt  # 自动探测可用镜像
 
-Pillow
-aiohttp
-anthropic
-certifi
-edge-tts
+# ---- 启动必需：缺任意一个 server.py 都起不来 ----
+# 判据：deps_audit 扫 server.py 的 import 图，以下 6 项有静态 import；
+# python-multipart 由 FastAPI 加载 File/UploadFile 时按名需要，算间接依赖。
 fastapi
-gradio_client
+uvicorn
+python-multipart   # server.py:41 顶层 import FastAPI 的 UploadFile/File，加载期就要它
+starlette
+edge-tts
+openai
+requests
+
+# ---- 能力依赖：缺了对应功能降级，不阻塞启动 ----
+websockets         # uvicorn 的 WebSocket 实现；缺了网页实时对话连不上
+uvloop; sys_platform != "win32"     # 事件循环加速（Windows 上 PyPI 没有 wheel）
+httptools; sys_platform != "win32"  # HTTP 解析加速（需 C 编译）
+aiohttp            # code_ops 远程工作区 / CLI 远程调用
+numpy              # 技能数值计算（android 校验、appearance 姿态）与图像工具
 httpx
+certifi
+Pillow
+yt_dlp
+tree_sitter
 mss
 netifaces
-numpy
-openai
+gradio_client
 playwright
-python-dotenv
-qrcode
-requests
-starlette
-tree_sitter
-uvicorn
-yt_dlp
+cryptography    # 联邦签名首选后端（peer_ledger.py，缺了退回 HMAC 并标注降级）
+pypdf           # attach_text.py:56 PDF 附件正文提取
+qrcode          # server.py:1818 手机配对二维码
 
 # ---- 可选：装不上不影响核心 ----
-# pyautogui     截屏/自动化兜底；Windows 直接可用，Linux 需 python3-xlib（截屏另有 mss 兜底）
-# sounddevice   麦克风采集；需系统音频库
-# uiautomator2  安卓真机 UI 自动化（skills/android）；需连真机 + adb，按需装
+# pyautogui      截屏/自动化兜底；Windows 直接可用，Linux 需 python3-xlib（截屏另有 mss 兜底）
+# sounddevice    麦克风采集；需系统音频库
+# uiautomator2   安卓真机 UI 自动化（skills/android）；需连真机 + adb，按需装
+# anthropic      Anthropic SDK；全仓零引用（模型走 openai 兼容层），要直连再装
+# python-dotenv  .env 加载；全仓零引用（密钥由 deploy/windows/launch.py 注入环境变量）

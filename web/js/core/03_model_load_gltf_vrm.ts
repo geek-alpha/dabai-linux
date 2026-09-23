@@ -103,12 +103,8 @@ export default (function init(App: AppKernel) {
     if (App.vrm) {
       App.modelType = 'vrm';
       // VRM 0.x 朝向修正：将模型转到面向 +Z，与相机保持一致
+      // （VRM1 模型本身按规范就面朝 +Z，不能再转，否则背对相机）
       VRMUtils.rotateVRM0(App.vrm);
-      // MMD 转换的 VRM1（如莉丽拉）：骨骼结构与 VRM0 一致（左臂 +X、骨骼 rest 旋转 = I），
-      // 同样需要绕 Y 180° 才能让驱动旋转方向正确（applyVrmRestPose 手臂自然下垂、Mixamo 动作方向正常）
-      if (App.vrm.meta?.metaVersion === '1') {
-        App.vrm.scene.rotation.y = Math.PI;
-      }
       VRMUtils.removeUnnecessaryVertices(root);
 
       // 调优弹簧骨骼：增大阻尼、降低刚度，防止头发衣物乱摆穿模
@@ -124,6 +120,12 @@ export default (function init(App: AppKernel) {
           if (bone) App.vrmBones[boneName] = bone;
         }
         App.headBone = App.vrmBones.head || null;
+        // 手臂放松旋转的方向：normalized 骨骼的 position 就是「父→子」的局部向量，
+        // 左小臂在左上臂 +X 侧 = 手臂朝 +X 伸展（VRM1），绕 Z 要负旋才下垂；-X 侧（VRM0）反之。
+        // 实测：白头凤 x=-0.225 → +1；dabai.vrm x=+0.330 → -1。
+        App.vrmArmRestSign = 1;
+        const loArmL = App.vrmBones.leftLowerArm;
+        if (loArmL && loArmL.position.x > 0) App.vrmArmRestSign = -1;
         console.log('[VRM] 骨骼缓存:', Object.keys(App.vrmBones).join(', '));
         // 立即应用放松站姿（手臂自然下垂），避免 T-pose 闪烁
         App.applyVrmRestPose();

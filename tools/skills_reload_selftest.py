@@ -4,7 +4,7 @@
 回归背景（两个真实踩坑）：
 1. 旧实现只清加载期快照 _mods_added 里的模块，函数体内延迟 import 的兄弟模块
    （skills/android/adb_ui.py 里的 `import viewtree`）永远清不掉 → 改 viewtree.py
-   后热重载仍读旧代码（现象：see 报 no attribute res_name）。
+   后热重载仍读旧代码（现象：调用 viewtree 里的函数报 no attribute）。
 2. 改成按 __file__ 归属清除后，若清单里 path 缺失，Path("").resolve() == cwd
    会把整个项目的模块从 sys.modules 摘掉（实测误清 5 个 harness 模块）。
    故清除前必须校验目标目录是 base_dir 的真子目录。

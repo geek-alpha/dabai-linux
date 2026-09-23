@@ -13,7 +13,7 @@
     <link rel="manifest" href="/manifest.webmanifest">
     <link rel="apple-touch-icon" href="/static/icons/icon-192.png">
     <link rel="icon" type="image/png" sizes="192x192" href="/static/icons/icon-192.png">
-    <link rel="stylesheet" href="/static/style.css?v=40">
+    <link rel="stylesheet" href="/static/style.css?v=41">
     <!-- 普通用户看不到管理员专属入口（任务中心/工作区）：点了也是 403，不如不显示。
          角色由服务端在 head 收尾标签之前同步注入
          （形如 window.__ROLE=...; document.documentElement.dataset.role=...;，见 server.py 的 index 路由）。 -->
@@ -38,67 +38,6 @@
             <canvas id="three-canvas"></canvas>
             <div id="status-badge" class="status-badge"><span class="status-dot"></span>连接中…</div>
             <div id="subtitle" class="subtitle"></div>
-
-            <!-- 顶部右侧工具栏：侧边竖排，可上下滚动（默认收缩在右上角） -->
-            <div class="stage-tools collapsed" id="stage-tools">
-                <button id="stage-tools-toggle" class="stage-tools-toggle" title="展开工具栏">
-                    <svg class="icon-open" viewBox="0 0 24 24" width="16" height="16"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" d="M5 7h14M5 12h14M5 17h14"/></svg>
-                    <svg class="icon-close" viewBox="0 0 24 24" width="16" height="16"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" d="M6 6l12 12M18 6L6 18"/></svg>
-                </button>
-                <button id="wheel-up-btn" class="stage-tools-arrow" title="上一组">▲</button>
-                <div class="stage-tools-ring" id="stage-tools-ring">
-                <button id="role-card-btn" class="stage-tool-btn" title="角色卡片：一键切换形象/声音/称呼/人设">
-                    <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M4 4h7v7H4V4zm9 0h7v7h-7V4zM4 13h7v7H4v-7zm9 0h7v7h-7v-7z"/></svg>
-                </button>
-                <button id="llm-provider-btn" class="stage-tool-btn" data-admin-only title="模型供应商：添加/管理全局 LLM 供应商（Ollama 本地 / 自定义 API）">
-                    <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M7 4v7h-1.5A2.5 2.5 0 0 0 3 13.5V15a2 2 0 0 0 2 2h1.5v3h2v-3H13.5a2 2 0 0 0 2-2v-1.5A2.5 2.5 0 0 0 13 11H11V4h2a1 1 0 0 0 0-2H6a1 1 0 0 0 0 2h1z"/><path fill="currentColor" d="M19 10.5c0-1.38-1.12-2.5-2.5-2.5S14 9.12 14 10.5v3.6c0 .5.18.96.5 1.32V15H16v.5c.36.32.82.5 1.32.5h.36A2.32 2.32 0 0 0 20 13.68V10.5z" transform="translate(0 -1)"/></svg>
-                </button>
-                <button id="bg-btn" class="stage-tool-btn" title="背景场景">
-                    <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M20 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 14H4V6h16v12zm-9-3l-2-2.5L7 16h10l-3.5-4.5z"/></svg>
-                </button>
-                <button id="move-btn" class="stage-tool-btn" title="移动模式：选中并拖动模型/背景">
-                    <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M13 6v5h5V7.75L22.25 12 18 16.25V13h-5v5h3.25L12 22.25 7.75 18H11v-5H6v3.25L1.75 12 6 7.75V11h5V6H7.75L12 1.75 16.25 6H13z"/></svg>
-                </button>
-                <button id="fpv-btn" class="stage-tool-btn" title="机位调整">
-                    <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z"/></svg>
-                </button>
-                <button id="reset-cam-btn" class="stage-tool-btn" title="重置视角">
-                    <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M12 5V1L7 6l5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z"/></svg>
-                </button>
-                <button id="cam-settings-btn" class="stage-tool-btn" title="相机设置">
-                    <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M12 15.5A3.5 3.5 0 1 1 12 8.5a3.5 3.5 0 0 1 0 7z"/><path fill="currentColor" d="M20 4h-3.17L15 2H9L7.17 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm-8 13c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5z"/></svg>
-                </button>
-                <button id="gyro-btn" class="stage-tool-btn" data-admin-only title="VR模式：WebXR 沉浸体验" style="display:none">
-                    <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M18.57 4C17.71 3.38 16.65 3 15.5 3c-1.15 0-2.21.38-3.07 1C11.57 3.38 10.51 3 9.36 3S7.15 3.38 6.29 4C4.96 5.33 4.5 8.38 4.5 12s.46 6.67 1.79 8c.86.62 1.92 1 3.07 1s2.21-.38 3.07-1c.86.62 1.92 1 3.07 1s2.21-.38 3.07-1c1.33-1.33 1.79-4.38 1.79-8s-.46-6.67-1.79-8zM12 18c-2.21 0-4-2.69-4-6s1.79-6 4-6 4 2.69 4 6-1.79 6-4 6zm5.5-4c.83 0 1.5-.67 1.5-1.5S18.33 11 17.5 11 16 11.67 16 12.5s.67 1.5 1.5 1.5z"/></svg>
-                </button>
-                <button id="fullscreen-btn" class="stage-tool-btn" title="全屏">
-                    <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z"/></svg>
-                </button>
-                <button id="music-btn" class="stage-tool-btn" title="在线音乐：搜索 / 歌单">
-                    <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M9 3v10.55A4 4 0 1 0 11 17V7h4V3H9z"/></svg>
-                </button>
-                <button id="video-btn" class="stage-tool-btn" title="在线视频：搜索 / 播放">
-                    <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M10 8.64L15.27 12 10 15.36V8.64zM12 3C7.03 3 3 7.03 3 12s4.03 9 9 9 9-4.03 9-9-4.03-9-9-9zm0 16.2c-3.97 0-7.2-3.23-7.2-7.2s3.23-7.2 7.2-7.2 7.2 3.23 7.2 7.2-3.23 7.2-7.2 7.2z"/></svg>
-                </button>
-                <button id="workspace-btn" class="stage-tool-btn" data-admin-only title="工作区：设置智能体工作目录">
-                    <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M10 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/></svg>
-                </button>
-                <button id="session-btn" class="stage-tool-btn" title="对话历史">
-                    <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M13 3a9 9 0 0 0-9 9H1l3.89 3.89.07.14L9 12H6c0-3.87 3.13-7 7-7s7 3.13 7 7-3.13 7-7 7c-1.93 0-3.68-.79-4.94-2.06l-1.42 1.42A8.954 8.954 0 0 0 13 21a9 9 0 0 0 0-18zm-1 5v5l4.28 2.54.72-1.21-3.5-2.08V8H12z"/></svg>
-                </button>
-                <button id="fps-btn" class="stage-tool-btn" title="帧率调节：点击切换60/30/20fps">
-                    <span id="fps-label" class="fps-label">60</span>
-                </button>
-                <button id="immerse-btn" class="stage-tool-btn" title="沉浸模式：隐藏所有按钮，专注对话与角色">
-                    <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M21 4H3c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h18c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 14H3V6h18v12zm-2-9H5v6h14V9z"/></svg>
-                </button>
-                <button id="lock-mode-btn" class="stage-tool-btn" title="锁屏模式：锁定屏幕防误触，仅可语音对话，再按一次解锁">
-                    <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm-6 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm3.1-9H8.9V6c0-1.71 1.39-3.1 3.1-3.1 1.71 0 3.1 1.39 3.1 3.1v2z"/></svg>
-                </button>
-                </div><!-- /stage-tools-ring -->
-                <button id="wheel-down-btn" class="stage-tools-arrow" title="下一组">▼</button>
-                <div class="stage-tools-label" id="stage-tools-label"></div>
-            </div>
 
             <!-- 拖拽导入提示 -->
             <div id="drop-hint" class="drop-hint">
@@ -143,6 +82,67 @@
                 </div>
             </div>
         </section>
+
+        <!-- 顶部右侧工具栏：侧边竖排，可上下滚动（默认收缩在右上角） -->
+        <div class="stage-tools collapsed" id="stage-tools">
+            <button id="stage-tools-toggle" class="stage-tools-toggle" title="展开工具栏">
+                <svg class="icon-open" viewBox="0 0 24 24" width="16" height="16"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" d="M5 7h14M5 12h14M5 17h14"/></svg>
+                <svg class="icon-close" viewBox="0 0 24 24" width="16" height="16"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" d="M6 6l12 12M18 6L6 18"/></svg>
+            </button>
+            <button id="wheel-up-btn" class="stage-tools-arrow" title="上一组">▲</button>
+            <div class="stage-tools-ring" id="stage-tools-ring">
+            <button id="role-card-btn" class="stage-tool-btn" title="角色卡片：一键切换形象/声音/称呼/人设">
+                <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M4 4h7v7H4V4zm9 0h7v7h-7V4zM4 13h7v7H4v-7zm9 0h7v7h-7v-7z"/></svg>
+            </button>
+            <button id="llm-provider-btn" class="stage-tool-btn" data-admin-only title="模型供应商：添加/管理全局 LLM 供应商（Ollama 本地 / 自定义 API）">
+                <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M7 4v7h-1.5A2.5 2.5 0 0 0 3 13.5V15a2 2 0 0 0 2 2h1.5v3h2v-3H13.5a2 2 0 0 0 2-2v-1.5A2.5 2.5 0 0 0 13 11H11V4h2a1 1 0 0 0 0-2H6a1 1 0 0 0 0 2h1z"/><path fill="currentColor" d="M19 10.5c0-1.38-1.12-2.5-2.5-2.5S14 9.12 14 10.5v3.6c0 .5.18.96.5 1.32V15H16v.5c.36.32.82.5 1.32.5h.36A2.32 2.32 0 0 0 20 13.68V10.5z" transform="translate(0 -1)"/></svg>
+            </button>
+            <button id="bg-btn" class="stage-tool-btn" title="背景场景">
+                <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M20 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 14H4V6h16v12zm-9-3l-2-2.5L7 16h10l-3.5-4.5z"/></svg>
+            </button>
+            <button id="move-btn" class="stage-tool-btn" title="移动模式：选中并拖动模型/背景">
+                <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M13 6v5h5V7.75L22.25 12 18 16.25V13h-5v5h3.25L12 22.25 7.75 18H11v-5H6v3.25L1.75 12 6 7.75V11h5V6H7.75L12 1.75 16.25 6H13z"/></svg>
+            </button>
+            <button id="fpv-btn" class="stage-tool-btn" title="机位调整">
+                <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z"/></svg>
+            </button>
+            <button id="reset-cam-btn" class="stage-tool-btn" title="重置视角">
+                <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M12 5V1L7 6l5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z"/></svg>
+            </button>
+            <button id="cam-settings-btn" class="stage-tool-btn" title="相机设置">
+                <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M12 15.5A3.5 3.5 0 1 1 12 8.5a3.5 3.5 0 0 1 0 7z"/><path fill="currentColor" d="M20 4h-3.17L15 2H9L7.17 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm-8 13c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5z"/></svg>
+            </button>
+            <button id="gyro-btn" class="stage-tool-btn" data-admin-only title="VR模式：WebXR 沉浸体验" style="display:none">
+                <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M18.57 4C17.71 3.38 16.65 3 15.5 3c-1.15 0-2.21.38-3.07 1C11.57 3.38 10.51 3 9.36 3S7.15 3.38 6.29 4C4.96 5.33 4.5 8.38 4.5 12s.46 6.67 1.79 8c.86.62 1.92 1 3.07 1s2.21-.38 3.07-1c.86.62 1.92 1 3.07 1s2.21-.38 3.07-1c1.33-1.33 1.79-4.38 1.79-8s-.46-6.67-1.79-8zM12 18c-2.21 0-4-2.69-4-6s1.79-6 4-6 4 2.69 4 6-1.79 6-4 6zm5.5-4c.83 0 1.5-.67 1.5-1.5S18.33 11 17.5 11 16 11.67 16 12.5s.67 1.5 1.5 1.5z"/></svg>
+            </button>
+            <button id="fullscreen-btn" class="stage-tool-btn" title="全屏">
+                <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z"/></svg>
+            </button>
+            <button id="music-btn" class="stage-tool-btn" title="在线音乐：搜索 / 歌单">
+                <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M9 3v10.55A4 4 0 1 0 11 17V7h4V3H9z"/></svg>
+            </button>
+            <button id="video-btn" class="stage-tool-btn" title="在线视频：搜索 / 播放">
+                <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M10 8.64L15.27 12 10 15.36V8.64zM12 3C7.03 3 3 7.03 3 12s4.03 9 9 9 9-4.03 9-9-4.03-9-9-9zm0 16.2c-3.97 0-7.2-3.23-7.2-7.2s3.23-7.2 7.2-7.2 7.2 3.23 7.2 7.2-3.23 7.2-7.2 7.2z"/></svg>
+            </button>
+            <button id="workspace-btn" class="stage-tool-btn" data-admin-only title="工作区：设置智能体工作目录">
+                <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M10 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/></svg>
+            </button>
+            <button id="session-btn" class="stage-tool-btn" title="对话历史">
+                <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M13 3a9 9 0 0 0-9 9H1l3.89 3.89.07.14L9 12H6c0-3.87 3.13-7 7-7s7 3.13 7 7-3.13 7-7 7c-1.93 0-3.68-.79-4.94-2.06l-1.42 1.42A8.954 8.954 0 0 0 13 21a9 9 0 0 0 0-18zm-1 5v5l4.28 2.54.72-1.21-3.5-2.08V8H12z"/></svg>
+            </button>
+            <button id="fps-btn" class="stage-tool-btn" title="帧率调节：点击切换60/30/20fps">
+                <span id="fps-label" class="fps-label">60</span>
+            </button>
+            <button id="immerse-btn" class="stage-tool-btn" title="沉浸模式：隐藏所有按钮，专注对话与角色">
+                <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M21 4H3c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h18c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 14H3V6h18v12zm-2-9H5v6h14V9z"/></svg>
+            </button>
+            <button id="lock-mode-btn" class="stage-tool-btn" title="锁屏模式：锁定屏幕防误触，仅可语音对话，再按一次解锁">
+                <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm-6 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm3.1-9H8.9V6c0-1.71 1.39-3.1 3.1-3.1 1.71 0 3.1 1.39 3.1 3.1v2z"/></svg>
+            </button>
+            </div><!-- /stage-tools-ring -->
+            <button id="wheel-down-btn" class="stage-tools-arrow" title="下一组">▼</button>
+            <div class="stage-tools-label" id="stage-tools-label"></div>
+        </div>
 
         <!-- 聊天消息区（初始收起隐藏，点右下角聊天按钮展开到 38%） -->
         <section id="chat-panel" class="collapsed">

@@ -66,7 +66,6 @@ _STATUS_ALIASES = {
 
 DEFAULT_DATA_FILE = 'tasks.json'
 DUE_TIME_FORMAT = '%Y-%m-%d %H:%M'
-TIME_FORMAT = '%Y-%m-%d %H:%M:%S'
 
 
 def normalize_priority(value) -> str:
@@ -83,13 +82,6 @@ def normalize_status(value) -> str:
         return STATUS_TODO
     key = str(value).strip().lower()
     return _STATUS_ALIASES.get(key, STATUS_TODO)
-
-
-def format_ts(ts, fmt=TIME_FORMAT) -> str:
-    """时间戳 → 可读字符串。"""
-    if not ts:
-        return ''
-    return time.strftime(fmt, time.localtime(float(ts)))
 
 
 class TodoService:

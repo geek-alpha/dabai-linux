@@ -1630,6 +1630,10 @@ export interface AppKernel {
   updatePlayerPhysics?: any;
   updateSmoothTeleport?: any;
   updateSpeechBubble?: any;
+  /** 手臂放松站姿的旋转符号：+1 = normalized 空间左臂在 -X 侧（VRM0），-1 = +X 侧（VRM1） */
+  vrmArmRestSign?: any;
+  /** 手臂 rotation.z 的统一取值：基础放松值 + 偏移，按模型手性取符号 */
+  armZ?: any;
   vrmMouthScale?: any;
   wasMutualGaze?: any;
 

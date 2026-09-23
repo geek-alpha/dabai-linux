@@ -325,5 +325,88 @@ def test_wiring_restore_and_persist_sites():
         "提示消费后没落盘——重启后同一句提示会被反复注入"
 
 
+# ---------- 契约 8：早提示的触发口径 ≡ 审计的多步轮口径 ----------
+# 背景（2026-09-23）：出口接好之后提示仍只响 15 轮，状态机重放期望 39 轮；漏提的
+# 129 个多步轮里，纯探索轮（无写工具、跨 3 类工具）占 50 个——旧触发口径要求
+# 「动了写工具 + ≥2 次调用」，这 50 轮一次都不会响。提示与审计拿两把尺子，
+# 达标线（50%）就永远够不着：读数低分不清是行为没改还是提示压根没响。
+
+
+def _armed_after(seq):
+    """按调用顺序重放 _watch_plan_tool，返回本轮早提示有没有置位。"""
+    ag = agent.AIAgent.__new__(agent.AIAgent)
+    ag._plan_round_used = False
+    ag._plan_round_calls = 0
+    ag._plan_round_names = set()
+    ag._plan_early_armed = False
+    for n in seq:
+        ag._watch_plan_tool(n)
+    return ag._plan_early_armed
+
+
+_TRIGGER_CASES = [
+    # 纯探索跨 3 类：旧口径漏掉的最大一块，必须响
+    ["code_read", "code_search", "shell_run"],
+    # 3 次但只跨 2 类：不算多步轮，不响
+    ["code_read", "code_search", "code_read"],
+    # 有写工具但只 2 次：单点小改，不响（旧口径在这里会响，是噪音）
+    ["code_read", "code_edit"],
+    # 3 次含写工具：响
+    ["code_read", "code_edit", "code_verify"],
+    # 4 次仍只 2 类且没落笔：不响
+    ["code_read", "code_search", "code_read", "code_search"],
+    # 探索够了才落笔：响
+    ["code_read", "code_search", "shell_run", "code_edit"],
+]
+
+
+def test_trigger_matches_audit_multi_rounds():
+    """早提示的置位必须与审计 is_multi_round 逐例同值。
+
+    反证方向：把 _watch_plan_tool 的判据换回「写工具 + ≥2 次」，第一条用例立刻红。
+    """
+    audit = _load_audit()
+    for seq in _TRIGGER_CASES:
+        got = _armed_after(seq)
+        want = audit.is_multi_round(
+            {"tool_calls": len(seq), "call_names": list(dict.fromkeys(seq))})
+        assert got == want, f"{seq} 提示置位 {got} ≠ 审计多步轮 {want}"
+
+
+def test_early_hint_reaches_pure_explore_round():
+    """纯探索多步轮（无写工具）必须响——它们占漏提的 50/129。"""
+    assert _armed_after(["code_read", "code_search", "shell_run"]) is True
+
+
+def test_early_hint_withdrawn_after_plan_update():
+    """先置位、后提清单要撤回；已提过清单的轮次不再响（一轮只提醒一次）。"""
+    assert _armed_after(["code_read", "code_search", "shell_run",
+                         "plan_update"]) is False
+    ag = agent.AIAgent.__new__(agent.AIAgent)
+    ag._plan_round_used = False
+    ag._plan_round_calls = 0
+    ag._plan_round_names = set()
+    ag._plan_early_armed = False
+    for n in ["code_read", "code_search", "shell_run"]:
+        ag._watch_plan_tool(n)
+    assert ag._plan_early_armed is True
+    assert "【开工提示】" in ag._plan_early_hint()
+    assert ag._plan_early_hint() == "", "提示消费后又被重放"
+
+
+def test_multi_round_judgement_has_one_implementation():
+    """判据只允许一份实现——提示和计数各写一份，就是下一次分叉的种子。"""
+    lines = _agent_lines()
+    # 常量定义行不算「第二份实现」：定义只该有一条，消费它的表达式也只该有一条。
+    uses = [i for i, l in enumerate(lines)
+            if "PLAN_MISS_MIN_KINDS" in l
+            and not l.strip().startswith("PLAN_MISS_MIN_KINDS")]
+    assert len(uses) == 1, \
+        f"多步轮判据出现 {len(uses)} 处（第 {[i + 1 for i in uses]} 行）：被复制了第二份实现"
+    wt = next(i for i, l in enumerate(lines) if "def _watch_plan_tool" in l)
+    body = "\n".join(lines[wt:wt + 25])
+    assert "_plan_round_multi(" in body, "早提示没走统一判据，口径会再次分叉"
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

@@ -46,6 +46,9 @@ BASE = Path(__file__).resolve().parent.parent
 AGENT_PY = BASE / "agent.py"
 METRICS = BASE / "data" / "turn_metrics.jsonl"
 SUBAGENTS = BASE / "data" / "sub_agents.jsonl"
+# 交付文本流水（agent.py 的 _reply_style_flush 写，2026-09-24 起）：一轮一行，
+# 只有计数与命中的黑名单词名——回复原文不在盘上。
+REPLY_STYLE = BASE / "data" / "reply_style.jsonl"
 
 # 「本进程加载快照」：热更新守护每次启动写盘，at = 这批代码进内存的时刻。
 # 判据为什么不用进程启动时间（/proc starttime）：自动重启走 os.execv 自替换，
@@ -63,6 +66,55 @@ LOW_RATE = 0.01
 PLAN_MIN_RATIO = 0.5
 VERIFY_MIN_RATIO = 0.6
 EXPLORE_MIN_RATIO = 0.5
+# 「改前必读」达标线：盲改率 = 目标范围没读过的编辑 / 有目标的编辑。
+# 定 10% 而不是 0：区间判定有已知的保守降级（无行号的编辑退化为文件级），
+# 而真正的目标是「别凭记忆改」，偶发一次不值得报警；超过 10% 意味着每十次
+# 改动就有一次没看过目标范围，那已经不是偶发。
+BLIND_EDIT_MAX_RATIO = 0.10
+
+# 「交付文本」三条规则共用的达标线（暂定值，等实测分布出来再校准）：判据是
+# 「发生率」不是「出现即违规」——正常解释里也可能写出「重要的是」，单次命中
+# 说明不了什么，成为习惯才说明问题。
+# 套话定 5%：规则里是「禁用」而非「少用」，留的余量只给误报。
+REPLY_BOILERPLATE_MAX = 0.05
+# 道歉定 15%：不是禁止道歉，是禁止「无条件道歉」——真犯了错就该认，
+# 但每六轮就有一次道歉，那是姿态不是纠正。
+REPLY_APOLOGY_MAX = 0.15
+# 结尾征询定 35%：该问的时候必须问（不可逆操作、取不到的偏好），卡太严会
+# 把正常的请决策也算成违规，判据就没人看了。
+REPLY_TAIL_ASK_MAX = 0.35
+# 回复文本样本下限：低于这个轮数，「零套话」不构成证据。
+REPLY_MIN_TURNS = 20
+
+# 「委派任务自包含率」达标线（暂定值，依据见下）：委派是交接——接手方拿不到
+# 「在哪做/要什么产出/有什么约束」里的任何一条，就得回来问或猜，返工成本远高于写清楚。
+# 所以自包含应该是默认而不是半数。定 0.7 不是 1.0：极短任务（「跑一下 X」）确实不需要
+# 三要素全写。
+# 2026-09-23 修正：定 0.5 时无数据依据，实测分布（0/1/2/3 要素命中 = 4/8/7/18）出来
+# 后才定的 0.7。
+SPEC_MIN_RATIO = 0.7
+# 委派任务「能不能让接手方直接开工」的三要素：在哪做、要什么产出、有什么约束。
+#
+# 为什么不用「目标/范围/验收/步骤/回滚」这种规范词表：2026-09-23 实测证伪了——词表
+# 口径把「审查1/5 核心」那条判成 0 命中，而它明明写了 paths（范围）、focus（验收）、
+# 调用参数（步骤）。词表测的是「用没用规范的词」，不是「有没有规范」，读数会直接把人
+# 带去改措辞而不是改内容。
+_SELF_CONTAINED_SIGNS = (
+    ("工作区", "/home/wxf/dabai", "/tmp/"),
+    ("汇报", "输出", "报告", "结论", "返回", "结果", "首行"),
+    ("不要", "必须", "禁止", "只读", "一律", "绝对"),
+)
+
+
+def _self_contained(task) -> bool:
+    """一条委派任务能不能让接手方直接开工（三要素齐备）。"""
+    t = str(task or "")
+    return all(any(k in t for k in group) for group in _SELF_CONTAINED_SIGNS)
+
+
+# 「注释只写 why」判定所需的最小注入行数：几十行里本来就写不了几个注释，
+# 样本太小时「零占位注释」不构成证据。
+COMMENT_MIN_LINES = 200
 
 # 运行时提醒的最小可触发轮数，与 agent.py 的 PLAN_MISS_STREAK_N / SINGLE_RO_STREAK_N
 # 同源（有测试防分叉）。低于这个轮数时「0 次触发」是必然，不是异常——门槛不写进
@@ -120,6 +172,27 @@ _EXPLORE_TOOLS = {"code_search", "code_read", "symbols", "code_locate", "read_li
                   "read_json", "find_file", "search_text", "list_files", "sys_find",
                   "sys_recent", "sys_locate", "search_web", "search_extract"}
 
+# 「摸清大项目」：一轮里跨 ≥3 种检索/分析工具＝在做项目摸底（改一个小地方用不到 3 种）。
+# 这类轮该先 code_map 拿全貌，而不是凭感觉挑文件整读。达标线暂定：摸底轮里先 code_map
+# 的比例 ≥25%——很多摸底轮的入口本来就在具体文件上（改一个小地方），不全是「陌生大项目」。
+_SURVEY_TOOLS = {"code_map", "code_read", "code_search", "code_locate", "symbols",
+                 "code_list_files", "code_analyze", "code_deps", "code_graph",
+                 "list_files", "search_text", "find_file"}
+SURVEY_MIN_KINDS = 3
+SURVEY_MAP_MIN_RATIO = 0.25
+
+# 「简单任务直接做」：规则点名的形态是「查一句话/算个数/读个文件/改个小地方」。判据取
+# 任务文本长度 + 多步骤信号，与「委派规范完整率」不重叠——那个看自包含性（内容够不够
+# 接手方开工），这个看规模（这事值不值得后台化）。达标线暂定 ≤10%。
+SMALL_TASK_MAX_CHARS = 120
+SMALL_TASK_MAX_RATIO = 0.10
+_SMALL_TASK_STEPS = ("步骤", "阶段", "并行", "批量", "流程", "链路", "先", "再",
+                     "个文件", "轮", "扫描", "全部", "所有")
+
+# 「交付即停」：只读意图轮里动手的比例＝越界把结论牵出的下一件事做掉。达标线暂定 ≤5%
+# ——规则明令「问事实→只回答」，余量只给「只读词误命中」这类噪声。
+SCOPE_CREEP_MAX_RATIO = 0.05
+
 # 委派指纹判据：同一任务指纹被反复委派时，怎么区分「定时调度」与「原样重发」。
 # 定时任务的时间间隔落在整点小时上（±5min），重发没有这个规律。
 SCHED_TOL = 300
@@ -158,7 +231,7 @@ _OP_METRICS = {
 # kind=none 的规则当前无任何日志能反映，只能标 UNMEASURED。
 RULE_MAP = [
     ("委派任务用 delegate_agent_task", "delegate", "subagent"),
-    ("简单任务直接做", "delegate", "subagent"),
+    ("简单任务直接做", "delegate", "small_task"),
     ("防重复委派", "delegate", "subagent"),
     ("删除类任务", "metric", "delete_ops"),
     ("画图/图片", "metric", "img_gen_calls"),
@@ -166,29 +239,38 @@ RULE_MAP = [
     ("并行优先", "parallel", "batch_ratio"),
     ("不重复读", "metric", "re_reads"),
     ("长文件", "metric", "truncations"),
-    ("摸清大项目", "none", None),
-    ("说重点", "none", None),
+    # 「摸清大项目」：从 call_names 数「摸底轮里先 code_map 的比例」（2026-09-24 前标
+    # none——其实数据源一直在盘上，只是没人接）。
+    ("摸清大项目", "metric", "code_map_use"),
+    # 「说重点」：交付文本里的 AI 套话率（2026-09-24 起有数据源——回复文本
+    # 此前不进任何日志，这条规则只能标 none）。
+    ("说重点", "metric", "reply_boilerplate"),
     # —— 行为准则段（2026-09-22 纳入）——
-    # 这 17 块合计 3539 字符此前从未进过审计流程：不是「审了判不出」，是连入口都没有。
+    # 这 11 块此前从未进过审计流程：不是「审了判不出」，是连入口都没有。
     # 第二轮：能从 turn_metrics 明细（call_names / script_names）量化的接上 metric，
     # 剩下的如实标 none——「有数据源但样本不足」与「根本没有数据源」是两回事，前者
     # 攒样本就能判，后者再攒也判不了，报告里不能混成一个数。
+    # 2026-09-23：授权类 7 块（授权边界/授权持久化/先做完再问/示例/该问不该问/
+    # 默认倾向/够了就动）合并为【授权与自主】——它们讲的是同一件事的三个侧面，
+    # 拆成 7 块只是把 815 字符摊成 7 个标题，可执行性一点没增。
     ("工作准则", "metric", "plan_update"),
-    ("证据优先", "none", None),
+    # 「证据优先」501 字符（10.9%，最大块）此前一直标 none——它最硬的一条
+    # （改文件前必须读过目标区间）其实精确可测，只是从没埋过点。2026-09-23 起
+    # agent.py 的 _watch_read_edit 记 blind_edits/edit_calls，这条终于能判了。
+    ("证据优先", "metric", "blind_edit"),
     ("经验回流", "script", "lesson_add.py"),
     ("长期事业", "script", "long_horizon.py"),
-    ("主体性", "none", None),
+    ("主体性", "script", "conviction.py"),
     ("探索优先", "metric", "explore"),
-    ("授权边界", "none", None),
-    ("授权持久化", "none", None),
-    ("先做完再问", "none", None),
-    ("示例", "none", None),
-    ("该问不该问", "none", None),
-    ("默认倾向", "none", None),
-    ("交付即停", "none", None),
-    ("克制自我纠正", "none", None),
-    ("够了就动", "none", None),
-    ("注释只写 why", "none", None),
+    # 「授权与自主」与「说重点」共用同一份交付文本流水：它们讲的都是
+    # 「交出去的话长什么样」的三个侧面。
+    ("授权与自主", "metric", "reply_tail_ask"),
+    ("交付即停", "metric", "scope_creep"),
+    ("克制自我纠正", "metric", "reply_apology"),
+    # 「注释只写 why」106 字符此前标 none：规则里「有信息量」要语义判断、不可测，
+    # 但「不留改名占位、不留『已移除』注释」是精确可测的坏行为。2026-09-23 起
+    # agent.py 的 _watch_read_edit 顺带记 inject_lines/comment_lines/placeholder_comments。
+    ("注释只写 why", "metric", "edit_comments"),
     ("改码纪律", "metric", "verify_after_edit"),
 ]
 
@@ -329,18 +411,26 @@ def call_stats(rows: list[dict]) -> dict:
     _since = loaded_at()
     _pe = plan_hint_expect(rows, _since)
     named = [r for r in rows if r.get("call_names")]
+    # 提示覆盖率的窗口内读数：早提示的触发口径 ≡ 多步轮判据，所以窗口内每个漏提
+    # 多步轮都该收到一次提示（见 plan_coverage_note）。_since 未知时不猜，留空。
+    _win = [r for r in rows if _since > 0 and "plan_hints" in r
+            and float(r.get("ts") or 0) >= _since]
 
     def has(r: dict, names: set) -> bool:
         return bool(set(r["call_names"]) & names)
 
     multi = [r for r in named if is_multi_round(r)]
     edits = [r for r in named if has(r, _EDIT_TOOLS)]
+    # 「摸清大项目」：摸底轮 = 一轮里跨 ≥3 种检索/分析工具（改一个小地方用不到 3 种）。
+    survey = [r for r in named if len(set(r["call_names"]) & _SURVEY_TOOLS) >= SURVEY_MIN_KINDS]
     scripts: Counter = Counter()
     for r in rows:
         scripts.update(r.get("script_names") or [])
     return {
         "turns": len(named),
         "multi_rounds": len(multi),
+        "survey_rounds": len(survey),
+        "survey_map_rounds": sum(1 for r in survey if "code_map" in r["call_names"]),
         "plan_rounds": sum(1 for r in multi if "plan_update" in r["call_names"]),
         "edit_rounds": len(edits),
         "verified_edit_rounds": sum(1 for r in edits if _round_verified(r)),
@@ -366,6 +456,17 @@ def call_stats(rows: list[dict]) -> dict:
         "plan_hint_expect": _pe.get("expect"),
         "plan_hint_expect_rounds": _pe.get("rounds", 0),
         "plan_hint_since": _since,
+        "plan_hint_turns_since": sum(1 for r in _win if (r.get("plan_hints") or 0) > 0),
+        "plan_miss_rounds_since": sum(
+            1 for r in _win if is_multi_round(r)
+            and "plan_update" not in (r.get("call_names") or [])),
+        # 清单更新率：分母 = 本轮开工时清单还没干完的轮（回显触发），分子 = 其中真调了
+        # plan_update 的轮。旧口径 plan_rate 只问「提没提」——提过一次就永远满足，
+        # 「提了但从不更新」落在缝里（实测 8 份清单 3 份只提交过 1 次）。
+        "plan_recap_rounds": sum(1 for r in rows if (r.get("plan_recaps") or 0) > 0),
+        "plan_recap_updated_rounds": sum(
+            1 for r in rows if (r.get("plan_recaps") or 0) > 0
+            and "plan_update" in (r.get("call_names") or [])),
         # 第二种运行时提醒（连续单发只读）单独记账：它的可累加轮是「本轮恰好 1 个
         # 只读工具」，与多步轮不是同一批轮，共用一个采样数会让样本判断错位。
         "ro_hint_sampled_rounds": sum(1 for r in rows if "single_ro_hints" in r),
@@ -426,6 +527,44 @@ def hint_note(calls: dict, kind: str = "plan") -> str:
     return f"；{label}已触发 {n} 次（{turns} 轮）"
 
 
+def plan_coverage_note(calls: dict) -> str:
+    """本进程窗口内「清单提示有没有覆盖到每个漏提多步轮」。
+
+    早提示的触发口径 ≡ 多步轮判据（agent._plan_round_multi），所以窗口内每个
+    「多步轮且没提清单」的轮都该拿到一次提示——收到提示的轮数 < 漏提轮数，只可能
+    是出口/接线断了。2026-09-23 查「提示只响 15 轮」时只能手工重放日志，这条读数
+    就是为了下次一眼看出来：它把「机制没触发」和「触发了但没用」当场分开。
+    窗口必须是本进程（重启清零 streak/armed），跨进程比只会得到假警报。
+    """
+    miss = int(calls.get("plan_miss_rounds_since") or 0)
+    if miss <= 0:
+        return ""
+    hinted = int(calls.get("plan_hint_turns_since") or 0)
+    if hinted < miss:
+        return (f"提示覆盖（本进程窗口）：漏提多步轮 {miss} 个，只有 {hinted} 个收到提示"
+                "——出口或接线断了，先查两条工具执行分支的注入点，别调阈值")
+    return (f"提示覆盖（本进程窗口）：漏提多步轮 {miss} 个，收到提示 {hinted} 个"
+            "——口径对得上")
+
+
+def plan_recap_note(calls: dict) -> str:
+    """清单回显有没有真的推动更新。
+
+    旧口径 plan_rate 只问「提没提清单」——提过一次就永远满足，「提了但从不更新」
+    落在缝里（实测 8 份清单 3 份只提交过 1 次）。分母是「本轮开工时清单还没干完」
+    的轮（回显触发），分子是其中真调了 plan_update 的轮。回显响了却 0 轮更新，
+    要么注入点断了（查接线），要么说明不够推动（改措辞）——两者改的东西完全不同。
+    """
+    covered = int(calls.get("plan_recap_rounds") or 0)
+    if covered <= 0:
+        return ""
+    updated = int(calls.get("plan_recap_updated_rounds") or 0)
+    if updated <= 0:
+        return (f"清单更新率：回显覆盖 {covered} 轮，0 轮更新清单——先查两条工具分支"
+                "的注入点，再看说明措辞够不够推动")
+    return f"清单更新率：回显覆盖 {covered} 轮，{updated} 轮更新（{updated / covered:.0%}）"
+
+
 def verify_hint_note(calls: dict) -> str:
     """同轮验证提示的触发情况。
 
@@ -467,6 +606,21 @@ def delegation_stats(subs: list[dict]) -> dict:
         groups[fp].append(ts)
 
     sched = suspect = 0
+    _spec_n = _spec_hits = _small_n = 0
+    for evs in by_id.values():
+        first = evs[0]
+        title = str(first.get("title") or "")
+        # 定时调度的 task 由 sched_add 生成、联邦来电的 task 是同伴来信正文——两者
+        # 都不是「我写的委派」，混进来会把读数稀释成噪声（实测 4 条 0 要素全是来电）。
+        if title.startswith("定时·") or title.startswith("联邦来电"):
+            continue
+        _spec_n += 1
+        if _self_contained(first.get("task")):
+            _spec_hits += 1
+        # 「简单任务直接做」：短文本且无多步骤信号＝本该直接做的小任务被后台化。
+        _task = str(first.get("task") or "")
+        if len(_task) < SMALL_TASK_MAX_CHARS and not any(k in _task for k in _SMALL_TASK_STEPS):
+            _small_n += 1
     for ts_list in groups.values():
         if len(ts_list) < 2:
             continue
@@ -486,7 +640,51 @@ def delegation_stats(subs: list[dict]) -> dict:
         "unique_tasks": len(groups),
         "sched_repeats": sched,
         "suspect_repeats": suspect,
+        # 「委派任务用 delegate_agent_task」的可测代理：任务规范完整率。规则要求先产出
+        # 规范（目标/范围/验收/步骤/回滚），这是委派唯一能留下文本证据的部分。定时调度
+        # 任务的 task 文本由 sched_add 生成、不遵守委派规范，混进来会把读数稀释成噪声
+        # ——按标题前缀排除。
+        "spec_tasks": _spec_n,
+        "spec_hits": _spec_hits,
+        "small_tasks": _small_n,
     }
+
+
+def load_reply_style() -> list[dict]:
+    if not REPLY_STYLE.exists():
+        return []
+    out = []
+    for line in REPLY_STYLE.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return out
+
+
+def reply_stats(rows: list[dict]) -> dict:
+    """交付文本流水 → 三个坏行为的发生率分子/分母（只读计数，原文不在盘上）。"""
+    s = lambda k: sum(r.get(k, 0) or 0 for r in rows)  # noqa: E731
+    words = Counter(w for r in rows for w in (r.get("boilerplate_words") or []))
+    return {
+        "reply_turns": len(rows),
+        "reply_chars": s("chars"),
+        # 分子是「带该行为的轮数」不是「命中次数」：一轮里说三遍套话，
+        # 和三轮里各说一遍，对「这规则管住了没有」是一回事。
+        "reply_boilerplate_rounds": sum(1 for r in rows if (r.get("boilerplate") or 0) > 0),
+        "reply_boilerplate_hits": s("boilerplate"),
+        "reply_apology_rounds": sum(1 for r in rows if (r.get("apology") or 0) > 0),
+        "reply_apology_hits": s("apology"),
+        "reply_tail_ask_rounds": sum(1 for r in rows if (r.get("tail_ask") or 0) > 0),
+        # 词名排行：黑名单哪个词在误报，看它就知道（校准达标线靠这个）。
+        "reply_words": "、".join(f"{w}×{c}" for w, c in words.most_common(3)),
+    }
+
+
+def _reply_words_note(agg: dict) -> str:
+    w = agg.get("reply_words") or ""
+    return f"，命中词 {w}" if w else ""
 
 
 def totals(rows: list[dict]) -> dict:
@@ -505,6 +703,9 @@ def totals(rows: list[dict]) -> dict:
         "img_gen_calls": s("img_gen_calls"),
         "music_calls": s("music_calls"),
         "delete_ops": s("delete_ops"),
+        # 「交付即停」：只读意图轮数 / 其中动了手的轮数
+        "readonly_rounds": s("readonly_rounds"),
+        "scope_creep": s("scope_creep"),
         "tool_errors": s("tool_errors"),
         "llm_calls": s("llm_calls"),
         "prompt_tokens": s("prompt_tokens"),
@@ -515,6 +716,14 @@ def totals(rows: list[dict]) -> dict:
         "per_llm_round": round(tc / max(s("tool_rounds"), 1), 2),
         "re_read_rate": round(s("re_reads") / max(tc, 1), 4),
         "trunc_rate": round(s("truncations") / max(tc, 1), 4),
+        # 「改前必读」：blind_edits/edit_calls = 目标范围没读过的编辑 / 有目标的编辑
+        # （口径 = 本进程窗口；重启后由 _restore_read_edit 接回文件级，不会误报）。
+        "blind_edits": s("blind_edits"),
+        "edit_calls": s("edit_calls"),
+        # 「注释只写 why」：注入行 / 注释行 / 占位残留注释行
+        "inject_lines": s("inject_lines"),
+        "comment_lines": s("comment_lines"),
+        "placeholder_comments": s("placeholder_comments"),
     }
 
 
@@ -557,7 +766,80 @@ def judge(kind: str, metric: str | None, agg: dict, subs: list[dict],
                 return "INSUFFICIENT", (base + f"——样本不足（唯一任务 < {DELEGATE_MIN_UNIQUE}），"
                                         "零重复也不足以判零收益")
             return "MEASURED_OK", base + "——无重发，规则零收益候选"
+        if label.startswith("简单任务直接做"):
+            d = delegation_stats(subs)
+            n, m = d["small_tasks"], d["spec_tasks"]
+            if m < DELEGATE_MIN_UNIQUE:
+                return "INSUFFICIENT", (f"委派任务 {m} 条（已排除定时调度/联邦来电），"
+                                        f"样本不足（< {DELEGATE_MIN_UNIQUE} 条），先攒样本")
+            r = n / m
+            tag = "MEASURED_OK" if r <= SMALL_TASK_MAX_RATIO else "MEASURED_GAP"
+            return tag, (f"委派任务 {m} 条里 {n} 条是小任务（< {SMALL_TASK_MAX_CHARS} 字符"
+                         f"且无多步骤信号，{r:.0%}，暂定达标线 <={SMALL_TASK_MAX_RATIO:.0%}）"
+                         "——超线说明本该直接做的事被后台化了")
+        if label.startswith("委派任务用"):
+            d = delegation_stats(subs)
+            base = (f"委派任务 {d['spec_tasks']} 条（已排除定时调度/联邦来电），"
+                    f"{d['spec_hits']} 条自包含（含位置+产出+约束三要素）")
+            if d["spec_tasks"] < DELEGATE_MIN_UNIQUE:
+                return "INSUFFICIENT", base + (
+                    f"——样本不足（< {DELEGATE_MIN_UNIQUE} 条），先攒样本")
+            r = d["spec_hits"] / d["spec_tasks"]
+            tag = "MEASURED_OK" if r >= SPEC_MIN_RATIO else "MEASURED_GAP"
+            return tag, base + f"（{r:.0%}，暂定达标线 {SPEC_MIN_RATIO:.0%}）"
         return "UNMEASURED", f"委派记录 {n} 条，任务均长 {avg} 字符（无法判「是否本该自己做」）"
+    if metric == "reply_boilerplate":
+        n, m = agg.get("reply_boilerplate_rounds", 0), agg.get("reply_turns", 0)
+        if m < REPLY_MIN_TURNS:
+            return "INSUFFICIENT", (
+                f"交付文本只有 {m} 轮（埋点 2026-09-24 加，需 {REPLY_MIN_TURNS} 轮才能判）"
+                "——先攒样本，别拿它下结论")
+        r = n / m
+        tag = "MEASURED_OK" if r <= REPLY_BOILERPLATE_MAX else "MEASURED_GAP"
+        return tag, (f"{m} 轮交付里 {n} 轮带 AI 套话（{r:.1%}，达标线 "
+                     f"<={REPLY_BOILERPLATE_MAX:.0%}；共 {agg.get('reply_boilerplate_hits', 0)} 处"
+                     + _reply_words_note(agg) + "）")
+    if metric == "reply_apology":
+        n, m = agg.get("reply_apology_rounds", 0), agg.get("reply_turns", 0)
+        if m < REPLY_MIN_TURNS:
+            return "INSUFFICIENT", (
+                f"交付文本只有 {m} 轮（埋点 2026-09-24 加，需 {REPLY_MIN_TURNS} 轮才能判）"
+                "——先攒样本")
+        r = n / m
+        tag = "MEASURED_OK" if r <= REPLY_APOLOGY_MAX else "MEASURED_GAP"
+        return tag, (f"{m} 轮交付里 {n} 轮带道歉措辞（{r:.1%}，达标线 "
+                     f"<={REPLY_APOLOGY_MAX:.0%}；共 {agg.get('reply_apology_hits', 0)} 处）")
+    if metric == "reply_tail_ask":
+        n, m = agg.get("reply_tail_ask_rounds", 0), agg.get("reply_turns", 0)
+        if m < REPLY_MIN_TURNS:
+            return "INSUFFICIENT", (
+                f"交付文本只有 {m} 轮（埋点 2026-09-24 加，需 {REPLY_MIN_TURNS} 轮才能判）"
+                "——先攒样本")
+        r = n / m
+        tag = "MEASURED_OK" if r <= REPLY_TAIL_ASK_MAX else "MEASURED_GAP"
+        return tag, (f"{m} 轮交付里 {n} 轮以征询收尾（{r:.1%}，达标线 "
+                     f"<={REPLY_TAIL_ASK_MAX:.0%}）——超线说明决定权被推回用户")
+
+    if metric == "code_map_use":
+        c = calls or {}
+        n, m = c.get("survey_map_rounds", 0), c.get("survey_rounds", 0)
+        if m < 10:
+            return "INSUFFICIENT", (f"摸底轮（一轮跨 >={SURVEY_MIN_KINDS} 种检索/分析工具）"
+                                    f"仅 {m} 轮，样本不足")
+        r = n / m
+        tag = "MEASURED_OK" if r >= SURVEY_MAP_MIN_RATIO else "MEASURED_GAP"
+        return tag, (f"摸底轮 {m} 中 {n} 轮调了 code_map（{r:.0%}，暂定达标线 "
+                     f"{SURVEY_MAP_MIN_RATIO:.0%}）——余 {m - n} 轮靠挑文件整读")
+    if metric == "scope_creep":
+        n, m = agg.get("scope_creep", 0), agg.get("readonly_rounds", 0)
+        if m < 10:
+            return "INSUFFICIENT", (
+                f"只读意图轮只有 {m} 轮（埋点 2026-09-24 加，需 10 轮才能判）"
+                "——先攒样本，别拿它下结论")
+        r = n / m
+        tag = "MEASURED_OK" if r <= SCOPE_CREEP_MAX_RATIO else "MEASURED_GAP"
+        return tag, (f"只读意图轮 {m} 中 {n} 轮动了手（{r:.1%}，暂定达标线 "
+                     f"<={SCOPE_CREEP_MAX_RATIO:.0%}）——超线说明越界做了下一件事")
     if metric == "plan_update":
         c = calls or {}
         n, m = c.get("plan_rounds", 0), c.get("multi_rounds", 0)
@@ -567,7 +849,8 @@ def judge(kind: str, metric: str | None, agg: dict, subs: list[dict],
         r = n / m
         tag = "MEASURED_OK" if r >= PLAN_MIN_RATIO else "MEASURED_GAP"
         return tag, (f"多步轮 {m} 中 {n} 轮先提交了清单（{r:.0%}，"
-                     f"暂定达标线 {PLAN_MIN_RATIO:.0%}）" + hint_note(c))
+                     f"暂定达标线 {PLAN_MIN_RATIO:.0%}）" + hint_note(c)
+                     + plan_recap_note(c))
     if metric == "verify_after_edit":
         c = calls or {}
         n, e = c.get("verified_edit_rounds", 0), c.get("edit_rounds", 0)
@@ -589,6 +872,36 @@ def judge(kind: str, metric: str | None, agg: dict, subs: list[dict],
                      f"暂定达标线 {VERIFY_MIN_RATIO:.0%}；全量旧口径 {n}/{e}="
                      f"{n / e:.0%}、只看工具名 {old} 轮——差值就是 shell 里跑的"
                      f"pytest/py_compile）" + verify_hint_note(c))
+    if metric == "blind_edit":
+        n, m = agg.get("blind_edits", 0), agg.get("edit_calls", 0)
+        if m < 10:
+            return "INSUFFICIENT", (
+                f"带目标的编辑只有 {m} 次（埋点 2026-09-23 加，需 10 次才能判）"
+                "——先攒样本，别拿它下结论")
+        r = n / m
+        tag = "MEASURED_OK" if r <= BLIND_EDIT_MAX_RATIO else "MEASURED_GAP"
+        return tag, (f"盲改率 {r * 100:.1f}%（{n}/{m} 次编辑的目标范围此前没读过，"
+                     f"达标线 <={BLIND_EDIT_MAX_RATIO:.0%}）；"
+                     "口径 = 本进程窗口，重启后由 _restore_read_edit 接回文件级")
+    if metric == "edit_comments":
+        n, tot = agg.get("comment_lines", 0), agg.get("inject_lines", 0)
+        ph = agg.get("placeholder_comments", 0)
+        if tot < COMMENT_MIN_LINES:
+            return "INSUFFICIENT", (
+                f"注入代码仅 {tot} 行（埋点 2026-09-23 加，需 {COMMENT_MIN_LINES} 行"
+                "才能判）——先攒样本，别拿它下结论")
+        # 占位注释只要出现就判缺口：它是明确的违规，不是统计噪声（正常注释不会写
+        # 「已移除」）。达标线不用百分比——分母越大越容易把一条真违规摊成零。
+        if ph > 0:
+            return "MEASURED_GAP", (
+                f"占位/残留类注释 {ph} 行（规则明令不留「已移除/改名占位」注释）；"
+                f"注入 {tot} 行、注释 {n} 行（{n / tot:.1%}）")
+        if n == 0:
+            return "INSUFFICIENT", (
+                f"注入 {tot} 行里 0 行注释——规则从未被触发（本就不写注释），删留仍无据")
+        return "MEASURED_OK", (
+            f"注入 {tot} 行、注释 {n} 行（{n / tot:.1%}），占位残留注释 0 行"
+            "——规则零收益候选")
     if metric == "explore":
         c = calls or {}
         n, t = c.get("explore_rounds", 0), c.get("turns", 0)
@@ -650,7 +963,10 @@ def build() -> dict:
     work = extract_work_rules()
     rows = load_metrics()
     subs = load_subagents()
+    reply = load_reply_style()
     agg = totals(rows)
+    # 交付文本统计来自另一条流水（reply_style.jsonl）：并进 agg，judge 只认 agg。
+    agg.update(reply_stats(reply))
     sysn = sys_chars(rows)
     calls = call_stats(rows)
 
@@ -769,6 +1085,10 @@ def render(rep: dict) -> str:
     if d:
         out.append(f"委派：{d['records']} 条记录 / {d['unique_tasks']} 个唯一任务"
                    f"（定时重复 {d['sched_repeats']}、疑似重发 {d['suspect_repeats']}）")
+    if a.get("reply_turns"):
+        out.append(f"交付文本：{a['reply_turns']} 轮里 套话 "
+                   f"{a['reply_boilerplate_rounds']} / 道歉 {a['reply_apology_rounds']} / "
+                   f"结尾征询 {a['reply_tail_ask_rounds']}")
     out.append("")
     c = rep.get("calls") or {}
     if c.get("turns"):
@@ -777,6 +1097,9 @@ def render(rep: dict) -> str:
                    f"埋点覆盖轮 {c['covered_edit_rounds']} 中验证 "
                    f"{c['covered_verified_edit_rounds']}；"
                    f"含脚本调用 {c['script_rounds']} 轮")
+        _cov = plan_coverage_note(c)
+        if _cov:
+            out.append(_cov)
     out.append(f"{'规则':<22}{'字符':>5}{'占比':>7}  判定 / 实测")
     out.append("-" * 68)
     for e in rep["entries"]:
@@ -805,7 +1128,8 @@ def render(rep: dict) -> str:
     out.append(f"零收益候选（{len(ok)}）：{'、'.join(ok) or '无'}")
     out.append(f"问题仍在  （{len(gap)}）：{'、'.join(gap) or '无'}")
     out.append(f"行为发生  （{len(used)}）：{'、'.join(used) or '无'}（规则有作用面，不可删）")
-    out.append(f"样本不足  （{len(ins)}）：{'、'.join(ins) or '无'}（埋点已就位，等样本——补埋点没用）")
+    out.append(f"样本不足  （{len(ins)}）：{'、'.join(ins) or '无'}"
+               "（埋点已就位，只缺样本——先攒样本，别急着重调判据）")
     out.append(f"无数据源  （{len(un)}）：{'、'.join(un) or '无'}（要补的是埋点）")
     return "\n".join(out)
 

@@ -1,0 +1,11 @@
+{
+  "name": "github",
+  "title": "GitHub 与仓库操作（提交/发布/协作）",
+  "version": "1.0.0",
+  "description": "本机 GitHub 操作总入口：日常 git（status/diff/commit/push/pull/分支/撤销）、提交前密钥闸门、发版与盯落地、自动更新拉新版、给上游仓库提 PR、PR 审查与 issue 修复。含本机凭据/代理/踩坑的实测口径，不用再满仓找脚本。",
+  "author": "dabai",
+  "enabled": true,
+  "disclosure": "on_demand",
+  "prompt": "【技能 GitHub】碰到 GitHub / 仓库 / 提交 / 推送 / 发版 / 拉新版 / PR / issue 时，先 skill_help(\"github\") 读总纲，别满仓找脚本。三条最常踩的：①本机 gh CLI 未安装，GitHub API 用 curl + GITHUB_TOKEN（在 /etc/dabai/secrets.env）；②git 的代理已配在全局 http.proxy=127.0.0.1:7890，api.github.com 可直连；③推送前闸门是 deploy/gitguard/safe_push.py，发版一条命令是 deploy/release/publish.py -m \"...\"。",
+  "tools": []
+}

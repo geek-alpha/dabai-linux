@@ -1048,16 +1048,6 @@ def settle(prev: str, timeout: float = 2.5, quiet: float = 1.2) -> str:
     return changed
 
 
-def refresh_snap() -> str:
-    """强制现场刷新实时层缓存（用户手动操作过手机、或守护进程刚好没采到时用）。"""
-    s = snapshot()
-    if not s:
-        return "✗ dump 失败（播放视频时 uiautomator 会卡 idle）"
-    write_snap(s)
-    clicks, texts = snap_pairs(s)
-    return f"✓ 已刷新｜{s['win']}｜{len(clicks)} 可点 / {len(texts)} 文字"
-
-
 def norm_win(raw: str) -> str:
     """dumpsys 给的是 Window{4439a80 u0 com.x.x/...}，只留包名/Activity。"""
     m = re.search(r"([A-Za-z][\w.]*)/[\w.$]+", raw)
@@ -1151,8 +1141,8 @@ _RESID = {}
 def _resid_name(pkg: str, rid: str) -> str:
     """hex 资源 id -> 'id/plus_icon'。表由 tools/resid_map.py 从 APK 的 resources.arsc 生成。
 
-    不复用 viewtree.res_name：热重载只清技能加载期导入的模块，函数内延迟 import
-    的 viewtree 会一直留在 sys.modules 里不刷新，改它必须重启进程才生效。
+    不复用 viewtree 里的同类实现：热重载只清技能加载期导入的模块，函数内延迟
+    import 的 viewtree 会一直留在 sys.modules 里不刷新，改它必须重启进程才生效。
     """
     if not rid:
         return ""

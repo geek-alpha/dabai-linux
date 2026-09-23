@@ -123,11 +123,6 @@ def _resid_map(pkg):
     return _RESID[pkg]
 
 
-def res_name(pkg, rid):
-    """hex 资源 id -> 'id/plus_icon'；无表或查不到返回空串。"""
-    rid = (rid or "").lower().lstrip("0x")
-    return (_resid_map(pkg).get(rid) or "") if (pkg and rid) else ""
-
 def show(nodes, only_clickable=True, min_size=1, screen=None, pkg=None):
     """pkg 非空时，用本地 resid 表把 hex id 翻译成资源名。"""
     scr = screen or (1080, 2412)

@@ -1,5 +1,8 @@
 # GitHub 协作（github）
 
+日常 git / 推送闸门 / 发版 / 拉新版 / 凭据与代理的总纲见 `skills/github/SKILL.md`（技能 `github`）。
+本篇只保留 PR 审查与 issue 修复两条深度流程。
+
 合并自 github-review-pr + github-fix-issue。
 
 ## 审查 PR

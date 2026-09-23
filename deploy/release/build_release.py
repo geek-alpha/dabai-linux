@@ -15,6 +15,7 @@
     python build_release.py --bump patch       # 版本号 +1 后打包
     python build_release.py --list             # 只列出会进包的文件
     python build_release.py --no-verify        # 跳过解包回验（不推荐）
+    python build_release.py --no-deps-gate     # 跳过依赖闸门（不推荐）
 """
 
 from __future__ import annotations
@@ -43,6 +44,8 @@ import paths as P  # noqa: E402
 
 ENTRY = "server.py"
 VERSION_FILE = "VERSION"
+DEPS_AUDIT = "tools/deps_audit.py"
+DEPS_TIMEOUT = 600
 
 
 def git_head_meta(root: Path) -> Tuple[str, int]:
@@ -135,6 +138,36 @@ def local_import_gaps(root: Path, pairs: List[Tuple[str, Path]]) -> List[str]:
             elif (root / mod / "__init__.py").is_file():
                 gaps.append(f"{rel} → import {mod}，但 {mod}/ 不在包内（未入仓）")
     return sorted(set(gaps))
+
+
+def deps_gate(root: Path) -> Tuple[List[str], str]:
+    """依赖闸门 —— 包内代码的启动依赖，清单声明全了吗。
+
+    判据是「新机器装完 requirements-core.txt 能不能起来」，所以只拦
+    startup_hard_missing_decl（包本身的缺陷）；startup_not_installed 不拦 ——
+    那是构建机自己的环境问题，打出的包没问题。
+
+    返回 (硬缺口, 备注)。备注非空 = 闸门没真跑成（不是通过）。
+    """
+    script = root / DEPS_AUDIT
+    if not script.is_file():
+        return [], f"找不到 {DEPS_AUDIT}，依赖闸门未生效"
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(script), "--root", str(root), "--json"],
+            capture_output=True, text=True, timeout=DEPS_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return [], f"{DEPS_AUDIT} 超时（>{DEPS_TIMEOUT}s），依赖闸门未生效"
+    except OSError as exc:
+        return [], f"{DEPS_AUDIT} 跑不起来（{exc}），依赖闸门未生效"
+    if proc.returncode != 0:
+        return [], f"{DEPS_AUDIT} 退出码 {proc.returncode}：{proc.stderr.strip()[:200]}"
+    try:
+        rep = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return [], f"{DEPS_AUDIT} 输出不是 JSON，依赖闸门未生效"
+    return [f"{r['package'] or r['module']} ← {r['lines'][0]}"
+            for r in rep.get("startup_hard_missing_decl", [])], ""
 
 
 _TS_REF = re.compile(r"""(?:from|import)\s*\(?\s*["'](\.[^"']*)["']""")
@@ -282,6 +315,7 @@ def main() -> int:
     ap.add_argument("--bump", choices=["major", "minor", "patch"], default="", help="打包前先升版本")
     ap.add_argument("--list", action="store_true", help="只列出会进包的文件")
     ap.add_argument("--no-verify", action="store_true", help="跳过解包回验")
+    ap.add_argument("--no-deps-gate", action="store_true", help="跳过依赖闸门")
     args = ap.parse_args()
 
     root = Path(args.root).resolve()
@@ -309,6 +343,19 @@ def main() -> int:
             print("   拒绝打包。先 git add 补进仓，或确认该模块本就该在仓外。")
             return 1
         print("   （--list 只列清单，故不拦截）")
+
+    if not args.no_deps_gate:
+        dep_gaps, dep_note = deps_gate(root)
+        if dep_note:
+            print(f"! {dep_note}")
+        if dep_gaps:
+            print(f"✘ 启动路径有 {len(dep_gaps)} 个依赖清单没声明（新机器装完仍起不来）：")
+            for g in dep_gaps[:20]:
+                print("   ", g)
+            if not args.list:
+                print("   拒绝打包。补进 requirements-core.txt，或确认该 import 不该在启动路径上。")
+                return 1
+            print("   （--list 只列清单，故不拦截）")
 
     if front_soft:
         print(f"! {len(front_soft)} 处前端引用指向本机私有资源，包里不会有：")

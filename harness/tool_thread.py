@@ -74,14 +74,3 @@ def tool_thread_stats() -> dict:
     except Exception:
         mw = 8
     return {"active": active, "queued": queued, "max_workers": mw}
-
-
-def reset_tool_pool() -> None:
-    """测试/热重载用：重置线程池。"""
-    global _TOOL_POOL, _ACTIVE, _QUEUED
-    with _TOOL_POOL_LOCK:
-        if _TOOL_POOL is not None:
-            _TOOL_POOL.shutdown(wait=False, cancel_futures=True)
-            _TOOL_POOL = None
-        _ACTIVE = 0
-        _QUEUED = 0

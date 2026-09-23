@@ -1,12 +1,12 @@
 {
   "name": "code_ops",
   "title": "代码工程（检索/分析/修改+工作区）",
-  "version": "2.1.0",
+  "version": "2.4.0",
   "description": "代码工程一体化：检索/分析/修改/验证代码（Python 带 AST 结构感知）、git 全流程、本机命令行、全盘搜索、隔离工作树、工作区切换、GitHub 协作。",
   "author": "dabai",
   "enabled": true,
   "disclosure": "on_demand",
-  "prompt": "【代码工程技能】改代码/查代码/分析依赖/重构/跑测试时用 code_* 工具；本机命令/找文件/系统体检用 shell_*、sys_*；git 操作用 git_*、code_git_*、wt_*；切换/收藏工作区用 workspace_*；GitHub PR 审查与 issue 修复遵循 github 技能规范（references/ 下）。改前先摸结构，改完必验证（code_verify + code_smoke）。",
+  "prompt": "【代码工程技能】改代码/查代码/分析依赖/重构/跑测试时用 code_* 工具；本机命令/找文件/系统体检用 shell_*、sys_*；git 操作用 git_*、code_git_*、wt_*；切换/收藏工作区用 workspace_*；GitHub/仓库/发版先读技能 github 的总纲（skills/github/SKILL.md），PR 审查与 issue 修复的详细流程在 references/github/ 下。改前先摸结构，改完必验证（code_verify + code_smoke）。",
   "tools": [
     {
       "type": "function",
@@ -136,7 +136,7 @@
       "type": "function",
       "function": {
         "name": "code_locate",
-        "description": "定位符号：找函数/类/变量/接口的定义与引用位置，返回 文件:行号 清单。改代码前先定位。",
+        "description": "定位符号：找函数/类/变量/接口的定义与引用位置，返回 文件:行号 清单；定义行带块起止行（Python 用 AST end_lineno，Go/JS/Rust 等用括号配平），可直接接 code_read 读那一段。改代码前先定位。",
         "parameters": {
           "type": "object",
           "properties": {
@@ -229,8 +229,37 @@
     {
       "type": "function",
       "function": {
+        "name": "code_graph",
+        "description": "符号级引用图：影响面分析 + 死代码检测（Python，AST 级）。传 symbol 看「改它会不会炸」——列出全部调用点及所在函数、以及它调用的符号；同名定义按 import 来源消歧（本文件定义优先 → import 来源模块 → 包 re-export，推不出的单列「无法归属」，不猜）。不传则给项目级排名：被调用最多的符号 + 零引用的公开定义（疑似死代码，已计入 getattr/字符串下标派发，已排除 vendored 第三方目录）。比 code_search 准：注释和字符串里的同名不算命中。调用口径：只有裸名调用、self.f()、项目内模块调用（lib.helper()）才算；x.get()、re.sub() 这类接收者不可知或外部模块调用不计入排名（仍计入引用，不影响死代码判定）。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "symbol": {
+              "type": "string",
+              "description": "可选：聚焦某个函数/类名，输出定义、全部调用点（影响面）、它调用的符号；省略则输出项目级影响面排名 + 死代码清单"
+            },
+            "root": {
+              "type": "string",
+              "description": "项目根目录（默认当前目录）"
+            },
+            "paths": {
+              "type": "string",
+              "description": "可选：限定子目录，逗号/换行分隔（大型仓库用它排除 vendor/第三方代码）"
+            },
+            "limit": {
+              "type": "integer",
+              "description": "每节最多显示多少条（默认 15，最大 100）"
+            }
+          },
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
         "name": "code_map",
-        "description": "项目全貌：一次调用拿到「该读哪几个文件」的排名——入口点（文件名/__main__ 块/package.json）、枢纽文件（被 import 最多 = 改动影响面最大）、复杂函数（≥60 行，最该定点读）、改动热点（近 N 次提交改得最勤 = bug 高发区）、TODO 热点。摸清陌生或大型项目的第一步：先看排名再读文件，不要凭感觉挑文件整读。",
+        "description": "项目全貌：一次调用拿到「该读哪几个文件」的排名——入口点（文件名/__main__ 块/package.json）、枢纽文件（被 import 最多 = 改动影响面最大）、复杂函数（圈复杂度 ≥11 或 ≥60 行，radon 口径 A~F）、改动热点（近 N 次提交改得最勤 = bug 高发区）、TODO 热点。摸清陌生或大型项目的第一步：先看排名再读文件，不要凭感觉挑文件整读。",
         "parameters": {
           "type": "object",
           "properties": {

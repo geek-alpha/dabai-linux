@@ -129,13 +129,14 @@ LOCAL_GLOBS: tuple[str, ...] = (
 )
 
 # ── 受管资产：住在大资产目录里，但属于发布方受管、随包分发 ──────────────────
-# models/** 与 backgrounds/** 默认是 LOCAL（本机私有、换机器无意义），但这两个
-# 角色模型是前端加载的运行时资源：cards.example.json 的种子卡就指向它们，新机器
-# 缺了 3D 角色就是空的。所以逐个点名放行 —— 与 LOCAL 的「默认拒绝」相反，
-# 以后往 models/ 里丢新文件仍然默认受保护。
+# models/** 与 backgrounds/** 默认是 LOCAL（本机私有、换机器无意义），但这几个
+# 角色模型是前端加载的运行时资源：character_cards.example.json 的种子卡指向
+# 白头凤/渡鸦将军，本机生效卡指向大白，新机器缺了 3D 角色就是空的。所以逐个点名
+# 放行 —— 与 LOCAL 的「默认拒绝」相反，以后往 models/ 里丢新文件仍然默认受保护。
 PACKED_ASSETS: tuple[str, ...] = (
     "models/白头凤.vrm",
     "models/渡鸦将军.vrm",
+    "models/dabai.vrm",
 )
 
 # ── 保护地板：update.py 内嵌一份同样的最小集，与清单取并集 ──────────────────
@@ -334,6 +335,7 @@ def _selftest() -> int:
         ("models/x.vrm", LOCAL),
         ("models/白头凤.vrm", CODE),           # 受管资产：点名放行
         ("models/渡鸦将军.vrm", CODE),
+        ("models/dabai.vrm", CODE),
         ("models/未点名角色.vrm", LOCAL),   # 未点名 → 默认受保护
         ("backgrounds/太空飞船走廊.glb", LOCAL),
         ("key.pem", LOCAL),

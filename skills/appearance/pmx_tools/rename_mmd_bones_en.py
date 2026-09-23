@@ -146,14 +146,6 @@ def english_gloss_for_bone(name: str) -> Optional[str]:
     return gloss
 
 
-def format_bone_name_with_english(name: str) -> Optional[str]:
-    base = strip_english_suffix(name)
-    gloss = english_gloss_for_bone(base)
-    if not gloss:
-        return None
-    return _fit_appended_name(base, gloss)
-
-
 def _update_vrm1_humanoid_bone_names(armature, rename_map: Dict[str, str]) -> Dict[str, Any]:
     updated: Dict[str, str] = {}
     if not rename_map:

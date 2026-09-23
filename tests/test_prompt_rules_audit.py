@@ -90,9 +90,15 @@ def test_可量化率与映射覆盖率分开报(tmp_path, monkeypatch):
         "live": body, "raw": 0, "lines": [1, 2]})
     monkeypatch.setattr(mod, "METRICS", tmp_path / "none.jsonl")
     monkeypatch.setattr(mod, "SUBAGENTS", tmp_path / "none.jsonl")
+    # 2026-09-24：映射表里已没有 kind=none 的规则（三条全接上了数据源），用
+    # monkeypatch 造一条回来——这个用例测的是「none 算覆盖但不进可量化率」，
+    # 拿真规则当样本会随映射表演进失效（这次就是这么失效的）。
+    monkeypatch.setattr(mod, "RULE_MAP",
+                        [("删除类任务", "metric", "delete_ops"),
+                         ("摸清大项目", "none", None)])
     rep = mod.build()
     assert rep["mapped"] == rep["rules_count"] == 2
-    assert 0 < rep["sourced_ratio"] < 1, "删除类有数据源、摸清大项目没有"
+    assert 0 < rep["sourced_ratio"] < 1, "删除类有数据源、被 patch 成 none 的摸清大项目没有"
 
 
 def test_drift_is_reported_and_rc_nonzero(tmp_path, monkeypatch, capsys):
@@ -367,13 +373,105 @@ def test_dup_rule_enough_sample_zero_repeat_is_ok():
     assert "无重发" in obs
 
 
-def test_other_delegate_rules_keep_old_judgement():
-    """另两条委派规则没有指纹可判，仍标 UNMEASURED——别被新判据顺带改判。"""
+def test_simple_task_rule_judges_small_task_rate():
+    """「简单任务直接做」的判据是委派任务里的「小任务」占比（2026-09-24 接入）。
+
+    此前它落在 delegate 分支的 UNMEASURED 兜底里（只有条数与任务均长，判不了
+    「是否本该自己做」）；现在按任务文本长度 + 多步骤信号量规模，样本不足时如实
+    报 INSUFFICIENT——两者必须分得清。
+    """
     mod = _load_audit()
     agg = mod.totals(_rows(tool_calls=10, batches=5))
-    for label in ("委派任务用 delegate_agent_task", "简单任务直接做"):
-        verdict, _ = mod.judge("delegate", "subagent", agg, [_sub("a", "T", 1)], label)
-        assert verdict == "UNMEASURED", label
+    verdict, obs = mod.judge("delegate", "small_task", agg, [_sub("a", "T", 1)],
+                             "简单任务直接做")
+    assert verdict == "INSUFFICIENT"
+    assert "样本不足" in obs
+
+
+def test_delegate_rule_judges_self_contained_rate():
+    """「委派任务用 delegate_agent_task」的判据是自包含率（2026-09-23 接入）。
+
+    为什么不测「有没有用规范的词」：实测证伪过——写了 paths（范围）、focus（验收）、
+    调用参数（步骤）的审查任务被判 0 命中，读数会把人带去改措辞而不是改内容。
+    """
+    mod = _load_audit()
+    agg = mod.totals(_rows(tool_calls=10, batches=5))
+    ok = "工作区 /home/wxf/dabai。必须只读。汇报结论。"
+    subs = [_sub(f"a{i}", ok if i < 8 else "看看这个", 1_789_300_000_000 + i * 1000)
+            for i in range(10)]
+    verdict, obs = mod.judge("delegate", "subagent", agg, subs,
+                             "委派任务用 delegate_agent_task")
+    assert verdict == "MEASURED_OK"          # 8/10 = 80% >= 70%
+    assert "8 条自包含" in obs
+
+
+def test_delegate_rule_small_sample_is_insufficient():
+    """样本不足 → INSUFFICIENT（缺样本，不是缺数据源）。"""
+    mod = _load_audit()
+    agg = mod.totals(_rows(tool_calls=10, batches=5))
+    subs = [_sub(f"a{i}", "看看这个", 1_789_300_000_000 + i * 1000) for i in range(3)]
+    verdict, obs = mod.judge("delegate", "subagent", agg, subs,
+                             "委派任务用 delegate_agent_task")
+    assert verdict == "INSUFFICIENT"
+    assert "样本不足" in obs
+
+
+def test_delegate_rule_excludes_sched_and_peer_tasks():
+    """定时调度与联邦来电不是「我写的委派」，混进来会把读数稀释成噪声。
+
+    实测依据：37 条非定时任务里 4 条 0 要素，全部是联邦来电（同伴来信正文）。
+    """
+    mod = _load_audit()
+    base = {"task": "看看这个", "created_at": 1_789_300_000_000}
+    d = mod.delegation_stats([
+        dict(base, id="x1", title="定时·掌柜巡店·每日"),
+        dict(base, id="x2", title="联邦来电·rpi"),
+        dict(base, id="x3", title="审查1/5 核心"),
+    ])
+    assert d["spec_tasks"] == 1
+
+
+# ---------- 「注释只写 why」的判定（2026-09-23 接入 edit_comments） ----------
+
+def _comment_agg(inject, comment, ph):
+    return {"inject_lines": inject, "comment_lines": comment, "placeholder_comments": ph}
+
+
+def test_comment_rule_small_sample_is_insufficient():
+    mod = _load_audit()
+    verdict, obs = mod.judge("metric", "edit_comments", _comment_agg(50, 3, 0),
+                             [], "注释只写 why")
+    assert verdict == "INSUFFICIENT"
+    assert "先攒样本" in obs
+
+
+def test_comment_rule_placeholder_is_a_gap():
+    """占位注释只要出现就判缺口：它是明确违规，不是统计噪声。
+
+    不用百分比当判据——分母越大越容易把一条真违规摊成零。
+    """
+    mod = _load_audit()
+    verdict, obs = mod.judge("metric", "edit_comments", _comment_agg(500, 30, 1),
+                             [], "注释只写 why")
+    assert verdict == "MEASURED_GAP"
+    assert "占位/残留类注释 1 行" in obs
+
+
+def test_comment_rule_zero_comments_is_insufficient():
+    """一行注释都没有 = 规则从未被触发，不构成「零收益」的证据。"""
+    mod = _load_audit()
+    verdict, obs = mod.judge("metric", "edit_comments", _comment_agg(300, 0, 0),
+                             [], "注释只写 why")
+    assert verdict == "INSUFFICIENT"
+    assert "从未被触发" in obs
+
+
+def test_comment_rule_clean_sample_is_ok():
+    mod = _load_audit()
+    verdict, obs = mod.judge("metric", "edit_comments", _comment_agg(300, 12, 0),
+                             [], "注释只写 why")
+    assert verdict == "MEASURED_OK"
+    assert "占位残留注释 0 行" in obs
 
 
 # ---------- 契约 9：样本不足 ≠ 缺数据源（决定下一轮该补埋点还是等样本） ----------
@@ -391,9 +489,12 @@ def test_insufficient_is_distinct_from_unmeasured():
     assert mod.judge("metric", "music_calls", empty, [])[0] == "INSUFFICIENT"
     assert mod.judge("delegate", "subagent", empty,
                      [{"task": "T", "created_at": 1_000}], "防重复委派")[0] == "INSUFFICIENT"
-    # 数据源有但回答不了这个问题（只有条数与任务长度）→ UNMEASURED，不是样本问题
+    # 映射表里没有判据的规则 → UNMEASURED 兜底（不是样本问题，是没尺子）
     assert mod.judge("delegate", "subagent", empty,
-                     [{"task": "T", "created_at": 1_000}], "简单任务直接做")[0] == "UNMEASURED"
+                     [{"task": "T", "created_at": 1_000}], "没接判据的规则")[0] == "UNMEASURED"
+    # 2026-09-24：这条从 UNMEASURED 挪进了 INSUFFICIENT——接上判据后缺的只是样本
+    assert mod.judge("delegate", "small_task", empty,
+                     [{"task": "T", "created_at": 1_000}], "简单任务直接做")[0] == "INSUFFICIENT"
     # 没有任何数据源能回答这个问题 → UNMEASURED
     assert mod.judge("none", None, empty, [])[0] == "UNMEASURED"
 
@@ -413,7 +514,10 @@ def test_render_separates_the_two_undecidable_buckets():
     out = mod.render(rep)
     assert "样本不足  （1）：画图" in out
     assert "无数据源  （1）：说重点" in out
-    assert "补埋点没用" in out
+    # 断言「下一步动作」本身，不锁措辞：2026-09-23 把「补埋点没用」改成
+    # 「先攒样本，别急着重调判据」——对刚补上埋点的规则（如「证据优先」），
+    # 「补埋点没用」是错的，会让下一轮误判成「这条根本判不了」。
+    assert "先攒样本" in out
     assert "要补的是埋点" in out
 
 
@@ -495,6 +599,45 @@ def test_hint_note_distinguishes_no_sample_from_zero_trigger():
     fired = mod.hint_note({"hint_sampled_rounds": 12, "plan_hint_total": 3,
                            "plan_hint_turns": 2})
     assert "3 次" in fired and "2 轮" in fired
+
+
+def test_plan_coverage_note_flags_broken_outlet():
+    """覆盖率读数：收到提示的轮数 < 漏提多步轮数，只能是出口/接线断了。
+
+    这是 2026-09-23 那次排查（提示只响 15 轮、状态机重放期望 39 轮）留下的哨兵：
+    没有它，「清单率没涨」又得从日志手工重放一遍才分得清是机制没触发还是触发无效。
+    """
+    mod = _load_audit()
+    broken = mod.plan_coverage_note({"plan_miss_rounds_since": 5,
+                                     "plan_hint_turns_since": 2})
+    assert "出口或接线断了" in broken
+    ok = mod.plan_coverage_note({"plan_miss_rounds_since": 5,
+                                 "plan_hint_turns_since": 5})
+    assert "口径对得上" in ok
+    # 窗口内没有漏提轮、或进程起点未知：不吭声——空样本上喊狼来了会训练出无视
+    assert mod.plan_coverage_note({}) == ""
+    assert mod.plan_coverage_note({"plan_miss_rounds_since": 0,
+                                   "plan_hint_turns_since": 0}) == ""
+
+
+def test_call_stats_coverage_is_window_scoped(monkeypatch):
+    """覆盖率只数本进程窗口内的轮：重启清零 streak/armed，跨进程比会得到假警报。"""
+    mod = _load_audit()
+    monkeypatch.setattr(mod, "loaded_at", lambda: 1_789_000_100.0)
+    rows = [
+        # 窗口外：漏提多步轮 + 没提示（老数据），不能算进来
+        {"ts": 1_789_000_000.0, "tool_calls": 4, "plan_hints": 0,
+         "call_names": ["code_read", "code_search", "shell_run"]},
+        # 窗口内：漏提多步轮，收到了提示
+        {"ts": 1_789_000_200.0, "tool_calls": 4, "plan_hints": 1,
+         "call_names": ["code_read", "code_search", "shell_run"]},
+        # 窗口内：多步轮但提了清单——不算漏提
+        {"ts": 1_789_000_300.0, "tool_calls": 4, "plan_hints": 0,
+         "call_names": ["code_read", "plan_update", "shell_run"]},
+    ]
+    c = mod.call_stats(rows)
+    assert c["plan_miss_rounds_since"] == 1
+    assert c["plan_hint_turns_since"] == 1
 
 
 def test_plan_verdict_carries_hint_note():
@@ -655,3 +798,22 @@ def test_ro_hint_never_borrows_plan_expect():
     note = mod.hint_note({"ro_hint_sampled_rounds": 1, "ro_hint_total": 0,
                           "plan_hint_expect": 3, "plan_hint_expect_rounds": 30}, "ro")
     assert "样本不足" in note and "去查" not in note
+
+
+def test_plan_recap_note_flags_silent_outlet():
+    """回显覆盖了轮次却 0 轮更新：先查注入点，别先改措辞。
+
+    「清单提交一次就不动」那次修复留下的哨兵：旧口径 plan_rate 只问提没提，
+    提过一次就永远满足，更新率跌到 0 也看不出来。
+    """
+    mod = _load_audit()
+    # 空样本不吭声——回显还没覆盖到任何轮时喊狼来了会训练出无视
+    assert mod.plan_recap_note({}) == ''
+    assert mod.plan_recap_note({'plan_recap_rounds': 0,
+                                'plan_recap_updated_rounds': 0}) == ''
+    silent = mod.plan_recap_note({'plan_recap_rounds': 7,
+                                  'plan_recap_updated_rounds': 0})
+    assert '0 轮更新' in silent and '注入点' in silent
+    ok = mod.plan_recap_note({'plan_recap_rounds': 4,
+                              'plan_recap_updated_rounds': 3})
+    assert '75%' in ok

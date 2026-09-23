@@ -15,7 +15,8 @@
 
 ## 规划与进度（plan_* / plan_mode）
 - `plan_update` 提交/更新**你自己**的工作步骤清单（整份提交，非增量）——多步任务开工前先建，每推进一步重新提交一次
-  - 工具层硬约束（不是靠自觉）：同时只允许 1 个 in_progress；不许 pending 直接跳 completed（必须先经过 in_progress）；最多 20 步
+  - 工具层硬约束（不是靠自觉）：同时只允许 1 个 in_progress；pending 直接标 completed 要带 explanation 说明（一轮里一次做完的照常提交，跨轮推进的先置 in_progress）；最多 20 步
+  - 一轮里能做完的小事不必分步做样子；跨轮的大任务才靠「逐步提交」让进度可见——跳级会记进 history，审计读得出这份清单是怎么走完的
 - `plan_show` 看当前清单与进度 / `plan_history` 看历史快照（事后核对有没有「事后批量补完」）/ `plan_clear` 收尾清空
 - `plan_mode` Plan Mode 开关：`enter` 进入 / `exit` 退出 / `status` 查看
   - 进入后改动型工具（写文件/改代码/shell 等）在执行前被闸门拒绝，只读探索放行
