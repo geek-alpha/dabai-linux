@@ -25,23 +25,13 @@ from tools.longrun import status_view as sv  # noqa: E402
 
 # ---------- 合成视图：契约与只读性 ----------
 
-@pytest.fixture(autouse=True)
-def _isolate_dismissed(tmp_path, monkeypatch):
-    """把「用户清除过哪一轮」的标记挪出真实运行目录。
-
-    DISMISSED 是模块级常量（指向真实 data/longrun/dismissed.json），只 patch
-    RUN_DIR 挪不动它 —— 本机点过一次「清除已完成」，这整套视图测试就集体变红：
-    引擎已停 + 清除轮次 == 当前轮次 → snapshot 按契约返回 None。
-    """
-    import importlib
-    global sv
-    live = importlib.import_module("tools.longrun.status_view")
-    if live is not sv:
-        sv = live
-    monkeypatch.setattr(sv, "DISMISSED", tmp_path / "dismissed.json")
-
-
-def test_snapshot_has_fields_frontend_needs():
+def test_snapshot_has_fields_frontend_needs(tmp_path, monkeypatch):
+    """字段契约。必须隔离运行目录：不隔离时读的是本机真实 data/longrun，
+    引擎从没跑过（state/journal/heartbeat 都不存在）→ created_at 恒为 0，
+    这条契约在本机永远红，而它跟被测代码无关。"""
+    _patch_paths(monkeypatch, tmp_path)
+    (tmp_path / "state.json").write_text(json.dumps({"cycle": 1, "last_goal": "g"}),
+                                        encoding="utf-8")
     s = sv.snapshot(full=False)
     for k in ("id", "kind", "channel", "title", "status", "steps",
               "logs_tail", "logs_count", "agent", "created_at", "updated_at"):
@@ -53,7 +43,8 @@ def test_snapshot_has_fields_frontend_needs():
     assert isinstance(s["created_at"], int) and s["created_at"] > 0
 
 
-def test_snapshot_full_carries_round_ledger():
+def test_snapshot_full_carries_round_ledger(tmp_path, monkeypatch):
+    _patch_paths(monkeypatch, tmp_path)
     s = sv.snapshot(full=True)
     assert "brief" in s and "logs" in s
     # 详情页要能回答「它在干嘛」：轮次台账 + 上一轮产出
@@ -62,12 +53,7 @@ def test_snapshot_full_carries_round_ledger():
 
 def test_snapshot_is_read_only(tmp_path, monkeypatch):
     """只读契约：合成快照不许写文件（任务中心每几秒轮询一次）。"""
-    monkeypatch.setattr(sv, "RUN_DIR", tmp_path)
-    monkeypatch.setattr(sv, "STATE", tmp_path / "state.json")
-    monkeypatch.setattr(sv, "JOURNAL", tmp_path / "journal.jsonl")
-    monkeypatch.setattr(sv, "HEARTBEAT", tmp_path / "heartbeat")
-    monkeypatch.setattr(sv, "STOP", tmp_path / "STOP")
-    monkeypatch.setattr(sv, "LOCK", tmp_path / "runner.lock")
+    _patch_paths(monkeypatch, tmp_path)
     before = set(os.listdir(tmp_path))
     s = sv.snapshot(full=True)
     assert set(os.listdir(tmp_path)) == before, "快照过程写了文件，违反只读契约"
@@ -77,12 +63,7 @@ def test_snapshot_is_read_only(tmp_path, monkeypatch):
 
 def test_stale_heartbeat_is_flagged(tmp_path, monkeypatch):
     """心跳滞后要显式告警 —— 这正是「不知道它在干嘛」的核心场景。"""
-    monkeypatch.setattr(sv, "RUN_DIR", tmp_path)
-    monkeypatch.setattr(sv, "STATE", tmp_path / "state.json")
-    monkeypatch.setattr(sv, "JOURNAL", tmp_path / "journal.jsonl")
-    monkeypatch.setattr(sv, "HEARTBEAT", tmp_path / "heartbeat")
-    monkeypatch.setattr(sv, "STOP", tmp_path / "STOP")
-    monkeypatch.setattr(sv, "LOCK", tmp_path / "runner.lock")
+    _patch_paths(monkeypatch, tmp_path)
     (tmp_path / "state.json").write_text(json.dumps({"cycle": 3, "last_goal": "g"}))
     (tmp_path / "heartbeat").write_text(str(int(time.time())))
     (tmp_path / "runner.lock").write_text(str(os.getpid()))   # 自己当 runner：活着
@@ -339,9 +320,19 @@ def test_api_longrun_trace_endpoint(client):
 # ---------- 进行中轮次：journal 还没落盘时的实时视图 ----------
 
 def _patch_paths(monkeypatch, run_dir: Path) -> None:
+    """把视图读的运行目录整体挪到临时目录。
+
+    DISMISSED 也得挪：它是模块级常量（指向真实 data/longrun/dismissed.json），
+    只 patch RUN_DIR 挪不动它 —— 本机点过一次「清除已完成」，这整套视图测试
+    就集体变红（引擎已停 + 清除轮次 == 当前轮次 → snapshot 按契约返回 None）。
+    LEDGER 同理：本机台账里挂着「等主人决定」的项目时，steps 里会多出卡点行，
+    跟被测代码无关。
+    """
     for name, rel in (("RUN_DIR", ""), ("STATE", "state.json"), ("JOURNAL", "journal.jsonl"),
                       ("TRACES", "traces"), ("HEARTBEAT", "heartbeat"),
-                      ("STOP", "STOP"), ("LOCK", "runner.lock")):
+                      ("STOP", "STOP"), ("LOCK", "runner.lock"),
+                      ("DISMISSED", "dismissed.json"),
+                      ("LEDGER", "long_horizon.json")):
         monkeypatch.setattr(sv, name, (run_dir / rel) if rel else run_dir)
 
 

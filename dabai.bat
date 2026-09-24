@@ -157,18 +157,30 @@ rem 用 goto 而不是 if(...) 块：install_node.py 的 FAIL 信息里可能带半角括号，
 rem 在块里会把块提前闭合掉。
 if "%CHECKONLY%"=="1" goto node_done
 if "%DIAG%"=="1" goto node_done
-set "PYTHONUTF8=1"
+rem 这里不设 PYTHONUTF8：install_node.py 自己按控制台代码页输出，而 PYTHONUTF8 会泄漏给
+rem 后面的 check_deps.py，把中文依赖清单写成 UTF-8 塞进 GBK 控制台，用户看到一片乱码。
+rem 结果走文件回传，不用 for /f 捕获命令输出：命令串以引号开头时 cmd 会按「去掉首引号
+rem + 删掉末尾引号」重解析，把 python.exe" 连引号当成程序名，报「文件名、目录名或卷标
+rem 语法不正确。」，一行输出都拿不到，只剩「produced no output」这种查不出所以然的结论。
+if not defined TEMP set "TEMP=%ROOT%"
+set "NODE_OUT=%TEMP%\dabai-node-result.txt"
+del "%NODE_OUT%" 2>nul
 set "NODE_LINE="
-for /f "usebackq delims=" %%L in (`%PYCMD% "%ROOT%\tools\install_node.py" --ensure`) do set "NODE_LINE=%%L"
-if not defined NODE_LINE set "NODE_LINE=FAIL install_node.py produced no output"
+%PYCMD% "%ROOT%\tools\install_node.py" --ensure --result "%NODE_OUT%"
+set "NODE_RC=!errorlevel!"
+for /f "usebackq delims=" %%L in ("%NODE_OUT%") do set "NODE_LINE=%%L"
+if not defined NODE_LINE set "NODE_LINE=FAIL install_node.py produced no output (rc=!NODE_RC!)"
+if "!NODE_LINE:~0,5!"=="FAIL " echo     [提示] 读不到 install_node.py 的结果行（退出码 !NODE_RC!），看上面的报错，或检查 %TEMP% 是否可写
 if not "!NODE_LINE:~0,3!"=="OK " goto node_fail
 set "NODE_EXE=!NODE_LINE:~3!"
 for %%I in ("!NODE_EXE!") do set "PATH=%%~dpI;!PATH!"
+del "%NODE_OUT%" 2>nul
 echo [OK] Node.js：!NODE_EXE!
 goto node_done
 
 :node_fail
 echo [X] !NODE_LINE!
+del "%NODE_OUT%" 2>nul
 echo     网页会永远卡在「连接中…」。请手动装 Node.js 22.13+（或 23.2+）：
 echo       https://nodejs.org/
 echo       国内镜像 https://registry.npmmirror.com/-/binary/node/
@@ -236,6 +248,9 @@ rem 端口绑不上（Windows 保留端口段 / 已被占用）是「非管理员起不来」的最常见
 rem 原因，server.py 会自己打印 netsh 修复命令，这里再补一条兜底提示。
 title dabai
 echo [2/2] 启动服务（首次启动约 10-30 秒，日志停在最后一行属正常）...
+rem ---- 本地定制回打：release 资产包/更新会整文件覆盖工作区，端口 8008 等定制随之丢失 ----
+rem 脚本在 local\ 下，既不在 git 也不在资产包里，所以它自己永远活着，启动前跑一次即可。
+if exist "%ROOT%\local\ensure_local.py" %PYCMD% "%ROOT%\local\ensure_local.py"
 set PYTHONUTF8=1
 set PYTHONIOENCODING=utf-8
 %PYCMD% "%ROOT%\deploy\windows\launch.py" %PASS%

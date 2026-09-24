@@ -8,9 +8,6 @@ export default (function init(App: AppKernel) {
    *  不叫「工具链」、不编号；完整执行状态仍投递给任务直播大屏。
    * ============================================================ */
 
-  /** 执行结束后停留多久再自动折叠（毫秒）：够看清参数/结果，又不堆屏 */
-  const AUTO_FOLD_MS = 2000;
-
   const TOOL_ICONS: Record<string, string> = {
     web_search: '🌐', search: '🔍', read: '📄', read_image: '🖼️', write: '✏️', edit: '📝',
     glob: '📂', grep: '🔎', pwsh: '💻', run_code: '⚙️',
@@ -53,7 +50,6 @@ export default (function init(App: AppKernel) {
     success: boolean | undefined;
     el: HTMLElement;
     startedAt: number;   // 起始时间戳：交给游戏化层算耗时评级
-    foldTimer?: number;  // 结束后自动折叠的定时器（0/空 = 未排）
   }
 
   let round = 0;                    // 当前轮次（thinking 时 +1）
@@ -74,17 +70,17 @@ export default (function init(App: AppKernel) {
     if (!b) return null;
     if (App.sealTurnSeg) App.sealTurnSeg();
     const d = document.createElement('div');
-    // 运行中默认展开：参数实时可见，不用点开瞄一眼
-    d.className = 'tool-inline open ' + status;
+    // 默认收起：工具块只占一行；自动开合会晃眼，细节由用户自己点开
+    d.className = 'tool-inline ' + status;
     d.innerHTML =
-      '<button type="button" class="tool-inline-head" aria-expanded="true">' +
+      '<button type="button" class="tool-inline-head" aria-expanded="false">' +
         '<span class="tool-inline-ic"></span>' +
         '<span class="tool-inline-name"></span>' +
         '<span class="tool-inline-summary"></span>' +
         '<span class="tool-inline-state"></span>' +
-        '<span class="tool-inline-caret">▾</span>' +
+        '<span class="tool-inline-caret">▸</span>' +
       '</button>' +
-      '<div class="tool-inline-body">' +
+      '<div class="tool-inline-body" hidden>' +
         '<div class="tool-inline-body-in">' +
           '<div class="tool-inline-args"></div>' +
           '<div class="tool-inline-result"></div>' +
@@ -94,10 +90,9 @@ export default (function init(App: AppKernel) {
     (d.querySelector('.tool-inline-name') as HTMLElement).textContent = toolLabel(name);
     const state = d.querySelector('.tool-inline-state') as HTMLElement;
     state.innerHTML = '<span class="turn-spin">⟳</span>执行中';
-    // 点击头部展开/收起详细内容；手动开合即接管，不再被自动折叠收走
+    // 点击头部展开/收起详细内容
     const head = d.querySelector('.tool-inline-head') as HTMLElement;
     head.addEventListener('click', () => {
-      d.dataset.manualFold = '1';
       setBodyOpen(d, !d.classList.contains('open'));
     });
     b.appendChild(d);
@@ -115,7 +110,6 @@ export default (function init(App: AppKernel) {
     // 只换状态类，不动 open：展开与否归 setBodyOpen 管，否则状态一变就被折叠
     st.el.classList.remove('running', 'done', 'error', 'ended');
     st.el.classList.add(status);
-    if (status !== 'running') scheduleAutoFold(st);
   }
 
   // ---------- 对外 API ----------
@@ -131,7 +125,6 @@ export default (function init(App: AppKernel) {
 
   /** 会话切换/历史恢复：清空记录 */
   App.toolChainReset = function toolChainReset() {
-    clearFoldTimers();
     steps = [];
     round = 0;
     startAt = 0;
@@ -186,8 +179,6 @@ export default (function init(App: AppKernel) {
   App.toolChainCollapseAll = function toolChainCollapseAll() {
     for (let i = 0; i < steps.length; i++) {
       const st = steps[i];
-      clearFoldTimer(st);
-      st.el.dataset.manualFold = '1';
       setBodyOpen(st.el, false);
     }
   };
@@ -229,25 +220,6 @@ export default (function init(App: AppKernel) {
     if (head) head.setAttribute('aria-expanded', String(open));
     const caret = d.querySelector('.tool-inline-caret') as HTMLElement | null;
     if (caret) caret.textContent = open ? '▾' : '▸';
-  }
-
-  function clearFoldTimer(st: ToolStep) {
-    if (st.foldTimer) { window.clearTimeout(st.foldTimer); st.foldTimer = 0; }
-  }
-
-  function clearFoldTimers() {
-    for (let i = 0; i < steps.length; i++) clearFoldTimer(steps[i]);
-  }
-
-  /** 执行结束的块停留 AUTO_FOLD_MS 再收起（用户手动开合过就不再打扰） */
-  function scheduleAutoFold(st: ToolStep) {
-    clearFoldTimer(st);
-    if (st.el.dataset.manualFold) return;
-    st.foldTimer = window.setTimeout(() => {
-      st.foldTimer = 0;
-      if (st.el.dataset.manualFold) return;
-      setBodyOpen(st.el, false);
-    }, AUTO_FOLD_MS);
   }
 
   function finalizePrevious() {

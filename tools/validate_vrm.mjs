@@ -1,13 +1,23 @@
-// 用 three-vrm 校验 莉丽拉.vrm（ESM）
+// 用 three-vrm 校验 VRM（ESM）。
+// Node 里没有 createImageBitmap/document，GLTFLoader 解析内嵌纹理会永久挂起（表现为超时）。
+// 给个假实现让流程跑完——这里验的是骨骼与表情，不看像素。
+// 必须用动态 import：静态 import 会被提升到 polyfill 之前执行。
+globalThis.createImageBitmap = globalThis.createImageBitmap || (async () => ({ width: 1, height: 1, close() {} }));
+
 import fs from 'fs';
-import * as THREE from 'three';
-import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
-import { VRMLoaderPlugin } from '@pixiv/three-vrm';
+
+const THREE = await import('three');
+const { GLTFLoader } = await import('three/examples/jsm/loaders/GLTFLoader.js');
+const { VRMLoaderPlugin } = await import('@pixiv/three-vrm');
 
 const file = process.argv[2] || 'models/莉丽拉.vrm';
 const buf = fs.readFileSync(file);
 const loader = new GLTFLoader();
 loader.register((parser) => new VRMLoaderPlugin(parser));
+
+// GLTFLoader.parse 是异步的：Node 事件循环里没有待处理 handle 时会在回调触发前退出，
+// 表现是「无任何输出、exit=0」。用一个计时器把进程钉住，直到回调自己 exit。
+setTimeout(() => { console.error('TIMEOUT'); process.exit(2); }, 30000);
 
 try {
   loader.parse(buf, '', (gltf) => {

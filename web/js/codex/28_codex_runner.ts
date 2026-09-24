@@ -177,7 +177,7 @@ export default (function init(App: AppKernel) {
   function createStepView(card, e) {
     const st = card.__cx;
     const wrap = document.createElement('div');
-    wrap.className = 'cx-step running open';
+    wrap.className = 'cx-step running';
     wrap.innerHTML =
       '<div class="cx-step-head">' +
         '<span class="cx-step-idx"></span>' +
@@ -192,18 +192,12 @@ export default (function init(App: AppKernel) {
     const nameEl = wrap.querySelector('.cx-step-name') as HTMLElement;
     nameEl.textContent = toolLabel(e.tool);
     nameEl.title = e.tool;
-    const step = { e, args: [], out: [], status: 'running', dur_ms: null, el: wrap, open: true };
+    const step = { e, args: [], out: [], status: 'running', dur_ms: null, el: wrap, open: false };
     wrap.addEventListener('click', (ev) => {
       if ((ev.target as HTMLElement).closest('.codex-full-log')) return;
       step.open = !step.open;
       wrap.classList.toggle('open', step.open);
     });
-    // 折叠上一个步骤，让最新动作始终可见
-    if (st.steps.length) {
-      const prev = st.steps[st.steps.length - 1];
-      prev.open = false;
-      prev.el.classList.remove('open');
-    }
     st.steps.push(step);
     card.querySelector('.codex-trace-steps').appendChild(wrap);
     while (st.steps.length > 80) {

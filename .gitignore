@@ -253,3 +253,33 @@ godot-dabai/.project_build/
 .pytest_libs/
 # mcp fs server 的运行时 pid 文件，每次启动都会生成
 skills/mcp/run/
+
+# ── 本机工作目录与构建残留（发版前收口）────────────────────────────────
+# 判据是 deploy/release/build_release.py:92 collect() —— 它只打包 git ls-files
+# 的文件，所以「进了仓」等于「进了别人机器的更新写入面」，这四类都不该进：
+#   baymax_build/  本地建模工作目录（VRM/FBX 二进制 + 几十张预览图），可重建
+#   run/           服务日志与桌面截图；tools/browser_daemon.js:5 把日志写这儿
+#   local/         本机定制（local/ensure_local.py 自述「既不在 git 里，也不在
+#                  release 资产包里」——正是这一点让它更新后还活着）
+#   MANIFEST.json  build_release.py 的产物（built_at/commit 每次都变）
+/baymax_build/
+/run/
+/local/
+/MANIFEST.json
+
+# 建模期的一次性检查页，无任何引用（web/_swprobe.html 同例，上面已忽略）
+web/_arm_axis_check.html
+web/_restpose_check.html
+
+# Windows 侧本机入口（两个文件自述「不在 git 也不在 release 资产包里，更新不会覆盖」）：
+# start-dabai.cmd 写死 DABAI_PORT=8008 并调 local\ensure_local.py 回打定制，
+# open-dabai-8008.bat 直接开 https://127.0.0.1:8008 —— 都是这台机器的端口事实，
+# 进仓会跟着资产包发到别的机器上（那边服务监听在 8000）。
+/start-dabai.cmd
+/open-dabai-8008.bat
+
+# 自我迭代轮的一次性探针（agent.py 副本、diff 草稿、提示分布统计脚本）——
+# 每轮重新生成、轮结束即无用，进仓等于把中间态发到别的机器上。
+/_tmp_*
+/_head_*.py
+tools/_tmp_*.py

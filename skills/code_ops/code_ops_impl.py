@@ -1635,6 +1635,9 @@ def _py_graph_scan(tree, rel: str, defs: dict, calls: dict, refs: dict,
 
 
 def _is_test_file(rel: str) -> bool:
+    # Windows 上 rel 带反斜杠（实测 code_graph 输出里就是 tests\test_x.py），
+    # 不归一会让 "/tests/" 匹配不到，测试文件被当死代码列出来。
+    rel = rel.replace("\\", "/")
     name = rel.rsplit("/", 1)[-1]
     stem = name[:-3] if name.endswith(".py") else name
     return (stem.startswith("test_") or stem.startswith("_test")

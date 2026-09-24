@@ -1,0 +1,128 @@
+{
+  "name": "playwright",
+  "title": "浏览器自动化（Playwright 无头）",
+  "version": "1.0.0",
+  "description": "无头 Chromium 干活：截图（含整页）、抓页面文本/元素、跑任意 Playwright 脚本。零常驻进程，用完即退。",
+  "author": "dabai",
+  "enabled": true,
+  "disclosure": "on_demand",
+  "prompt": "【技能 浏览器自动化】无头 Chromium（Playwright 1.63，内核 chromium-1243）：pw_shot 截图（可 full_page/selector/viewport）、pw_text 抓正文或元素文本、pw_run 跑任意 Playwright 脚本（预置 page/browser/context，console.log 即返回）、pw_doctor 环境自检。每次调用起一个浏览器、结束即退，不留常驻进程。要界面（open/codegen/有头模式）在无显示的 WSL 里跑不了，用无头；需要登录态就在 pw_run 里自己 context.addCookies。",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "pw_shot",
+        "description": "用无头 Chromium 打开 URL 并截图存文件（默认整页 full_page=true），返回文件路径、像素尺寸、字节数、页面标题。可只截某个元素（selector）。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "url": {
+              "type": "string",
+              "description": "页面地址，http/https 开头"
+            },
+            "out_path": {
+              "type": "string",
+              "description": "输出图片路径（默认 /tmp/pw-<时间戳>.png）"
+            },
+            "full_page": {
+              "type": "boolean",
+              "description": "是否整页截图（默认 true；false=只截视口）"
+            },
+            "selector": {
+              "type": "string",
+              "description": "可选：只截这个 CSS 选择器命中的元素"
+            },
+            "viewport": {
+              "type": "string",
+              "description": "视口尺寸，如 \"1280x800\"（默认）"
+            },
+            "wait_ms": {
+              "type": "integer",
+              "description": "页面加载后额外等待毫秒数（默认 0，给 JS 渲染留时间可用 1500）"
+            },
+            "timeout": {
+              "type": "integer",
+              "description": "导航超时秒数（默认 45）"
+            }
+          },
+          "required": [
+            "url"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "pw_text",
+        "description": "用无头 Chromium 打开 URL，取页面可见文本（document.body.innerText）或某个元素（selector）的文本，返回标题 + URL + 文本（默认截断 6000 字符）。抓文章/文档/列表内容用这个。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "url": {
+              "type": "string",
+              "description": "页面地址，http/https 开头"
+            },
+            "selector": {
+              "type": "string",
+              "description": "可选：只取这个 CSS 选择器命中元素的文本"
+            },
+            "wait_ms": {
+              "type": "integer",
+              "description": "加载后额外等待毫秒数（默认 0；SPA 页面可给 2000）"
+            },
+            "max_chars": {
+              "type": "integer",
+              "description": "最多返回多少字符（默认 6000，上限 30000）"
+            },
+            "timeout": {
+              "type": "integer",
+              "description": "导航超时秒数（默认 45）"
+            }
+          },
+          "required": [
+            "url"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "pw_run",
+        "description": "跑一段任意 Playwright（Node）脚本，逃生舱：脚本里已预置 chromium/browser/context/page（page 已新建，默认无头、视口 1280x800），写完直接 await 用；console.log 的输出原样返回，浏览器自动关闭。点击、填表、多页抓取、下 cookie、导出 PDF 都用它。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "script": {
+              "type": "string",
+              "description": "脚本主体（Node CommonJS 语法，可用 await）。例：await page.goto('https://example.com'); console.log(await page.title());"
+            },
+            "timeout": {
+              "type": "integer",
+              "description": "整体超时秒数（默认 90，上限 600）"
+            },
+            "headless": {
+              "type": "boolean",
+              "description": "是否无头（默认 true；无显示的 WSL 里有头会失败）"
+            }
+          },
+          "required": [
+            "script"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "pw_doctor",
+        "description": "Playwright 环境自检：node/npm 路径、playwright 版本、浏览器内核是否就绪、可执行文件路径、默认无头视口。装完或报错时先跑这个。",
+        "parameters": {
+          "type": "object",
+          "properties": {}
+        }
+      }
+    }
+  ]
+}

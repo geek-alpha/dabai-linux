@@ -11,11 +11,14 @@ server.py 会静默退回「原样直服」，浏览器把 TS 源码当 JS 跑 �
 目录补一份。
 
 用法（dabai.bat 调用）：
-    python tools/install_node.py --ensure   缺 / 版本低就下载安装
-    python tools/install_node.py --check    只报告状态，不下载
+    python tools/install_node.py --ensure              缺 / 版本低就下载安装
+    python tools/install_node.py --ensure --result F  同上，并把结果行另写一份到 F
+    python tools/install_node.py --check               只报告状态，不下载
 
 --ensure 模式下：进度写 stderr（给人看），stdout 只留最后一行结果
-（`OK <node.exe 路径>` 或 `FAIL <原因>`），批处理用 for /f 取最后一行。
+（`OK <node.exe 路径>` 或 `FAIL <原因>`）。dabai.bat 读的是 --result 写出的文件，
+不用 for /f 捕获命令输出 —— 命令串以引号开头时 cmd 会重解析引号，把 `python.exe"`
+连引号当程序名，报「文件名、目录名或卷标语法不正确。」，一行都拿不到。
 """
 from __future__ import annotations
 
@@ -46,6 +49,35 @@ MIN_ZIP_BYTES = 1024 * 1024
 
 def eprint(*args) -> None:
     print(*args, file=sys.stderr, flush=True)
+
+
+_RESULT_PATH: str | None = None
+
+
+def console_encoding() -> str:
+    """cmd 按控制台输出代码页解码我们写出的字节，不匹配就是一片乱码。"""
+    try:
+        import ctypes
+
+        cp = ctypes.windll.kernel32.GetConsoleOutputCP()
+        if cp:
+            return f"cp{cp}"
+    except Exception:
+        pass
+    return "mbcs"
+
+
+def emit(line: str) -> None:
+    """结果行：stdout 一份给人看，--result 文件一份给批处理读。"""
+    print(line, flush=True)
+    if not _RESULT_PATH:
+        return
+    enc = console_encoding() if is_windows() else "utf-8"
+    try:
+        with open(_RESULT_PATH, "w", encoding=enc, errors="replace", newline="") as fh:
+            fh.write(line + "\r\n")
+    except OSError as exc:
+        eprint(f"    [警告] 结果文件写不进去：{exc}")
 
 
 def parse_version(text: str) -> tuple[int, int, int] | None:
@@ -177,12 +209,12 @@ def is_windows() -> bool:
 
 def do_ensure() -> int:
     if not is_windows():
-        print("FAIL 本脚本只负责 Windows；Linux/macOS 请用系统包管理器装 Node 22.13+（apt install nodejs 或 nvm）")
+        emit("FAIL 本脚本只负责 Windows；Linux/macOS 请用系统包管理器装 Node 22.13+（apt install nodejs 或 nvm）")
         return 1
     exe, ver = find_usable()
     if exe:
         eprint(f"  Node.js 已就绪：{exe}（{fmt(ver)}）")
-        print(f"OK {exe}")
+        emit(f"OK {exe}")
         return 0
 
     want = f"{MIN_VERSION[0]}.{MIN_VERSION[1]}"
@@ -202,7 +234,7 @@ def do_ensure() -> int:
             eprint(f"    [失败] {last_err}")
     else:
         shutil.rmtree(tmp, ignore_errors=True)
-        print(f"FAIL 所有下载源都失败（最后错误：{last_err}）")
+        emit(f"FAIL 所有下载源都失败（最后错误：{last_err}）")
         return 1
 
     dest = private_dir()
@@ -212,7 +244,7 @@ def do_ensure() -> int:
         dest.mkdir(parents=True, exist_ok=True)
         skipped = extract_strip_top(zip_path, dest)
     except Exception as exc:
-        print(f"FAIL 解压失败：{exc.__class__.__name__}: {exc}")
+        emit(f"FAIL 解压失败：{exc.__class__.__name__}: {exc}")
         return 1
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -223,10 +255,10 @@ def do_ensure() -> int:
     exe = private_exe()
     ver = node_version(exe) if exe.is_file() else None
     if not is_supported(ver):
-        print(f"FAIL 装完仍不可用：{exe} 版本={fmt(ver)}")
+        emit(f"FAIL 装完仍不可用：{exe} 版本={fmt(ver)}")
         return 1
     eprint(f"  安装完成：{exe}（{fmt(ver)}）")
-    print(f"OK {exe}")
+    emit(f"OK {exe}")
     return 0
 
 
@@ -248,16 +280,25 @@ def do_check() -> int:
 
 
 def main() -> int:
+    global _RESULT_PATH
     if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        enc = console_encoding() if is_windows() else "utf-8"
+        sys.stdout.reconfigure(encoding=enc, errors="replace")
+        sys.stderr.reconfigure(encoding=enc, errors="replace")
     ap = argparse.ArgumentParser(description="Windows 下自动安装 Node.js（前端 .ts 转译依赖）")
     ap.add_argument("--ensure", action="store_true", help="缺 / 版本低就下载安装")
     ap.add_argument("--check", action="store_true", help="只报告状态，不下载")
+    ap.add_argument("--result", metavar="FILE",
+                    help="把最终结果行（OK/FAIL）另写一份到这个文件，供 dabai.bat 读取")
     args = ap.parse_args()
-    if args.check:
-        return do_check()
-    return do_ensure()
+    _RESULT_PATH = args.result
+    try:
+        return do_check() if args.check else do_ensure()
+    except Exception as exc:
+        # 批处理只认一行结果：脚本自己崩掉的话，用户看到的是「produced no output」，
+        # 什么都查不出来。任何未预期异常都要落成一行 FAIL。
+        emit(f"FAIL 未预期错误：{exc.__class__.__name__}: {exc}")
+        return 1
 
 
 if __name__ == "__main__":

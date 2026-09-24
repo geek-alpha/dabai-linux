@@ -46,6 +46,7 @@ def _mk_agent():
     ag._verify_round_edit = False
     ag._verify_round_verified = False
     ag._verify_miss_armed = False
+    ag._verify_hint_shown = False
     return ag
 
 
@@ -198,6 +199,94 @@ def test_hint_never_leaks_into_counters():
     ag._watch_verify_tool("code_edit")
     ag._verify_miss_hint()
     assert ag._verify_miss_streak == 6
+
+
+def test_hint_is_capped_at_once_per_round():
+    """轮级上限：一轮里改 N 次码，提示也只能出现 1 次（2026-09-24 修刷屏）。
+
+    背景（可复算 data/_probe_verify_hint_cap.py）：实测 data/turn_metrics.jsonl 217 个
+    带埋点轮里 40 轮 verify_hints>1、最高 45 次——成因是 _watch_verify_tool 在每次
+    edit 调用上都重新置位 armed，而 armed 是一次性消费的，于是「提醒→消费→再改→再置位」
+    循环。提示是事实反馈不是计数板，同一句话在一轮里喊 45 遍只会被忽略。
+
+    什么观测会推翻它：把 _watch_verify_tool 里 `_verify_hint_shown` 那个条件删掉，
+    本用例立刻红（hints 回到 N 次）——那说明上限没生效，刷屏照旧。
+    """
+    ag = _mk_agent()
+    ag._reset_verify_watch()
+    shown = 0
+    for _ in range(45):                      # 复刻实测最坏那轮的调用密度
+        ag._watch_verify_tool("code_edit")
+        if ag._verify_miss_hint():
+            shown += 1
+    assert shown == 1, f"一轮里提示了 {shown} 次，轮级上限没生效"
+
+
+def test_cap_holds_across_both_injection_points():
+    """两个注入点（文本协议分支 / 原生工具分支）共用同一个轮级上限。
+
+    只在一个注入点上加闸，另一条分支照样能刷；这两条分支在 agent.py 里是两段独立
+    代码（有源码级断言钉住条数），所以上限必须落在 _verify_miss_hint 内部。
+    """
+    ag = _mk_agent()
+    ag._reset_verify_watch()
+    ag._watch_verify_tool("code_edit")
+    assert ag._verify_miss_hint() != ""          # 第一个注入点
+    ag._watch_verify_tool("code_create_file")    # 同一轮里又改了一个文件
+    assert ag._verify_miss_hint() == ""          # 第二个注入点：同一轮不再喊
+    assert ag._verify_miss_armed is False
+
+
+def test_cap_resets_next_round():
+    """上限是轮级的：下一轮还得提醒，否则「一轮一次」会被读成「一次之后永不提醒」。
+
+    什么观测会推翻它：_reset_verify_watch 漏清 _verify_hint_shown，下一轮直接静默——
+    那样缺口会从「刷屏」翻成「不提醒」，比刷屏更坏。
+    """
+    ag = _mk_agent()
+    ag._reset_verify_watch()
+    ag._watch_verify_tool("code_edit")
+    assert ag._verify_miss_hint() != ""
+    ag._reset_verify_watch()
+    ag._watch_verify_tool("code_edit")
+    assert ag._verify_miss_hint() != "", "新的一轮必须重新提醒"
+
+
+def test_cap_wired_in_source():
+    """接线契约：shown 必须三处齐全（轮入口清零 / 登记处判它 / 注入处置它）。
+
+    缺任一处：清零缺 → 之后永不提醒；登记处缺 → 刷屏；注入处缺 → 上限永不生效。
+    """
+    lines = _agent_lines()
+    reset = next(i for i, l in enumerate(lines)
+                 if "def _reset_verify_watch" in l)
+    seg = "\n".join(lines[reset:reset + 12])
+    assert "self._verify_hint_shown = False" in seg, "轮入口没清零 shown"
+    watch = next(i for i, l in enumerate(lines) if "def _watch_verify_tool" in l)
+    wseg = "\n".join(lines[watch:watch + 22])
+    assert "_verify_hint_shown" in wseg, "登记处没判 shown：每次 edit 都会重新 arm"
+    hint = next(i for i, l in enumerate(lines) if "def _verify_miss_hint" in l)
+    hseg = "\n".join(lines[hint:hint + 18])
+    assert "self._verify_hint_shown = True" in hseg, "注入处没置 shown：上限不生效"
+
+
+def test_cap_keeps_audit_denominator_unchanged():
+    """上限只压次数、不压覆盖：触发轮数不变，只有总次数下降。
+
+    这是本轮的改判判据，可复算 data/_probe_verify_hint_cap2.py：把历史数据里每轮
+    hints 压到 ≤1，审计 verify_hint_turns 必须不变（57 轮），total 必须下降
+    （407→57）。若哪天修完上限触发轮数反而降了，说明把整轮的提示也吞了——那是
+    把刷屏换成了缺口，该推翻本轮改动。
+    """
+    mod = _load_audit()
+    rows = [{"call_names": ["code_edit"], "verify_hints": 45},
+            {"call_names": ["code_edit"], "verify_hints": 3},
+            {"call_names": ["code_edit"], "verify_hints": 0}]
+    capped = [dict(r, verify_hints=min(1, int(r["verify_hints"]))) for r in rows]
+    a, b = mod.call_stats(rows), mod.call_stats(capped)
+    assert b["verify_hint_total"] == 2 < a["verify_hint_total"] == 48
+    assert b["verify_hint_turns"] == a["verify_hint_turns"] == 2
+    assert b["verify_hint_expect"] == a["verify_hint_expect"]
 
 
 # ---------- 契约 5：轮级标记每轮清零 ----------
@@ -502,3 +591,58 @@ def test_shell_hits_reset_per_round():
     ag._reset_verify_watch()
     assert ag._verify_shell_hits == 0
     assert ag._verify_round_verified is False
+
+
+# ---------- 契约 9：验证口径必须认「非 Python 栈」的编译/测试（2026-09-24） ----------
+#
+# 背景（第 2 轮实测，可复算 data/_probe_flip.py）：旧口径只认 pytest / py_compile /
+# compileall / unittest / py.test 四个词，而本仓在改 web/js/*.ts。真实命令回放 53 个
+# 埋点覆盖改码轮：09-24 15:14 与 15:19 两轮跑
+# `tsc --noEmit --skipLibCheck --target ES2020 ...`、15:03 跑 `node --check`，
+# 旧口径全判「没验证」（verify_rate 0.3019），认这两类命令后 3 轮翻正（0.3585）。
+# 假阴性比漏判更坏：提示据此把模型推向 code_verify（只做 py_compile），比它本来跑的
+# tsc 更弱——指标腐化。
+#
+# 反过来说清什么观测会推翻这两条测试：若 verify_shell_hits 上升而审计里未验证轮的
+# 绝对数不降，说明这些命令只是被顺带跑过、并非真验证，那就该收紧口径而非继续放宽。
+
+
+def test_non_python_stack_verify_commands_count():
+    """非 Python 栈的编译/测试命令必须算验证（本轮修正的假阴性）。"""
+    for cmd in ("cd /d D:\\AI\\dabai && tsc --noEmit --skipLibCheck --target ES2020",
+                "node --check v1.mjs",
+                "node --test tests/foo.test.js",
+                "npm run build",
+                "npm run typecheck",
+                "vite build",
+                "cargo check",
+                "go test ./...",
+                "dotnet build"):
+        assert agent._is_verify_call("shell_run", {"command": cmd}), cmd
+
+
+def test_widened_caliber_still_rejects_non_verify():
+    """放宽后仍不许虚高：写状态/探索/下载一律不算验证。
+
+    这是本轮的「反证」：若为了让读数好看把这几个也认成验证，缺口就会被盖住——
+    那时该推翻本轮改动。
+    """
+    for cmd in ("venv/Scripts/python tools/lesson_add.py 'x'",
+                "venv/Scripts/python tools/long_horizon.py log self-evolution 'x'",
+                "venv/Scripts/python tools/self_iterate.py record --target rules:verify_rate",
+                "cd /d %TEMP% && curl -k -s -o a.mjs https://127.0.0.1:8008/static/js/core/uid.ts",
+                "ls -la", "cat agent.py"):
+        assert not agent._is_verify_call("shell_run", {"command": cmd}), cmd
+
+
+def test_verify_hint_names_the_right_stack():
+    """提示措辞必须按语言给命令，且必须点名「别拿 py_compile 验 .ts」。
+
+    旧措辞只给 code_verify / py_compile——改 .ts 的轮照做就等于假验证（指标腐化）。
+    """
+    ag = _mk_agent()
+    ag._reset_verify_watch()
+    ag._watch_verify_tool("code_edit", {})
+    hint = ag._verify_miss_hint()
+    assert "tsc" in hint and "node --check" in hint
+    assert ".ts" in hint and "py_compile" in hint

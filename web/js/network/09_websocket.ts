@@ -6,6 +6,7 @@ import type {
   RlStatusPayload,
   ServerMessage,
 } from '../types/ws-protocol.js';
+import { resolveUserId } from '../core/uid.ts';
 
 export default (function init(App: AppKernel) {
   const {
@@ -263,9 +264,8 @@ export default (function init(App: AppKernel) {
         wsEverConnected = true;
         App.addSystemMsg('已连接到 AI');
       }
-      // 发送用户标识以恢复历史
-      const uid = localStorage.getItem('dabai.userId') || 'u_' + Date.now().toString(36);
-      localStorage.setItem('dabai.userId', uid);
+      // 发送用户标识以恢复历史（支持 ?uid= 显式指定，见 core/uid.ts）
+      const uid = resolveUserId();
       App.ws.send(JSON.stringify({
         type: 'set_user',
         user_id: uid

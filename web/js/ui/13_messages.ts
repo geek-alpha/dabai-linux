@@ -409,6 +409,11 @@ export default (function init(App: AppKernel) {
    * ============================================================ */
   App._newMsgCount = 0;
   let _scrollBottomPending = false;
+  // 「跟随底部」= 用户意图，默认跟随。上滑离开底部就脱离，滚回底部自动恢复。
+  // 不能用 isNearBottom() 在插入后现测距离：新卡片（工具块/代码块）一进 DOM
+  // 容器就变高，距离瞬间超过阈值，会被误判成「用户在看历史」而不再贴底。
+  // 这个状态只在用户滚动（scroll 事件）和强制贴底时更新，所以插入前的位置语义被保留。
+  let _followBottom = true;
 
   App.isNearBottom = function isNearBottom() {
     const el = App.messagesEl!;
@@ -429,6 +434,7 @@ export default (function init(App: AppKernel) {
 
   App.scrollToBottom = function scrollToBottom(force?: boolean) {
     if (force === true) {
+      _followBottom = true;
       // 平滑滚动动画期间不显示"回到底部"提示，避免闪烁
       App._forceScrolling = true;
       if (App._forceScrollTimer) clearTimeout(App._forceScrollTimer);
@@ -440,11 +446,13 @@ export default (function init(App: AppKernel) {
       // 正在底部跟随：直接贴底（auto 避免流式高频更新时平滑动画抖动）。
       // 流式每 token 都会调到这里，而 scrollHeight/clientHeight 读取会强制同步布局，
       // 因此合并到 rAF：一帧最多一次贴底 + 一次布局读取。
+      if (!_followBottom) return;   // 用户上滑翻阅历史中：不打扰
       if (!_scrollBottomPending) {
         _scrollBottomPending = true;
         requestAnimationFrame(() => {
           _scrollBottomPending = false;
-          if (App.isNearBottom()) App.messagesEl!.scrollTop = App.messagesEl!.scrollHeight;
+          // 等这一帧的期间用户可能又上滑了，所以这里再确认一次
+          if (_followBottom) App.messagesEl!.scrollTop = App.messagesEl!.scrollHeight;
           App.updateScrollHint();
         });
       }
@@ -473,7 +481,15 @@ export default (function init(App: AppKernel) {
       hint.textContent = '↓';
     }
   };
-  App.messagesEl!.addEventListener('scroll', App.updateScrollHint, { passive: true });
+  App.messagesEl!.addEventListener('scroll', () => {
+    const el = App.messagesEl!;
+    // 强制平滑滚动途中的中间帧不代表用户意图，忽略；
+    // 内容不足一屏（切换/新建会话刚清空）视为必然在底部，顺手恢复跟随。
+    if (!App._forceScrolling) {
+      _followBottom = App.isNearBottom() || el.scrollHeight <= el.clientHeight + 4;
+    }
+    App.updateScrollHint();
+  }, { passive: true });
   App.scrollHint!.addEventListener('click', () => App.scrollToBottom(true));
 
   const EXT_TONES: Record<string, string> = {
@@ -790,7 +806,7 @@ export default (function init(App: AppKernel) {
         App.toolChainProgress(e.tool_name, e.elapsed, e.message);
       }
     }
-    // 重放出来的是历史块（都已结束）：直接收起；只有实时运行中的块才展开显示参数
+    // 重放出来的都是历史块，统一收起；实时块也默认收起，细节由用户自己点开
     if (App.toolChainCollapseAll) App.toolChainCollapseAll();
     if (App.noteTurnActivity) App.noteTurnActivity();
     App.scrollToBottom(true);

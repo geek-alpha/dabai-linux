@@ -84,7 +84,10 @@ class _FakeFS:
         self.core_snapshots = 0
 
     def snapshot(self, paths):
-        names = {str(p) for p in paths}
+        # Windows 上 str(Path("/fake/core_x.py")) 是 "\fake\core_x.py" —— 不归一会
+        # 让下面的 CORE in names 恒假，核心变化永远检测不到、循环跑到保险丝熔断
+        # （实测 Windows 宿主 5 failed / 9 passed，Linux 宿主不受影响）。
+        names = {str(p).replace("\\", "/") for p in paths}
         if self.CORE in names:
             i = min(self.core_snapshots, len(self._versions) - 1)
             self.core_snapshots += 1

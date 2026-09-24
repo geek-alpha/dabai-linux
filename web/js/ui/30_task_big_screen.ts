@@ -587,13 +587,17 @@ export default (function init(App: AppKernel) {
   }
 
   // 队列空时的隐式连播：从视频面板（29_video_ui）最近一次搜索结果里
-  // 找到刚播完那部的位置，按搜索顺序接下一部。返回 true = 已起播。
+  // 找到刚播完那部的位置，按搜索顺序接下一部（列表末尾会自动扩页，见 videoNextFromSearch）。
+  // 单片解析失败不该打断无人值守播放 —— 跳过它继续试下一部，最多 5 次。返回 true = 已起播。
   async function playNextFromSearch(endedUrl?: string): Promise<boolean> {
     if (!App.videoNextFromSearch || !App.playVideoItem) return false;
-    const nx = App.videoNextFromSearch(endedUrl || '');
-    if (!nx) return false;
-    const ok = await App.playVideoItem(nx, { auto: true });
-    return !!ok;
+    for (let i = 0; i < 5; i++) {
+      // 第 2 轮起不再传 endedUrl：失败那部已由 playVideoItem 推进游标，再传会重复匹配同一部
+      const nx = await App.videoNextFromSearch(i === 0 ? (endedUrl || '') : '');
+      if (!nx) return false;
+      if (await App.playVideoItem(nx, { auto: true })) return true;
+    }
+    return false;
   }
 
   // 播完 → 回报子智能体（worker_id 带回 → 闭环看护）+ 取队列下一部连播；

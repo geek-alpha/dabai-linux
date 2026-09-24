@@ -138,7 +138,11 @@ _VERIFY_TOOLS = {"code_verify", "code_test", "code_smoke"}
 # self_iterate）不算——那是写状态，不是验证。
 _SHELL_TOOLS = {"shell_run", "run_shell", "shell", "bash", "sh"}
 _VERIFY_CMD_RE = re.compile(
-    r"(?<![A-Za-z0-9_])(?:pytest|py_compile|compileall|unittest|py\.test)(?![A-Za-z0-9_])",
+    r"(?<![A-Za-z0-9_])(?:pytest|py_compile|compileall|unittest|py\.test"          # Python
+    r"|tsc|node\s+--check|node\s+--test|eslint|jest|vitest|webpack"                # TS / JS
+    r"|npm\s+(?:run\s+)?(?:build|test|lint|typecheck|check|verify)|vite\s+build"
+    r"|cargo\s+(?:check|test|build)|go\s+(?:build|test|vet)"                       # Rust / Go
+    r"|dotnet\s+build|godot\s+--headless)(?![A-Za-z0-9_])",
     re.I)
 
 

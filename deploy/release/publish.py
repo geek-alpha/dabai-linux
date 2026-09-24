@@ -87,9 +87,10 @@ def _indent(text: str, prefix: str = "    ") -> None:
 
 def _python() -> str:
     """优先用仓库自带 venv —— 打包脚本和测试都依赖它的依赖。"""
-    candidate = ROOT / "venv" / "bin" / "python"
-    if candidate.exists():
-        return str(candidate)
+    for rel in (("venv", "bin", "python"), ("venv", "Scripts", "python.exe")):
+        candidate = ROOT.joinpath(*rel)
+        if candidate.exists():
+            return str(candidate)
     return sys.executable
 
 
@@ -128,13 +129,23 @@ def git(*args, token: str = "", check: bool = False):
 
 
 def _token_paths() -> tuple:
-    return (Path("/etc/dabai/secrets.env"), Path.home() / ".config" / "dabai" / "secrets.env")
+    """token 的持久化位置，按平台给默认值。
+
+    与 deploy/gitguard/safe_push.py 的 secrets_env_candidates() 同源：
+    Windows 是 %APPDATA%\\dabai\\secrets.env，Linux 是 /etc/dabai/secrets.env。
+    """
+    if os.name == "nt":
+        base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+        return (Path(base) / "dabai" / "secrets.env",
+                Path.home() / ".config" / "dabai" / "secrets.env")
+    return (Path("/etc/dabai/secrets.env"),
+            Path.home() / ".config" / "dabai" / "secrets.env")
 
 
 def read_token(paths=None) -> str:
-    """按序找 GITHUB_TOKEN：环境变量 → /etc/dabai/secrets.env → ~/.config/dabai/secrets.env。
+    """按序找 GITHUB_TOKEN：环境变量 → 平台 secrets.env → ~/.config/dabai/secrets.env。
 
-    顺序与 deploy/gitguard/safe-push.sh 一致 —— 两处都改才算改，别只改一边。
+    顺序与 deploy/gitguard/safe_push.py 一致 —— 两处都改才算改，别只改一边。
     paths 只为测试注入，正常调用不传。
     """
     tok = os.environ.get("GITHUB_TOKEN", "").strip()
@@ -349,9 +360,10 @@ def main() -> int:
         _p(f"=== 发布大白（仓库 {ROOT}）===")
         token = read_token()
         if not token:
-            die("没找到 GITHUB_TOKEN（按序找：环境变量 → /etc/dabai/secrets.env → "
+            die("没找到 GITHUB_TOKEN（按序找：环境变量 → 平台 secrets.env → "
                 "~/.config/dabai/secrets.env）\n"
-                "    临时一次：export GITHUB_TOKEN=ghp_xxx")
+                "    Windows 持久化：python deploy\\secrets\\sync_secrets.py set GITHUB_TOKEN ghp_xxx\n"
+                "    临时一次：set GITHUB_TOKEN=ghp_xxx")
         ok(f"token 可用（{token[:4]}***，走环境变量注入，不进命令行）")
 
         info = preflight(args, token)

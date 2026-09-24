@@ -2336,10 +2336,28 @@ _VERIFY_TOOLS = {"code_verify", "code_test", "code_smoke"}
 # 验证。实测代价（data/turn_metrics.jsonl 采样 6 轮）：4 个被判「未验证」的改码轮里
 # 每一轮都用 shell_run 跑过 pytest 或实发探针，18 次提示全是假警；更糟的是提示措辞
 # 把模型推向 code_verify（只做 py_compile），比它本来跑的 pytest 更弱——指标腐化。
-# 只认「能证伪改动」的强信号：编译检查与测试运行。跑台账脚本（lesson_add /
+# 只认「能证伪改动」的强信号：编译/类型检查与测试运行。跑台账脚本（lesson_add /
 # long_horizon / self_iterate）不算——那是写状态，不是验证。
+#
+# 2026-09-24 口径修正（第 2 轮核实）：旧口径只认 Python 的四个词，本仓却在改
+# web/js/*.ts 这类非 Python 栈——那些轮跑了 tsc / node --check 照样被判「没验证」。
+# 证据（可复算：venv/Scripts/python data/_probe_refute.py，用 data/tool_spill 里记录过的
+# 真实命令回放 54 个埋点覆盖改码轮）：09-24 15:14、15:19 两轮跑
+# `tsc --noEmit --skipLibCheck --target ES2020 ...`，15:03 跑
+# `curl ... && node --check v1.mjs && echo syntax_ok`，
+# 旧口径 3 轮全判未验证（verify_rate_covered 0.3148 = 17/54）；认这两类命令后 3 轮全翻正
+# （0.3704 = 20/54，data/_probe_flip.py 逐轮可对）。
+# 假阴性比漏判更坏：提示据此把模型推向 code_verify（只做 py_compile），比它本来跑的
+# tsc 更弱——指标腐化（下面 _verify_miss_hint 的措辞同步修掉了这一点）。
+# 反过来说清什么观测会推翻这条口径：若补上非 Python 方言后 verify_shell_hits 上升，
+# 但审计里「未验证轮」的绝对数不降，说明这些命令只是被顺带跑过、并非真验证，
+# 那时该收紧而不该再放宽。
 _VERIFY_CMD_RE = re.compile(
-    r"(?<![A-Za-z0-9_])(?:pytest|py_compile|compileall|unittest|py\.test)(?![A-Za-z0-9_])",
+    r"(?<![A-Za-z0-9_])(?:pytest|py_compile|compileall|unittest|py\.test"          # Python
+    r"|tsc|node\s+--check|node\s+--test|eslint|jest|vitest|webpack"                # TS / JS
+    r"|npm\s+(?:run\s+)?(?:build|test|lint|typecheck|check|verify)|vite\s+build"
+    r"|cargo\s+(?:check|test|build)|go\s+(?:build|test|vet)"                       # Rust / Go
+    r"|dotnet\s+build|godot\s+--headless)(?![A-Za-z0-9_])",
     re.I)
 
 
@@ -3960,6 +3978,12 @@ class AIAgent:
         self._plan_round_calls = 0       # 本轮已开始的工具调用数
         self._plan_round_names = set()   # 本轮跨过的工具种类（判多步轮，与审计同源）
         self._plan_early_armed = False   # 本轮该给早提示（刚够多步那一刻置位，一次即解除）
+        # 清单提示的轮级上限（2026-09-24 修同类刷屏）：armed 会被后续每次工具调用重新
+        # 置位——那正是刷屏的成因，实测 data/turn_metrics.jsonl 采样 220 轮里 16 轮
+        # plan_hints>1、最高 38 次（若「>1」只是两个注入点各说一次，上界只能是 2）。
+        # 两条清单提示（跨轮的【清单提示】与同轮的【开工提示】）**共用**这一个闸：
+        # 它们说的是同一个动作（plan_update），一轮里各喊一遍仍是重复。
+        self._plan_hint_shown = False
         # 盘上状态所属 sid：进程重启后由 _restore_plan_miss 接回（进程重启 ≠ 换会话）。
         self._plan_miss_sid = None
         # 「改码轮没同轮验证」检查点的状态：streak 跨轮（落盘），其余三个是轮级标记。
@@ -3968,6 +3992,10 @@ class AIAgent:
         self._verify_round_edit = False       # 本轮到此刻改过码
         self._verify_round_verified = False   # 本轮到此刻验过码
         self._verify_miss_armed = False       # 本轮该提醒（改完那一刻置位，提醒一次即解除）
+        # 轮级上限（2026-09-24 修刷屏）：armed 会被后续每次 edit 重新置位——那正是刷屏
+        # 的成因，实测 data/turn_metrics.jsonl 370 轮里 38 轮 verify_hints>1、最高 45 次。
+        # shown 一旦置位，本轮不再 arm，两个注入点也收敛成「一轮一次」。
+        self._verify_hint_shown = False
         self._verify_shell_hits = 0           # 本轮 shell 里跑验证命令的次数（口径埋点）
         # 「改前必读」埋点（2026-09-23）：规则区「证据优先」是最大一块（501 字符、
         # 10.9%）却一直没有数据源，只能人工判断留删。读过的范围跨轮累积
@@ -5172,9 +5200,18 @@ class AIAgent:
         稳定低于达标线 50%——抽象要求改不动行为，改成在模型刚做完一轮时告诉它
         「你已连着 N 轮调了 3 个以上工具却没提清单」。
         """
+        # 轮级上限（与开工提示共用同一个闸）：armed 之外再看 shown——轮末下发的 armed
+        # 只允许在本轮出现一次，两条清单提示都不重复喊同一个动作。
         if not self._plan_miss_armed:
             return ""
+        if getattr(self, "_plan_hint_shown", False):
+            # 本轮已经提醒过（开工提示先响，或另一个注入点先到）：撒掉 armed 并落盘，
+            # 否则同一件事会在下一轮再喊一遍。
+            self._plan_miss_armed = False
+            self._persist_plan_miss()
+            return ""
         self._plan_miss_armed = False
+        self._plan_hint_shown = True
         # 消费即落盘：不落盘的话「已经提醒过」活不过一次重启，重启后 armed 仍为
         # True → 同一句提示被反复注入（提示要一次，不要每轮重放）。
         self._persist_plan_miss()
@@ -5218,6 +5255,7 @@ class AIAgent:
         self._plan_round_calls = 0
         self._plan_round_names = set()
         self._plan_early_armed = False
+        self._plan_hint_shown = False
         self._plan_recap_done = False
 
     def _watch_plan_tool(self, tool_name: str) -> None:
@@ -5239,7 +5277,10 @@ class AIAgent:
                 self._plan_early_armed = False
             elif not self._plan_round_used:
                 names.add(name)
-                if _plan_round_multi(self._plan_round_calls, names):
+                if (not getattr(self, "_plan_hint_shown", False)
+                        and _plan_round_multi(self._plan_round_calls, names)):
+                    # 已提醒过的轮不再置位：每次工具调用都重新 arm 会让同一句提示在一轮里
+                    # 刷 N 次（实测最高 38 次）。提示是事实反馈不是计数板，刷屏只会被忽略。
                     self._plan_early_armed = True
         except Exception:
             pass
@@ -5320,9 +5361,13 @@ class AIAgent:
         与 _plan_miss_hint 的分工：那个跨轮、连中 2 轮才响，说的是「你连着几轮漏提」；
         这个同轮、本轮刚够多步那一刻就响，说的是「这一轮还来得及补」。
         """
-        if not self._plan_early_armed:
+        # 轮级上限（注入点的最后一道闸）：armed 之外再看 shown——轮内每次工具调用的
+        # 重新 arm 必须收敛到「一轮一次」。
+        if not self._plan_early_armed or getattr(self, "_plan_hint_shown", False):
+            self._plan_early_armed = False
             return ""
-        self._plan_early_armed = False   # 一轮只提醒一次：每轮重放等于刷屏
+        self._plan_early_armed = False
+        self._plan_hint_shown = True    # 一轮只提醒一次：每轮重放等于刷屏
         return (
             "\n\n【开工提示】本轮工具调用已经够「多步」，但还没提过工作清单。"
             "如果这件事不止一步，现在补一次 plan_update（整份清单，含收尾项）——"
@@ -5368,6 +5413,7 @@ class AIAgent:
         self._verify_round_edit = False
         self._verify_round_verified = False
         self._verify_miss_armed = False
+        self._verify_hint_shown = False
         self._verify_shell_hits = 0
 
     def _watch_verify_tool(self, tool_name: str, arguments=None) -> None:
@@ -5380,9 +5426,12 @@ class AIAgent:
             name = str(tool_name or "")
             if name in _VERIFY_EDIT_TOOLS:
                 self._verify_round_edit = True
-                if not getattr(self, "_verify_round_verified", False):
+                if (not getattr(self, "_verify_round_verified", False)
+                        and not getattr(self, "_verify_hint_shown", False)):
                     # armed 在「改完的那一刻」置位：提示必须紧跟这次改动，本轮还来
                     # 得及跑验证；等本轮结束再提醒，改的上下文已经散了。
+                    # 但已提醒过的轮不再置位：每次 edit 都重新 arm 会让同一句提示在一轮里
+                    # 刷 N 次（实测最高 45 次），提示是事实反馈不是计数板，刷屏只会被忽略。
                     self._verify_miss_armed = True
             elif _is_verify_call(name, arguments):
                 self._verify_round_verified = True
@@ -5401,16 +5450,23 @@ class AIAgent:
         「改完就验」实测 158 个改码轮只有 48% 同轮验证（达标线 60%）——抽象要求改不
         动行为，事实反馈才有埋点能验（与清单提示同一个结论）。
         """
-        if not self._verify_miss_armed:
+        # 轮级上限（注入点的最后一道闸）：armed 之外再看 shown——两个注入点、以及
+        # 轮内每次 edit 的重新 arm，都必须收敛到「一轮一次」。
+        if not self._verify_miss_armed or getattr(self, "_verify_hint_shown", False):
+            self._verify_miss_armed = False
             return ""
-        self._verify_miss_armed = False   # 一轮只提醒一次：每轮重放等于刷屏
+        self._verify_miss_armed = False
+        self._verify_hint_shown = True    # 一轮只提醒一次：每轮重放等于刷屏
         streak = int(getattr(self, "_verify_miss_streak", 0) or 0)
         tail = f"（你已经连续 {streak} 轮改完码没验证）" if streak >= 1 else ""
         return (
             "\n\n【验证提示】你本轮已经改了代码，到这个工具调用为止还没跑过验证。"
-            "改完码要在**同一轮里**跑一次验证：code_verify / code_test / code_smoke，"
-            "或者 shell_run 跑 pytest / py_compile（这两种也算，审计口径认命令内容）。"
-            "跨轮再补不算。" + tail +
+            "改完码要在**同一轮里**跑一次验证，且必须针对你改的文件的语言："
+            "改 .py 就 code_verify / code_test / code_smoke 或 shell_run 跑 pytest / "
+            "py_compile；改 .ts/.js 就 shell_run 跑 tsc --noEmit / node --check / "
+            "npm run build；改别的东西就选那个栈真正的编译或测试命令。"
+            "别拿 py_compile 去验 .ts——它只会说「语法没毛病」而根本没看你的改动，"
+            "那是假验证。跨轮再补不算。" + tail +
             "没验的改动里藏着的是没过语法、没过测试、没被证据支持的改动。")
 
     def _remember_cross_fp(self, fp: str) -> None:

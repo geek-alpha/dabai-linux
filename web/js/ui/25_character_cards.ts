@@ -1,4 +1,5 @@
 import type { AppKernel } from '../types/app-kernel.js';
+import { resolveUserId } from '../core/uid.ts';
 
 export default (function init(App: AppKernel) {
   const {
@@ -97,7 +98,7 @@ export default (function init(App: AppKernel) {
   App.refreshRoleCardList = async function refreshRoleCardList() {
     try {
       await App.loadRcLlmGlobalConfig(true);
-      const _uid = localStorage.getItem('dabai.userId') || '';
+      const _uid = resolveUserId();
       const res = await fetch('/api/character_cards?user_id=' + encodeURIComponent(_uid));
       const data = await res.json();
       App.renderRoleCardList(data.cards || []);
@@ -973,7 +974,7 @@ export default (function init(App: AppKernel) {
   App.applyRoleCard = async function applyRoleCard(cardId, opts) {
     const _opts = opts || {};
     try {
-      const _uid = localStorage.getItem('dabai.userId') || '';
+      const _uid = resolveUserId();
       const res = await fetch(`/api/character_cards/${cardId}/apply`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1035,9 +1036,14 @@ export default (function init(App: AppKernel) {
         const llmRes = await fetch('/api/llm/config');
         const llmCfg = await llmRes.json();
         App.llmGlobalConfig = llmCfg;
-        const ap = (llmCfg.providers || []).find(p => p.id === llmCfg.active_id);
-        const pName = ap ? ap.name : '';
-        modelHint = pName ? (`，模型：${pName} · ${llmCfg.model || '默认'}`) : '';
+        // 卡片声明的 provider/model 才是真正在跑的（load_config_for 用它覆盖全局）；
+        // 直接显示 llmCfg.model 会把供应商默认模型报成当前模型
+        const cardLlm = card.llm || {};
+        const pid = (cardLlm.provider_id || '').trim() || (llmCfg.active_id || '');
+        const ap = (llmCfg.providers || []).find(p => p.id === pid);
+        const modelName = (cardLlm.model || '').trim()
+          || (ap && ap.default_model) || llmCfg.model || '默认';
+        modelHint = ap ? (`，模型：${ap.name} · ${modelName}`) : '';
       } catch (e) { /* 提示里不带模型信息也不影响 */ }
       if (_opts.toast !== '') {
         App.showToast(_opts.toast || `已切换角色：${card.name || roleName}${modelHint}`);
@@ -1051,7 +1057,7 @@ export default (function init(App: AppKernel) {
   /** 启动时静默恢复上次使用的角色卡片配置（仅返回卡片数据，不触发切换动作/AI 消息） */
   App.restoreActiveRoleCard = async function restoreActiveRoleCard() {
     try {
-      const _uid = localStorage.getItem('dabai.userId') || '';
+      const _uid = resolveUserId();
       const res = await fetch('/api/character_cards?user_id=' + encodeURIComponent(_uid));
       const data = await res.json();
       // 按人隔离：服务端返回的是「本用户」当前生效的卡片（各人各自一份），

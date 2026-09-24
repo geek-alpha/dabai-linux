@@ -48,6 +48,7 @@ function fmtDate(ts: number | undefined): string {
 export default function init_29_video_ui(App: AppKernel) {
   /* ---------- 搜索结果分页状态（下拉持续加载更多） ---------- */
   const PAGE_SIZE = 12;  // 每页条数（与后端 limit 一致）
+  const MAX_PAGES = 50;      // 列表页数硬上限（50×12=600 条，与后端 page 上限一致）：持续加载也得有终点
   type SearchPager = { keyword: string; platform: string; sort: string; page: number; loading: boolean; hasMore: boolean };
   let searchPager: SearchPager = { keyword: '', platform: 'all', sort: 'relevance', page: 0, loading: false, hasMore: true };
   let renderedUrls: Set<string> = new Set(); // 已渲染卡片 url（跨页去重：B站排序漂移/AcFun重复返回）
@@ -356,13 +357,27 @@ export default function init_29_video_ui(App: AppKernel) {
   }
 
   /* ---------- 下拉持续加载：滚动接近底部时加载下一页 ---------- */
-  async function loadSearchMore() {
+  // 返回本页「去重后新增的条数」（0 = 上游没有新内容了）。自动连播补页与用户滚动
+  // 可能同时发生，并发调用复用同一次请求——各发一次会重复拉同一页，也会把翻页误当失败。
+  let pendingMore: Promise<number> | null = null;
+  function loadSearchMore(): Promise<number> {
+    if (pendingMore) return pendingMore;
+    pendingMore = loadMorePage().finally(() => {
+      pendingMore = null;
+      maybeAutoFillMore();   // 补页链：容器可见且仍不满一屏时继续补，直到填满或到底
+    });
+    return pendingMore;
+  }
+
+  async function loadMorePage(): Promise<number> {
     const st = searchPager;
-    if (st.loading || !st.hasMore) return;
-    if (!st.keyword && !hotMode) return;   // 既无关键词又不是热门模式 → 无源可加载
+    if (st.loading || !st.hasMore) return 0;
+    if (!st.keyword && !hotMode) return 0;   // 既无关键词又不是热门模式 → 无源可加载
+    if (st.page >= MAX_PAGES) { st.hasMore = false; updateSearchFooter(); return 0; }
     st.loading = true;
     const nextPage = st.page + 1;
     setSearchFooter('加载中…');
+    let added = 0;
     try {
       let data: any;
       if (st.keyword) {
@@ -374,7 +389,7 @@ export default function init_29_video_ui(App: AppKernel) {
         const res = await fetch('/api/video_hub/api/search?' + params.toString());
         if (!res.ok) throw new Error('HTTP ' + res.status);
         data = await res.json();
-        if (searchPager.keyword !== st.keyword || searchPager.platform !== st.platform || searchPager.sort !== st.sort) return;  // 已换关键词/换源/换排序，丢弃过期页
+        if (searchPager.keyword !== st.keyword || searchPager.platform !== st.platform || searchPager.sort !== st.sort) return 0;  // 已换关键词/换源/换排序，丢弃过期页
       } else {
         // 热门推荐翻页
         const params = new URLSearchParams({
@@ -383,11 +398,13 @@ export default function init_29_video_ui(App: AppKernel) {
         const res = await fetch('/api/video_hub/api/hot?' + params.toString());
         if (!res.ok) throw new Error('HTTP ' + res.status);
         data = await res.json();
-        if (!hotMode || searchPager.platform !== st.platform) return;  // 已切平台/已开始搜索，丢弃过期页
+        if (!hotMode || searchPager.platform !== st.platform) return 0;  // 已切平台/已开始搜索，丢弃过期页
       }
       st.page = nextPage;
       st.hasMore = data.has_more !== false;
-      appendVideoSearchResults(data.results || []);
+      added = appendVideoSearchResults(data.results || []);
+      // 去重后一条新的都没有（上游翻页开始重复）或已到页数上限 → 到底，列表不再长
+      if (!added || st.page >= MAX_PAGES) st.hasMore = false;
       updateSearchFooter();
     } catch (e) {
       const err = e as Error;
@@ -396,13 +413,17 @@ export default function init_29_video_ui(App: AppKernel) {
     } finally {
       st.loading = false;
     }
+    return added;
   }
 
   /* ---------- 追加后内容不满一屏时自动补页（保证滚动加载可触发） ---------- */
+  // 容器隐藏时 clientHeight=0 会一直误判「不满一屏」，隐藏就直接不补，
+  // 避免弹窗关着时白拉几十页；可见时补页由「填满即停 + 页数上限」收口。
   function maybeAutoFillMore() {
     const el = App.videoSearchResults!;
     setTimeout(() => {
       if (searchPager.loading || !searchPager.hasMore) return;
+      if (!el.clientHeight) return;
       if (el.scrollHeight <= el.clientHeight + 40) loadSearchMore();
     }, 60);
   }
@@ -498,17 +519,37 @@ export default function init_29_video_ui(App: AppKernel) {
   /* ---------- 搜索顺序自动连播：连播队列为空时的隐式片单 ---------- */
   // 大屏播完一部后若队列取不到片，调用这里接着播「最近一次搜索结果」的下一部：
   // 游标优先（最近从列表点播的那部顺延），其次按刚播完视频的原页链接匹配位置。
-  App.videoNextFromSearch = function videoNextFromSearch(endedUrl?: string): VideoItem | null {
+  // 顺延到列表末尾时自动扩下一页再接上 —— 没人干预也能一直播，直到上游翻页
+  // 不再返回新内容（去重后零新增）或到达页数上限。
+  App.videoNextFromSearch = async function videoNextFromSearch(endedUrl?: string): Promise<VideoItem | null> {
     const list = lastSearchVideos;
     if (!list.length) return null;
-    if (playedSearchItem) {
-      const i = list.indexOf(playedSearchItem);
-      if (i >= 0) return i + 1 < list.length ? list[i + 1] : null;
-    }
-    const url = String(endedUrl || '');
-    if (url) {
-      const j = list.findIndex(x => x.webpage_url === url);
-      if (j >= 0) return j + 1 < list.length ? list[j + 1] : null;
+    const cursorAt = (): number => {
+      if (playedSearchItem) {
+        const i = list.indexOf(playedSearchItem);
+        if (i >= 0) return i;
+      }
+      const url = String(endedUrl || '');
+      return url ? list.findIndex(x => x.webpage_url === url) : -1;
+    };
+    const pickAfter = (from: number): VideoItem | null => {
+      for (let i = from + 1; i < list.length; i++) {
+        if (list[i] && list[i].webpage_url) return list[i];
+      }
+      return null;
+    };
+    const at = cursorAt();
+    if (at < 0) return null;   // 刚播完那部不在最近搜索结果里（队列/收藏来的）→ 不硬接
+    const hit = pickAfter(at);
+    if (hit) return hit;
+    if (!searchPager.hasMore) return null;
+    // 翻页失败（hasMore 仍为 true）不该白断无人值守播放 → 再给一次机会；
+    // 零新增时 hasMore 已被置 false，直接停。
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const added = await loadSearchMore();
+      if (lastSearchVideos !== list) return null;   // 等页期间用户换了搜索 → 别把旧列表的游标接过去
+      if (added) return pickAfter(list.length - added - 1);
+      if (!searchPager.hasMore) return null;
     }
     return null;
   };

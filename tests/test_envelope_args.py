@@ -179,6 +179,10 @@ def test_replay_f_group_covers_recidivism_and_separates_residual():
             cwd=str(ROOT), capture_output=True, text=True, timeout=600).stdout)
 
     err = run("err_recidivism.py")
+    if not err["classes"]:
+        # data/longrun/ 不入仓（长跑引擎运行态），本机没跑过长跑就分不出错误类型。
+        # 这不是代码缺陷 —— 判据本身要在有 longrun trace 的机器上验，缺数据时跳过。
+        pytest.skip("本机没有 data/longrun/traces/*.jsonl，err_recidivism 无可分类报错")
     f_count = next(c["count"] for c in err["classes"] if c["code"] == "F")
     f = run("replay_validation.py")["classes"]["F"]
     assert f["total"] == f_count, f"重放分母 {f['total']} ≠ 历史计数 {f_count}"

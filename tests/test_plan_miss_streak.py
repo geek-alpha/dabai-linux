@@ -192,7 +192,9 @@ def test_hint_injected_on_every_tool_branch():
 
 def test_hint_text_defined_once():
     """提示文案只允许出现在 _plan_miss_hint 里——多一份拷贝就多一个走偏的入口。"""
-    src = "\n".join(_agent_lines())
+    # 只数代码行：注释里引用文案是说明，不是第二个注入入口。不排掉注释，任何人
+    # 在注释里提一句文案就会把这条钉子敲红（实测：加轮级上限的注释引用了一次）。
+    src = "\n".join(l for l in _agent_lines() if not l.lstrip().startswith("#"))
     assert src.count("【清单提示】") == 1
 
 
@@ -410,3 +412,158 @@ def test_multi_round_judgement_has_one_implementation():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+# ---------- 契约 9：清单提示的轮级上限（2026-09-24 修同类刷屏） ----------
+#
+# 背景：verify_hints 的刷屏（一轮最高 45 次）修完当天实测，plan_hints 是**同一类 bug**——
+# data/turn_metrics.jsonl 采样 220 轮里 16 轮 plan_hints>1、最高 38、合计 257。
+# 成因同源：_plan_early_armed 是「消费一次即解除」的一次性标记，而 _watch_plan_tool
+# 在**每次**工具调用上都重新置位——「提醒→消费→再调工具→再置位」循环，一轮能喊 38 遍。
+#
+# 上界论证（这决定了它是不是 bug）：若「>1」只是两个注入点（_plan_miss_hint /
+# _plan_early_hint）各说一次，上界只能是 2；实测最高 38，且 16 个 >1 的轮里 13 个
+# 「提示次数 > 本轮工具种类数」（同一工具被反复调用）——只能是同一句话被重放。
+# 反过来说清什么观测会推翻这组测试：若那些轮里每次注入带的是**不同的 streak 数字**
+# （每个 tool_round 各自是一条独立事实），则 >1 属设计，本轮改动该推翻。
+# 合成反证可复算：data/_probe_plan_cap_refute.py（40 次多步调用：新语义 1 次 /
+# 旁路轮级闸 38 次；压到 ≤1 后审计 plan_hint_turns 28→28 不变、total 257→28）。
+
+
+def _mk_round_agent():
+    """造一个只带清单检查点状态机的实例（轮级标记齐全）。"""
+    ag = agent.AIAgent.__new__(agent.AIAgent)
+    ag._plan_round_used = False
+    ag._plan_round_calls = 0
+    ag._plan_round_names = set()
+    ag._plan_early_armed = False
+    ag._plan_hint_shown = False
+    ag._plan_recap_done = True      # 回显不参与本组用例
+    ag._plan_miss_armed = False
+    ag._plan_miss_streak = 0
+    ag._plan_miss_sid = None
+    return ag
+
+
+def _round_hint_count(ag, n_calls, seq=("code_read", "code_search", "shell_run")):
+    """重放一轮：n_calls 次工具调用，返回「清单类提示」被注入的次数。
+
+    注入口径与两条工具执行分支逐字一致：_plan_miss_hint() + _plan_early_hint()，
+    非空才算一次（eff_plan_hints += 1 的判据）。
+    """
+    ag._reset_plan_watch()
+    shown = 0
+    for i in range(n_calls):
+        ag._watch_plan_tool(seq[i % len(seq)])
+        if ag._plan_miss_hint() + ag._plan_early_hint():
+            shown += 1
+    return shown
+
+
+def test_hint_capped_at_once_per_round():
+    """轮级上限：一轮里调 40 次工具，提示也只能出现 1 次（本轮修的主判据）。
+
+    什么观测会推翻它：这个数变成 >1（上限没生效），或变成 0（闸把提示整个关掉了）。
+    """
+    assert _round_hint_count(_mk_round_agent(), 40) == 1
+
+
+def test_control_without_cap_floods():
+    """反证：同一段重放，只要把轮级闸旁路（等价于改动前的语义），提示就刷屏。
+
+    这一条是「改动真的在起作用」的证据——没有它，「=1」也可能是别处恰好只响一次。
+    """
+    ag = _mk_round_agent()
+    ag._reset_plan_watch()
+    shown = 0
+    for i in range(40):
+        ag._plan_hint_shown = False     # 旁路轮级闸
+        ag._watch_plan_tool(("code_read", "code_search", "shell_run")[i % 3])
+        if ag._plan_miss_hint() + ag._plan_early_hint():
+            shown += 1
+    assert shown > 1, "旁路轮级闸后仍只响一次——说明刷屏另有成因，本改动该推翻"
+
+
+def test_both_plan_hints_share_one_cap():
+    """两条清单提示（跨轮的清单提示 / 同轮的开工提示）**共用同一个**轮级闸。
+
+    它们说的是同一个动作（plan_update）：一轮里各喊一遍仍是重复——
+    各自一个 shown 字段的上界是 2，实测最高 38 已经证明这不是设计。
+    共用同一字段：哪一条先响，另一条在本轮就闭嘴（并撒掉 armed、落盘）。
+    """
+    ag = _mk_round_agent()
+    ag._reset_plan_watch()
+    # 开工提示先响：随后 armed 的跨轮那条在本轮不能再响
+    ag._plan_early_armed = True
+    assert "【开工提示】" in ag._plan_early_hint()
+    ag._plan_miss_armed = True
+    assert ag._plan_miss_hint() == "", "同一轮里两条清单提示各响了一遍"
+    assert ag._plan_miss_armed is False, "被上限拦下的 armed 没撒掉——下一轮会重放"
+    # 消费一次即解除
+    assert ag._plan_early_hint() == "", "开工提示消费后又被重放"
+    # 已提醒过的轮不再重新 arm（刷屏成因）
+    ag._watch_plan_tool("code_read")
+    ag._watch_plan_tool("code_search")
+    ag._watch_plan_tool("shell_run")
+    assert ag._plan_early_hint() == "", "已提醒过的轮又被重新 arm——刷屏成因未除"
+
+
+def test_cap_resets_next_round():
+    """上限是轮级的：下一轮该提醒还得提醒（否则等于此后永不提醒）。
+
+    缺这一条，「压到 1 次」的改法很容易写成「一辈子只提醒一次」——
+    那是把刷屏换成缺口，比刷屏更坏。
+    """
+    ag = _mk_round_agent()
+    assert _round_hint_count(ag, 40) == 1
+    assert _round_hint_count(ag, 40) == 1, "第二轮不提醒了——轮级上限写成了全局上限"
+
+
+def test_cap_wiring_pinned_in_source():
+    """接线契约：三处少一处，上限就不成立（源码级钉死，防静默退化）。
+
+    · _reset_plan_watch 清零 shown —— 缺则此后永不提醒
+    · _watch_plan_tool 已置位不再 arm —— 缺则照旧刷屏
+    · 两个 _plan_*_hint 消费时置位并再判一次 —— 缺则上限不生效
+    """
+    lines = _agent_lines()
+    rw = next(i for i, l in enumerate(lines) if "def _reset_plan_watch" in l)
+    body = "\n".join(lines[rw:rw + 12])
+    assert "self._plan_hint_shown = False" in body, \
+        "轮入口没清零 shown——上限一旦置位就永不解除"
+    # 闸只允许有一个字段：两个字段 = 上界 2，本轮修的刷屏会回来一半
+    src = "\n".join(lines)
+    assert src.count("_plan_hint_shown = False") == 2, \
+        "轮级闸的字段数不是 1（应只有 __init__ 与 _reset_plan_watch 两处清零）——闸分叉了"
+    wt = next(i for i, l in enumerate(lines) if "def _watch_plan_tool" in l)
+    nxt = next(i for i in range(wt + 1, len(lines))
+               if lines[i].lstrip().startswith("def ") or lines[i].lstrip().startswith("# ----"))
+    wbody = "\n".join(lines[wt:nxt])
+    assert "_plan_hint_shown" in wbody, "登记处没看 shown——每次工具调用都会重新 arm"
+    for fn in ("def _plan_miss_hint", "def _plan_early_hint"):
+        hz = next(i for i, l in enumerate(lines) if fn in l)
+        nxt = next(i for i in range(hz + 1, len(lines))
+                   if lines[i].lstrip().startswith("def ")
+                   or lines[i].lstrip().startswith("# ----"))
+        hbody = "\n".join(lines[hz:nxt])
+        assert "_plan_hint_shown" in hbody, f"{fn} 的注入处没看轮级上限——闸形同虚设"
+
+
+def test_cap_suppresses_counts_not_coverage():
+    """上限只压次数，不压覆盖：压到 ≤1 后审计的「触发轮数」必须不变。
+
+    拿真实日志算（只读、不改盘）：轮数若也跟着降，说明改法把刷屏换成了缺口。
+    """
+    import json
+    log = BASE / "data" / "turn_metrics.jsonl"
+    if not log.exists():
+        pytest.skip("无实测日志")
+    rows = [json.loads(l) for l in log.read_text(encoding="utf-8").splitlines() if l.strip()]
+    if not any("plan_hints" in r for r in rows):
+        pytest.skip("埋点尚无采样")
+    mod = _load_audit()
+    capped = [dict(r, plan_hints=min(1, int(r.get("plan_hints") or 0))) for r in rows]
+    a, b = mod.call_stats(rows), mod.call_stats(capped)
+    assert b["plan_hint_turns"] == a["plan_hint_turns"], \
+        "压上限把触发轮数也压掉了——刷屏换成了缺口"
+    assert b["plan_hint_total"] <= a["plan_hint_total"]

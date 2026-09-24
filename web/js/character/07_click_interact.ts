@@ -1453,6 +1453,39 @@ export default (function init(App: AppKernel) {
     // 让 VRM 立即更新一次
     if (App.vrm && App.vrm.humanoid) App.vrm.humanoid.update();
   };
+  /* 待机动作波形库 —— 自然感不来自「加更多动作」，而来自「不再永远同一节拍」。
+   *
+   * 三个可量的机械感来源（tools/motion_naturalness_probe.py 测的就是它们）：
+   *   1. 呼吸是对称正弦 —— 真人吸气快、呼气慢（吸:呼 ≈ 1:1.4），纯 sin 两边一样长；
+   *   2. 整条脊椎同频同相 —— 真人靠横膈膜带动胸廓，锁骨、颈、头依次滞后；
+   *      同相时躯干看起来就是「一整块板在前后摆」；
+   *   3. 所有微动是固定常数频率 —— 盯久了就是节拍器，能量全压在一个频点上。
+   *
+   * 下面三个函数分别对付这三点，幅度全部沿用原值，只改波形形状与相位。 */
+  const BREATH_F = 0.19;   // 呼吸基频 Hz（≈11 次/分），与原 sin(t*1.2) 同频，不改呼吸快慢
+  const BREATH_IN = 0.42;  // 吸气占周期比例（其余 0.58 为呼气）
+
+  /** 非对称呼吸波：-1（气尽）→ +1（吸满）→ -1，吸气段短、呼气段长。
+   *  两段都端点导数为 0，因此周期衔接处不会有「折角」抖动。 */
+  function breathWave(t: number): number {
+    let p = (t * BREATH_F) % 1;
+    if (p < 0) p += 1;
+    if (p < BREATH_IN) return -Math.cos(Math.PI * (p / BREATH_IN));
+    return Math.cos(Math.PI * ((p - BREATH_IN) / (1 - BREATH_IN)));
+  }
+
+  /** 呼吸深度慢调制：周期约 27s，0.7~1.3 倍。没有它，每一次呼吸都一模一样深。 */
+  function breathDepth(t: number): number {
+    return 1 + 0.3 * Math.sin(t * 0.037);
+  }
+
+  /** 双频微动：两个非整数倍频率相加，波形长时间不重复。
+   *  权重之和为 1，峰值不超过单频，不会把幅度改大。 */
+  function micro(t: number, f1: number, f2: number, mix: number, ph: number = 0): number {
+    return Math.sin(t * f1 + ph) * (1 - mix) + Math.sin(t * f2 + ph * 0.6) * mix;
+  }
+
+
   App.animateModel = function animateModel(t, dt, mouthOpen) {
     if (!App.modelGroup) return;
 
@@ -1665,18 +1698,22 @@ export default (function init(App: AppKernel) {
 
     // --- 脊椎 / 呼吸 + 姿态偏移 + idle 活力摆动 ---
     const energy = App.currentState === App.State.IDLE ? 0.6 + Math.sin(App.idleEnergy) * 0.4 : 1.0;
-    const breathAmp = 0.008 + (App.currentState === App.State.IDLE ? 0.006 : 0);
-    const bodySwayY = App.currentState === App.State.IDLE ? Math.sin(App.idleEnergy * 0.7) * 0.012 * energy : 0;
-    const bodySwayZ = App.currentState === App.State.IDLE ? Math.cos(App.idleEnergy * 0.5) * 0.006 * energy : 0;
-    if (B.spine) B.spine.rotation.x = App.lerp(B.spine.rotation.x, poseVal('spine', 'x', Math.sin(t * 1.2) * breathAmp), 0.08);
+    const breathAmp = (0.008 + (App.currentState === App.State.IDLE ? 0.006 : 0)) * breathDepth(t);
+    // 呼吸沿关节链逐级传导：腰腹 → 胸廓 → 锁骨，每级滞后 0.09s（同频同相 = 整块板）
+    const brSpine = breathWave(t - 0.09) * breathAmp;
+    const brChest = breathWave(t - 0.18) * breathAmp;
+    const brUpper = breathWave(t - 0.27) * breathAmp;
+    const bodySwayY = App.currentState === App.State.IDLE ? micro(App.idleEnergy, 0.7, 0.23, 0.35) * 0.012 * energy : 0;
+    const bodySwayZ = App.currentState === App.State.IDLE ? micro(App.idleEnergy, 0.5, 0.19, 0.4) * 0.006 * energy : 0;
+    if (B.spine) B.spine.rotation.x = App.lerp(B.spine.rotation.x, poseVal('spine', 'x', brSpine), 0.08);
     if (B.spine) B.spine.rotation.y = App.lerp(B.spine.rotation.y, poseVal('spine', 'y', bodySwayY), 0.08);
     if (B.spine) B.spine.rotation.z = App.lerp(B.spine.rotation.z, poseVal('spine', 'z', bodySwayZ), 0.08);
-    if (B.chest) B.chest.rotation.x = App.lerp(B.chest.rotation.x, Math.sin(t * 1.2) * (breathAmp * 0.75) + poseValAxis('chest', 'x') * blend, 0.08);
-    if (B.upperChest) B.upperChest.rotation.x = App.lerp(B.upperChest.rotation.x, Math.sin(t * 1.2) * (breathAmp * 0.5), 0.08);
+    if (B.chest) B.chest.rotation.x = App.lerp(B.chest.rotation.x, brChest * 0.75 + poseValAxis('chest', 'x') * blend, 0.08);
+    if (B.upperChest) B.upperChest.rotation.x = App.lerp(B.upperChest.rotation.x, brUpper * 0.5, 0.08);
 
     // --- 颈部 + 姿态偏移 ---
     if (B.neck) {
-      let nz = Math.sin(t * 0.5) * 0.015 + poseValAxis('neck', 'z') * blend;
+      let nz = micro(t, 0.5, 0.17, 0.35) * 0.015 + poseValAxis('neck', 'z') * blend;
       B.neck.rotation.z = App.lerp(B.neck.rotation.z, nz, 0.06);
     }
 
@@ -1689,12 +1726,17 @@ export default (function init(App: AppKernel) {
         tX,
         tZ = 0;
       const headMicroAmp = App.mutualGaze ? 0.008 : 0.03;
+      // 头部微动同样双频叠加（单频盯久了就是节拍器）
+      const headSwayY = micro(t, 0.4, 0.13, 0.4);
+      const headSwayX = micro(t, 0.6, 0.21, 0.35);
+      // 呼吸传导到头部：链末端，滞后 0.5s，幅度极小（只留「有呼吸」的存在感）
+      const headBreath = breathWave(t - 0.5) * breathAmp * 0.5;
       if (look) {
-        tY = look.y + Math.sin(t * 0.4) * headMicroAmp;
-        tX = look.x + Math.sin(t * 0.6) * headMicroAmp * 0.5 + App.gazeHeadTiltAcc;
+        tY = look.y + headSwayY * headMicroAmp;
+        tX = look.x + headSwayX * headMicroAmp * 0.5 + headBreath + App.gazeHeadTiltAcc;
       } else {
-        tY = Math.sin(t * 0.4) * 0.05;
-        tX = Math.sin(t * 0.6) * 0.025 + App.gazeHeadTiltAcc;
+        tY = headSwayY * 0.05;
+        tX = headSwayX * 0.025 + headBreath + App.gazeHeadTiltAcc;
       }
       if (App.currentState === App.State.THINKING) {
         tX += -0.1;
@@ -1753,15 +1795,15 @@ export default (function init(App: AppKernel) {
     // 左臂与左腿反相，右臂与左臂反相
     const leftArmSwing = walkProgress > 0 ? -Math.sin(walkCyclePhase) * ARM_SWING_AMP : 0;
     const rightArmSwing = walkProgress > 0 ? Math.sin(walkCyclePhase) * ARM_SWING_AMP : 0;
-    const idleArmSwing = App.currentState === App.State.IDLE && walkProgress <= 0 ? Math.sin(App.idleEnergy * 0.9) * 0.035 * energy : 0;
+    const idleArmSwing = App.currentState === App.State.IDLE && walkProgress <= 0 ? micro(App.idleEnergy, 0.9, 0.31, 0.3) * 0.035 * energy : 0;
     if (B.leftUpperArm) {
       // 摆臂主要用 rotation.x（前后方向），z 保持 rest pose 只做呼吸微动
       let tz = App.armZ(
-        Math.sin(t * 1.2) * 0.012 + idleArmSwing
+        breathWave(t - 0.36) * 0.012 + idleArmSwing
         + poseValAxis('leftUpperArm', 'z') * blend
         + (App.currentState === App.State.SPEAKING ? Math.sin(t * 2.5) * 0.015 : 0)
       );
-      let tx = Math.sin(t * 1.2 + 0.3) * 0.015 + Math.sin(t * 0.7) * 0.008 * energy + leftArmSwing;
+      let tx = micro(t, 1.2, 0.43, 0.3, 0.3) * 0.015 + micro(t, 0.7, 0.29, 0.35) * 0.008 * energy + leftArmSwing;
       tx += poseValAxis('leftUpperArm', 'x') * blend;
       if (App.currentState === App.State.SPEAKING) {
         tx += Math.sin(t * 3) * 0.04;
@@ -1772,7 +1814,7 @@ export default (function init(App: AppKernel) {
     if (B.leftLowerArm) {
       // 肘部弯曲已取消
       let elbowBend = 0;
-      let tx = -0.15 + Math.sin(t * 1.2) * 0.015 + elbowBend + idleArmSwing * 0.5;
+      let tx = -0.15 + breathWave(t - 0.36) * 0.015 + elbowBend + idleArmSwing * 0.5;
       tx += poseValAxis('leftLowerArm', 'x') * blend;
       if (App.currentState === App.State.SPEAKING) tx += Math.sin(t * 3 + 0.5) * 0.03;
       B.leftLowerArm.rotation.x = App.lerp(B.leftLowerArm.rotation.x, tx, 0.07);
@@ -1781,11 +1823,11 @@ export default (function init(App: AppKernel) {
     // --- 右臂 + 姿态 + 行走摆臂（与左臂反相） + idle 活力微摆 ---
     if (B.rightUpperArm) {
       let tz = -App.armZ(
-        -Math.sin(t * 1.2 + 0.5) * 0.012 + idleArmSwing
+        -breathWave(t - 0.78) * 0.012 + idleArmSwing
         - poseValAxis('rightUpperArm', 'z') * blend
         + (App.currentState === App.State.SPEAKING ? Math.sin(t * 2.5) * 0.015 : 0)
       );
-      let tx = Math.sin(t * 1.2) * 0.015 + Math.sin(t * 0.65) * 0.008 * energy + rightArmSwing;
+      let tx = micro(t, 1.2, 0.47, 0.3) * 0.015 + micro(t, 0.65, 0.31, 0.35) * 0.008 * energy + rightArmSwing;
       tx += poseValAxis('rightUpperArm', 'x') * blend;
       if (App.currentState === App.State.SPEAKING) {
         tx += -Math.sin(t * 3) * 0.04;
@@ -1795,7 +1837,7 @@ export default (function init(App: AppKernel) {
     }
     if (B.rightLowerArm) {
       let elbowBend = 0;
-      let tx = -0.15 + Math.sin(t * 1.2) * 0.015 + elbowBend - idleArmSwing * 0.5;
+      let tx = -0.15 + breathWave(t - 0.78) * 0.015 + elbowBend - idleArmSwing * 0.5;
       tx += poseValAxis('rightLowerArm', 'x') * blend;
       B.rightLowerArm.rotation.x = App.lerp(B.rightLowerArm.rotation.x, tx, 0.07);
     }
@@ -1803,17 +1845,17 @@ export default (function init(App: AppKernel) {
     // --- 手部 (姿态驱动 + 呼吸微动) ---
     // 姿态可同时控制 rotation.x(屈伸) / rotation.y(内外转) / rotation.z(旋转)
     if (B.leftHand) {
-      let tx = Math.sin(t * 1.3) * 0.015 + poseValAxis('leftHand', 'x') * blend;
-      let ty = Math.sin(t * 0.7) * 0.01 + poseValAxis('leftHand', 'y') * blend;
-      let tz = Math.sin(t * 1.5) * 0.025 + poseValAxis('leftHand', 'z') * blend;
+      let tx = micro(t, 1.3, 0.41, 0.3) * 0.015 + poseValAxis('leftHand', 'x') * blend;
+      let ty = micro(t, 0.7, 0.27, 0.35) * 0.01 + poseValAxis('leftHand', 'y') * blend;
+      let tz = micro(t, 1.5, 0.53, 0.3) * 0.025 + poseValAxis('leftHand', 'z') * blend;
       B.leftHand.rotation.x = App.lerp(B.leftHand.rotation.x, tx, 0.08);
       B.leftHand.rotation.y = App.lerp(B.leftHand.rotation.y, ty, 0.08);
       B.leftHand.rotation.z = App.lerp(B.leftHand.rotation.z, tz, 0.08);
     }
     if (B.rightHand) {
-      let tx = Math.sin(t * 1.3 + 0.5) * 0.015 + poseValAxis('rightHand', 'x') * blend;
-      let ty = Math.sin(t * 0.7) * 0.01 + poseValAxis('rightHand', 'y') * blend;
-      let tz = -Math.sin(t * 1.5) * 0.025 + poseValAxis('rightHand', 'z') * blend;
+      let tx = micro(t, 1.3, 0.43, 0.3, 0.5) * 0.015 + poseValAxis('rightHand', 'x') * blend;
+      let ty = micro(t, 0.7, 0.23, 0.35) * 0.01 + poseValAxis('rightHand', 'y') * blend;
+      let tz = -micro(t, 1.5, 0.57, 0.3) * 0.025 + poseValAxis('rightHand', 'z') * blend;
       B.rightHand.rotation.x = App.lerp(B.rightHand.rotation.x, tx, 0.08);
       B.rightHand.rotation.y = App.lerp(B.rightHand.rotation.y, ty, 0.08);
       B.rightHand.rotation.z = App.lerp(B.rightHand.rotation.z, tz, 0.08);
@@ -1823,14 +1865,14 @@ export default (function init(App: AppKernel) {
     const walkHipSway = walkProgress > 0 ? Math.sin(walkCyclePhase) * 0.050 * sf : 0;
     const walkHipForward = walkProgress > 0 ? Math.cos(walkCyclePhase) * 0.040 * sf : 0;
     if (B.hips) {
-      let hy = Math.sin(t * 0.35) * 0.01 + walkHipSway;
+      let hy = micro(t, 0.35, 0.12, 0.35) * 0.01 + walkHipSway;
       B.hips.rotation.y = App.lerp(B.hips.rotation.y, hy, 0.06);
       // 髋部侧移（重心左右转移）
       if (B.hips.position) {
         let hx = walkProgress > 0 ? Math.cos(walkCyclePhase) * 0.025 * sf : 0;
         B.hips.position.x = App.lerp(B.hips.position.x || 0, hx, 0.06);
       }
-      let hz = walkHipForward + Math.sin(t * 1.2) * 0.004;
+      let hz = walkHipForward + breathWave(t) * 0.004;
       // 髋部 rotation.x = 前后倾斜
       B.hips.rotation.x = App.lerp(B.hips.rotation.x || 0, hz, 0.06);
     }

@@ -140,15 +140,23 @@ def _read_cmd(argv) -> int:
     return 0
 
 
+USAGE = ('用法：python tools/lesson_add.py "教训文本"（--force 跳过写入闸门）'
+         '\n       python tools/lesson_add.py list [N] ｜ show <序号|hash前缀>')
+
+
 def main() -> int:
     argv = [a for a in sys.argv[1:] if a != "--force"]
     force = len(argv) != len(sys.argv[1:])
+    # 试探性调用绝不能写库：本脚本原先不认 --help，那一串参数被当成教训文本
+    # 写成了第 316 条（内容是字面的 "--help"），只能人肉清库。
+    if argv and argv[0] in ("-h", "--help", "help"):
+        print(USAGE)
+        return 0
     if argv and argv[0] in ("list", "show"):
         return _read_cmd(argv)
     text = " ".join(argv).strip()
     if not text:
-        print('用法：python tools/lesson_add.py "教训文本"（--force 跳过写入闸门）'
-              '\n       python tools/lesson_add.py list [N] ｜ show <序号|hash前缀>')
+        print(USAGE)
         return 2
     hard, soft = _screen(text)
     if hard and not force:

@@ -594,8 +594,8 @@ export interface AppKernel {
   videoSearch: () => Promise<void>;
   renderVideoSearchResults: (videos: VideoItem[]) => void;
   playVideoItem: (v: VideoItem, opts?: { auto?: boolean }) => Promise<boolean>;
-  /* 队列为空时按最近搜索结果顺序取下一部（大屏自动连播兜底，29_video_ui 挂载） */
-  videoNextFromSearch: (endedUrl?: string) => VideoItem | null;
+  /* 队列为空时按最近搜索结果顺序取下一部；播到列表末尾会自动扩页再接上（29_video_ui 挂载） */
+  videoNextFromSearch: (endedUrl?: string) => Promise<VideoItem | null>;
   switchVideoTab: (tab: 'search' | 'favorites' | 'history' | 'sources') => void;
   refreshVideoFavorites: () => Promise<void>;
   renderVideoFavorites: (data: any) => void;

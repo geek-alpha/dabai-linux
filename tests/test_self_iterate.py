@@ -927,14 +927,24 @@ def test_non_evaluator_target_skips_the_check(mod, monkeypatch):
 # 自我迭代的接力棒记进了开源贡献那本账（long_horizon.json 里那两条 plan_miss 记录）。
 
 def test_ledger_id_only_from_real_ledger(mod):
+    """映射结果必须是台账里真实存在的 id。
+
+    2026-09-24 修正：本用例原先断言 "self-iterate" / "hermes-learning-loop" 在台账里
+    ——两者在 long_horizon.json 里**从来没有出现过**（git log -S 两个名字都查无提交），
+    所以这三条断言从写下那天起就是红的，只是没人跑过这个文件。现在改成对着真实台账
+    id 断言：映射结果必须 ∈ ledger_ids()。
+    """
     ids = mod.ledger_ids()
-    assert "self-iterate" in ids and "hermes-learning-loop" in ids
-    assert mod.ledger_id_for("rules:verify_rate") == "self-iterate"
-    assert mod.ledger_id_for("recidivism:A") == "self-iterate"
-    assert mod.ledger_id_for("learn") == "hermes-learning-loop"
-    # 台账里没有的名字（批判人格用的 longrun-engine / self-evolution）不硬塞，
-    # 退回自我迭代自己的账本
-    assert mod.ledger_id_for("longrun-engine") == "self-iterate"
+    assert ids, "读不到台账，本用例失去意义"
+    got_rule = mod.ledger_id_for("rules:verify_rate")
+    got_rec = mod.ledger_id_for("recidivism:A")
+    got_learn = mod.ledger_id_for("learn")
+    for got in (got_rule, got_rec, got_learn):
+        assert got in ids, f"{got!r} 不在台账 {ids} 里"
+    # 自我迭代自己的账本 = self-evolution（title「自我进化闭环」）
+    assert got_rule == got_rec
+    # 台账里没有的名字不硬塞，退回自我迭代自己的账本
+    assert mod.ledger_id_for("longrun-engine") == got_rule
 
 
 def test_ledger_id_never_invented(mod, monkeypatch):
@@ -954,8 +964,11 @@ def test_brief_writes_the_ledger_id(mod, monkeypatch):
     mod.start()
     monkeypatch.setattr(mod, "observe", _gaps(_one_gap(0.1983, "rules:verify_rate")))
     text = mod.brief()
-    assert "落盘 id 已由任务书写死：self-iterate" in text
+    real = mod.ledger_id_for("rules:verify_rate")
+    assert real, "台账里应有自我迭代自己的账本 id"
+    assert f"落盘 id 已由任务书写死：{real}" in text
     assert "不许自选" in text
+    # 台账读不到时退回 `<id>` 占位（宁可显式暴露，也不许编一个 id）
     monkeypatch.setattr(mod, "ledger_ids", lambda: [])
     assert "落盘 id 已由任务书写死：<id>" in mod.brief()
 
@@ -965,7 +978,9 @@ def test_brief_learn_round_writes_its_own_ledger_id(mod, monkeypatch):
     mod.start()
     monkeypatch.setattr(mod, "observe", _gaps())
     text = mod.brief()
-    assert "long_horizon.py log hermes-learning-loop" in text
+    real = mod.ledger_id_for("learn")
+    assert real, "台账里应有可落的账本 id"
+    assert f"long_horizon.py log {real}" in text
 
 
 def test_记账不许把真停因覆盖成未启动(mod):
@@ -982,3 +997,60 @@ def test_记账不许把真停因覆盖成未启动(mod):
     assert st["running"] is False
     assert st["stop_reason"] == "手动停止"
     assert st["stop_kind"] == "user"
+
+
+# ---------- 契约：任务书里的落盘 id 必须是台账里真实存在的 id（2026-09-24） ----------
+#
+# 背景（第 2 轮实测）：LEDGER_ID_BY_PREFIX 把 rules:* 映射到 "self-iterate"，而台账
+# long_horizon.json 里的这本账 id 是 "self-evolution"。ledger_id_for() 拿真实 id 校验
+# 不过就退回空串，任务书于是渲染成字面量「落盘 id 已由任务书写死：<id>」——执行体照着
+# 任务书没法落盘，只能自选 id，正是「第 5/6 轮把接力棒记进 oss-contrib」那类事故的温床。
+#
+# 什么观测会推翻它：若哪天台账把这本账改名，任务书又出现 `<id>` 占位符，说明对照表与
+# 台账再次脱节——那时该改成读台账自动发现，而不是再手写一个常量。
+
+
+def test_ledger_id_placeholder_never_leaks_into_brief(tmp_path, monkeypatch):
+    """任务书里不许出现 `<id>` 占位符；必须给出台账里真实存在的 id。"""
+    import json as _json
+    m = _load()
+    ledger = tmp_path / "long_horizon.json"
+    ledger.write_text(_json.dumps({"projects": [
+        {"id": "self-evolution", "title": "自我进化闭环"},
+        {"id": "pdd-cs", "title": "店铺双系统"}]}, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(m, "LEDGER_FILE", ledger)
+
+    got = m.ledger_id_for("rules:verify_rate")
+    assert got == "self-evolution", got
+    assert got in [p["id"] for p in _json.loads(ledger.read_text(encoding="utf-8"))["projects"]]
+    # 映射表里的每个目标都必须落到一个真实 id 上（learn 这本账不在表里时退回 self-evolution）
+    for t in ("rules:plan_rate", "recidivism:whatever", "self-iterate"):
+        assert m.ledger_id_for(t) in ("self-evolution", ""), t
+
+
+def test_ledger_mapping_points_at_existing_id():
+    """对照表指向的 id 必须在真实台账里存在（防止再写一个不存在的名字）。
+
+    本轮实测：表里写的是 "self-iterate"，台账里是 "self-evolution" —— 两者对不上，
+    任务书于是渲染出 `<id>` 占位符（brief 第 15 行），执行体只能自选 id。
+    """
+    m = _load()
+    ids = m.ledger_ids()
+    if not ids:
+        pytest.skip("读不到台账，跳过")
+    for prefix in ("rules", "recidivism", "self-iterate", "self-evolution"):
+        mapped = m.LEDGER_ID_BY_PREFIX.get(prefix)
+        assert mapped in ids, f"{prefix} -> {mapped} 不在台账 {ids} 里"
+
+
+def test_brief_never_renders_placeholder_with_real_ledger():
+    """回归：真实台账在场时，任务书的落盘 id 行**不许**出现 `<id>` 占位符。
+
+    这是本轮那个坑的直接判据——修好之前 brief 里就是字面量 `<id>`。
+    """
+    m = _load()
+    if not m.ledger_ids():
+        pytest.skip("读不到台账，跳过")
+    got = m.ledger_id_for("rules:verify_rate")
+    assert got and got != "<id>", got
+    assert got in m.ledger_ids()

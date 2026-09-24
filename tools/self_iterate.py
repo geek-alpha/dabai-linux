@@ -917,11 +917,17 @@ def critique_pack() -> str:
 # 下一轮读接力棒的人（下一个进程）就会在错的账本里找下一步。
 LEDGER_FILE = ROOT / "long_horizon.json"
 LEDGER_ID_BY_PREFIX = {
-    "rules": "self-iterate",          # 自指机制类缺口（rules:plan_rate / rules:verify_rate）
-    "recidivism": "self-iterate",     # 同错复发
-    "self-iterate": "self-iterate",
+    "rules": "self-evolution",        # 自指机制类缺口（rules:plan_rate / rules:verify_rate）
+    "recidivism": "self-evolution",   # 同错复发
+    "self-iterate": "self-evolution",
+    "self-evolution": "self-evolution",
     "learn": "hermes-learning-loop",  # 学习轮：学到的做法记在学习闭环那本账上
 }
+
+# 「自我迭代自己的账本」的候选 id，按优先级排。learn 那本账（hermes-learning-loop）
+# 现在台账里也不存在（该进化为「学习闭环」一册的内容被并进了 self-evolution 的 log），
+# 所以它同样走这条兜底——任务书只给存在的 id，缺账时不编名字。
+SELF_LEDGER_CANDIDATES = ("self-evolution", "self-iterate")
 
 
 def ledger_ids() -> list:
@@ -936,16 +942,24 @@ def ledger_ids() -> list:
 def ledger_id_for(target: str) -> str:
     """把本轮 target 映射成台账里**确定存在**的落盘 id（读不到台账返回空串）。
 
-    只从真实 id 里挑：先按 target 前缀查表，再拿台账校验，对不上就退回 self-iterate
-    （自我迭代自己的账本）——任务书永远只给存在的 id，执行体不必再从名字里猜。
+    只从真实 id 里挑：先按 target 前缀查表，表里的名字不在台账里就按候选顺序退到
+    「自我迭代自己的账本」（self-evolution，旧名 self-iterate）——任务书永远只给存在
+    的 id，执行体不必再从名字里猜。
+
+    2026-09-24 修正：旧实现把兜底写死成 "self-iterate"，而那名字台账里从来没有过 →
+    任务书渲染出 `<id>` 占位符。现在改成按候选表挑**台账里真实存在**的第一个，并在
+    候选全落空时返回空串（宁可显式暴露、也不编一个 id 出来）。
     """
     ids = ledger_ids()
     if not ids:
         return ""
-    pid = LEDGER_ID_BY_PREFIX.get(str(target or "").split(":")[0], "self-iterate")
-    if pid not in ids:
-        pid = "self-iterate" if "self-iterate" in ids else ""
-    return pid
+    pid = LEDGER_ID_BY_PREFIX.get(str(target or "").split(":")[0], "")
+    if pid in ids:
+        return pid
+    for cand in SELF_LEDGER_CANDIDATES:
+        if cand in ids:
+            return cand
+    return ""
 
 
 CONTRACT = """本轮契约（缺任一条，这轮就是无效轮）：

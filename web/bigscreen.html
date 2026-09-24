@@ -405,7 +405,10 @@
     try { ws = new WebSocket(proto + '://' + location.host + '/ws'); }
     catch (e) { setTimeout(connectWS, 3000); return; }
     ws.onopen = () => {
-      const uid = localStorage.getItem('dabai.userId') || 'u_' + Date.now().toString(36);
+      // ?uid= 优先：局域网下各 origin 的 localStorage 桶互不相通，靠它把大屏
+      // 和主页面指到同一个身份（公网只认 cookie，此参数不影响鉴权）
+      const _qUid = (new URLSearchParams(location.search).get('uid') || '').trim();
+      const uid = _qUid || localStorage.getItem('dabai.userId') || 'u_' + Date.now().toString(36);
       localStorage.setItem('dabai.userId', uid);
       ws.send(JSON.stringify({ type: 'set_user', user_id: uid }));
     };

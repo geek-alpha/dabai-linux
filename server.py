@@ -125,7 +125,9 @@ MODELS_DIR = BASE_DIR / "models"
 BACKGROUNDS_DIR = BASE_DIR / "backgrounds"
 # 聊天附件（用户发来的图片/文件）：按用户隔离、按天分目录，入口见 /api/upload
 UPLOADS_DIR = BASE_DIR / "data" / "uploads"
-SERVER_PORT = 8000
+# 端口可用环境变量覆盖（本机 8000 被 WSL 侧占着，由 DABAI_PORT=8008 提供）。
+# 默认值必须是 8000：别的机器服务就监听在 8000，写死 8008 会让它们起不来。
+SERVER_PORT = int(os.environ.get("DABAI_PORT", "8000"))
 # nginx 前置 TLS 终结模式（settings.json harness.http_only=true）下的回源端口
 HTTP_ONLY_PORT = 8001
 AUDIO_DIR.mkdir(exist_ok=True)
@@ -225,6 +227,12 @@ async def lifespan(app: FastAPI):
             # 定时任务从出生起就与连接解耦：广播代理 + 常驻状态——
             # 页面从未打开/已全部关闭时照样派发、执行、汇报（后台完成，落库）
             state = await _get_resident_state()
+            if _self_iterate_matches(job):
+                # 自我迭代轮不下发给子智能体：子智能体跑在独立会话里，主人只能看到
+                # 任务中心一个「执行中」，过程全在后台。注入主对话后，工具链、思考、
+                # 改动都长在主人眼前这条对话里 —— 这才是「从幕后到前端」。
+                await _self_iterate_fire_in_chat(job, state)
+                return
             si = _self_iterate_tick(job)
             if si is not None and not si.get("running"):
                 # 已停（环境阻塞/预算/连续无效）就别再派 —— 派出去的子智能体必然秒失败，
@@ -2892,6 +2900,103 @@ def _self_iterate_tick(job: dict):
         return None
 
 
+# 自我迭代轮注入主对话流后的现场标记：断轮判定、轮末收尾都读它。
+_SELF_ITERATE_TURN: dict = {}
+
+
+def _self_iterate_matches(job: dict) -> bool:
+    """这个调度任务是不是自我迭代循环。"""
+    try:
+        return str((job or {}).get("name") or "") == _self_iterate_job_name()
+    except Exception:
+        return False
+
+
+async def _self_iterate_fire_in_chat(job: dict, state) -> bool:
+    """把一轮自我迭代注入主对话流（不再 spawn 子智能体）。
+
+    搬家的理由：子智能体跑在独立会话里，主人只能看到任务中心一个「执行中」，
+    过程全在后台。注入主对话后，这一轮的工具链、思考、改动都长在主人眼前。
+
+    让位优先于推进：主人正在对话、或上一轮还没收尾时，释放 running 标记且不扣
+    预算 —— 白丢一轮远好过打断主人，下个周期或看门狗会补派。
+    """
+    import scheduler
+    from tools.self_iterate import brief, note_dispatch_result
+
+    def _yield(reason: str) -> bool:
+        scheduler.release_running(job.get("id"), reason)
+        logger.info("[SelfIterate] 本轮让位：%s", reason)
+        return False
+
+    if state is None:
+        return _yield("无可用连接状态")
+    if state.active_task is not None and not state.active_task.done():
+        return _yield("主对话正在跑")
+    if _SELF_ITERATE_TURN.get("active"):
+        return _yield("上一轮尚未收尾")
+    st = _self_iterate_tick(job)
+    if st is not None and not st.get("running"):
+        return _yield("已停：%s" % st.get("stop_reason"))
+    text = brief()
+    if text.lstrip().startswith("⛔"):
+        note_dispatch_result(text)
+        return _yield("任务书报停")
+    round_no = int(st.get("dispatched") or 0)
+    budget = int(st.get("budget_rounds") or 0)
+    _SELF_ITERATE_TURN.update({"active": True, "round": round_no, "budget": budget,
+                               "job_id": job.get("id"), "started": time.time()})
+    await safe_send_json(_BROADCAST_WS, {
+        "type": "system_msg",
+        "text": "♾ 自我迭代 · 第 %d/%d 轮开始（过程就在这条对话里）" % (round_no, budget),
+    })
+    history = getattr(state, "_ws_history", None) or []
+    sid = state.new_session()
+    state._last_proactive_speak = time.time()
+    state.active_task = asyncio.create_task(
+        handle_user_message_stream(
+            _BROADCAST_WS, text, history, sid, state,
+            current_model=state.current_model,
+            current_background=state.current_background,
+            current_bgm=state.current_bgm,
+            # 迭代过程不进主人对话上下文（它自己会落盘到台账与轮账）；
+            # msg_source=auto 才不触发「抽取用户记忆」——任务书不是主人说的话。
+            record_history=False,
+            msg_source="auto",
+            proactive=True,
+            speak=False,
+        )
+    )
+    _register_active_turn(state.active_task, sid, state, text, False)
+    logger.info("[SelfIterate] 第 %s/%s 轮已注入主对话（前端可见全过程）", round_no, budget)
+    return True
+
+
+async def _self_iterate_turn_done(full_text: str, interrupted: bool = False) -> None:
+    """迭代轮收尾：清现场标记 + 前端留一行结束 + 环境阻塞退回预算。
+
+    有效轮的记账不在这里：那由执行体按任务书自己调 record（带证据才算数）。
+    这里只兜「这轮到底跑完没有」，看门狗靠它区分断轮与在跑。
+    """
+    if not _SELF_ITERATE_TURN.get("active"):
+        return
+    n = _SELF_ITERATE_TURN.get("round")
+    _SELF_ITERATE_TURN.clear()
+    try:
+        from tools.self_iterate import note_dispatch_result
+        note_dispatch_result(full_text or "")
+    except Exception as e:
+        logger.warning(f"[SelfIterate] 轮末环境阻塞记账失败（忽略）: {e}")
+    try:
+        await safe_send_json(_BROADCAST_WS, {
+            "type": "system_msg",
+            "text": "♾ 第 %s 轮结束%s" % (n, "（被打断）" if interrupted else ""),
+        })
+    except Exception:
+        pass
+
+
+
 def _self_iterate_note_result(job_id: str, text: str) -> None:
     """子智能体汇报回来时给自我迭代记账：环境阻塞（402/401）当场退预算、必要时停派发。
 
@@ -2960,6 +3065,10 @@ def _self_iterate_worker_alive(job_id: str) -> bool:
 
     查不出来时按「还在跑」处理：宁可多等一轮，也不能重复派发烧双份预算。
     """
+    # 迭代轮已经搬进主对话流：执行体是那条主对话轮，不再是子智能体。
+    if _SELF_ITERATE_TURN.get("active") \
+            and str(_SELF_ITERATE_TURN.get("job_id") or "") == str(job_id):
+        return True
     try:
         for w in _get_sub_agents().active():
             if str((getattr(w, "extra", None) or {}).get("job_id") or "") == str(job_id):
@@ -6111,6 +6220,7 @@ async def handle_user_message_stream(ws: WebSocket, user_text: str, history: lis
                                       record_history: bool = True,
                                       msg_source: str = "chat",
                                       proactive: bool = False,
+                                      speak: bool = True,
                                       resume_checkpoint: Optional[dict] = None):
     """流式处理：AI 流式响应（含工具调用）→ 按句切分 → 每句生成 TTS → 推送 audio_chunk。
 
@@ -6127,6 +6237,7 @@ async def handle_user_message_stream(ws: WebSocket, user_text: str, history: lis
             环境交互（感知触发/自主行为等）不进短期记忆，避免重复内容导致思维僵化。
         msg_source: 消息来源标记，写入长期记忆的 source 字段：
             'chat'=用户直接输入，'auto'=环境交互（由记忆系统处理）。
+        speak: 是否朗读。自我迭代轮走主对话流显示全过程，但它不是给主人听的话。
     """
     if not user_text.strip():
         return
@@ -6168,7 +6279,7 @@ async def handle_user_message_stream(ws: WebSocket, user_text: str, history: lis
     STREAM_FLUSH_CHARS = 40  # 超过该长度视为正文（通常是最终回答），实时冲刷进正文
     seq = 0
     SOFT_CUT_LEN = 60   # 兜底字符切分（主要靠句号/逗号自然分段，此值只防超长无标点句）
-    TTS_LOOKAHEAD = 4   # 并行预生成句数：语音持续跟随文字，生成慢于播放也不断档
+    TTS_LOOKAHEAD = 1   # 并行预生成句数：1 = 严格串行，语音按句顺序播，不抢跑
     tool_calls_made = []  # 记录本轮调用的工具
     # 真实思维链（reasoning_content）的「思考中」实时指示：
     # 服务端累积全文，按间隔节流只推尾部，让前端回复气泡底部一行持续更新，
@@ -6284,7 +6395,9 @@ async def handle_user_message_stream(ws: WebSocket, user_text: str, history: lis
         sentence = _tts_plain_text(text)
         if not sentence or len(sentence) < 2:
             return
-        if ws is None or not manager.active or state.is_cancelled(session_id):
+        # 无客户端在场（如启动后台续跑）不浪费 TTS；但「本轮不朗读」（speak=False，
+        # 如自主说话）必须在这里拦：worker 的发送闸门只看有没有客户端，拦不住它
+        if ws is None or not manager.active or not speak or state.is_cancelled(session_id):
             return
         # 电话体验优化：先在首个停顿点（顿号/逗号/冒号）提前切出第一小段立刻进 TTS 队列；
         # 音频按 seq 顺序发送，抢先合成首包不改变播放顺序
@@ -6304,6 +6417,8 @@ async def handle_user_message_stream(ws: WebSocket, user_text: str, history: lis
 
     async def flush(sentence: str):
         """结论分句交给后台 TTS 队列（不阻塞文本流），音频按序发送。"""
+        if not speak:
+            return
         await _speak(sentence)
 
     tts_task = asyncio.create_task(_tts_worker())
@@ -6584,6 +6699,7 @@ async def handle_user_message_stream(ws: WebSocket, user_text: str, history: lis
         # 内容补记历史，再向上传播取消——否则 AI 对自己刚说的话毫无印象
         if tts_task:
             tts_task.cancel()
+        await _self_iterate_turn_done(full_text, interrupted=True)
         _append_history_round(history, user_text, full_text, proactive, record_history)
         # 回执中断事件：前端据此清队列、解除会话栅栏并复位状态徽章
         await safe_send_json(ws, {"type": "interrupted", "session_id": session_id})
@@ -6595,6 +6711,8 @@ async def handle_user_message_stream(ws: WebSocket, user_text: str, history: lis
         if tts_task:
             tts_task.cancel()
         logger.error(f"Agent 错误: {e}")
+        # 报错路径同样要清迭代轮现场：标记不清，后面每一轮对话收尾都会误判成迭代轮
+        await _self_iterate_turn_done(full_text, interrupted=True)
         await safe_send_json(ws, {"type": "error", "message": f"AI 出错了：{e}",
                             "session_id": session_id})
         state.last_response_done = time.time()
@@ -6625,6 +6743,7 @@ async def handle_user_message_stream(ws: WebSocket, user_text: str, history: lis
         # 保证用户搭话时 AI 记得自己刚说过的话
         if tts_task:
             tts_task.cancel()
+        await _self_iterate_turn_done(full_text, interrupted=True)
         _append_history_round(history, user_text, full_text, proactive, record_history)
         # 兜底：流式生成器可能因 is_cancelled 提前 break 而正常收尾
         # （不会抛 CancelledError 到 agent.chat_stream），这里显式把当前
@@ -6658,6 +6777,7 @@ async def handle_user_message_stream(ws: WebSocket, user_text: str, history: lis
     # 渲染层自动跳过空 user 轮次 → LLM 只看到「AI 说了一段话」）
     _append_history_round(history, user_text, full_text, proactive, record_history,
                           replace_last=is_resume)
+    await _self_iterate_turn_done(full_text)
     # 子智能体/媒体完成汇报轮收尾：把「已完成」汇报立即固化为摘要，
     # 防止后续主动对话仍读到过期的"进行中"摘要而自相矛盾
     if msg_source == "auto" and str(user_text).startswith("【子智能体汇报"):

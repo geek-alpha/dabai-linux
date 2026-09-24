@@ -42,10 +42,14 @@ def _load_windows_update() -> types.ModuleType:
     mod.__file__ = str(REL / "update.py")
     saved_name, saved_path = os.name, pathlib.Path
     os.name = "nt"
-    # os.name='nt' 时 pathlib.Path(...) 会分派到 WindowsPath，而 WindowsPath 在
-    # 非 Windows 上直接抛 UnsupportedOperation —— 这是测试环境的限制，不是被测代码
-    # 的问题（真 Windows 上 WindowsPath 就是本机实现）。钉成 PosixPath 绕过它。
-    pathlib.Path = pathlib.PosixPath
+    # 宿主是 Linux 时：os.name='nt' 会让 pathlib.Path 分派到 WindowsPath，而
+    # WindowsPath 在非 Windows 上直接抛 UnsupportedOperation —— 这是测试环境的限制，
+    # 不是被测代码的问题。钉成 PosixPath 绕过它。
+    # 宿主本来就是 Windows 时不能钉：PosixPath.__new__ 在非 posix 上同样抛
+    # UnsupportedOperation，而 update.py 顶层就要 Path.home() —— 本文件从写下起
+    # 只在 Linux 宿主上跑过，在 Windows 上 collect 阶段就整片 error（2026-09-24 实测）。
+    if saved_name == "posix":
+        pathlib.Path = pathlib.PosixPath
     try:
         exec(compile(src, str(REL / "update.py"), "exec"), mod.__dict__)
     finally:
