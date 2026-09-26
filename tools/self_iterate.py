@@ -35,6 +35,7 @@ import re
 import subprocess
 import sys
 import time
+from datetime import date
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -269,7 +270,129 @@ def eval_rule_metrics() -> list:
     return out
 
 
-EVALUATORS = [eval_recidivism, eval_rule_metrics]
+# ---------- 评估器 3：真实事业停滞（把外面的世界拉进选题池） ----------
+# 前 16 轮的落点全是自己的代码（recidivism / rules / self-iterate），26 个长期事业一个
+# 都没被推进 —— 那正是「自娱自乐的玩具」的形状。这一项让停滞的事业也进选题池：停滞
+# 天数当缺口，next 能不能自己动手当 feasible。
+# 纯读台账 JSON，不起子进程、不烧 token —— 观测本身必须零成本。
+
+STALL_DAYS = 7          # 多久没落盘算停滞
+STALL_FULL_DAYS = 14    # 停滞多少天算满格缺口（再久也不加码）
+STALL_TOP = 3           # 最多报 3 条：26 个项目全进池 = 选题池被噪音淹没
+# 下一步动作不在我手里的（等主人拍板 / 等 CI / 等外部解封）：派下去只会空转一轮，
+# 那是烧预算，不是推进。
+STALL_BLOCKED_PAT = re.compile(
+    r"等主人|待主人|等 CI|等限流|等 IP|等样本|等新 trace|等外部|等回复|等验收")
+# 已终止的方向：不是缺口，是墓碑。
+STALL_DEAD_PAT = re.compile(r"已砍|别推进|已放弃|别重开|已证伪并关闭")
+# 需要主人本人动作的（拍板/凭证/真机验收）：只认【】里的标记，正文里提到「等主人」不算。
+STALL_OWNER_PAT = re.compile(r"【[^】]*(?:等主人|待主人|等验收|等拍板|等凭证|等真机)[^】]*】")
+
+
+def _days_since(day: str, today: str) -> int | None:
+    """两个 ISO 日期差几天；任一个解析不出来返回 None（判不了就不猜）。"""
+    try:
+        return (date.fromisoformat(str(today)[:10])
+                - date.fromisoformat(str(day)[:10])).days
+    except Exception:
+        return None
+
+
+def _last_touch(p: dict) -> str:
+    """项目最后一次落盘的日期：log 末条的 t，没有 log 就退回 created。"""
+    for e in reversed(p.get("log") or []):
+        t = str((e or {}).get("t") or "").strip()
+        if t:
+            return t
+    return str(p.get("created") or "").strip()
+
+
+def _first_step(nxt: str) -> str:
+    """next 里的第一条动作（① 到 ② 之前）。状态判定只看它。
+
+    为什么：next 是多条并列的，①是当前该做的，②③ 常是「已做·别重开」这类历史
+    记录。拿整段搜索，一条历史记录就能把整个项目判成墓碑 —— 实测 2026-09-26，
+    bp-site / 渡鸦将军 / x-ip 的第一条都是【等主人…】、第二条是【已做·别重开】，
+    于是全部从「等你一句话」清单里消失。
+    """
+    s = str(nxt or "")
+    m = re.search(r"[②③④⑤]", s)
+    return s[:m.start()] if m else s
+
+
+def stalled_projects(today: str = "") -> list:
+    """停滞项目清单，按停滞天数降序。纯读台账；日期判不出来的直接跳过。"""
+    today = today or time.strftime("%Y-%m-%d")
+    out = []
+    for p in _read_root_json("long_horizon.json").get("projects") or []:
+        pid = str(p.get("id") or "").strip()
+        if not pid:
+            continue
+        last = _last_touch(p)
+        days = _days_since(last, today)
+        if days is None:
+            continue
+        nxt = str(p.get("next") or "")
+        head = _first_step(nxt)
+        out.append({"id": pid, "title": str(p.get("title") or pid), "days": days,
+                    "next": nxt, "head": head, "last": last,
+                    "dead": bool(STALL_DEAD_PAT.search(head)),
+                    "blocked": bool(STALL_BLOCKED_PAT.search(head)),
+                    "owner": bool(STALL_OWNER_PAT.search(head))})
+    out.sort(key=lambda x: -x["days"])
+    return out
+
+
+def eval_stalled_projects(today: str = "") -> list:
+    """事业停滞：停滞天数 = 缺口大小，能不能自己动手 = 进不进池。
+
+    卡在主人/外部那里的项目（等拍板 / 等 CI / 等限流）**不进选题池**：进了就会被选中
+    —— 池子里别的东西可能比它更小 —— 而它需要的是一句话，不是又一个 agent 轮次。
+    它们由 _print_blocked_projects 单独列出，不占轮次预算。
+    """
+    today = today or time.strftime("%Y-%m-%d")
+    out = []
+    for p in stalled_projects(today):
+        if p["dead"] or p["blocked"] or p["days"] < STALL_DAYS:
+            continue
+        out.append(_gap(
+            p["id"],
+            f"事业停滞 · {p['title']}（{p['days']} 天没动）",
+            f"停滞 {p['days']} 天（台账 log 末条 {p['last']} → {today}）",
+            f"long_horizon.json projects[{p['id']}]: log 末条 t={p['last']}, "
+            f"next=\"{p['next'][:120]}\"",
+            f"按台账 next 的第一条动作做，做完 long_horizon.py log {p['id']} "
+            "并把 next 改写成下一轮能直接开跑的原子动作",
+            gap_ratio=min(1.0, p["days"] / float(STALL_FULL_DAYS)),
+            feasible=0.9,
+        ))
+    out.sort(key=lambda g: -g["score"])
+    return out[:STALL_TOP]
+
+
+def _print_blocked_projects(today: str = "") -> None:
+    """打印卡在主人/外部那里的停滞项目，分两栏。
+
+    为什么分开：混在一起时「等限流自愈」与「等你拍板」看起来一样重，清单就没法
+    一眼决策 —— 前者不用他管，后者只差他一句话。看不见，它们就永远停在那儿。
+    """
+    blocked = [p for p in stalled_projects(today) if p["blocked"] and not p["dead"]]
+    if not blocked:
+        return
+    owner = [p for p in blocked if p["owner"]]
+    waiting = [p for p in blocked if not p["owner"]]
+    print()
+    if owner:
+        print(f"🙋 等你一句话的项目（{len(owner)} 个，最久 {owner[0]['days']} 天）：")
+        for p in owner:
+            print(f"  - {p['id']}（{p['days']} 天）：{p['next'][:70]}")
+    if waiting:
+        print(f"⏳ 等外部条件、不用你管的（{len(waiting)} 个）：")
+        for p in waiting:
+            print(f"  - {p['id']}（{p['days']} 天）：{p['next'][:40]}")
+
+
+EVALUATORS = [eval_recidivism, eval_rule_metrics, eval_stalled_projects]
 
 
 def observe() -> list:
@@ -917,17 +1040,17 @@ def critique_pack() -> str:
 # 下一轮读接力棒的人（下一个进程）就会在错的账本里找下一步。
 LEDGER_FILE = ROOT / "long_horizon.json"
 LEDGER_ID_BY_PREFIX = {
-    "rules": "self-evolution",        # 自指机制类缺口（rules:plan_rate / rules:verify_rate）
-    "recidivism": "self-evolution",   # 同错复发
-    "self-iterate": "self-evolution",
-    "self-evolution": "self-evolution",
+    "rules": "self-iterate",        # 自指机制类缺口（rules:plan_rate / rules:verify_rate）
+    "recidivism": "self-iterate",   # 同错复发
+    "self-iterate": "self-iterate",
+    "self-evolution": "self-iterate",  # 旧名：self-evolution 2026-09-26 并入 longrun-engine 后退役
     "learn": "hermes-learning-loop",  # 学习轮：学到的做法记在学习闭环那本账上
 }
 
-# 「自我迭代自己的账本」的候选 id，按优先级排。learn 那本账（hermes-learning-loop）
-# 现在台账里也不存在（该进化为「学习闭环」一册的内容被并进了 self-evolution 的 log），
-# 所以它同样走这条兜底——任务书只给存在的 id，缺账时不编名字。
-SELF_LEDGER_CANDIDATES = ("self-evolution", "self-iterate")
+# 「自我迭代自己的账本」的候选 id，按优先级排。台账里一本都不在时返回空串，不拿别的
+# 账本顶上：rules:*/recidivism:* 是自指缺口，记进事业线会把两本账搅在一起。
+# 2026-09-26 之前候选是 (self-evolution, self-iterate)，前者退役后只剩后者。
+SELF_LEDGER_CANDIDATES = ("self-iterate",)
 
 
 def ledger_ids() -> list:
@@ -943,8 +1066,9 @@ def ledger_id_for(target: str) -> str:
     """把本轮 target 映射成台账里**确定存在**的落盘 id（读不到台账返回空串）。
 
     只从真实 id 里挑：先按 target 前缀查表，表里的名字不在台账里就按候选顺序退到
-    「自我迭代自己的账本」（self-evolution，旧名 self-iterate）——任务书永远只给存在
-    的 id，执行体不必再从名字里猜。
+    「自我迭代自己的账本」（self-iterate）——任务书永远只给存在的 id，执行体不必再从
+    名字里猜。注意台账只算**活跃**项目：退役进 archived 的 id 不再算数（映射指向一本
+    已退役的账，任务书就会渲染出空串——2026-09-26 self-evolution 退役时正是如此）。
 
     2026-09-24 修正：旧实现把兜底写死成 "self-iterate"，而那名字台账里从来没有过 →
     任务书渲染出 `<id>` 占位符。现在改成按候选表挑**台账里真实存在**的第一个，并在
@@ -1275,12 +1399,12 @@ def main() -> int:
         gaps = observe()
         if not gaps:
             print("（无缺口：评估器全部达标，或样本不足）")
-            return 0
         for g in gaps:
             print(f"[{g['score']:.3f}] {g['id']}  {g['title']}")
             print(f"        指标：{g['metric']}")
             print(f"        证据：{g['evidence']}")
             print(f"        动作：{g['action']}")
+        _print_blocked_projects()
         return 0
 
     if args.cmd == "brief":

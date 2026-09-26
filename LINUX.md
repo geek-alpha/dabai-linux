@@ -68,7 +68,7 @@ sudo apt-get install -y python3-venv python3-dev ffmpeg ripgrep
 | 系统体检（进程/端口/磁盘） | ✅ 完整 | 换 `ps` / `ss` / `shutil` |
 | 系统文件搜索（sys_find/sys_recent/sys_locate） | ✅ 完整 | 扫主目录 + `/mnt`、`/media` 挂载点；`sys_locate` 按可执行位判定，不依赖 `where` |
 | 工作区面板 / 手机端目录下钻 | ✅ 完整 | 常用目录走 XDG + 本地化名，根目录为主目录 + 挂载点（`platform_compat.browse_roots`） |
-| 联网搜索 | ⚠️ 视引擎 | `web_search`/`read_web` 自带实现可用；anysearch/exa 引擎脚本需放到 `skills/search/engines/`，tavily 需 `tvly` CLI；JS 深挖需系统 Chrome |
+| 联网搜索 | ⚠️ 视 key | `web_search`/`read_web`/`search_web`（anysearch）/`search_paper` 免 key 可用；exa/tavily 已内置原生 HTTP（`skills/search/exa_impl.py`、`tavily_impl.py`），只需 EXA_API_KEY / TAVILY_API_KEY，不需引擎脚本、不需 `tvly` CLI；JS 深挖需系统 Chrome |
 | 翻墙代理（fq_ctl / proxy_test） | ⚠️ 需自备 fq | 设 `DABAI_FQ_ROOT` 或把 `fq` 放进 PATH；未配置时明确报错 |
 | 截屏 | ⚠️ 需图形会话 | `mss` → `PIL.ImageGrab` → `pyautogui` 三级回退 |
 | 语音（TTS/ASR） | ⚠️ 视依赖 | `edge-tts` / `faster-whisper` 均支持 Linux；麦克风需 PulseAudio |

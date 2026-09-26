@@ -131,13 +131,33 @@ def _should_retry_header(e: BaseException) -> Optional[bool]:
     return None
 
 
+def _is_opaque_400(e: BaseException) -> bool:
+    """无说明文字的 400：响应体只回请求里的 model 名，没带任何错误说明。
+
+    opencode zen/go 网关偶发这种 400（body = {"model": "deepseek-v4.1-flash"}）。
+    2026-09-26 19:59 实测：定时任务《掌柜巡店·每日》首轮调用 13 秒即被判死，
+    同一分钟内主对话轮报同一个错，而 20:0x 起同形状请求（curl 探针 + 主链路）
+    全部 200 —— 它说的是上游抽风，不是请求有病，所以归入可重试。
+    带真消息的 400（网关 {"error":{"message":...}}、渠道参数非法、上下文超长）
+    照旧不重试，那些重发一万次还是同一个结果。
+    """
+    if _status_code_of(e) != 400:
+        return False
+    body = getattr(e, "body", None)
+    if not isinstance(body, dict) or not body:
+        return False
+    if {"error", "message", "detail"} & set(body):
+        return False
+    return set(body) <= {"model"}
+
+
 def retry_decision(e: BaseException) -> Optional[bool]:
     """异常本身能确定的「该不该重试」；确定不了返回 None。
 
     优先级：业务主动声明（RetryableError）→ 服务端 x-should-retry 表态 →
-    HTTP 状态码。三者都没有就只能靠文本猜（is_transient_error 的兜底），
-    而猜测不该推翻任何一条明确表态——agent.py 的重连分类器靠这个 None
-    区分「确定不重试」与「猜的」。
+    HTTP 状态码（含「无说明文字的 400」这个网关抽风特例）。三者都没有就只能靠
+    文本猜（is_transient_error 的兜底），而猜测不该推翻任何一条明确表态——
+    agent.py 的重连分类器靠这个 None 区分「确定不重试」与「猜的」。
     """
     if isinstance(e, RetryableError):
         return True
@@ -148,6 +168,8 @@ def retry_decision(e: BaseException) -> Optional[bool]:
         return True
     code = _status_code_of(e)
     if code is not None:
+        if _is_opaque_400(e):
+            return True
         if 400 <= code < 500:
             return code in _RETRYABLE_4XX
         return code >= 500

@@ -17,6 +17,8 @@
   list / show <id> / stage <id> active|paused|done
   block <id> --why "卡在主人哪件事"   标记为等主人：长跑引擎跳过它，不再为它空烧轮次
   unblock <id>                        主人做完后解除，目标重新进入轮转
+  archive <id> --why "退役判据"       退役：移出活跃台账（不再注入/不再进选题池），log 全保留
+  unarchive <id> / archived           还原 / 看归档区
 """
 import argparse
 import json
@@ -43,6 +45,8 @@ def load():
         d["projects"] = []
     if not isinstance(d.get("questions"), list):
         d["questions"] = []
+    if not isinstance(d.get("archived"), list):
+        d["archived"] = []
     return d
 
 
@@ -178,6 +182,56 @@ def cmd_unblock(a):
     return 0
 
 
+def cmd_archive(a):
+    """退役：移出 projects，进 archived（带理由和时间）。
+
+    为什么不直接删：log 是项目的全部历史（每个最多 20 条带证据），删了不可逆；
+    而「退役」要的效果只是「不再占活跃面」——不注入提示词、不进自我迭代选题池。
+    归档同时保留判据，以后有人问「这事怎么不做了」能查到原因。
+    """
+    d = load()
+    p = find(d, a.id)
+    if not p:
+        if any(x.get("id") == a.id for x in d["archived"]):
+            print(f"已经在归档区了：{a.id}")
+            return 0
+        print(f"没有这个项目：{a.id}")
+        return 1
+    d["projects"].remove(p)
+    p["archived_at"] = today()
+    p["archive_why"] = a.why or "（未说明）"
+    d["archived"].insert(0, p)
+    save(d)
+    print(f"📦 已退役：{p.get('title')}（{a.id}）— {p['archive_why']}")
+    print(f"   保留 {len(p.get('log') or [])} 条 log；unarchive {a.id} 可随时还原。")
+    return 0
+
+
+def cmd_unarchive(a):
+    d = load()
+    p = next((x for x in d["archived"] if x.get("id") == a.id), None)
+    if not p:
+        print(f"归档区没有这个项目：{a.id}")
+        return 1
+    d["archived"].remove(p)
+    p.pop("archived_at", None)
+    p.pop("archive_why", None)
+    d["projects"].insert(0, p)
+    save(d)
+    print(f"↩ 已还原：{p.get('title')}（{a.id}）")
+    return 0
+
+
+def cmd_archived(a):
+    d = load()
+    if not d["archived"]:
+        print("归档区是空的。")
+        return 0
+    for p in d["archived"]:
+        print(f"📦 [{p.get('archived_at', '')}] {p.get('title')}（{p.get('id')}）— {p.get('archive_why', '')}")
+    return 0
+
+
 def cmd_q(a):
     d = load()
     qs = d["questions"]
@@ -230,11 +284,13 @@ def cmd_list(a):
 
 def cmd_show(a):
     d = load()
-    p = find(d, a.id)
+    p = find(d, a.id) or next((x for x in d["archived"] if x.get("id") == a.id), None)
     if not p:
         print(f"没有这个项目：{a.id}")
         return 1
     print(f"{p.get('title')}（{p.get('id')}）[{p.get('stage')}] {p.get('progress', 0)}%")
+    if p.get("archived_at"):
+        print(f"  📦 已退役 {p['archived_at']}：{p.get('archive_why', '')}")
     print(f"  为什么：{p.get('why')}")
     print(f"  价值：{p.get('value')}")
     print(f"  验收：{p.get('done_when')}")
@@ -285,6 +341,18 @@ def main():
     p = sub.add_parser("unblock")
     p.add_argument("id")
     p.set_defaults(fn=cmd_unblock)
+
+    p = sub.add_parser("archive")
+    p.add_argument("id")
+    p.add_argument("--why", default="", help="退役判据：为什么不做了、证据在哪")
+    p.set_defaults(fn=cmd_archive)
+
+    p = sub.add_parser("unarchive")
+    p.add_argument("id")
+    p.set_defaults(fn=cmd_unarchive)
+
+    p = sub.add_parser("archived")
+    p.set_defaults(fn=cmd_archived)
 
     p = sub.add_parser("q")
     p.add_argument("text", nargs="?", default="")

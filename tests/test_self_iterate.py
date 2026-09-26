@@ -7,6 +7,7 @@
 import importlib.util
 import json
 import time
+from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
@@ -1016,16 +1017,38 @@ def test_ledger_id_placeholder_never_leaks_into_brief(tmp_path, monkeypatch):
     m = _load()
     ledger = tmp_path / "long_horizon.json"
     ledger.write_text(_json.dumps({"projects": [
-        {"id": "self-evolution", "title": "自我进化闭环"},
+        {"id": "self-iterate", "title": "自我迭代循环"},
         {"id": "pdd-cs", "title": "店铺双系统"}]}, ensure_ascii=False), encoding="utf-8")
     monkeypatch.setattr(m, "LEDGER_FILE", ledger)
 
     got = m.ledger_id_for("rules:verify_rate")
-    assert got == "self-evolution", got
+    assert got == "self-iterate", got
     assert got in [p["id"] for p in _json.loads(ledger.read_text(encoding="utf-8"))["projects"]]
-    # 映射表里的每个目标都必须落到一个真实 id 上（learn 这本账不在表里时退回 self-evolution）
+    # 映射表里的每个目标都必须落到一个真实 id 上（learn 这本账不在表里时退回 self-iterate）
     for t in ("rules:plan_rate", "recidivism:whatever", "self-iterate"):
-        assert m.ledger_id_for(t) in ("self-evolution", ""), t
+        assert m.ledger_id_for(t) in ("self-iterate", ""), t
+
+
+def test_ledger_mapping_never_points_at_retired_id():
+    """反证：映射目标不许是**已退役**的 id。
+
+    2026-09-26 实测：self-evolution 并入 longrun-engine 退役后，映射表还指着它 →
+    ledger_id_for 拿不到真实 id 就退回空串，任务书那行落盘 id 又变回空的。
+    只验「表里的名字在活跃 projects 里」不够——退役区里的名字看着也「存在」。
+    """
+    m = _load()
+    ids = m.ledger_ids()
+    if not ids:
+        pytest.skip("读不到台账，跳过")
+    import json as _json
+    archived = {str(p.get("id")) for p in (_json.loads(
+        m.LEDGER_FILE.read_text(encoding="utf-8")).get("archived") or [])}
+    if not archived:
+        pytest.skip("归档区是空的，没有可对照的退役 id")
+    for prefix, mapped in m.LEDGER_ID_BY_PREFIX.items():
+        assert mapped not in archived, f"{prefix} -> {mapped} 已退役，别再把接力棒记进归档账"
+    for cand in m.SELF_LEDGER_CANDIDATES:
+        assert cand not in archived, f"兜底候选 {cand} 已退役"
 
 
 def test_ledger_mapping_points_at_existing_id():
@@ -1054,3 +1077,135 @@ def test_brief_never_renders_placeholder_with_real_ledger():
     got = m.ledger_id_for("rules:verify_rate")
     assert got and got != "<id>", got
     assert got in m.ledger_ids()
+
+
+# ---------- 评估器 3：真实事业停滞 ----------
+# 判据的核心不是「能不能算天数」，是「卡在外部的项目不许进选题池」——
+# 它进了池就会被选中（池子里别的东西可能更小），然后烧掉一轮去等一个不会来的条件。
+
+TODAY = "2026-09-26"
+
+
+def _ledger(monkeypatch, mod, projects):
+    """只喂事业台账，其余台账文件按空处理。"""
+    monkeypatch.setattr(
+        mod, "_read_root_json",
+        lambda name: {"long_horizon.json": {"projects": projects}}.get(name, {}))
+
+
+def _proj(pid, days_ago, nxt="①跑 pytest 收尾", today=TODAY):
+    d = (date.fromisoformat(today) - timedelta(days=days_ago)).isoformat()
+    return {"id": pid, "title": pid, "stage": "active", "next": nxt,
+            "created": d, "log": [{"t": d, "what": "x", "ev": "y"}]}
+
+
+def test_stalled_projects_measures_days(mod, monkeypatch):
+    _ledger(monkeypatch, mod, [_proj("a", 10), _proj("b", 2)])
+    assert [(r["id"], r["days"]) for r in mod.stalled_projects(TODAY)] == [("a", 10), ("b", 2)]
+
+
+def test_stalled_gap_skips_fresh_and_dead(mod, monkeypatch):
+    _ledger(monkeypatch, mod, [_proj("fresh", 1), _proj("dead", 30, "【已砍·别推进】本地目录已删")])
+    assert mod.eval_stalled_projects(TODAY) == []
+
+
+def test_stalled_gap_skips_blocked(mod, monkeypatch):
+    """反证：等主人的项目进池就会被选中，而它需要的是一句话，不是一轮 agent。"""
+    _ledger(monkeypatch, mod, [_proj("wait", 30, "①【等主人拍板】改 auth")])
+    assert mod.eval_stalled_projects(TODAY) == []
+    # 但它必须在停滞清单里可见 —— 否则「停滞」这件事就凭空消失了
+    assert [p["id"] for p in mod.stalled_projects(TODAY)] == ["wait"]
+    assert mod.stalled_projects(TODAY)[0]["blocked"] is True
+
+
+def test_stalled_gap_scores_by_days_and_orders(mod, monkeypatch):
+    _ledger(monkeypatch, mod, [_proj("old", 14), _proj("mid", 7)])
+    gs = mod.eval_stalled_projects(TODAY)
+    assert [g["id"] for g in gs] == ["old", "mid"]
+    assert gs[0]["score"] == pytest.approx(0.9)
+    assert gs[1]["gap_ratio"] == pytest.approx(0.5)
+
+
+def test_stalled_gap_top3_cap(mod, monkeypatch):
+    """26 个项目全进池 = 选题池被噪音淹没。"""
+    _ledger(monkeypatch, mod, [_proj(f"p{i}", 20 - i) for i in range(6)])
+    assert len(mod.eval_stalled_projects(TODAY)) == 3
+
+
+def test_stalled_days_unparsable_is_skipped(mod, monkeypatch):
+    """日期判不出来的项目不许被当成「停滞 0 天」，也不许把整轮观测搞崩。"""
+    _ledger(monkeypatch, mod, [
+        {"id": "x", "title": "x", "next": "①干活", "log": [{"t": "没日期"}]},
+        {"id": "y", "title": "y", "next": "①干活", "created": "2026-09-01"}])
+    assert [r["id"] for r in mod.stalled_projects(TODAY)] == ["y"]
+
+
+def test_stalled_uses_created_when_no_log(mod, monkeypatch):
+    _ledger(monkeypatch, mod, [{"id": "y", "title": "y", "next": "①干活", "created": "2026-09-01"}])
+    assert mod.stalled_projects(TODAY)[0]["days"] == 25
+
+
+def test_stalled_uses_last_log_entry_not_first(mod, monkeypatch):
+    """停滞天数看**最后**一次落盘；看第一条会把所有老项目都判成停滞。"""
+    _ledger(monkeypatch, mod, [{"id": "y", "title": "y", "next": "①干活", "created": "2026-01-01",
+                                "log": [{"t": "2026-01-01"}, {"t": "2026-09-25"}]}])
+    assert mod.stalled_projects(TODAY)[0]["days"] == 1
+
+
+def test_stalled_gap_id_is_a_known_target(mod, monkeypatch):
+    """缺口 id 就是台账 id —— 否则 record / 死磕判定全对不上。"""
+    _ledger(monkeypatch, mod, [_proj("stocklens", 20)])
+    g = mod.eval_stalled_projects(TODAY)[0]
+    assert g["id"] == "stocklens" and mod.target_ok(g["id"])
+
+
+def test_stalled_evaluator_registered(mod):
+    assert mod.eval_stalled_projects in mod.EVALUATORS
+
+
+def test_stalled_broken_ledger_does_not_kill_observe(mod, monkeypatch):
+    """台账坏了不许拖垮整轮观测（observe 会跳过出错的评估器，这里要求它干脆不出缺口）。"""
+    monkeypatch.setattr(mod, "_read_root_json", lambda name: {})
+    assert mod.eval_stalled_projects(TODAY) == []
+
+
+def test_blocked_projects_split_owner_and_external(mod, monkeypatch, capsys):
+    """清单必须分两栏：等你一句话的 / 等外部自愈的。
+
+    混在一起时「等限流自愈」和「等你拍板」看起来一样重，清单就没法一眼决策。
+    """
+    _ledger(monkeypatch, mod, [
+        _proj("owner1", 12, "①【等主人·真机验收】刷新看会话列表"),
+        _proj("ext1", 9, "①【等限流自愈】熔断 30 分钟后自动放行"),
+    ])
+    mod._print_blocked_projects(TODAY)
+    out = capsys.readouterr().out
+    assert "等你一句话" in out and "owner1" in out
+    assert "等外部条件" in out and "ext1" in out
+    assert out.index("owner1") < out.index("ext1")
+
+
+def test_blocked_projects_silent_when_nothing_blocked(mod, monkeypatch, capsys):
+    _ledger(monkeypatch, mod, [_proj("workable", 30, "①跑 pytest 收尾")])
+    mod._print_blocked_projects(TODAY)
+    assert capsys.readouterr().out == ""
+
+
+def test_stalled_status_judges_first_step_only(mod, monkeypatch):
+    """反证：next 第二条是「已做·别重开」时，项目不许被判成墓碑。
+
+    实测形状（2026-09-26）：bp-site / 渡鸦将军 / x-ip 的第一条都是【等主人…】，
+    第二条是【已做·别重开】—— 拿整段 next 搜索，它们全从「等你一句话」清单里消失。
+    """
+    _ledger(monkeypatch, mod, [_proj(
+        "bp", 11,
+        "①【等主人拍板】选时机重启 myservice；②【已做·别重开】bp-community 已验证")])
+    rows = mod.stalled_projects(TODAY)
+    assert rows[0]["dead"] is False, "一条历史记录把整个项目判成了墓碑"
+    assert rows[0]["owner"] is True and rows[0]["blocked"] is True
+
+
+def test_stalled_owner_needs_marker_not_body_text(mod, monkeypatch):
+    """「等主人」出现在正文里（描述的是别人在等）不算等主人，否则清单里全是噪音。"""
+    _ledger(monkeypatch, mod, [_proj("x", 9, "①把「等主人」的项目变成清单，别只躺在 next 里")])
+    assert mod.stalled_projects(TODAY)[0]["owner"] is False

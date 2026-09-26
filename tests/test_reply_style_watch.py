@@ -124,7 +124,8 @@ def test_hook_sits_before_the_tool_round_early_exit():
 def test_rule_map_points_three_rules_at_reply_metrics():
     mod = _load_audit()
     m = {r[0]: (r[1], r[2]) for r in mod.RULE_MAP}
-    assert m["说重点"] == ("metric", "reply_boilerplate")
+    # 「说重点」2026-09-25 改指 mid_speech：套话率测不出「全程沉默」，而那是实测的失败模式
+    assert m["说重点"] == ("metric", "mid_speech")
     assert m["克制自我纠正"] == ("metric", "reply_apology")
     assert m["授权与自主"] == ("metric", "reply_tail_ask")
 

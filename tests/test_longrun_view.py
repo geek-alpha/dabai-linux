@@ -9,6 +9,7 @@
   2. /api/tasks/longrun-engine 详情能拿到完整轮次台账；
   3. 合成过程只读 —— 不写任何文件、不启停任何服务。
 """
+import importlib
 import json
 import os
 import sys
@@ -89,7 +90,34 @@ def client():
     return TestClient(server.app)
 
 
-def test_api_tasks_lists_longrun(client):
+@pytest.fixture()
+def isolated_longrun(tmp_path, monkeypatch):
+    """把长跑运行目录挪进 tmp_path，并确保 server 拿到的是同一个模块对象。
+
+    ① 条目出不出现取决于磁盘事实（server.py:2649 `if _lr:`），而本机那份
+    data/longrun 带着用户的 dismissed.json（cycle=72 == state.json 的 72），
+    snapshot 就返回 None —— 这两条 HTTP 契约于是随环境变红。
+    ② 还得把模块回填进 sys.modules：harness 的工具/技能加载会把
+    tools.longrun.status_view 从 sys.modules 里清掉（先跑 test_autoload_skill.py
+    就能复现：探针实测该键消失），此后 server 里 `from tools.longrun.status_view
+    import snapshot` 每次都新建模块对象、读真实路径，patch 全落空 ——
+    单跑绿、全量红就是这个形状。
+    """
+    sv_mod = importlib.import_module("tools.longrun.status_view")
+    run_dir = tmp_path / "data" / "longrun"
+    run_dir.mkdir(parents=True)
+    (run_dir / "state.json").write_text(
+        json.dumps({"cycle": 1, "last_goal": "g"}), encoding="utf-8")
+    for name, rel in (("RUN_DIR", ""), ("STATE", "state.json"),
+                      ("JOURNAL", "journal.jsonl"), ("HEARTBEAT", "heartbeat"),
+                      ("LOCK", "runner.lock"), ("TRACES", "traces"),
+                      ("DISMISSED", "dismissed.json")):
+        monkeypatch.setattr(sv_mod, name, run_dir / rel if rel else run_dir)
+    monkeypatch.setitem(sys.modules, "tools.longrun.status_view", sv_mod)
+    return run_dir
+
+
+def test_api_tasks_lists_longrun(client, isolated_longrun):
     r = client.get("/api/tasks")
     assert r.status_code == 200
     tasks = r.json()["tasks"]
@@ -99,7 +127,7 @@ def test_api_tasks_lists_longrun(client):
     assert t["kind"] == "longrun" and t["agent"]["name"]
 
 
-def test_api_task_detail_longrun(client):
+def test_api_task_detail_longrun(client, isolated_longrun):
     r = client.get("/api/tasks/longrun-engine")
     assert r.status_code == 200
     task = r.json()["task"]

@@ -22,6 +22,7 @@ from harness.core import (  # noqa: E402
     _status_code_of,
     is_transient_error,
     retry_async,
+    retry_decision,
 )
 
 
@@ -252,3 +253,45 @@ def test_尊重RetryAfter的HTTPdate形式(monkeypatch):
     assert _run(retry_async(factory, attempts=3, backoff=1.0)) == "ok"
     assert delays, "应该重试过一次"
     assert 17.0 <= delays[0] <= 20.0, (hdr, delays)
+
+
+# ---------- 网关「无说明文字的 400」：上游抽风，可重试 ----------
+# 2026-09-26 19:59 实测：opencode zen/go 网关偶发 HTTP 400，body 只有请求里的
+# model 名（{"model": "deepseek-v4.1-flash"}）—— 定时任务《掌柜巡店·每日》首轮
+# 调用 13 秒即被判死，同一分钟主对话轮报同一个错，而 1 分钟后同形状请求
+# （curl 探针 + 主链路）全部 200。旧分类把 400 一律当确定性错误，于是把上游
+# 抽风读成「请求有病」，任务整轮白跑、当天不再重试。
+
+
+class _BodyErr(Exception):
+    """openai SDK 异常形状：status_code + 解析后的 body。"""
+
+    def __init__(self, code, body):
+        self.status_code = code
+        self.body = body
+        super().__init__(f"Error code: {code} - {body}")
+
+
+def test_无说明文字的400判为可重试():
+    e = _BodyErr(400, {"model": "deepseek-v4.1-flash"})
+    assert retry_decision(e) is True
+    assert is_transient_error(e) is True
+
+
+@pytest.mark.parametrize("body", [
+    {"error": {"message": "The `reasoning_content` in the thinking mode must be passed back"}},
+    {"message": "max_tokens 500 exceeds limit"},
+    {"detail": "prompt is too long"},
+    {"model": "deepseek-v4.1-flash", "extra": "x"},   # 多带字段 = 不是那个形状
+    {},
+])
+def test_带说明或形状不符的400仍不重试(body):
+    """反例：真·请求有病的 400 重发一万次还是同一个结果，重试只是白等。"""
+    e = _BodyErr(400, body)
+    assert retry_decision(e) is False
+    assert is_transient_error(e) is False
+
+
+def test_同类形状的非400不受影响():
+    assert retry_decision(_BodyErr(401, {"model": "x"})) is False   # 鉴权：不重试
+    assert retry_decision(_BodyErr(503, {"model": "x"})) is True    # 5xx：本来就重试

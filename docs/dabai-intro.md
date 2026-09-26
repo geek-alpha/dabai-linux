@@ -163,7 +163,7 @@ function calling 工具表，它们注入的提示词片段自动拼进 system p
 | `code_ops` | 代码检索 / 分析 / 修改 / 验证（Python AST 结构感知）、git 全流程、全盘搜索、隔离工作树 |
 | `github` | 日常 git、提交前密钥闸门、发版与盯落地、给上游提 PR、PR 审查与 issue 修复 |
 | `tasks` | 长任务 / 批量任务 + TODO 清单 + 定时任务 |
-| `search` | 四引擎合一：anysearch（通用 + 垂直域 + 批量 + URL 提取）/ tavily / exa / web |
+| `search` | 四引擎合一：anysearch（通用 + 垂直域 + 批量 + URL 提取）/ tavily / exa（后两者原生 HTTP，只需 key，不需 CLI）/ web；科研引擎 search_paper + read_paper + paper_cite（arXiv/OpenAlex/PubMed/Crossref 四源融合、PDF 全文、BibTeX，免 key）；极客信息源 search_tech（HN/StackExchange/GitHub/Wikipedia/论文库/tavily/官方文档 llms.txt 融合，每条带权威度分层 A/B/C）+ registry_info（PyPI/npm/crates/DockerHub/HuggingFace/OpenRouter 一手版本与价格） |
 | `media` | 在线影音（B站 / AcFun / 酷我 / 网易云）+ 油管汉化流水线 + 小游戏 + AI 画图 |
 | `vision` | 看图：URL / 本地路径 / data URL，像素直接进上下文；自动判定模型是否支持读图 |
 | `lark` | 飞书：消息 / 云文档 / 表格 / 多维表格 / 日历 / 任务 / 邮件 / 云盘 / 通讯录 |

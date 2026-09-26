@@ -780,11 +780,16 @@ class SubAgentManager:
             return f"工具执行失败：{e.__class__.__name__}: {e}"
 
     async def _llm_call(self, client, model, messages, tools):
-        """带瞬态重试的 LLM 调用（429/5xx/网络抖动退避重试，最多 3 次）。
+        """带瞬态重试的 LLM 调用（429/5xx/网络抖动/网关抽风 400，退避重试）。
 
-        单次调用有硬超时：客户端默认 600s，加 3 次重试最坏能挂半小时，
+        单次调用有硬超时：客户端默认 600s，加多次重试最坏能挂很久，
         而子智能体全程占着全局并发槽位（默认 4 个）——卡住一个等于产能少 1/4。
         超时属于瞬时错误，retry_async 会正常退避重试。
+
+        重试预算按「上游抽风能持续多久」定，不按次数：6 次 × 指数退避
+        （2/4/8/16/30s，封顶 30s）≈ 60s 窗口。2026-09-26 实测的网关 400
+        （body 只有 model 名、无错误说明）在 19:59 让一轮任务 13 秒内判死，
+        而 1 分钟后同形状请求就正常——3 次 ≈ 6s 的窗口根本驮不过去。
         """
         # 兜底：保证 role=tool 消息带 tool_call_id（与主智能体同一规范函数），
         # 否则发给 OpenAI 兼容提供方会被 400（missing field tool_call_id）
@@ -812,7 +817,7 @@ class SubAgentManager:
 
         try:
             from harness.core import retry_async
-            resp = await retry_async(lambda: _one(budget), attempts=3, backoff=2.0)
+            resp = await retry_async(lambda: _one(budget), attempts=6, backoff=2.0)
         except Exception as e:
             from agent import _is_reasoning_echo_error
             if _is_reasoning_echo_error(e):

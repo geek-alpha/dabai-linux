@@ -2,11 +2,11 @@
   "name": "search",
   "title": "统一搜索（anysearch/tavily/exa/web 四引擎合一）",
   "version": "1.0.0",
-  "description": "四引擎统一搜索：anysearch（通用+垂直域+批量+URL提取，匿名可用）、tavily（LLM优化搜索/提取/爬取/深度研究，需 tvly CLI+key）、exa（语义搜索/答案/相似页，需 EXA_API_KEY）、web（DuckDuckGo+Bing 直连/代理自动切换+读网页+天气+翻墙）。",
+  "description": "四引擎统一搜索：anysearch（通用+垂直域+批量+URL提取，匿名可用）、tavily（LLM优化搜索/提取/深度研究，原生 HTTP 免 CLI，需 TAVILY_API_KEY）、exa（语义搜索/答案/相似页，原生 HTTP，需 EXA_API_KEY）、web（DuckDuckGo+Bing 直连/代理自动切换+读网页+天气+翻墙）；外加免 key 的科研引擎：search_paper（arXiv+OpenAlex+Crossref+PubMed 四源融合）/ read_paper（PDF 全文抽取）/ paper_cite（BibTeX）；外加极客信息源：search_tech（HN+StackExchange+GitHub+Wikipedia+论文库融合，带权威度分层 A/B/C）/ registry_info（PyPI/npm/crates/DockerHub/HuggingFace/OpenRouter 一手元数据）。",
   "author": "dabai",
   "enabled": true,
   "disclosure": "on_demand",
-  "prompt": "【技能 统一搜索】查信息/新闻/文档/教程：优先 search_web（anysearch 引擎，匿名可用，支持垂直域 finance/academic/code 等，垂直域先 search_subdomains 拿参数）；需要语义搜索/找相似页用 search_exa（需 EXA_API_KEY）；需要深度研究/爬站用 search_tavily（需 tvly CLI+TAVILY_API_KEY）；读网页正文用 read_web（web 引擎，JS 渲染自动无头 Chrome）；天气用 weather_check；翻墙/代理用 fq_ctl/proxy_test。查实时信息先搜再答，不凭空编造。",
+  "prompt": "【技能 统一搜索】查信息/新闻/文档/教程：优先 search_web（anysearch 引擎，匿名可用，支持垂直域 finance/academic/code 等，垂直域先 search_subdomains 拿参数）；查论文/科研用 search_paper（arXiv+OpenAlex+Crossref+PubMed 四源融合，免 key；追最新进展用 sort=latest 配 days）→ read_paper 读 PDF 全文（传 arXiv ID/DOI）→ paper_cite 出 BibTeX；读网页正文用 read_web（JS 渲染自动无头 Chrome）；天气用 weather_check；翻墙/代理用 fq_ctl/proxy_test。注意：exa/tavily 六个工具已是原生 HTTP 实现（不再需要 exa-skills 脚本或 tvly CLI），只差 key——配好 EXA_API_KEY / TAVILY_API_KEY 即可用；无 key 时工具直接返回配置指引，别反复重试，改用 search_paper 或 search_web。查实时信息先搜再答，不凭空编造。 技术选型/踩坑/有没有人做过：用 search_tech（五源融合 + 权威度标记，[C] 社区讨论当线索别当结论，✓N源 表示同一内容被多源引用）；写依赖或选模型前用 registry_info 查真实版本号、发布时间、上下文长度与价格（PyPI/npm/crates/DockerHub/HuggingFace/OpenRouter），别凭记忆写版本号。",
   "tools": [
     {
       "type": "function",
@@ -22,7 +22,25 @@
             },
             "domain": {
               "type": "string",
-              "enum": ["general", "resource", "social_media", "finance", "academic", "legal", "health", "business", "security", "ip", "code", "energy", "environment", "agriculture", "travel", "film", "gaming"],
+              "enum": [
+                "general",
+                "resource",
+                "social_media",
+                "finance",
+                "academic",
+                "legal",
+                "health",
+                "business",
+                "security",
+                "ip",
+                "code",
+                "energy",
+                "environment",
+                "agriculture",
+                "travel",
+                "film",
+                "gaming"
+              ],
               "description": "垂直域（可选）。垂直搜索前必须先 search_subdomains 确认 sub_domain"
             },
             "sub_domain": {
@@ -35,7 +53,10 @@
             },
             "zone": {
               "type": "string",
-              "enum": ["cn", "intl"],
+              "enum": [
+                "cn",
+                "intl"
+              ],
               "description": "区域偏好：cn 或 intl"
             },
             "language": {
@@ -47,7 +68,9 @@
               "description": "最多返回几条（1-10，默认 10）"
             }
           },
-          "required": ["query"]
+          "required": [
+            "query"
+          ]
         }
       }
     },
@@ -60,12 +83,17 @@
           "type": "object",
           "properties": {
             "queries": {
-              "type": ["string", "array"],
+              "type": [
+                "string",
+                "array"
+              ],
               "description": "多个查询：传 JSON 数组字符串（如 [{\"query\":\"AAPL\"},{\"query\":\"GOOG\"}]），或直接传字符串数组（[\"AAPL\",\"GOOG\"] 亦可）；每项支持 query/domain/sub_domain/sub_domain_params/max_results"
             },
             "query": {
               "type": "array",
-              "items": {"type": "string"},
+              "items": {
+                "type": "string"
+              },
               "description": "简写：多个独立查询串（最多 5 个）"
             },
             "max_results": {
@@ -87,7 +115,25 @@
           "properties": {
             "domain": {
               "type": "string",
-              "enum": ["general", "resource", "social_media", "finance", "academic", "legal", "health", "business", "security", "ip", "code", "energy", "environment", "agriculture", "travel", "film", "gaming"],
+              "enum": [
+                "general",
+                "resource",
+                "social_media",
+                "finance",
+                "academic",
+                "legal",
+                "health",
+                "business",
+                "security",
+                "ip",
+                "code",
+                "energy",
+                "environment",
+                "agriculture",
+                "travel",
+                "film",
+                "gaming"
+              ],
               "description": "单个垂直域"
             },
             "domains": {
@@ -112,7 +158,9 @@
               "description": "网页完整地址（http:// 或 https:// 开头）"
             }
           },
-          "required": ["url"]
+          "required": [
+            "url"
+          ]
         }
       }
     },
@@ -120,7 +168,7 @@
       "type": "function",
       "function": {
         "name": "search_exa",
-        "description": "Exa 语义搜索：按含义而非关键词检索，返回标题/URL/摘要。需 EXA_API_KEY（未配置会报错）。查询要『描述想找的页面』而非关键词。",
+        "description": "Exa 语义搜索：按含义而非关键词检索，返回标题/URL/摘要。原生 HTTP，需 EXA_API_KEY（未配置时返回配置指引）。查询要『描述想找的页面』而非关键词。",
         "parameters": {
           "type": "object",
           "properties": {
@@ -130,15 +178,31 @@
             },
             "num": {
               "type": "integer",
-              "description": "返回条数（默认 10）"
+              "description": "返回条数（默认 8，上限 25）"
             },
             "category": {
               "type": "string",
-              "enum": ["company", "news", "research paper", "github", "pdf"],
+              "enum": [
+                "company",
+                "news",
+                "research paper",
+                "github",
+                "pdf"
+              ],
               "description": "分类聚焦（可选）"
+            },
+            "include_domains": {
+              "type": "string",
+              "description": "限定域名，逗号分隔（可选）"
+            },
+            "text": {
+              "type": "boolean",
+              "description": "true 时同时取回正文片段（可选，会增加花费）"
             }
           },
-          "required": ["query"]
+          "required": [
+            "query"
+          ]
         }
       }
     },
@@ -155,7 +219,9 @@
               "description": "要回答的问题"
             }
           },
-          "required": ["question"]
+          "required": [
+            "question"
+          ]
         }
       }
     },
@@ -176,7 +242,9 @@
               "description": "返回条数（默认 10）"
             }
           },
-          "required": ["url"]
+          "required": [
+            "url"
+          ]
         }
       }
     },
@@ -184,7 +252,7 @@
       "type": "function",
       "function": {
         "name": "search_tavily",
-        "description": "Tavily 搜索（LLM 优化）：支持 advanced 深度、time-range 时间过滤、include-domains 限定站点。需安装 tvly CLI 并配置 TAVILY_API_KEY。",
+        "description": "Tavily 搜索（LLM 优化）：支持 advanced 深度、time-range 时间过滤、include-domains 限定站点。原生 HTTP，需 TAVILY_API_KEY（无需 tvly CLI）。",
         "parameters": {
           "type": "object",
           "properties": {
@@ -194,12 +262,20 @@
             },
             "depth": {
               "type": "string",
-              "enum": ["basic", "advanced"],
+              "enum": [
+                "basic",
+                "advanced"
+              ],
               "description": "搜索深度（默认 basic，advanced 更全面）"
             },
             "time_range": {
               "type": "string",
-              "enum": ["day", "week", "month", "year"],
+              "enum": [
+                "day",
+                "week",
+                "month",
+                "year"
+              ],
               "description": "时间过滤（可选）"
             },
             "include_domains": {
@@ -208,10 +284,20 @@
             },
             "max_results": {
               "type": "integer",
-              "description": "最多返回几条（默认 5）"
+              "description": "最多返回几条（默认 5，上限 20）"
+            },
+            "topic": {
+              "type": "string",
+              "description": "话题类型（可选，如 general / news）"
+            },
+            "include_answer": {
+              "type": "boolean",
+              "description": "true 时额外返回一句直接答案（可选）"
             }
           },
-          "required": ["query"]
+          "required": [
+            "query"
+          ]
         }
       }
     },
@@ -219,16 +305,23 @@
       "type": "function",
       "function": {
         "name": "search_tavily_extract",
-        "description": "Tavily 提取 URL 正文（支持 JS 渲染页）。需 tvly CLI + TAVILY_API_KEY。",
+        "description": "Tavily 提取 URL 正文（markdown，支持 JS 渲染页）。原生 HTTP，需 TAVILY_API_KEY。",
         "parameters": {
           "type": "object",
           "properties": {
             "url": {
               "type": "string",
               "description": "网页完整地址"
+            },
+            "urls": {
+              "type": [
+                "string",
+                "array"
+              ],
+              "description": "一次提取多个 URL（可选，上限 20）"
             }
           },
-          "required": ["url"]
+          "required": []
         }
       }
     },
@@ -236,7 +329,7 @@
       "type": "function",
       "function": {
         "name": "search_tavily_research",
-        "description": "Tavily 深度研究：多源聚合带引用（30-120s）。需 tvly CLI + TAVILY_API_KEY。",
+        "description": "Tavily 深度研究：多源聚合带引用（30-120s，异步任务自动轮询）。原生 HTTP，需 TAVILY_API_KEY。",
         "parameters": {
           "type": "object",
           "properties": {
@@ -246,10 +339,18 @@
             },
             "model": {
               "type": "string",
-              "description": "模型（默认 pro）"
+              "description": "模型（默认 auto）"
+            },
+            "request_id": {
+              "type": "string",
+              "description": "复查既有任务（超时后传它取结果，不新建）"
+            },
+            "timeout": {
+              "type": "integer",
+              "description": "等待秒数（默认 180，上限 600）"
             }
           },
-          "required": ["topic"]
+          "required": []
         }
       }
     },
@@ -270,7 +371,9 @@
               "description": "最多返回几条（默认 5，最大 10）"
             }
           },
-          "required": ["query"]
+          "required": [
+            "query"
+          ]
         }
       }
     },
@@ -288,7 +391,13 @@
             },
             "mode": {
               "type": "string",
-              "enum": ["text", "links", "headings", "tables", "html"],
+              "enum": [
+                "text",
+                "links",
+                "headings",
+                "tables",
+                "html"
+              ],
               "description": "挖法：text 正文（默认）/ links 链接清单 / headings 标题大纲 / tables 表格 / html 原始 HTML"
             },
             "keyword": {
@@ -297,7 +406,11 @@
             },
             "js": {
               "type": "string",
-              "enum": ["auto", "true", "false"],
+              "enum": [
+                "auto",
+                "true",
+                "false"
+              ],
               "description": "是否用无头 Chrome 渲染 JS：auto（默认，内容自动太少启用）/ true / false"
             },
             "max_chars": {
@@ -305,7 +418,9 @@
               "description": "最多返回多少字符（默认 3000，最大 8000）"
             }
           },
-          "required": ["url"]
+          "required": [
+            "url"
+          ]
         }
       }
     },
@@ -322,7 +437,9 @@
               "description": "城市名（中文或拼音均可），如 '北京'、'Shanghai'。"
             }
           },
-          "required": ["city"]
+          "required": [
+            "city"
+          ]
         }
       }
     },
@@ -336,7 +453,16 @@
           "properties": {
             "action": {
               "type": "string",
-              "enum": ["list", "status", "start", "stop", "test", "update", "chrome", "sysproxy"],
+              "enum": [
+                "list",
+                "status",
+                "start",
+                "stop",
+                "test",
+                "update",
+                "chrome",
+                "sysproxy"
+              ],
               "description": "要执行的操作。list=全部协议概览；status=进程+端口详情；start=启动核心；stop=停止；test=走代理访问gstatic(204=通)；update=云端拉新IP配置；chrome=只开便携Chrome；sysproxy=系统代理开关。"
             },
             "target": {
@@ -364,7 +490,9 @@
               "description": "update 操作的显式确认（会备份并覆盖现有配置文件）。必须用户明确要求换 IP 后才传 true。"
             }
           },
-          "required": ["action"]
+          "required": [
+            "action"
+          ]
         }
       }
     },
@@ -386,6 +514,179 @@
             }
           },
           "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "search_paper",
+        "description": "学术论文检索：arXiv + OpenAlex + Crossref + PubMed 四源并行、RRF 融合去重（全部免 key）。返回标题/年份/期刊/被引/作者/DOI/PDF 直链。追最新进展用 sort=latest 配 days。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string",
+              "description": "研究主题或关键词（英文检索效果最好）"
+            },
+            "source": {
+              "type": "string",
+              "description": "信息源：auto=默认 arxiv+openalex+crossref；all=再加 pubmed；也可单独指定 arxiv/openalex/crossref/pubmed 或逗号组合"
+            },
+            "days": {
+              "type": "integer",
+              "description": "只看最近 N 天（时效追踪，配 sort=latest 用）"
+            },
+            "sort": {
+              "type": "string",
+              "enum": [
+                "relevance",
+                "latest"
+              ],
+              "description": "排序：relevance=相关度（默认），latest=最新"
+            },
+            "limit": {
+              "type": "integer",
+              "description": "返回条数（默认 8）"
+            }
+          },
+          "required": [
+            "query"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "read_paper",
+        "description": "读论文全文：传 arXiv ID / DOI / PDF 直链，自动定位开放获取 PDF（arXiv 直取，DOI 走 OpenAlex+Unpaywall）并用 pypdf 抽取正文文本。扫描版 PDF 无法抽取，会明确告知。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "ref": {
+              "type": "string",
+              "description": "论文标识：arXiv ID（如 2312.10997）/ DOI（如 10.1145/3777378）/ PDF 直链"
+            },
+            "pages": {
+              "type": "string",
+              "description": "页段：省略=前 5 页；all=全部（上限 60 页）；3=第 3 页；2-6=区间"
+            },
+            "max_chars": {
+              "type": "integer",
+              "description": "返回字符上限（默认 8000）"
+            }
+          },
+          "required": [
+            "ref"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "paper_cite",
+        "description": "取论文 BibTeX 引用：DOI 走 Crossref content negotiation，arXiv ID 由 Atom 元数据生成。支持一次多个。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "refs": {
+              "type": [
+                "string",
+                "array"
+              ],
+              "description": "DOI 或 arXiv ID，可多个（逗号/换行分隔，或数组）"
+            }
+          },
+          "required": [
+            "refs"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "search_tech",
+        "description": "极客技术检索：一次查询并行打 Hacker News（工程评价/踩坑）、StackExchange（问答）、GitHub（仓库）、Wikipedia（概念）、论文库（arXiv+OpenAlex+Crossref+PubMed）、tavily（厂商博客/榜单）、官方文档（GitHub 仓库 homepage → llms.txt），RRF 融合去重 + 跨源交叉印证（同一 URL 被多源引用会标 ✓N源），每条带权威度标记 [A]一手/[B]同行评审或高信誉问答/[C]社区讨论。查「某技术怎么用/有什么坑/有没有人做过/有没有论文」用它；查时事新闻或百科综述用 search_web。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string",
+              "description": "检索关键词（技术名、库名、报错信息、问题描述）"
+            },
+            "sources": {
+              "type": "string",
+              "description": "信息源，逗号分隔或 auto（默认 auto = hn,so,gh,wiki,academic,tavily,official）。可选 hn/so/devto/wiki/gh/hf/academic/tavily/official；devto 只能按 tag 匹配，默认不开；official 靠 gh 源提供官方域（GitHub 仓库 homepage）再抓该域 llms.txt"
+            },
+            "site": {
+              "type": "string",
+              "description": "StackExchange 站点，默认 stackoverflow（可选 serverfault/superuser/askubuntu/mathoverflow 等）"
+            },
+            "limit": {
+              "type": "integer",
+              "description": "每个源取几条（1-10，默认 3）"
+            },
+            "max_results": {
+              "type": "integer",
+              "description": "融合后展示几条（1-30，默认 10）"
+            },
+            "days": {
+              "type": "integer",
+              "description": "只看最近 N 天（追新用）"
+            },
+            "sort": {
+              "type": "string",
+              "enum": [
+                "relevance",
+                "latest"
+              ],
+              "description": "relevance=相关度（默认）/ latest=最新"
+            },
+            "lang": {
+              "type": "string",
+              "description": "Wikipedia 语言（en/zh），默认按 query 是否含中文自动判定"
+            }
+          },
+          "required": [
+            "query"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "registry_info",
+        "description": "包/镜像/模型注册表精确查询（一手元数据 tier A）：PyPI、npm、crates.io、DockerHub、HuggingFace 模型与数据集、OpenRouter 大模型（上下文长度与输入输出价格）。写依赖、写 Dockerfile、选模型之前先查真实版本号与发布时间，别凭记忆写。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string",
+              "description": "包名/镜像名/模型名，如 requests、react、serde、library/nginx、meta-llama/Llama-3.2-1B-Instruct、claude"
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "auto",
+                "pypi",
+                "npm",
+                "crates",
+                "docker",
+                "hf",
+                "model",
+                "dataset",
+                "llm"
+              ],
+              "description": "注册表类型，默认 auto（并行查 PyPI/npm/crates/DockerHub/HuggingFace）"
+            }
+          },
+          "required": [
+            "name"
+          ]
         }
       }
     }

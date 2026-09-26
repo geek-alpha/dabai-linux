@@ -3,8 +3,8 @@
 
 合并自 4 个搜索技能：
 - anysearch-skill-main（通用/垂直域/批量/URL提取，匿名可用）
-- tavily-skills（LLM 优化搜索/提取/爬取/深度研究，需 tvly CLI + TAVILY_API_KEY）
-- exa-skills（语义搜索/答案/相似页，需 EXA_API_KEY）
+- tavily（LLM 优化搜索/提取/深度研究，原生 HTTP，需 TAVILY_API_KEY）
+- exa（语义搜索/答案/相似页，原生 HTTP，需 EXA_API_KEY）
 - web（DuckDuckGo+Bing 搜索/读网页/天气/翻墙代理）
 
 工具命名规则：
@@ -16,7 +16,6 @@ from __future__ import annotations
 import glob
 import json
 import os
-import shutil
 import subprocess
 import sys
 
@@ -52,14 +51,15 @@ def _find_engine(*rel_parts: str) -> str:
 
 
 _ANYSEARCH_CLI = _find_engine("anysearch-skill-main", "scripts", "anysearch_cli.py")
-_EXA_WEB_SEARCH = _find_engine("exa-skills", "exa-web-search", "scripts", "web_search.py")
-_EXA_CLIENT = _find_engine("exa-skills", "_shared", "exa_client.py")
-_EXA_ANSWER = _find_engine("exa-skills", "exa-web-search", "scripts", "exa_client.py")
 
 # ---------- web 引擎（原 web 技能实现） ----------
 import web_impl  # noqa: E402
 import weather_impl  # noqa: E402
 import fq_impl  # noqa: E402
+import academic_impl  # noqa: E402
+import exa_impl  # noqa: E402
+import tavily_impl  # noqa: E402
+import tech_impl  # noqa: E402
 
 
 def _run(cmd: list, timeout: int = 120) -> str:
@@ -169,107 +169,39 @@ def search_extract(args: dict) -> str:
     return _run([sys.executable, _ANYSEARCH_CLI, "extract", url])
 
 
-# ---------- exa 引擎 ----------
-def _exa_web_search(args: dict) -> str:
-    err = _check_file(_EXA_WEB_SEARCH)
-    if err:
-        return err
-    query = str(args.get("query") or "").strip()
-    if not query:
-        return "请提供查询（描述想找的页面）。"
-    cmd = [sys.executable, _EXA_WEB_SEARCH, query]
-    n = args.get("num")
-    if n:
-        cmd += ["-n", str(n)]
-    cat = args.get("category")
-    if cat:
-        cmd += ["-c", str(cat)]
-    return _run(cmd)
-
-
-def _exa_client(sub: str, args: dict) -> str:
-    err = _check_file(_EXA_CLIENT)
-    if err:
-        return err
-    cmd = [sys.executable, _EXA_CLIENT, sub]
-    if sub == "contents":
-        url = str(args.get("url") or "").strip()
-        if not url:
-            return "请提供要读取的 URL。"
-        cmd += [url, "--text"]
-    elif sub == "answer":
-        q = str(args.get("question") or args.get("query") or "").strip()
-        if not q:
-            return "请提供要回答的问题。"
-        cmd += [q]
-    elif sub == "similar":
-        url = str(args.get("url") or "").strip()
-        if not url:
-            return "请提供参考页面 URL。"
-        cmd += [url]
-        n = args.get("num")
-        if n:
-            cmd += ["-n", str(n)]
-    return _run(cmd)
-
-
+# ---------- exa 引擎（原生 HTTP，不再依赖 exa-skills 脚本） ----------
 def search_exa(args: dict) -> str:
-    return _exa_web_search(args)
+    return exa_impl.exa_search(args)
 
 
 def search_exa_answer(args: dict) -> str:
-    return _exa_client("answer", args)
+    return exa_impl.exa_answer(args)
 
 
 def search_exa_similar(args: dict) -> str:
-    return _exa_client("similar", args)
+    return exa_impl.exa_similar(args)
 
 
-# ---------- tavily 引擎 ----------
-def _tvly(args: list, timeout: int = 180) -> str:
-    tvly = shutil.which("tvly")
-    if not tvly:
-        return ("tvly CLI 未安装。安装：pip install tavily-cli（或 uv tool install tavily-cli），"
-                "然后 tvly login --api-key tvly-xxx 配置 TAVILY_API_KEY。")
-    return _run([tvly] + args, timeout=timeout)
-
-
+# ---------- tavily 引擎（原生 HTTP，不再依赖 tvly CLI） ----------
 def search_tavily(args: dict) -> str:
-    query = str(args.get("query") or "").strip()
-    if not query:
-        return "请提供搜索关键词（query 参数）。"
-    cmd = ["search", query, "--json"]
-    depth = args.get("depth")
-    if depth:
-        cmd += ["--depth", str(depth)]
-    tr = args.get("time_range")
-    if tr:
-        cmd += ["--time-range", str(tr)]
-    dom = args.get("include_domains")
-    if dom:
-        cmd += ["--include-domains", str(dom)]
-    mr = args.get("max_results")
-    if mr:
-        cmd += ["--max-results", str(mr)]
-    return _tvly(cmd)
+    return tavily_impl.tavily_search(args)
 
 
 def search_tavily_extract(args: dict) -> str:
-    url = str(args.get("url") or "").strip()
-    if not url:
-        return "请提供要提取的 URL。"
-    return _tvly(["extract", url, "--json"])
+    return tavily_impl.tavily_extract(args)
 
 
 def search_tavily_research(args: dict) -> str:
-    topic = str(args.get("topic") or "").strip()
-    if not topic:
-        return "请提供研究主题（topic 参数）。"
-    cmd = ["research", topic]
-    model = args.get("model")
-    if model:
-        cmd += ["--model", str(model)]
-    return _tvly(cmd, timeout=300)
+    return tavily_impl.tavily_research(args)
+
+
+# ---------- 极客信息源（tech_impl：HN/StackExchange/GitHub/Wikipedia/HF/论文库 + 注册表） ----------
+def search_tech(args: dict) -> str:
+    return tech_impl.search_tech(args)
+
+
+def registry_info(args: dict) -> str:
+    return tech_impl.registry_info(args)
 
 
 # ---------- web 引擎（原样转发，web_impl 是 async 协程） ----------
@@ -308,5 +240,10 @@ HANDLERS = {
     "read_web": read_web,
     "weather_check": weather_check,
     "fq_ctl": fq_ctl,
-    "proxy_test": proxy_test,
+    "proxy_test": fq_impl.proxy_test,
+    "search_paper": academic_impl.search_paper,
+    "read_paper": academic_impl.read_paper,
+    "paper_cite": academic_impl.paper_cite,
+    "search_tech": search_tech,
+    "registry_info": registry_info,
 }

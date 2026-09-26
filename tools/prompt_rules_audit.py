@@ -85,6 +85,17 @@ REPLY_APOLOGY_MAX = 0.15
 REPLY_TAIL_ASK_MAX = 0.35
 # 回复文本样本下限：低于这个轮数，「零套话」不构成证据。
 REPLY_MIN_TURNS = 20
+# 「说重点」节奏面（2026-09-25 加）：这条规则有两面——不该说废话（套话率，见上）
+# 和该说的时候必须说（工具轮里连续沉默）。第二面此前无数据源：全程沉默在日志里
+# 与「一切正常」长得一样。它的可数形式就是规则自己写的触发条件：连续 3 轮工具调用
+# 没说话 = 一次违规。
+# 口径：这里量的是下限（没憋死），量不到「该说的时候说得有没有价值」——后半句靠规则里
+# 「拿不准就说一句」的默认倾向兜，不设阈值，也不拿它当通过判据。
+MID_SPEECH_SILENT_LIMIT = 3
+# 违规轮占比达标线（暂定值，不是实测基准）：攒够样本再校准。
+MID_SPEECH_BAD_MAX = 0.20
+# 样本下限 = 带埋点的轮数，低于此不判。
+MID_SPEECH_MIN_TURNS = 20
 
 # 「委派任务自包含率」达标线（暂定值，依据见下）：委派是交接——接手方拿不到
 # 「在哪做/要什么产出/有什么约束」里的任何一条，就得回来问或猜，返工成本远高于写清楚。
@@ -246,9 +257,10 @@ RULE_MAP = [
     # 「摸清大项目」：从 call_names 数「摸底轮里先 code_map 的比例」（2026-09-24 前标
     # none——其实数据源一直在盘上，只是没人接）。
     ("摸清大项目", "metric", "code_map_use"),
-    # 「说重点」：交付文本里的 AI 套话率（2026-09-24 起有数据源——回复文本
-    # 此前不进任何日志，这条规则只能标 none）。
-    ("说重点", "metric", "reply_boilerplate"),
+    # 「说重点」：这条规则两面都要测——套话率（不该说的别说）+ 过程话节奏（该说的必须说）。
+    # 2026-09-24 先接上套话率；2026-09-25 改指 mid_speech，因为实测的失败模式是「全程沉默」
+    # 而不是「说废话」——只测套话率会把沉默读成满分。mid_speech 分支内部仍报套话率，两面合在一个判据里。
+    ("说重点", "metric", "mid_speech"),
     # —— 行为准则段（2026-09-22 纳入）——
     # 这 11 块此前从未进过审计流程：不是「审了判不出」，是连入口都没有。
     # 第二轮：能从 turn_metrics 明细（call_names / script_names）量化的接上 metric，
@@ -728,6 +740,16 @@ def totals(rows: list[dict]) -> dict:
         "inject_lines": s("inject_lines"),
         "comment_lines": s("comment_lines"),
         "placeholder_comments": s("placeholder_comments"),
+        # 「说重点」节奏面：分子 = 说话的工具轮数，分母 = 带埋点行的工具轮数
+        # （老行没有这两个字段，算进分母会把比例稀释成假的）。silent_bad 数
+        # 「连续静默 >= 3 轮」的轮数——规则的可数形式就是它自己写的触发条件。
+        "mid_speech_rounds": s("mid_speech_rounds"),
+        "silent_bad_rounds": sum(
+            1 for r in rows if (r.get("silent_max") or 0) >= MID_SPEECH_SILENT_LIMIT),
+        "speech_tool_rounds": sum(
+            int(r.get("tool_rounds") or 0) for r in rows if "mid_speech_rounds" in r),
+        "speech_turns": sum(1 for r in rows if "mid_speech_rounds" in r),
+        "silent_max_worst": max([int(r.get("silent_max") or 0) for r in rows] or [0]),
     }
 
 
@@ -803,6 +825,23 @@ def judge(kind: str, metric: str | None, agg: dict, subs: list[dict],
         return tag, (f"{m} 轮交付里 {n} 轮带 AI 套话（{r:.1%}，达标线 "
                      f"<={REPLY_BOILERPLATE_MAX:.0%}；共 {agg.get('reply_boilerplate_hits', 0)} 处"
                      + _reply_words_note(agg) + "）")
+    if metric == "mid_speech":
+        m = agg.get("speech_turns", 0)
+        if m < MID_SPEECH_MIN_TURNS:
+            return "INSUFFICIENT", (
+                f"过程话埋点只有 {m} 轮（2026-09-25 加，需 {MID_SPEECH_MIN_TURNS} 轮才能判）"
+                "——先攒样本，别拿它下结论")
+        bad = agg.get("silent_bad_rounds", 0)
+        r = bad / m
+        bp_n, bp_m = agg.get("reply_boilerplate_rounds", 0), agg.get("reply_turns", 0)
+        bp = f"；同期交付文本套话 {bp_n}/{bp_m} 轮" if bp_m else ""
+        tag = "MEASURED_OK" if r <= MID_SPEECH_BAD_MAX else "MEASURED_GAP"
+        return tag, (
+            f"{m} 轮里 {bad} 轮出现「连续 {MID_SPEECH_SILENT_LIMIT} 轮工具调用没说话」"
+            f"（{r:.0%}，达标线 <={MID_SPEECH_BAD_MAX:.0%}）；"
+            f"最长一次静默 {agg.get('silent_max_worst', 0)} 轮，"
+            f"说话轮 {agg.get('mid_speech_rounds', 0)}/{agg.get('speech_tool_rounds', 0)}"
+            + bp)
     if metric == "reply_apology":
         n, m = agg.get("reply_apology_rounds", 0), agg.get("reply_turns", 0)
         if m < REPLY_MIN_TURNS:
@@ -1093,6 +1132,10 @@ def render(rep: dict) -> str:
         out.append(f"交付文本：{a['reply_turns']} 轮里 套话 "
                    f"{a['reply_boilerplate_rounds']} / 道歉 {a['reply_apology_rounds']} / "
                    f"结尾征询 {a['reply_tail_ask_rounds']}")
+    if a.get("speech_turns"):
+        out.append(f"过程话：{a['speech_turns']} 轮里 {a['silent_bad_rounds']} 轮出现连续静默，"
+                   f"最长 {a.get('silent_max_worst', 0)} 轮；"
+                   f"说话轮 {a['mid_speech_rounds']}/{a['speech_tool_rounds']}")
     out.append("")
     c = rep.get("calls") or {}
     if c.get("turns"):
