@@ -18,7 +18,7 @@
  * 它 import 的 69 个子模块（如 js/ui/30_task_big_screen.ts）URL 不带版本，
  * 在 SWR 下缓存 key 永不变 → 改子模块后第一次打开仍拿到旧文件（后台才更新）。
  * 升这个号 = 强制清缓存，一次重拉（含 24MB VRM，局域网几秒），换后续全部新鲜。 */
-const SW_VERSION = '8';
+const SW_VERSION = '9';
 const CACHE = `dabai-shell-v${SW_VERSION}`;
 
 // 首屏骨架：装完 SW 就有离线可用的底子。

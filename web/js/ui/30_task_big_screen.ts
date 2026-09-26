@@ -18,7 +18,12 @@ export default (function init(App: AppKernel) {
    *    走行式布局引擎，互不重叠、排版优美。
    * ============================================================ */
 
-  const DRAW_W = 1280, DRAW_H = 720;  // 逻辑画布分辨率（满幅 16:9）
+  const DRAW_W = 1280, DRAW_H = 720;  // 逻辑画布坐标系（满幅 16:9，所有布局代码都用它）
+  // 超采样倍数：画布真实像素 = 逻辑尺寸 × SS，绘制前用 setTransform 整体缩放。
+  // 布局代码一行不改（仍是 1280×720 坐标系），但贴图密度成倍提高：
+  // VR 巨幕屏宽 17.1m、7m 处张角 101° → 1x 时 12.6 px/度（头显单眼约 21.5 px/度，必然发虚），
+  // 3x 时 37.9 px/度，超过头显像素密度。代价：纹理 33MB，重绘已降至 10Hz，2D 成本可控。
+  const SS = 3;
   const BOARD_W = 3.8;                // Billboard 世界宽度（固定），高度随内容自适应（基础值翻倍）
   const MIN_CONTENT_H = 400;          // 待机画面最小内容高（内容再少也不会扁过这个；保底让「大白直播间」待机横幅够大够醒目）
   const GUTTER = 30;                  // 左右安全边距
@@ -28,6 +33,11 @@ export default (function init(App: AppKernel) {
   let canvas = null, ctx = null;
   let webScratch = null;              // 网页帧中转画布（帧尺寸≠主画布，需缩放中转）
   let texture = null;
+  // 视频层：独立平面 + 原生 VideoTexture —— 视频帧由浏览器直接上传 GL，不再经
+  // canvas drawImage → texImage2D 中转（免掉每帧一次全幅重采样，清晰度=源分辨率）
+  let videoPlane = null;
+  let videoTex = null;
+  let __vpOffVec = null;               // syncVideoPlane 的临时向量（避免每帧 new）
   let tasks = [];                     // 最近任务列表
   let detailCache = new Map();        // id -> full
   let lastDraw = 0;
@@ -40,9 +50,51 @@ export default (function init(App: AppKernel) {
   let showcase = null;                // { id, kind:'media'|'info', url?, payload?, ts }
   let showcaseSeq = 0;
   let displayH = DRAW_H;              // 当前"展示高度"（平滑插值中），决定屏幕实际大小与形状
-  const VR_BOARD_SCALE = 4.0;         // VR 沉浸模式大屏整体放大倍数（再翻倍=巨幕，占满视野）
+  const VR_BOARD_SCALE = 4.5;         // VR 沉浸模式大屏放大倍数（4.5 = 旧版 2.6 的面积 3 倍、边长 √3 倍）
+  // VR 巨幕 = 方向锚定（原「每帧钉在视线正前方」已弃用）：屏幕摆在「锁定方向 × vrLockDist」处、
+  // 法线正对双眼。锁定方向进 VR 首帧取当前视线，之后不再跟头 —— 转头看别处屏幕留在原地；
+  // 只有「注视屏幕外的点满 10s」才平滑挪到那个方向（躺着看天花板、侧躺看侧墙都行）。
+  // 满幅屏宽 17.1m（BOARD_W 3.8 × VR_BOARD_SCALE 4.5）：7m 处边缘 ±51°、垂直 ±34°。
+  // 水平张角 101° 略超头显 FOV（约 96°），两侧边缘要稍转头才看全 —— 巨幕铺满视野的必然代价；
+  // 想一次看全就把距离推远（14m 处张角 63°）或把屏幕调小（控制带 / 摇杆）。
+  const VR_GAZE_DIST = 7.0;           // 进入 VR 的初始锁定距离（米，沿视线量）
+  const VR_LOCK_MIN = 2.0;            // 能拉到多近（2m 处满幅屏张角 154°，贴脸必糊，用户自己权衡）
+  const VR_LOCK_MAX = 30.0;           // 能推多远
+  const VR_SCALE_MIN = 0.3;           // 屏幕大小倍率下限（乘在 VR_BOARD_SCALE 上）
+  const VR_SCALE_MAX = 3.0;           // 上限：满幅屏宽 51.3m，7m 处张角 149°
+  const VR_REANCHOR_MS = 10000;       // 注视屏幕外的点满 10s → 屏幕挪到那个方向
+  let vrLockDist = VR_GAZE_DIST;      // 当前锁定距离（摇杆 / 聊天面板控制带改的就是它）
+  let vrUserScale = 1;                // 用户调的大小倍率（1 = VR_BOARD_SCALE）
+  let vrLockDir: any = null;          // 锁定方向（世界向量）；null = 进 VR 后等首帧视线初始化
+  let vrDirTarget: any = null;        // 重锚目标方向（平滑过渡中；非空时暂停注视判定）
+  let vrOffSince = 0;                 // 注视屏幕外的起始时刻（回到屏内即清零）
+  let _gq: any = null, _gv: any = null, _gp: any = null, _gd: any = null;
+  function clampN(v: number, lo: number, hi: number) { return v < lo ? lo : (v > hi ? hi : v); }
+  /** 视线是否落在别的 VR 面板上：看面板时不计时重锚 ——
+   *  否则操作对话大屏/点播面板 10s 后，巨幕会整块挪到面板方向糊在脸上。 */
+  function gazingPanel(): boolean {
+    if (!App.vrRay || !App._xrEyeRay) return false;
+    const THREE = App.THREE;
+    if (!_gp) { _gp = new THREE.Vector3(); _gd = new THREE.Vector3(); }
+    try {
+      if (!App._xrEyeRay(_gp, _gd)) return false;
+      return !!App.vrRay.pick(_gp, _gd, false);
+    } catch (_) { return false; }
+  }
+  // 大小/距离调节通道：vr-chat 的控制带与手柄摇杆都走这里，改完下一帧即生效
+  App._vrBoardCtl = {
+    get: () => ({ dist: vrLockDist, scale: vrUserScale }),
+    step(kind: 'dist' | 'scale', delta: number) {
+      if (kind === 'dist') vrLockDist = clampN(vrLockDist + delta, VR_LOCK_MIN, VR_LOCK_MAX);
+      else vrUserScale = clampN(vrUserScale + delta, VR_SCALE_MIN, VR_SCALE_MAX);
+    },
+    reset() { vrLockDist = VR_GAZE_DIST; vrUserScale = 1; vrOffSince = 0; }
+  };
+  // 摇杆推拉通道（webxr-vr 的 zoomY）：方向锚定下改的是锁定距离，不是屏幕的世界位置
+  App._vrBoardZoom = function _vrBoardZoom(delta: number) {
+    App._vrBoardCtl!.step('dist', delta);
+  };
   let vrScaleCur = 1;                 // 当前生效的放大系数（进入/退出 VR 平滑过渡）
-  let vrFrozen = false;               // VR 世界锚定标记：进入 VR 后首个有效头部帧计算一次位姿并定格，整场会话不再改写
   // 网页渲染桥状态：3D 大屏优先显示 bigscreen.html 的网页画面（iframe 自截图贴纹理），
   // 失败自动回退手绘。state: 'loading'（iframe 加载中）→ 'ready'（截图流正常）→ 'failed'（回退手绘）
   let webRender = { state: 'idle', iframe: null, readyAt: 0, failAt: 0, lastFrame: 0, startedAt: 0 };
@@ -97,8 +149,15 @@ export default (function init(App: AppKernel) {
     if (!App.modelGroup) return;
 
     canvas = document.createElement('canvas');
-    canvas.width = DRAW_W; canvas.height = DRAW_H;
+    // 上限保险：个别低端设备 maxTextureSize 只有 2048，2560 宽的纹理会上传失败（大屏变黑）。
+    // 按能力降到 1x 也不至于出不来。
+    const maxTex = (App.renderer && App.renderer.capabilities && App.renderer.capabilities.maxTextureSize) || 4096;
+    const ss = Math.max(1, Math.min(SS, Math.floor(maxTex / DRAW_W)));
+    canvas.width = DRAW_W * ss; canvas.height = DRAW_H * ss;
     ctx = canvas.getContext('2d');
+    // 一次设定、全局生效：所有绘制路径（手绘 draw / 网页帧 / 截图）都走 1280×720 逻辑坐标。
+    // 这里没有 resetTransform，save/restore 也配平（save 时已含本变换），故不需每次重绘重设。
+    ctx.setTransform(ss, 0, 0, ss, 0, 0);
     texture = new THREE.CanvasTexture(canvas);
     texture.anisotropy = 4;
     texture.colorSpace = THREE.SRGBColorSpace;
@@ -223,6 +282,83 @@ export default (function init(App: AppKernel) {
       left.position.set(-worldW / 2 - t, 0, 0);   left.scale.set(t * 2.4, worldH + t * 2, 1);
     }
   }
+
+  // ---------- 视频层（原生 VideoTexture，不经 canvas 中转） ----------
+
+  function ensureVideoPlane() {
+    if (videoPlane) return;
+    const THREE = App.THREE;
+    if (!THREE || !App.scene) return;
+    videoPlane = new THREE.Mesh(
+      new THREE.PlaneGeometry(1, 1),
+      new THREE.MeshBasicMaterial({ transparent: true, depthWrite: false, side: THREE.DoubleSide })
+    );
+    // renderOrder 6 > board(5)：视频盖在 canvas 正片区之上，UI（顶栏/底栏/边框）仍在最上层
+    videoPlane.renderOrder = 6;
+    videoPlane.visible = false;
+    App.scene.add(videoPlane);
+  }
+
+  // 绑定/解绑视频纹理。换片/恢复每次都新建 <video> 元素（见 videoLoad 注释），
+  // 必须重建纹理；旧纹理 dispose 后即使元素被清空也不会泄漏。
+  function attachVideoTexture(el: any) {
+    const THREE = App.THREE;
+    if (!THREE) return;
+    ensureVideoPlane();
+    if (!videoPlane) return;
+    if (videoTex) { try { videoTex.dispose(); } catch (e) {} videoTex = null; }
+    if (!el) {
+      videoPlane.material.map = null;
+      videoPlane.material.needsUpdate = true;
+      videoPlane.visible = false;
+      return;
+    }
+    videoTex = new THREE.VideoTexture(el);
+    videoTex.colorSpace = THREE.SRGBColorSpace;
+    videoTex.minFilter = THREE.LinearFilter;
+    videoTex.magFilter = THREE.LinearFilter;
+    videoTex.generateMipmaps = false;
+    // WebXR 会话中非 XR-compatible 的视频元素作纹理源可能上传失败（VR 里黑屏）。
+    // three 只对 WebGL context 调 makeXRCompatible，不碰 video 元素，这里补上。
+    try {
+      if (typeof el.makeXRCompatible === 'function') el.makeXRCompatible().catch(() => {});
+    } catch (e) {}
+    videoPlane.material.map = videoTex;
+    videoPlane.material.needsUpdate = true;
+  }
+
+  // 每帧同步：尺寸取视频 contain 后的真实像素区（worldW 对应 canvas 宽 1280），
+  // 位姿与 board 一致 + 沿法线前移 2cm 避免共面 z-fighting。
+  function syncVideoPlane() {
+    if (!videoPlane || !board) return;
+    const vl = videoLive;
+    if (!vl || !vl.ready || vl.dead || !videoPlane.material.map || !board.visible) {
+      videoPlane.visible = false;
+      return;
+    }
+    const THREE = App.THREE;
+    const el = vl.el;
+    const iw = el.videoWidth || 1280, ih = el.videoHeight || 720;
+    const TOP_H = 84, BOT_H = 64;
+    const vh = DRAW_H - TOP_H - BOT_H;
+    const sc = Math.min(DRAW_W / iw, (vh - 20) / ih);
+    const dw = iw * sc, dh = ih * sc;
+    const dx = (DRAW_W - dw) / 2;
+    const dy = (TOP_H + DRAW_H - BOT_H) / 2 - dh / 2;
+    const worldW = board.scale.x, worldH = board.scale.y;
+    const spanH = displayH > 1 ? displayH : DRAW_H;
+    videoPlane.scale.set(dw / DRAW_W * worldW, dh / spanH * worldH, 1);
+    videoPlane.position.copy(board.position);
+    videoPlane.quaternion.copy(board.quaternion);
+    // canvas 坐标 → board 局部坐标（x 居中、y 自顶向下翻转）
+    const ox = ((dx + dw / 2) - DRAW_W / 2) / DRAW_W * worldW;
+    const oy = (spanH / 2 - (dy + dh / 2)) / spanH * worldH;
+    if (!__vpOffVec) __vpOffVec = new THREE.Vector3();
+    __vpOffVec.set(ox, oy, 0.02).applyQuaternion(board.quaternion);
+    videoPlane.position.add(__vpOffVec);
+    videoPlane.visible = true;
+  }
+
 
   // ---------- 数据 ----------
 
@@ -576,6 +712,7 @@ export default (function init(App: AppKernel) {
     }
     disposeVideoElement(videoLive.el);
     videoLive = null;
+    attachVideoTexture(null);
     dirty = true;
     if (!silent && App.showToast) App.showToast('📺 大屏回到待机');
   }
@@ -931,6 +1068,7 @@ export default (function init(App: AppKernel) {
     };
     v.src = url;
     v.load();
+    attachVideoTexture(v);   // 视频层直贴原生帧（不经 canvas 中转）
     showcase = null; // 视频接管全屏焦点
     dirty = true;
     if (!autoplay) return; // 暂停中跳转：等用户手动继续
@@ -1807,7 +1945,8 @@ export default (function init(App: AppKernel) {
       const sc = Math.min(DRAW_W / iw, (vh - 20) / ih);
       const dw = iw * sc, dh = ih * sc;
       const dx = (DRAW_W - dw) / 2, dy = vcy - dh / 2;
-      try { ctx.drawImage(v, dx, dy, dw, dh); } catch (e) {}
+      // 正片不再画进 canvas：由 videoPlane（原生 VideoTexture）直接上屏 ——
+      // 视频按源分辨率采样，绕开 canvas 1280 宽的重采样（竖屏源曾被压到 322px 宽）
       ctx.strokeStyle = 'rgba(255,255,255,0.14)';
       ctx.lineWidth = 2;
       rr(ctx, dx - 5, dy - 5, dw + 10, dh + 10, 10);
@@ -2161,6 +2300,7 @@ export default (function init(App: AppKernel) {
     if (boardClosed) {
       if (board) board.visible = false;
       if (frame) frame.visible = false;
+      if (videoPlane) videoPlane.visible = false;
       return;
     }
 
@@ -2177,7 +2317,7 @@ export default (function init(App: AppKernel) {
       displayH = targetH;
     }
     // VR 放大系数平滑过渡（进入/退出 VR 时大屏缓缓变大/复原，不瞬跳）
-    const vrTarget = App.xrPresenting ? VR_BOARD_SCALE : 1;
+    const vrTarget = App.xrPresenting ? VR_BOARD_SCALE * vrUserScale : 1;
     if (Math.abs(vrTarget - vrScaleCur) > 0.005) {
       vrScaleCur += (vrTarget - vrScaleCur) * (1 - Math.exp(-dt * 5));
     } else {
@@ -2213,14 +2353,9 @@ export default (function init(App: AppKernel) {
     const THREE = App.THREE;
     const avatar = App.modelGroup;
 
-    // VR 沉浸模式：大屏锚定在世界固定位置（像影院里挂好的幕布）——
-    // 进入 VR 后按进入视角计算一次位姿并定格，此后不再每帧改写；
-    // 大屏同时在 _xrWorldObjs 世界对象列表里，随世界整体平移/旋转
-    // （VR 里玩家移动 = 世界反向位移），因此大屏世界位置恒定不变，
-    // 玩家可以真实地走近/远离，角色转身/跳舞、玩家走动/转头都不带动大屏。
-    // 退出 VR 恢复「跟随角色身后 + 面向相机」的常规逻辑。
+    // VR 沉浸模式：巨幕 HUD 锁定在视线正前方（距离可由摇杆推拉），每帧覆盖位姿。
+    // 退出 VR 恢复「跟随角色身后 + 面向相机」。
     if (!App.xrPresenting) {
-      vrFrozen = false;
       // 大屏跟随角色身后 + 面向主相机（普通模式，每帧）
       const camX = App.camera.position.x;
       const camY = App.camera.position.y;
@@ -2246,53 +2381,78 @@ export default (function init(App: AppKernel) {
       board.lookAt(camX, camY, camZ);
       frame.position.copy(board.position);
       frame.quaternion.copy(board.quaternion);
-    } else if (!vrFrozen) {
-      // 进入 VR 后首个有效头部帧：按进入视角计算并定格大屏世界位姿。
-      // 头显位置：优先 XR 相机矩阵（_xrHeadPos 由手柄循环兜底）。
-      // camY>0.5 是就绪探测：会话首帧 XR 相机矩阵可能仍是单位矩阵（头在原点/地面），
-      // 直接定格会把屏焊死在脚边，须跳过等下一帧真实头部数据。
-      let camX = App._xrHeadPos && App._xrHeadPos.x;
-      let camY = App._xrHeadPos && App._xrHeadPos.y;
-      let camZ = App._xrHeadPos && App._xrHeadPos.z;
+      // 退出 VR：距离/大小/锁定方向全部复位 —— 下次进 VR 从默认观影位起，
+      // 不继承上一轮「屏幕贴脸 / 放大 3 倍」的状态（要什么当场用控制带调）
+      vrLockDist = VR_GAZE_DIST;
+      vrUserScale = 1;
+      vrLockDir = null;
+      vrDirTarget = null;
+      vrOffSince = 0;
+    } else if (board && frame) {
+      // 方向锚定：屏幕钉在「vrLockDir × vrLockDist」处、法线正对双眼。
+      // 锁定方向只在两种时候变：① 进 VR 首帧取当前视线；② 注视屏幕外满 10s 重锚。
+      // 其余时间转头/抬头都不牵动它 —— 看别处时屏幕老老实实待在原地。
+      // 本函数在 updateXRControllers 之后跑，每帧无条件覆盖位姿，最后写入者就是它。
+      const hp = App._xrHeadPos;
+      const eyeOff = App._xrEyeOffY || 0;
+      // 视线方向 = XR 相机世界朝向（含俯仰）
+      let fx = 0, fy = 0, fz = -1, gotDir = false;
       try {
         const renderer = App.renderer;
         const xrCam = renderer && renderer.xr ? renderer.xr.getCamera() : null;
-        if (xrCam && xrCam.matrixWorld) {
-          const e = xrCam.matrixWorld.elements;
-          camX = e[12]; camY = e[13]; camZ = e[14];
+        if (xrCam) {
+          const dir = new THREE.Vector3();
+          xrCam.getWorldDirection(dir);
+          if (dir.lengthSq() > 0.5) { fx = dir.x; fy = dir.y; fz = dir.z; gotDir = true; }
         }
       } catch (_) {}
-      if (camX == null) { camX = 0; camY = 1.6; camZ = 0; }
-      if (camY > 0.5) {
-        const back = new THREE.Vector3(
-          avatar.position.x - camX, 0, avatar.position.z - camZ
-        );
-        if (back.lengthSq() < 0.0001) back.set(0, 0, -1);
-        back.normalize();
-        const dist = 1.55;
-        const SCREEN_LIFT_FULL = 2.85;
-        const SCREEN_LIFT_IDLE = 1.90;
-        const liftFrac = Math.max(0, Math.min(1, (displayH - MIN_CONTENT_H) / (DRAW_H - MIN_CONTENT_H)));
-        const lift = SCREEN_LIFT_IDLE + (SCREEN_LIFT_FULL - SCREEN_LIFT_IDLE) * liftFrac
-                     + 0.5;  // VR 巨幕整体再抬高 0.5m
+      // hp.y > 0.5 是就绪探测：会话首帧 XR 相机矩阵可能仍是单位矩阵（头在原点/地面），
+      // 那一帧会把屏幕摆到脚下，跳过等下一帧真实头部数据。
+      if (hp && gotDir && hp.y > 0.5) {
+        const eyeY = hp.y + eyeOff;
+        if (!_gq) { _gq = new THREE.Quaternion(); _gv = new THREE.Vector3(); }
+        if (!vrLockDir) {
+          // 首帧：屏幕就锚在当前看的方向，用户不用先找屏幕
+          vrLockDir = new THREE.Vector3(fx, fy, fz).normalize();
+          vrOffSince = 0;
+        } else if (!vrDirTarget) {
+          // 屏幕在锁定距离处的半张角：视线偏出这个范围 = 没在看屏幕
+          const halfW = Math.atan(board.scale.x / 2 / vrLockDist);
+          const halfH = Math.atan(board.scale.y / 2 / vrLockDist);
+          // 视线转到屏幕局部系：屏幕中心方向在局部系里就是 -z
+          _gq.copy(board.quaternion).invert();
+          _gv.set(fx, fy, fz).applyQuaternion(_gq);
+          const hAng = Math.atan2(_gv.x, -_gv.z);
+          const vAng = Math.atan2(_gv.y, -_gv.z);
+          const onScreen = Math.abs(hAng) < halfW * 0.92 && Math.abs(vAng) < halfH * 0.92;
+          if (onScreen || gazingPanel()) {
+            vrOffSince = 0;   // 回到屏内 / 在看面板：计时清零
+          } else {
+            const t = performance.now();
+            if (!vrOffSince) vrOffSince = t;
+            else if (t - vrOffSince >= VR_REANCHOR_MS) {
+              vrDirTarget = new THREE.Vector3(fx, fy, fz).normalize();
+              vrOffSince = 0;
+            }
+          }
+        }
+        // 重锚：缓缓转过去（约 1s 到位），不瞬移 —— 瞬移会让人一瞬间丢掉空间感
+        if (vrDirTarget) {
+          vrLockDir.lerp(vrDirTarget, Math.min(1, 1 - Math.exp(-dt * 3.2))).normalize();
+          if (vrLockDir.angleTo(vrDirTarget) < 0.012) { vrLockDir.copy(vrDirTarget); vrDirTarget = null; }
+        }
         board.position.set(
-          avatar.position.x + back.x * dist,
-          avatar.position.y + lift,
-          avatar.position.z + back.z * dist
+          hp.x + vrLockDir.x * vrLockDist,
+          eyeY + vrLockDir.y * vrLockDist,
+          hp.z + vrLockDir.z * vrLockDist
         );
-        board.lookAt(camX, camY, camZ);
+        board.lookAt(hp.x, eyeY, hp.z);
         frame.position.copy(board.position);
         frame.quaternion.copy(board.quaternion);
-        // 注册进世界对象列表：后续世界平移/旋转（= 玩家移动/转身/缩放）带动大屏，
-        // 保持其世界位置不变（ensureBoard 早于 VR 创建时已由 _xrCaptureWorld 收集，
-        // 这里兜底迟创建/迟进入的情况）
-        if (App._xrWorldObjs && App._xrWorldObjs.indexOf(board) < 0) {
-          App._xrWorldObjs.push(board, frame);
-        }
-        vrFrozen = true;
       }
     }
-    // else：VR 已定格 → 位姿保持世界固定，不随角色/头显改写（尺寸缩放照常更新）
+    syncVideoPlane();
+
 
     const now = performance.now();
     // 截图流停摆（超过 WEB_FRAME_FRESH_MS 没新帧）→ 重连，不留永久冻结
@@ -2324,13 +2484,13 @@ export default (function init(App: AppKernel) {
       // （60fps 高帧率源）持续绘制会压满 GPU 带宽/主线程，正是诱发「画面冻结、
       // 声音照常」的要因之一。帧流健康（600ms 内有新帧）时忽略 timeupdate 的
       // dirty 重绘请求（进度 UI 随帧绘制更新即可）；帧停摆后由 dirty/兜底刷新。
-      const framesRecent = (now - (videoLive.lastFrameTs || 0)) < 600;
-      shouldDraw = (newFrame && now - lastDraw >= 33) ||
-                   (dirty && !framesRecent) || now - lastDraw > (mobile ? 1000 : 500);
-      // 兜底：帧循环本身被降档（性能档 20fps）或后台标签页节流时，rAF 间隔可能
-      // 超过 33ms，若只靠 newFrame 触发，新帧会被反复跳过 → 画面停滞（声音照常）。
-      // 距上次重绘超过 120ms 仍无一次成功绘制 → 强制画一帧，保证画面持续前进。
-      if (!shouldDraw && now - lastDraw > 120) shouldDraw = true;
+      // canvas 现在只承载 UI（顶栏/底栏/进度条），正片已由 videoPlane 原生纹理上屏，
+      // 不必再跟随视频帧率重绘：按 dirty（timeupdate 约 4Hz）驱动 + 100ms 下限，
+      // 纹理上传从 ~110MB/s 降到 ~10MB/s。看门狗不受影响 —— framePending 未被消费时
+      // 会保留到下次重绘，届时 newFrame=true 照常喂 lastDipTs。
+      shouldDraw = (dirty && now - lastDraw >= 100) || now - lastDraw > (mobile ? 1000 : 500);
+      // 兜底：帧循环被降档或后台标签页节流时，UI 也要前进（进度条/时间不卡住）
+      if (!shouldDraw && now - lastDraw > 250) shouldDraw = true;
     }
 
     if (shouldDraw) {

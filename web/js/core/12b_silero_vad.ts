@@ -14,6 +14,7 @@ export default (function init(App: AppKernel) {
   const CTX = 64;             // v5 上下文样本（上一帧尾部）
   const QUEUE_MAX = 10;       // 推理积压上限（≈320ms），超了丢最旧
   const PROB_STALE_MS = 250;  // 概率过期阈值：久无新结果即视为不可用
+  const XR_SILERO_DIV = 3;    // XR 里每 3 帧推理一次（头显里主线程是最稀缺资源）
   const TH_ON = 0.5;          // 双阈值迟滞（对齐小智 config.yaml：threshold 0.5 / threshold_low 0.3）
   const TH_OFF = 0.3;
 
@@ -32,6 +33,7 @@ export default (function init(App: AppKernel) {
 
   let prob = -1;
   let probAt = 0;
+  let xrSkip = 0;
   let hold = false;           // 迟滞区间内的保持状态
 
   function resetState() {
@@ -128,6 +130,15 @@ export default (function init(App: AppKernel) {
       pendLen -= CHUNK;
     }
     if (queue.length > QUEUE_MAX) queue.splice(0, queue.length - QUEUE_MAX);
+    // XR 沉浸会话：主线程每帧都要交出双屏画面，而 pump() 里的 session.run 是单线程
+    // wasm 推理、同步占主线程 —— 不降频就是和渲染抢帧，表现为头显里又卡又听不清。
+    // 每 XR_SILERO_DIV 帧推理一次（≈96ms，远小于 PROB_STALE_MS），非推理帧清空队列
+    // 只留最新音频（否则积压 320ms 的旧音频会让判定滞后）；精度由 12_vad_auto 的
+    // 频谱启发式在判定里补足。
+    if (App.xrPresenting) {
+      xrSkip += 1;
+      if (xrSkip % XR_SILERO_DIV !== 0) { queue.length = 0; return; }
+    }
     void pump();
   };
 

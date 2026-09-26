@@ -4,8 +4,9 @@
 由 media 技能（skills/media/skill.py）与主服务（server.py 的
 /api/video_hub/* 端点）共享同一模块实例，能力完全内建：
 
-  * 聚合搜索：B站（yt-dlp bilisearch + buvid cookie 预热）+ AcFun（公开 REST）
-  * 直链解析：yt-dlp 提取 + 选流（优先浏览器通吃的 h264/av1 合一 mp4）
+  * 聚合搜索：B站（公开 REST + buvid cookie 预热）+ AcFun（公开 REST）
+  * 直链解析：B 站官方 API 直解（网页对机房/代理出口 IP 返回 412，yt-dlp 走不通）；
+    其余平台 yt-dlp 提取 + 选流（优先浏览器通吃的 h264/av1 合一 mp4）
   * 流输出：direct 直链代理（Range 可拖进度）/ relay ffmpeg 实时合流（?t=1 转码兜底）
   * 播放状态：当前播放 / 连播队列 / 前端心跳上报
 
@@ -197,8 +198,183 @@ def bili_cookiefile():
 
 
 # ---------------------------------------------------------------------------
+# B 站：官方 API 直解（不请求网页）
+# 机房/代理出口 IP 请求 www.bilibili.com/video/* 会被风控 412（实测同一 IP 带
+# 浏览器 UA + buvid cookie 依然 412，而 api.bilibili.com 正常返回），yt-dlp 的
+# BiliBiliIE 必须先抓网页拿 __INITIAL_STATE__ —— 于是所有 B 站视频都解析失败。
+# 这里改走官方 API：view 拿 cid、playurl 拿直链，完全不碰网页。
+# ---------------------------------------------------------------------------
+_BILI_URL_RE = re.compile(
+    r"b23\.tv/(?P<short>[0-9A-Za-z]+)"
+    r"|/video/(?P<bvid>[Bb][Vv][0-9A-Za-z]{8,})"
+    r"|/video/av(?P<aid>\d+)"
+    r"|/bangumi/play/(?P<ep>ep\d+)"
+    r"|/bangumi/play/(?P<ss>ss\d+)")
+_BILI_P_RE = re.compile(r"[?&]p=(\d+)")
+
+# qn → 画质高度（B 站文档口径）
+_BILI_QN_HEIGHT = {127: 4320, 126: 2160, 125: 2160, 120: 2160, 116: 1080,
+                   112: 1080, 80: 1080, 74: 720, 64: 720, 32: 480, 16: 360}
+
+
+def _bili_api_session():
+    """带 buvid cookie 的 API 会话。
+
+    首页被 412 也照收 Set-Cookie（buvid3 会下发），API 侧凭它过 -352 风控。"""
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": UA,
+        "Referer": "https://www.bilibili.com/",
+        "Origin": "https://www.bilibili.com",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+    })
+    try:
+        s.get("https://www.bilibili.com/", timeout=10)
+    except Exception:
+        pass
+    return s
+
+
+def _bili_playurl_formats(s, ids, pgc=False):
+    """取播放地址。
+
+    普通视频优先 html5 合并 mp4（单段 durl，最高 720P）：浏览器直连可 seek、
+    秒开，不经 ffmpeg；番剧的 html5 durl 只给 360P，改让 DASH（480P 起）优先。
+    两者都拿不到时退回 DASH 分离流（ffmpeg 实时合流）。"""
+    path = "/pgc/player/web/playurl" if pgc else "/x/player/playurl"
+    key = "result" if pgc else "data"
+    hdrs = {"User-Agent": UA, "Referer": "https://www.bilibili.com/"}
+
+    def _durl_formats():
+        try:
+            r = s.get("https://api.bilibili.com" + path, timeout=20, params=dict(
+                ids, qn=80, fnval=1, fnver=0, fourk=1,
+                platform="html5", high_quality=1))
+            data = (r.json() or {}).get(key) or {}
+            durl = data.get("durl") or []
+            # 多段 durl 是切片拼接流，单条直链播不完，只能退回 DASH
+            if len(durl) == 1 and durl[0].get("url"):
+                return [{
+                    "url": durl[0]["url"], "protocol": "https", "ext": "mp4",
+                    "vcodec": "avc1.64001F", "acodec": "mp4a.40.2",
+                    "height": _BILI_QN_HEIGHT.get(data.get("quality"), 0),
+                    "filesize": durl[0].get("size"), "http_headers": hdrs,
+                }]
+        except Exception as exc:
+            log.info("bili durl unavailable (%s)", exc)
+        return []
+
+    def _dash_formats():
+        formats = []
+        try:
+            r = s.get("https://api.bilibili.com" + path, timeout=20, params=dict(
+                ids, qn=120, fnval=4048, fnver=0, fourk=1, platform="pc"))
+            dash = ((r.json() or {}).get(key) or {}).get("dash") or {}
+        except Exception as exc:
+            log.info("bili dash unavailable (%s)", exc)
+            return formats
+        for v in dash.get("video") or []:
+            u = v.get("baseUrl") or v.get("base_url")
+            if not u:
+                continue
+            formats.append({
+                "url": u, "protocol": "https", "ext": "mp4",
+                "vcodec": v.get("codecs"), "acodec": "none",
+                "height": v.get("height"), "width": v.get("width"),
+                "tbr": (v.get("bandwidth") or 0) / 1000.0,
+                "filesize": v.get("size"), "http_headers": hdrs,
+            })
+        for a in dash.get("audio") or []:
+            u = a.get("baseUrl") or a.get("base_url")
+            if not u:
+                continue
+            formats.append({
+                "url": u, "protocol": "https", "ext": "mp4",
+                "vcodec": "none", "acodec": a.get("codecs"),
+                "abr": (a.get("bandwidth") or 0) / 1000.0,
+                "filesize": a.get("size"), "http_headers": hdrs,
+            })
+        return formats
+
+    if pgc:
+        return _dash_formats() or _durl_formats()
+    return _durl_formats() or _dash_formats()
+
+
+def _bili_api_info(url, session=None):
+    """B 站 API 直解，返回 yt-dlp 风格 info（含 formats / http_headers）。
+
+    支持普通视频（BV/av、分P ?p=N）、番剧（ep/ss）与 b23.tv 短链。"""
+    s = session or _bili_api_session()
+    if "b23.tv" in url:
+        try:
+            url = s.head(url, allow_redirects=True, timeout=15).url or url
+        except Exception as exc:
+            log.info("b23 short link expand failed: %s", exc)
+    m = _BILI_URL_RE.search(url)
+    if not m:
+        raise RuntimeError("unrecognized bilibili url: %s" % url)
+
+    hdrs = {"User-Agent": UA, "Referer": "https://www.bilibili.com/"}
+    ep, ss = m.group("ep"), m.group("ss")
+    if ep or ss:
+        season = s.get("https://api.bilibili.com/pgc/view/web/season", timeout=20,
+                       params={"ep_id": ep[2:]} if ep else {"season_id": ss[2:]}).json()
+        data = season.get("result") or {}
+        eps = data.get("episodes") or []
+        target = next((e for e in eps if ep and str(e.get("id")) == ep[2:]), None) \
+            or (eps[0] if eps else None)
+        if not target:
+            raise RuntimeError("bilibili bangumi %s: no episode" % (ep or ss))
+        ids = {"ep_id": target.get("id"), "cid": target.get("cid")}
+        formats = _bili_playurl_formats(s, ids, pgc=True)
+        if not formats:
+            raise RuntimeError("bilibili bangumi %s: no playable format" % (ep or ss))
+        return {
+            "id": str(target.get("id") or ep or ss),
+            "title": ("%s %s" % (data.get("title") or "", target.get("long_title") or "")).strip(),
+            "uploader": data.get("up_name") or "",
+            "duration": target.get("duration") and target["duration"] / 1000.0,
+            "thumbnail": target.get("cover") or data.get("cover"),
+            "view_count": None,
+            "webpage_url": url, "extractor_key": "BiliBili",
+            "http_headers": hdrs, "formats": formats,
+        }
+
+    params = {"bvid": m.group("bvid")} if m.group("bvid") else {"aid": m.group("aid")}
+    r = s.get("https://api.bilibili.com/x/web-interface/view", params=params, timeout=20).json()
+    if r.get("code") != 0:
+        raise RuntimeError("bilibili view api: %s %s" % (r.get("code"), r.get("message")))
+    data = r.get("data") or {}
+    bvid = data.get("bvid")
+    pages = data.get("pages") or []
+    pm = _BILI_P_RE.search(url)
+    pno = int(pm.group(1)) if pm else 1
+    page = next((x for x in pages if x.get("page") == pno), pages[0] if pages else None)
+    cid = (page or {}).get("cid") or data.get("cid")
+    if not (bvid and cid):
+        raise RuntimeError("bilibili view api: missing bvid/cid")
+    title = data.get("title") or bvid
+    if len(pages) > 1 and page:
+        title = "%s p%02d %s" % (title, page.get("page") or 1, page.get("part") or "")
+    formats = _bili_playurl_formats(s, {"bvid": bvid, "cid": cid})
+    if not formats:
+        raise RuntimeError("bilibili %s: no playable format" % bvid)
+    return {
+        "id": bvid, "title": title.strip(),
+        "uploader": (data.get("owner") or {}).get("name") or "",
+        "duration": (page or {}).get("duration") or data.get("duration"),
+        "thumbnail": data.get("pic"),
+        "view_count": (data.get("stat") or {}).get("view"),
+        "webpage_url": url, "extractor_key": "BiliBili",
+        "http_headers": hdrs, "formats": formats,
+    }
+
+
+# ---------------------------------------------------------------------------
 # yt-dlp：解析 / 选流
 # ---------------------------------------------------------------------------
+
 def _normalize_info(info, fallback_url):
     if info.get("_type") in ("playlist", "multi_video") and info.get("entries"):
         info = info["entries"][0]
@@ -458,7 +634,10 @@ def _register_stream(item, **extra):
 
 
 def resolve(url, need_stream=True, force=False):
-    """统一解析入口（yt-dlp，B 站带 buvid cookie 预热）。
+    """统一解析入口。
+
+    B 站走官方 API 直解（网页对机房/代理出口 IP 412，yt-dlp 抓不到
+    __INITIAL_STATE__），其余平台走 yt-dlp。
     force=True 跳过缓存强制重解析（断流自动恢复用：拿全新直链与流 key）。"""
     now = time.time()
     if not force:
@@ -474,17 +653,27 @@ def resolve(url, need_stream=True, force=False):
     # YouTube relay 实际经代理拉流（ffmpeg -http_proxy），测速须同路径才准，
     # 否则直连必失败 → 误判慢流 → 降级到错误档位
     yt_probe = {"http": _YT_PROXY, "https": _YT_PROXY} if is_yt else None
-    if re.search(r"(?:^|\.)bilibili\.com", url):
+    is_bili = bool(re.search(r"(?:^|\.)bilibili\.com|b23\.tv", url))
+    if is_bili:
         ck = bili_cookiefile()
         if ck:
             opts["cookiefile"] = ck
+    # API 会话建一次：两轮重解析（测速换节点）复用同一份 buvid cookie
+    bili_sess = _bili_api_session() if is_bili else None
     picked = None
     headers = {}
     # 两轮解析：首轮选流后实测拉速，慢节点（卡顿根因）时丢弃重解析换
     # CDN 节点再来一次；direct/HLS 无需测速一轮即定。
     for attempt in (0, 1):
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+        info = None
+        if is_bili:
+            try:
+                info = _bili_api_info(url, bili_sess)
+            except Exception as exc:
+                log.warning("bili api resolve failed (%s); fallback to yt-dlp", exc)
+        if info is None:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
         entry = _normalize_info(info, url)
         if not need_stream:
             break
@@ -897,24 +1086,16 @@ def search_videos(query, platform="all", limit=12, sort="relevance", page=1):
 
 
 def _bili_flat_candidates(query, count=3):
-    """B 站 flat 搜索取前 N 条带标题的候选（跳过逐条元数据解析，点播提速）。"""
-    opts = dict(BASE_OPTS, extract_flat=True, skip_download=True)
-    ck = bili_cookiefile()
-    if ck:
-        opts["cookiefile"] = ck
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(f"bilisearch{count + 3}:{query}", download=False)
-    out = []
-    for e in info.get("entries") or []:
-        if not e:
-            continue
-        u = e.get("url") or e.get("webpage_url")
-        t = e.get("title") or ""
-        if u and t and not t.startswith("http"):
-            out.append(u)
-            if len(out) >= count:
-                break
-    return out
+    """B 站 REST 搜索取前 N 条候选 URL（跳过逐条元数据解析，点播提速）。
+
+    不走 yt-dlp bilisearch flat：新版 flat 条目的标题已是 NA，过滤后候选恒为空，
+    等于白等一次搜索再回退完整搜索。"""
+    try:
+        items = _bili_video_search_page(query, count, 1, "")
+    except Exception as exc:
+        log.warning("bili flat search failed: %s", exc)
+        return []
+    return [it["webpage_url"] for it in items if it.get("webpage_url")][:count]
 
 
 # ---------------------------------------------------------------------------
@@ -1369,39 +1550,39 @@ def acfun_hot(limit=12, page=1):
         log.warning("acfun home fetch failed: %s", exc)
         raise RuntimeError(f"acfun home fetch failed: {exc}")
     out = []
-    seen = set()
-    # 首页 HTML 里卡片是转义引号（\"），按 data-mediaid 切块逐卡片解析
-    blocks = re.split(r'data-mediaid=\\?"(\d+)\\?"', text)
-    for i in range(1, len(blocks), 2):
-        mid = blocks[i]
-        if mid in seen:
+    # 同一视频在首页有多个 <a href="/v/acNNN">：封面 a（无标题）+ 标题 a（title 属性里
+    # 带「标题 / UP:xxx / 点击:NNN」），顶部轮播则是一个 <a ... data-title>。
+    # 按 ac 号聚合各标签的标题信息，id 直接取 href 里的 ac 号。
+    # 不依赖 data-mediaid：href 排在它前面，按 mediaid 切块只会抓到下一张卡片的链接，
+    # 列表 id/标题与链接整体错位一格 → 点 A 播 B。
+    cards = {}
+    for m in re.finditer(r'<a\b[^>]*>', text):
+        tag = m.group(0)
+        hm = re.search(r'href=\\?"/v/ac(\d+)\\?"', tag)
+        if not hm:
             continue
-        seen.add(mid)
-        b = blocks[i + 1][:3000]
-        # 标题：优先 data-title（纯标题）；否则取普通 title 属性第一行
-        title = ""
-        tm = re.search(r'data-title=\\?"([^"\\]*)', b)
-        if tm:
-            title = html.unescape(tm.group(1)).strip()
-        info = ""
-        tm2 = re.search(r'(?<!data-)title=\\?"([^"\\]*)', b)
-        if tm2:
-            info = html.unescape(tm2.group(1)).strip()
+        ac = hm.group(1)
+        c = cards.get(ac)
+        if c is None:
+            # pos 取首个标签的起点：卡片正文（封面 img / 时长 / UP / 点击）紧随其后
+            c = cards[ac] = {"pos": m.start(), "title": "", "info": ""}
+        tm = re.search(r'data-title=\\?"([^"\\]*)', tag)
+        if tm and not c["title"]:
+            c["title"] = html.unescape(tm.group(1)).strip()
+        tm2 = re.search(r'(?<!data-)title=\\?"([^"\\]*)', tag)
+        if tm2 and not c["info"]:
+            c["info"] = html.unescape(tm2.group(1)).strip()
+
+    for ac, c in cards.items():
+        b = text[c["pos"]:c["pos"] + 3000]
+        info = c["info"]
+        # 标题：优先 data-title（轮播卡片）；否则取 title 属性第一行
+        title = c["title"]
         if not title and info:
             first = re.split(r'[\r\n]+', info)[0].strip()
             if first:
                 title = first
         if not title:
-            continue
-        href = ""
-        hm = re.search(r'href=\\?"(/v/ac\d+)\\?"', b)
-        if hm:
-            href = hm.group(1)
-        else:
-            hm2 = re.search(r'href="(/v/ac\d+)"', b)
-            if hm2:
-                href = hm2.group(1)
-        if not href:
             continue
         # 封面
         img = ""
@@ -1434,13 +1615,13 @@ def acfun_hot(limit=12, page=1):
             if v_m2:
                 view = int(v_m2.group(1))
         out.append({
-            "id": mid,
+            "id": ac,
             "title": title,
             "uploader": up,
             "duration": dur,
             "thumbnail": img,
             "view_count": view,
-            "webpage_url": "https://www.acfun.cn" + href,
+            "webpage_url": "https://www.acfun.cn/v/ac" + ac,
             "platform": "acfun",
         })
         if len(out) >= page * limit:
@@ -1469,8 +1650,9 @@ def _yt_consent_cookiefile():
 def youtube_hot(limit=12, page=1):
     """YouTube 热门（yt-dlp trending，走 fq 代理）。
 
-    部分区域无登录会把 /feed/trending 重定向回首页（yt-dlp 直接报错），
-    此时回退到带 bp 的 trending 子榜（gaming most popular，yt-dlp 自测可用）。
+    实测（机房/代理出口 IP）：/feed/trending 本体与 /feed/explore 都已重定向回首页
+    （yt-dlp 直接报 "channel/playlist does not exist"），带 bp 的游戏子榜仍直出内容，
+    因此把子榜当主路径，本体留作兜底。
     """
     page = max(1, int(page or 1))
     limit = max(1, int(limit or 12))
@@ -1478,8 +1660,8 @@ def youtube_hot(limit=12, page=1):
     opts = dict(BASE_OPTS, extract_flat=True, skip_download=True, proxy=_YT_PROXY,
                 cookiefile=_yt_consent_cookiefile())
     urls = [
-        "https://www.youtube.com/feed/trending",
         "https://www.youtube.com/feed/trending?bp=4gIcGhpnYW1pbmdfY29ycHVzX21vc3RfcG9wdWxhcg%3D%3D",
+        "https://www.youtube.com/feed/trending",
     ]
     entries = []
     last_err = None

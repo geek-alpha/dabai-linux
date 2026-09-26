@@ -1,0 +1,70 @@
+{
+  "name": "baidu-drive",
+  "title": "百度网盘（bdpan CLI）",
+  "version": "1.7.5",
+  "description": "百度网盘文件管理：上传/下载/转存/分享/搜索/移动/复制/重命名/建目录，远端路径限定在应用目录 /apps/bdpan/。触发词：百度网盘、网盘、云盘、bdpan、上传到网盘、发大文件、分享资料。",
+  "author": "baidu-netdisk（上游 SKILL.md + scripts）+ dabai 适配层",
+  "enabled": true,
+  "disclosure": "on_demand",
+  "prompt": "【技能 百度网盘 bdpan】网盘操作走 bdpan 工具（远端路径相对 /apps/bdpan/）。先 bdpan_status 看登录态，未登录用 bdpan_login 拿授权链接、拿 32 位授权码后 bdpan_login(code=...)。常用：ls/search --json、upload、download、mkdir、share -d 7、transfer、mv、cp、rename。公共参数自动注入；rm 必须用户确认后传 confirm=true；大文件传输用 background=true。",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "bdpan",
+        "description": "执行百度网盘 bdpan 命令（ls/search/upload/download/mkdir/cp/mv/rename/share/transfer/whoami 等）。远端路径相对 /apps/bdpan/。公共参数自动注入；login/logout/update/install 不放行；rm 必须带 confirm=true。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "args": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "命令参数数组，不含 bdpan 本身。例：[\"ls\",\"/\",\"--json\"]、[\"search\",\"体检报告\",\"--json\"]、[\"upload\",\"/tmp/a.pdf\",\"a.pdf\"]、[\"share\",\"资料/x.pdf\",\"-d\",\"7\"]"
+            },
+            "session_input": {
+              "type": "string",
+              "description": "本轮用户原始输入（逐字复制，用于服务质量追踪；不填则留空）"
+            },
+            "confirm": {
+              "type": "boolean",
+              "description": "仅 rm 需要：用户已明确确认删除清单后传 true"
+            },
+            "timeout": {
+              "type": "number",
+              "description": "超时秒数（默认 180，上限 1800）；大文件上传/下载建议配 background=true"
+            },
+            "background": {
+              "type": "boolean",
+              "description": "大文件传输时传 true：后台跑并立刻返回 PID 与日志路径，随后用 tail 查进度"
+            }
+          },
+          "required": ["args"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "bdpan_status",
+        "description": "检查百度网盘技能状态：bdpan 是否安装、版本、二进制路径、当前是否已登录。",
+        "parameters": { "type": "object", "properties": {} }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "bdpan_login",
+        "description": "百度网盘登录（OOB 授权）。不带 code：返回授权链接，让用户在浏览器打开；带 code：用浏览器显示的 32 位授权码完成登录。内部走上游 scripts/login.sh，不裸调 bdpan login。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "code": {
+              "type": "string",
+              "description": "浏览器授权后显示的 32 位十六进制授权码；不传则只取授权链接"
+            }
+          }
+        }
+      }
+    }
+  ]
+}

@@ -23,13 +23,14 @@
  *   - XR 手柄：手柄射线命中按钮 → 触发
  *   - 蓝牙手柄/无手柄：A/B/X/Y 键视中心射线命中按钮 → 触发
  *
- * 面板固定在 AI 角色右侧（侧向进入 VR 时由 webxr-vr 确定：App._vrHudSide，
- * 用户看向角色时的右手侧），位置整场会话不变、不跟随头显；朝向始终
- * 正对用户头部（走到哪都读得清）。收起时为角色身侧的迷你状态条；
- * 展开时为完整遥控面板。仅 WebXR 沉浸（非游戏模式）显示。
+ * 收起时是固定在 AI 角色右侧的迷你状态条（侧向进入 VR 时由 webxr-vr 确定：
+ * App._vrHudSide，位置整场会话不变）；展开时钉在「波波点播」面板正上方
+ * （读它的 mesh 位姿，随点播面板一起走，不跟头），朝向与它同一平面。
+ * 仅 WebXR 沉浸（非游戏模式）显示。
  * ============================================================ */
 import * as THREE from 'three';
 import type { AppKernel, VrHud, VideoItem } from '../types/app-kernel.js';
+import { vrRayPanel } from './vr-ray.js';
 
 export default function initVrHud(App: AppKernel) {
   if (App.vrHud) return; // 幂等：避免重复初始化/重复包裹
@@ -74,9 +75,25 @@ export default function initVrHud(App: AppKernel) {
   let lastProgAt = 0;           // 播放中进度条节流重绘
   let autoExpanded = false;     // 本部片已自动展开过（不再打扰手动收起的用户）
   let userCollapsed = false;    // 用户手动收起（同一部片内禁止再自动展开）
-  let listItems: any[] = [];    // 收藏片单（f.video + _cat 分类名）
+  let listItems: any[] = [];    // 片单条目（统一成 VideoItem + _cat 副标题）
+  let listSrc: 'hot' | 'fav' | 'hist' = 'hot';  // 片单来源：热门 / 收藏 / 历史
   let listPage = 0;
   let listLoading = false;
+  let lockExpand: boolean | null = null;  // 朝向锁定的展开态（null = 还没定过）
+  let hudOffY = 0;                        // 显示时的视野升降偏移（面板之后只跟这个差值上下走）
+  const lockDir = new THREE.Vector3(0, 0, -1); // 锁定瞬间的面板前向（世界系）
+
+  /* 展开态摆位：钉在「波波点播」面板正上方（读它的 mesh 位姿，世界锚定）。
+   * 只有点播面板不存在时才回退到「视线前方 1.85m」的旧摆法。 */
+  const REMOTE_GAP = 0.06;    // 与点播面板上沿的缝隙（米）
+  const REMOTE_DIST = 1.85;   // 兜底：视线正前方距离（米），点播面板不可用时才用
+  const REMOTE_UP = 0.93;     // 兜底：中心抬升（米）
+  const REMOTE_DEAD = 0.10;   // 软锚定死区：此范围内不跟（不晃、按钮不滑）
+  const REMOTE_GAIN = 1.8;
+  const REMOTE_MAX = 1.2;
+  let hudAnchor: THREE.Vector3 | null = null;  // 展开态软锚点（null = 下一帧重挂）
+  const hudIdeal = new THREE.Vector3();
+  const hudFwd = new THREE.Vector3();
 
   /* ---------------- Canvas 绘制工具 ---------------- */
   function roundRect(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number) {
@@ -123,12 +140,15 @@ export default function initVrHud(App: AppKernel) {
     ];
     if (!hud.videoOpen) return btns;
     if (hud.listOpen) {
-      // 片单视图：翻页 + 返回 + 条目行
-      btns.push({ id: 'pageUp', x: 288, y: 88, w: 44, h: 30 });
-      btns.push({ id: 'pageDown', x: 338, y: 88, w: 44, h: 30 });
-      btns.push({ id: 'backCtrl', x: 396, y: 88, w: 60, h: 30 });
+      // 片单视图：来源页签 + 翻页 + 返回 + 条目行
+      btns.push({ id: 'srcHot', x: 20, y: 112, w: 136, h: 32 });
+      btns.push({ id: 'srcFav', x: 172, y: 112, w: 136, h: 32 });
+      btns.push({ id: 'srcHist', x: 324, y: 112, w: 136, h: 32 });
+      btns.push({ id: 'pageUp', x: 288, y: 84, w: 44, h: 30 });
+      btns.push({ id: 'pageDown', x: 338, y: 84, w: 44, h: 30 });
+      btns.push({ id: 'backCtrl', x: 396, y: 84, w: 60, h: 30 });
       for (let i = 0; i < LIST_ROWS; i++) {
-        btns.push({ id: 'item-' + (listPage * LIST_ROWS + i), x: 20, y: 128 + i * 58, w: 440, h: 52 });
+        btns.push({ id: 'item-' + (listPage * LIST_ROWS + i), x: 20, y: 152 + i * 50, w: 440, h: 46 });
       }
       return btns;
     }
@@ -196,6 +216,26 @@ export default function initVrHud(App: AppKernel) {
     ctx.textBaseline = 'middle';
     ctx.font = 'bold 19px ' + FONT;
     ctx.fillStyle = flashed || active ? '#ffffff' : 'rgba(232,246,255,0.85)';
+    ctx.fillText(label, b.x + b.w / 2, b.y + b.h / 2 + 1);
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+  }
+
+  // 片单来源页签（热门 / 收藏 / 历史）：头显里没键盘，能点的入口就是选片的主要途径
+  function drawTab(ctx: CanvasRenderingContext2D, id: string, label: string, now: number, active: boolean) {
+    const b = btnById(id);
+    if (!b) return;
+    const flashed = !!(hud.flash && hud.flash.id === id && now < hud.flash.until);
+    roundRect(ctx, b.x, b.y, b.w, b.h, 10);
+    ctx.fillStyle = (flashed || active) ? 'rgba(0,229,255,0.22)' : 'rgba(255,255,255,0.06)';
+    ctx.fill();
+    ctx.lineWidth = (flashed || active) ? 2 : 1.2;
+    ctx.strokeStyle = (flashed || active) ? 'rgba(0,229,255,0.9)' : 'rgba(255,255,255,0.2)';
+    ctx.stroke();
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = '600 18px ' + FONT;
+    ctx.fillStyle = (flashed || active) ? '#ffffff' : 'rgba(200,215,235,0.8)';
     ctx.fillText(label, b.x + b.w / 2, b.y + b.h / 2 + 1);
     ctx.textAlign = 'left';
     ctx.textBaseline = 'alphabetic';
@@ -374,15 +414,20 @@ export default function initVrHud(App: AppKernel) {
 
     ctx.textBaseline = 'middle';
     ctx.textAlign = 'left';
+    const SRC_TITLE: Record<string, string> = { hot: '🔥 热门推荐', fav: '📋 我的收藏', hist: '🕘 观看历史' };
     ctx.font = 'bold 22px ' + FONT;
-    ctx.fillStyle = '#b39ddb';
-    ctx.fillText('📋 我的收藏', 24, 104);
+    ctx.fillStyle = listSrc === 'hot' ? '#ffb26b' : listSrc === 'fav' ? '#b39ddb' : '#7fd1c8';
+    ctx.fillText(SRC_TITLE[listSrc], 24, 100);
+
+    drawTab(ctx, 'srcHot', '🔥 热门', now, listSrc === 'hot');
+    drawTab(ctx, 'srcFav', '📋 收藏', now, listSrc === 'fav');
+    drawTab(ctx, 'srcHist', '🕘 历史', now, listSrc === 'hist');
 
     const pages = Math.max(1, Math.ceil(listItems.length / LIST_ROWS));
     ctx.font = '600 17px ' + FONT;
     ctx.fillStyle = '#8c8ca0';
     ctx.textAlign = 'center';
-    ctx.fillText((listPage + 1) + '/' + pages, 266, 103);
+    ctx.fillText((listPage + 1) + '/' + pages, 266, 99);
     drawIconBtn(ctx, 'pageUp', '◀', now, listPage > 0);
     drawIconBtn(ctx, 'pageDown', '▶', now, (listPage + 1) * LIST_ROWS < listItems.length);
     drawIconBtn(ctx, 'backCtrl', '⬅ 返回', now, false);
@@ -398,8 +443,10 @@ export default function initVrHud(App: AppKernel) {
     if (!listItems.length) {
       ctx.font = '500 19px ' + FONT;
       ctx.fillStyle = '#8c8ca0';
-      ctx.fillText('收藏夹是空的', HUD_W / 2, 200);
-      ctx.fillText('退出 VR 在「在线视频」里点 ☆ 收藏', HUD_W / 2, 232);
+      ctx.fillText(listSrc === 'hot' ? '热门推荐暂时拿不到'
+        : listSrc === 'fav' ? '收藏夹是空的' : '还没有观看记录', HUD_W / 2, 214);
+      ctx.fillText(listSrc === 'fav' ? '退出 VR 在「在线视频」里点 ☆ 收藏'
+        : '也可以对大白说「播放○○」直接点播', HUD_W / 2, 246);
       ctx.textAlign = 'left';
       ctx.textBaseline = 'alphabetic';
       return;
@@ -455,13 +502,25 @@ export default function initVrHud(App: AppKernel) {
     listLoading = true;
     hud.dirty = true;
     try {
-      const res = await fetch('/api/video_hub/api/favorites');
-      const data = await res.json();
-      const cats: any[] = data.categories || [];
-      listItems = (data.favorites || []).map((f: any) => {
-        const c = cats.find((x: any) => x.id === f.category_id);
-        return Object.assign({}, f.video || {}, { _cat: c ? c.name : '' });
-      });
+      if (listSrc === 'hot') {
+        // 视频源跟网页端当前选中的 chip 走（默认 all），面板看到的就是同一个源
+        const plat = App.videoPlatformChips?.querySelector('.video-plat-chip[data-plat].active')?.getAttribute('data-plat') || 'all';
+        const res = await fetch('/api/video_hub/api/hot?platform=' + encodeURIComponent(plat) + '&limit=24&page=1');
+        const data = await res.json();
+        listItems = (data.results || []).map((v: any) => Object.assign({}, v, { _cat: v.platform || '' }));
+      } else if (listSrc === 'fav') {
+        const res = await fetch('/api/video_hub/api/favorites');
+        const data = await res.json();
+        const cats: any[] = data.categories || [];
+        listItems = (data.favorites || []).map((f: any) => {
+          const c = cats.find((x: any) => x.id === f.category_id);
+          return Object.assign({}, f.video || {}, { _cat: c ? c.name : '' });
+        });
+      } else {
+        const res = await fetch('/api/video_hub/api/history');
+        const data = await res.json();
+        listItems = (data.history || []).map((h: any) => Object.assign({}, h.video || {}, { _cat: '看过' }));
+      }
       if (listPage * LIST_ROWS >= listItems.length) listPage = 0;
     } catch (e) {
       listItems = [];
@@ -494,6 +553,9 @@ export default function initVrHud(App: AppKernel) {
     userCollapsed = false;
     listItems = [];
     listPage = 0;
+    lockExpand = null;
+    hudOffY = App._xrEyeOffY || 0;
+    hudAnchor = null;      // 下次 update 重新挂锚（不继承上一轮位置）
     hud.dirty = true;
     if (hud.mesh) hud.mesh.visible = true;
   };
@@ -516,17 +578,67 @@ export default function initVrHud(App: AppKernel) {
     // 角色侧向锚点（进入 VR 时确定，整场会话固定；拿不到时兜底角色 +X 侧）
     const side = App._vrHudSide || { x: 1, z: 0 };
     const expanded = !!hud.videoOpen;
-    // 迷你条贴角色身侧偏上；展开的遥控面板稍低稍远（像立在角色旁边的触屏）
-    const lateral = expanded ? 1.02 : 0.92;
-    const topY = expanded ? 1.62 : 1.55;
     const worldH = HUD_WORLD_W * (HUD_H / HUD_W);
-    hud.mesh.position.set(
-      mc.position.x + side.x * lateral,
-      topY - worldH / 2,
-      mc.position.z + side.z * lateral
-    );
-    // 面板位置固定，但永远正对用户头部（走动/侧身时依然可读）
-    hud.mesh.lookAt(hp.x, hp.y - (expanded ? 0.12 : 0.0), hp.z);
+    // 点播面板在呼出中 → 遥控面板钉它上沿。读它的位姿而不是自己按视线重算：
+    // 按视线算等于每帧跟头，头一动按钮就跟着滑，射线描不住也点不中。
+    const vm = (expanded && App.vrVideo && App.vrVideo.open && App.vrVideo.mesh) || null;
+    if (vm) {
+      const gp = (vm.geometry as any).parameters;
+      const vH = (gp && gp.height) || 1.4 * (560 / 760);  // 兜底：vr-video 的 WORLD_W 1.4 × 560/760
+      hudIdeal.set(0, vH / 2 + worldH / 2 + REMOTE_GAP, 0)
+        .applyQuaternion(vm.quaternion)   // 点播面板倾斜时沿它的"上"走，不脱离
+        .add(vm.position);
+      hudAnchor = null;
+      hud.mesh.position.copy(hudIdeal);
+    } else if (expanded) {
+      // 兜底：点播面板没开/没建 → 视线正前方 1.85m，抬到眼高 +0.93m
+      let hx = 0, hz = -1;
+      const r = App.renderer;
+      if (r && r.xr && r.xr.isPresenting) {
+        try { r.xr.getCamera().getWorldDirection(hudFwd); hx = hudFwd.x; hz = hudFwd.z; } catch (_) { /* 取不到就沿默认前向摆 */ }
+      }
+      let len = Math.hypot(hx, hz);
+      if (len < 1e-3) { hx = 0; hz = -1; len = 1; }
+      hx /= len; hz /= len;
+      hudIdeal.set(
+        hp.x + hx * REMOTE_DIST,
+        hp.y + (App._xrEyeOffY || 0) + REMOTE_UP,
+        hp.z + hz * REMOTE_DIST
+      );
+      if (!hudAnchor) hudAnchor = hudIdeal.clone();
+      // 软锚定：死区内不动（不晃），偏出死区按限速缓缓追上（走动/升降不丢面板）
+      const dd = hudAnchor.distanceTo(hudIdeal);
+      if (dd > REMOTE_DEAD) {
+        const v = Math.min(dd * REMOTE_GAIN, REMOTE_MAX);
+        hudAnchor.lerp(hudIdeal, Math.min(1, (v * dt) / dd));
+      }
+      hud.mesh.position.copy(hudAnchor);
+    } else {
+      // 收起：迷你状态条贴角色身侧偏上（整场会话固定，不跟头显）
+      hudAnchor = null;
+      hud.mesh.position.set(
+        mc.position.x + side.x * 1.45,
+        1.45 - worldH / 2 + (App._xrEyeOffY || 0) - hudOffY, // 视野升降：面板跟着视觉眼高走
+        mc.position.z + side.z * 1.45
+      );
+    }
+    // 朝向只定一次（展开/收起切换或用户绕到侧后方时重算）：每帧 lookAt 会让按钮
+    // 随头部追踪噪声在空间里滑动，头显里描不住也点不中
+    if (vm) {
+      // 钉在点播面板上时朝向完全跟它一致（同一平面），本帧不参与重算
+      hud.mesh.quaternion.copy(vm.quaternion);
+      lockDir.set(0, 0, -1).applyQuaternion(hud.mesh.quaternion);
+      lockExpand = expanded;
+    } else {
+      const tx = hud.mesh.position.x - hp.x, tz = hud.mesh.position.z - hp.z;
+      const tl = Math.hypot(tx, tz) || 1;
+      const off = (tx / tl) * lockDir.x + (tz / tl) * lockDir.z;
+      if (lockExpand === null || lockExpand !== expanded || off < (expanded ? 0.86 : 0.6)) {
+        hud.mesh.lookAt(hp.x, hp.y - (expanded ? 0.12 : 0.0), hp.z);
+        lockDir.set(0, 0, -1).applyQuaternion(hud.mesh.quaternion);
+        lockExpand = expanded;
+      }
+    }
 
     // 播放状态节流拉取（含 AI 语音点播的换片，title 变化自动重绘）
     pullVst();
@@ -566,28 +678,43 @@ export default function initVrHud(App: AppKernel) {
   App.updateVrHud = hud.update;
 
   /* ---------------- 命中测试：射线 → 按钮id / 进度条跳转 ---------------- */
-  hud.hitTest = function hitTest(origin: THREE.Vector3, dir: THREE.Vector3) {
-    if (!hud.active || !hud.mesh) return null;
-    const ray = hud._ray;
-    ray.set(origin, dir);
-    ray.far = 4;
-    const hits = ray.intersectObject(hud.mesh, false);
-    if (!hits || !hits.length) return null;
-    const uv = hits[0].uv;
-    if (!uv) return null;
-    const px = uv.x * HUD_W;
-    const py = (1 - uv.y) * HUD_H;
-    for (const b of hud.buttons) {
-      if (px >= b.x && px <= b.x + b.w && py >= b.y && py <= b.y + b.h) return b.id;
-    }
-    // 进度条：点按位置 → 跳转分数（'seek:0.42'，trigger 内校验可拖动性）
-    if (hud.videoOpen && !hud.listOpen) {
-      const sa = SEEK_AREA;
-      if (px >= sa.x && px <= sa.x + sa.w && py >= sa.y && py <= sa.y + sa.h) {
-        return 'seek:' + Math.max(0, Math.min(1, (px - sa.x) / sa.w)).toFixed(3);
+  /** 命中口径：面板矩形 + 外扩磁力带（vr-ray 统一仲裁，跨面板互斥） */
+  const probe = vrRayPanel({
+    id: 'hud',
+    active: () => !!(hud.active && hud.mesh && hud.mesh.visible),
+    mesh: () => hud.mesh,
+    cvW: () => HUD_W,
+    cvH: () => HUD_H,
+    hit: (px, py, loose, inside) => {
+      for (const b of hud.buttons) {
+        if (px >= b.x && px <= b.x + b.w && py >= b.y && py <= b.y + b.h) return b.id;
       }
-    }
-    return null; // 命中面板但不在按钮上
+      // 进度条：点按位置 → 跳转分数（'seek:0.42'，trigger 内校验可拖动性）
+      if (hud.videoOpen && !hud.listOpen) {
+        const sa = SEEK_AREA;
+        if (px >= sa.x && px <= sa.x + sa.w && py >= sa.y && py <= sa.y + sa.h) {
+          return 'seek:' + Math.max(0, Math.min(1, (px - sa.x) / sa.w)).toFixed(3);
+        }
+      }
+      if (!loose) return null;
+      // 视线/磁力带：吸附最近按钮（hud 按钮小，头显里靠它才点得中）
+      let best = '';
+      let bestD = Infinity;
+      for (const b of hud.buttons) {
+        const dx = Math.max(b.x - px, 0, px - (b.x + b.w));
+        const dy = Math.max(b.y - py, 0, py - (b.y + b.h));
+        const d = Math.hypot(dx, dy);
+        if (d < bestD) { bestD = d; best = b.id; }
+      }
+      return bestD <= (inside ? 60 : 260) ? best : '';
+    },
+    trigger: (id) => hud.trigger(id)
+  });
+  App.vrRay?.register(probe);
+
+  hud.hitTest = function hitTest(origin: THREE.Vector3, dir: THREE.Vector3) {
+    const r = probe.pick(origin, dir, true);
+    return r ? r.id : null;
   };
 
   /* ---------------- 命中动作 ---------------- */
@@ -611,6 +738,11 @@ export default function initVrHud(App: AppKernel) {
       return;
     }
     if (id === 'list') { hud.listOpen = true; hud.dirty = true; refreshList(); return; }
+    if (id === 'srcHot' || id === 'srcFav' || id === 'srcHist') {
+      const src = id === 'srcHot' ? 'hot' : id === 'srcFav' ? 'fav' : 'hist';
+      if (src !== listSrc) { listSrc = src as 'hot' | 'fav' | 'hist'; listPage = 0; listItems = []; refreshList(); }
+      return;
+    }
     if (id === 'backCtrl') { hud.listOpen = false; hud.dirty = true; return; }
     if (id === 'pageUp') { if (listPage > 0) { listPage--; hud.dirty = true; } return; }
     if (id === 'pageDown') {
@@ -692,13 +824,13 @@ export default function initVrHud(App: AppKernel) {
     const c = e.target;
     if (hud.active && c) {
       try {
-        c.updateMatrixWorld(true);
-        const o = hud._v3.setFromMatrixPosition(c.matrixWorld);
-        const d = new THREE.Vector3(0, 0, -1).applyQuaternion(c.getWorldQuaternion(hud._q));
-        const id = hud.hitTest(o, d);
-        if (id) {
-          hud.trigger(id);
-          return;
+        const o = hud._v3, d = new THREE.Vector3();
+        if (App._xrCtrlRay(c, o, d, hud._q)) {
+          const h = App._vrRayPick ? App._vrRayPick(o, d, true) : null;
+          if (h) {
+            h.panel.trigger(h.id);
+            return;
+          }
         }
       } catch (_) { /* 忽略异常，回退到戳一戳 */ }
     }
@@ -711,23 +843,17 @@ export default function initVrHud(App: AppKernel) {
     if (hud.active && !this._xrGameMode) {
       let origin: THREE.Vector3 | null = null, dir: THREE.Vector3 | null = null;
       if (this.xrPresenting && this.renderer && this.renderer.xr) {
-        try {
-          const xrCam = this.renderer.xr.getCamera();
-          if (xrCam) {
-            origin = new THREE.Vector3().setFromMatrixPosition(xrCam.matrixWorld);
-            dir = new THREE.Vector3();
-            xrCam.getWorldDirection(dir);
-          }
-        } catch (_) {}
+        const o = new THREE.Vector3(), d = new THREE.Vector3();
+        if (App._xrEyeRay(o, d)) { origin = o; dir = d; }
       }
       if (!origin || !dir) {
         const yaw = this.gyroYaw || 0, pitch = this.gyroPitch || 0, cp = Math.cos(pitch);
         origin = this.camera.position.clone();
         dir = new THREE.Vector3(-Math.sin(yaw) * cp, Math.sin(pitch), -Math.cos(yaw) * cp);
       }
-      const id = hud.hitTest(origin, dir);
-      if (id) {
-        hud.trigger(id);
+      const h = App._vrRayPick ? App._vrRayPick(origin, dir, true) : null;
+      if (h) {
+        h.panel.trigger(h.id);
         return;
       }
     }

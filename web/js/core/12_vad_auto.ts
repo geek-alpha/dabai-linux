@@ -138,7 +138,9 @@ export default (function init(App: AppKernel) {
   const VAD_PREROLL_INTERRUPT_MS = 120; // 打断 AI 后起录的回溯（只补检测延迟，不带回 AI 尾音）
   const VAD_PCM_SAMPLE_RATE = 16000; // 上传采样率（STT 原生 16k，后端免重采样）
   const VAD_PCM_MIN_SPEECH_MS = 150; // PCM 路径最短语音时长（短于此视为误触发，丢弃）
-  let vadPcmNode: ScriptProcessorNode | null = null;
+  let vadPcmNode: ScriptProcessorNode | AudioWorkletNode | null = null;
+  let vadWorkletReady = false;        // worklet 模块只 addModule 一次
+  const VAD_WORKLET_URL = '/static/js/audio/vad-capture-worklet.js';
   let vadPcmSink: GainNode | null = null;
   let vadPreRoll: Float32Array | null = null; // 环形预滚缓冲（原始采样率）
   let vadPreRollWrite = 0;
@@ -149,8 +151,11 @@ export default (function init(App: AppKernel) {
   let vadPcmSpeechSamples = 0; // 本次录音中「检测后」采集到的样本数（不含回溯）
   let vadPrerollMs = VAD_PREROLL_MS; // 本次起点回溯时长（打断场景缩短，防带入 AI 尾音）
 
-  /** 启动常驻 PCM 采集（在 startVADMode 里麦克风源建立后调用） */
-  function startVADPCMCapture(src: AudioNode) {
+  /** 启动常驻 PCM 采集（在 startVADMode 里麦克风源建立后调用）。
+   *  首选 AudioWorklet：采集跑在音频线程，主线程被 XR 双屏渲染占满时也一帧不丢 ——
+   *  VR 里「说什么都认不出来」的根因就是 ScriptProcessor 的回调在主线程被饿死。
+   *  Worklet 不可用（旧浏览器 / 加载失败）才退回 ScriptProcessor。 */
+  async function startVADPCMCapture(src: AudioNode) {
     stopVADPCMCapture();
     const ctx = App.audioCtx;
     if (!ctx) return;
@@ -160,40 +165,77 @@ export default (function init(App: AppKernel) {
     vadPreRollWrite = 0;
     vadPcmChunks = [];
     vadPcmActive = false;
+    // 采集节点必须挂到 destination 才会被音频图拉取；零增益避免麦克风外放
+    const sink = ctx.createGain();
+    sink.gain.value = 0;
+    try {
+      if (ctx.audioWorklet) {
+        if (!vadWorkletReady) {
+          await ctx.audioWorklet.addModule(VAD_WORKLET_URL);
+          vadWorkletReady = true;
+        }
+        const node = new AudioWorkletNode(ctx, 'vad-capture', {
+          numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1]
+        });
+        node.port.onmessage = (ev: MessageEvent) => {
+          const d = ev.data;
+          if (d && d.length) onPCMFrame(d as Float32Array);
+        };
+        node.connect(sink);
+        sink.connect(ctx.destination);
+        src.connect(node);
+        vadPcmNode = node;
+        vadPcmSink = sink;
+        console.log('[VAD] PCM 采集就绪：AudioWorklet（音频线程 ' + vadPcmRate + 'Hz）');
+        return;
+      }
+    } catch (e) {
+      console.warn('[VAD] AudioWorklet 不可用，回退 ScriptProcessor:', e);
+    }
     try {
       const node = ctx.createScriptProcessor(2048, 1, 1);
-      node.onaudioprocess = (e: AudioProcessingEvent) => {
-        const inp = e.inputBuffer.getChannelData(0);
-        App.sileroVadPush(inp, vadPcmRate);
-        if (!vadPreRoll) return;
-        const capN = vadPreRoll.length;
-        const first = Math.min(inp.length, capN - vadPreRollWrite);
-        vadPreRoll.set(inp.subarray(0, first), vadPreRollWrite);
-        if (inp.length > first) vadPreRoll.set(inp.subarray(first), 0);
-        vadPreRollWrite = (vadPreRollWrite + inp.length) % capN;
-        if (vadPcmActive) { vadPcmChunks.push(new Float32Array(inp)); vadPcmSpeechSamples += inp.length; }
-      };
-      // ScriptProcessor 必须接到 destination 才会被调度；零增益避免麦克风外放
-      const sink = ctx.createGain();
-      sink.gain.value = 0;
+      node.onaudioprocess = (e: AudioProcessingEvent) => onPCMFrame(e.inputBuffer.getChannelData(0));
       node.connect(sink);
       sink.connect(ctx.destination);
       src.connect(node);
       vadPcmNode = node;
       vadPcmSink = sink;
+      console.log('[VAD] PCM 采集就绪：ScriptProcessor（主线程，回退路径）');
     } catch (e) {
       console.warn('[VAD] PCM 预滚采集不可用，回退 MediaRecorder:', e);
+      try { sink.disconnect(); } catch (e2) {}
       vadPcmNode = null;
       vadPcmSink = null;
       vadPreRoll = null;
     }
   }
 
+  /** 一帧 PCM 的统一入口：worklet 消息与 ScriptProcessor 回调都走这里 ——
+   *  两条搬运路径共用同一份处理，行为不会分叉。 */
+  function onPCMFrame(inp: Float32Array) {
+    App.sileroVadPush(inp, vadPcmRate);
+    if (!vadPreRoll) return;
+    const capN = vadPreRoll.length;
+    const first = Math.min(inp.length, capN - vadPreRollWrite);
+    vadPreRoll.set(inp.subarray(0, first), vadPreRollWrite);
+    if (inp.length > first) vadPreRoll.set(inp.subarray(first), 0);
+    vadPreRollWrite = (vadPreRollWrite + inp.length) % capN;
+    if (vadPcmActive) { vadPcmChunks.push(new Float32Array(inp)); vadPcmSpeechSamples += inp.length; }
+  }
+
   /** 释放 PCM 采集（stopVADMode / 重建时调用） */
   function stopVADPCMCapture() {
     if (vadPcmNode) {
-      try { vadPcmNode.disconnect(); } catch (e) {}
-      vadPcmNode.onaudioprocess = null;
+      try {
+        const anyNode: any = vadPcmNode;
+        if (anyNode.port && typeof anyNode.port.postMessage === 'function') {
+          anyNode.port.onmessage = null;
+          try { anyNode.port.postMessage('stop'); } catch (e) {}
+        } else {
+          anyNode.onaudioprocess = null;
+        }
+        vadPcmNode.disconnect();
+      } catch (e) {}
       vadPcmNode = null;
     }
     if (vadPcmSink) {
@@ -315,7 +357,8 @@ export default (function init(App: AppKernel) {
     const src = App.audioCtx!.createMediaStreamSource(App.vadStream!);
     src.connect(App.vadAnalyser);
     // 常驻 PCM 采集 + 预滚环形缓冲：让"开头"在检测到人声之前就已经被录下来
-    startVADPCMCapture(src);
+    // （await：worklet 模块首次加载要等，采集没就绪前不能宣称自动对话已启动）
+    await startVADPCMCapture(src);
     // 神经 VAD（Silero）后台加载：加载完成前由频谱启发式顶着，不阻塞自动对话
     App.sileroVadInit();
     vadEmaVol = 0;
@@ -335,6 +378,10 @@ export default (function init(App: AppKernel) {
   // 走定时器还是走 rAF，全模块只此一处判据（调度与检测门控必须用同一条，否则节奏会重叠）
   const useTimerSchedule = () => App.chatQuiet && !document.hidden;
   const scheduleVAD = () => {
+    // XR 沉浸会话：帧循环由头显驱动（three 在 sessionstart 自动切到 XR 帧调度），
+    // DOM 的 rAF 在头显里不保证回调、timer 也可能被压频 —— 这里不自调度，
+    // 改由 animate 每帧调 App.vadXrTick（与 vr-hud / vr-chat 等层同一套驱动方式）。
+    if (App.xrPresenting) { App.vadRAF = null; vadTimer = null; return; }
     // 页面不可见时仍走 rAF：浏览器会把挂起的 rAF 彻底暂停（零唤醒），定时器只会被压到 1Hz
     // —— 手机锁屏后每秒白醒一次。可见时再用定时器，那时才是「rAF 逼着出帧」的代价。
     if (useTimerSchedule()) {
@@ -441,18 +488,19 @@ export default (function init(App: AppKernel) {
     vadEmaVol = VAD_EMA_ALPHA * raw + (1 - VAD_EMA_ALPHA) * vadEmaVol;
     return vadEmaVol;
   };
-App.vadLoop = function vadLoop() {
+/** 前置检查：false = 本帧不检测（各分支内部已按原语义处理续跑 / 重建流） */
+  function vadPreflight(): boolean {
     // 'auto'（自动对话）是唯一需要 VAD 持续聆听的模式
-    if (App.voiceMode !== 'auto') return;
+    if (App.voiceMode !== 'auto') return false;
 
     // 检查 AudioContext 是否被浏览器暂停（长时间空闲后浏览器会挂起音频上下文）
     if (App.audioCtx && App.audioCtx.state === 'suspended') {
       App.audioCtx.resume().then(() => console.log('[VAD] AudioContext 已自动恢复'));
       // 等待下一个周期再检测，让 resume 生效
       scheduleVAD();
-      return;
+      return false;
     }
-    if (!App.vadAnalyser) return;
+    if (!App.vadAnalyser) return false;
 
     // 检查 vadStream 是否还活着（浏览器长时间后台可能回收麦克风流）
     if (App.vadStream && !App.vadStream.active) {
@@ -467,14 +515,30 @@ App.vadLoop = function vadLoop() {
           App.voiceMode = 'press';
         }
       });
-      return;
+      return false;
     }
+    return true;
+  }
+
+  /** 一次 VAD 推进：排下一拍 + 节流门控 + 检测。
+   *  非 XR 的 rAF/timer 调度与 XR 的帧循环调度共用这一份 —— 两条驱动路径的
+   *  节拍与判定必须逐字一致，否则「头显里听到的话」和「屏幕上听到的话」两套行为。 */
+  function vadStep() {
     scheduleVAD();
 
     // 性能分级：降频VAD检测以节省CPU。
     // 走定时器时间隔已经按 skip 换算过，每次 tick 都该检测 —— 再 skip 一次等于把频率砍半，
     // 打断会变迟钝，而全屏聊天恰恰是最需要随时打断的场景。
-    if (!useTimerSchedule() && !App.shouldVADFrame()) return;
+    // XR 会话帧率 72~90Hz（高于 rAF 的 60 基准）：一律按 skip 节流，否则每帧白跑一遍检测。
+    if (App.xrPresenting) {
+      if (!App.shouldVADFrame()) return;
+    } else if (!useTimerSchedule() && !App.shouldVADFrame()) return;
+
+    runVADDetect();
+  }
+
+  /** 检测主体（自原 vadLoop 原样搬出，判定逻辑一字未改） */
+  function runVADDetect() {
 
     const vol = App.vadGetVolume();
     const now = performance.now();
@@ -600,6 +664,21 @@ App.vadLoop = function vadLoop() {
         App.vadSilenceStart = 0;
       }
     }
+  }
+
+  App.vadLoop = function vadLoop() {
+    if (!vadPreflight()) return;
+    vadStep();
+  };
+
+  /** XR 沉浸会话的 VAD 驱动入口（由 animate 每帧调用）：
+   *  头显里页面 DOM 的 rAF 不保证回调（调度判据在 document.hidden 时会退回 rAF，
+   *  而 rAF 恰恰是页面不可见时被浏览器彻底暂停的那条路），timer 也可能被压频 ——
+   *  唯一确定在跑的是 three 的 XR 帧循环，VAD 挂上去才不会「戴上头显就听不见你说话」。 */
+  App.vadXrTick = function vadXrTick() {
+    if (!App.xrPresenting) return;
+    if (!vadPreflight()) return;
+    vadStep();
   };
   App.startVADRecording = function startVADRecording() {
     if (!App.vadStream) return;

@@ -8,7 +8,12 @@ import type { AppKernel } from '../types/app-kernel.js';
  *  html2canvas 全文档截图、热度火花 / 街机数据流 / 施法计时 / 全息看门狗
  *  采样 / 任务轮询……用户一个都看不见。
  *
- *  这里给它们一个总闸：进全屏 → 全停；退出全屏 → 原样恢复。
+ *  这里给它们一个总闸：进全屏 / 进 VR → 全停；退出 → 原样恢复。
+ *  静默有两个来源（合成后写进 App.chatQuiet，任一成立即为静默）：
+ *    · 聊天不透明全屏 —— 整页只剩对话
+ *    · WebXR 沉浸会话 —— 头显里页面 DOM 一个像素都不渲染，普通模式那套照跑
+ *  两者只差一处：html.chat-quiet 这个 class 只跟全屏来源走（它的规则里有
+ *  #three-canvas visibility:hidden，而 VR 里 canvas 是 XR 图层的提交源，藏不得）。
  *  与 html.fx-lite（41_holo_stage 的掉帧降档）分工：
  *    fx-lite   = 看得见但少画一点（保画面）
  *    chat-quiet = 根本看不见，一帧都不画（保 CPU）
@@ -27,6 +32,9 @@ export default (function init(App: AppKernel) {
   };
 
   let loopStopped = false;
+  /* 两个静默来源，合成值写进 App.chatQuiet */
+  let fullscreenQuiet = false;   // 聊天不透明全屏
+  let vrQuiet = false;           // WebXR 沉浸会话
 
   /** 3D 帧循环与静默态对齐（幂等）：每次调用都按目标状态写一遍，不看旧标志位。
    *  原来的「状态没变就早退」有个致命漂移 —— 若某次调用时 renderer 还没建好
@@ -67,11 +75,15 @@ export default (function init(App: AppKernel) {
     } catch { /* 跨域 / 已卸载：忽略 */ }
   };
 
-  App.setQuiet = function setQuiet(on: boolean) {
-    on = !!on;
+  /** 合成静默态：任一来源成立即为静默。两个来源可能同时成立，
+   *  所以谁都不能直接写 App.chatQuiet —— 各自只翻自己的开关，这里统一算。 */
+  function applyQuiet() {
+    const on = fullscreenQuiet || vrQuiet;
     const changed = on !== App.chatQuiet;
     App.chatQuiet = on;
-    document.documentElement.classList.toggle('chat-quiet', on);
+    // 这个 class 只跟全屏来源走：规则里有 #three-canvas visibility:hidden，
+    // 而 VR 里 canvas 是 XR 图层的提交源，藏了会连头显画面一起没。
+    document.documentElement.classList.toggle('chat-quiet', fullscreenQuiet);
 
     // 1) 3D 帧循环 —— 最大的一块开销。WebXR 会话中帧由头显驱动，不能停。
     alignFrameLoop(on);
@@ -86,10 +98,23 @@ export default (function init(App: AppKernel) {
     for (let i = 0; i < hooks.length; i += 1) {
       try { hooks[i](on); } catch { /* 同上 */ }
     }
+  }
+
+  App.setQuiet = function setQuiet(on: boolean) {
+    fullscreenQuiet = !!on;
+    applyQuiet();
+  };
+
+  /** VR 沉浸会话的静默来源（webxr-vr 进出会话时切换）。
+   *  头显里页面 DOM 一个像素都不渲染，而街机数据流 / 施法计时 / 全息采样 /
+   *  任务大屏 iframe 截图 / 速率 HUD 照跑 —— 全是白烧的 CPU。 */
+  App.setVrQuiet = function setVrQuiet(on: boolean) {
+    vrQuiet = !!on;
+    applyQuiet();
   };
 
   /* 对外只读快照：调试 / 测试用 */
   App.quietSnapshot = function quietSnapshot() {
-    return { quiet: App.chatQuiet, loopStopped, hooks: hooks.length };
+    return { quiet: App.chatQuiet, loopStopped, hooks: hooks.length, fullscreen: fullscreenQuiet, vr: vrQuiet };
   };
 });

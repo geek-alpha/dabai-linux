@@ -1,0 +1,101 @@
+{
+  "name": "lark",
+  "title": "飞书（lark-cli）",
+  "version": "1.0.96",
+  "description": "飞书官方 CLI：消息/群聊(im)、云文档(docs)、表格(sheets)、多维表格(base)、日历(calendar)、任务(task)、邮件(mail)、云盘(drive)、知识库(wiki)、通讯录(contact)、审批(approval)、考勤(attendance)、妙搭应用(apps)等 20+ 业务域。触发词：飞书、lark、发飞书消息、飞书文档、飞书表格、飞书日历、飞书任务、飞书群、飞书审批。",
+  "author": "larksuite（上游 CLI + 28 个内嵌 Skill）+ dabai 适配层",
+  "enabled": true,
+  "disclosure": "on_demand",
+  "prompt": "【技能 飞书 lark-cli】飞书操作走 lark 工具（larksuite 官方 CLI）。先 lark_status 看配置与登录态：未配置用 lark_login(mode=\"app\")，未登录用 lark_login(mode=\"auth\")，把返回链接原样给用户，用户说完成后调 lark_login(mode=\"auth\", finish=true)。命令用法别猜：lark_skill(action=\"list\") 看 28 个域技能、lark_skill(action=\"read\", name=\"lark-im\") 读该域全文，或 lark(args=[\"im\",\"--help\"]) / lark(args=[\"schema\",\"im.message.create\"])。优先 +shortcut。铁律：成功判定看 ok==true；高风险写要 --yes，先经用户确认再传 confirm=true。",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "lark",
+        "description": "执行飞书 lark-cli 命令（透传）。args 为参数数组，不含 lark-cli 本身。例：[\"calendar\",\"+agenda\"]、[\"im\",\"+send\",\"--receive-id\",\"ou_xxx\",\"--text\",\"hi\"]、[\"schema\",\"im.message.create\"]、[\"api\",\"GET\",\"/open-apis/...\"]。auth login/logout、config init/bind、update 被拒（走 lark_login）。--yes 会被剥掉：高风险写需用户确认后传 confirm=true。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "args": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "命令参数数组，不含 lark-cli 本身。例：[\"calendar\",\"+agenda\"]、[\"docs\",\"+create\",\"--title\",\"周报\"]、[\"im\",\"+send\",\"--receive-id\",\"ou_xxx\",\"--text\",\"hi\"]"
+            },
+            "confirm": {
+              "type": "boolean",
+              "description": "仅高风险写命令需要：用户已明确同意执行该命令后传 true（否则 --yes 会被剥掉）"
+            },
+            "timeout": {
+              "type": "number",
+              "description": "超时秒数（默认 180，上限 1800）；长任务配 background=true"
+            },
+            "background": {
+              "type": "boolean",
+              "description": "长任务传 true：后台跑并立刻返回 PID 与日志路径，随后 tail 查进度"
+            }
+          },
+          "required": ["args"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "lark_status",
+        "description": "检查飞书技能状态：lark-cli 版本、doctor 体检（配置/连通性）、当前登录态与身份。",
+        "parameters": { "type": "object", "properties": {} }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "lark_login",
+        "description": "飞书授权。mode=\"app\"：后台跑 config init --new 建/绑应用，返回授权链接（用户在浏览器完成）；mode=\"auth\"：发起用户授权，返回链接（不阻塞）；mode=\"auth\" + finish=true：用上次的 device code 完成授权并回报登录态。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": ["app", "auth"],
+              "description": "app=建/绑应用凭据；auth=用户身份授权（默认 app）"
+            },
+            "finish": {
+              "type": "boolean",
+              "description": "仅 mode=auth：用户已在浏览器完成授权后传 true，用保存的 device code 收尾"
+            },
+            "domains": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "仅 mode=auth：限定申请的业务域，如 [\"calendar\",\"im\"]、[\"all\"]；不传等于全部域"
+            },
+            "device_code": {
+              "type": "string",
+              "description": "一般不用填：留空会自动读取上次发起的 device code"
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "lark_skill",
+        "description": "读 lark-cli 内嵌的技能文档（与 CLI 版本同步）。action=\"list\" 列 28 个业务域技能；action=\"read\" + name（如 lark-im、lark-doc、lark-sheets、lark-base）读该域 SKILL.md 全文，含 shortcuts 与 references 路径。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "enum": ["list", "read"],
+              "description": "list=列全部技能；read=读某个技能文档（默认 list）"
+            },
+            "name": {
+              "type": "string",
+              "description": "read 时的技能名，如 lark-im、lark-calendar、lark-doc"
+            }
+          }
+        }
+      }
+    }
+  ]
+}

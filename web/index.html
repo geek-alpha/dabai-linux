@@ -884,7 +884,7 @@
         <div id="vr-hint" class="vr-hint"></div>
     </div>
 
-    <script type="module" src="/static/app.ts?v=173"></script>
+    <script type="module" src="/static/app.ts?v=176"></script>
     <script>
     // PWA 资源本地化层：注册 Service Worker。
     // 只在受信任的 HTTPS 下会成功——自签名证书会被浏览器拒绝（不报错、静默跳过），
@@ -895,7 +895,21 @@
     if ('serviceWorker' in navigator && window.isSecureContext
             && !/DabaiApp/.test(navigator.userAgent)) {
         window.addEventListener('load', function () {
-            navigator.serviceWorker.register('/sw.js', { scope: '/' }).catch(function () {});
+            navigator.serviceWorker.register('/sw.js', { scope: '/' }).then(function (reg) {
+                // 主动查一次更新：浏览器默认要 24 小时才检查一次 sw.js，
+                // 不主动查的话「改了 sw.js 得等一天才生效」。
+                reg.update().catch(function () {});
+            }).catch(function () {});
+            // 新 SW（skipWaiting + clients.claim）接管时，当前页面仍由旧 SW 控制，
+            // 不重载就表现为「改了前端代码刷新还是旧的，得刷两次」——这正是 VR 里
+            // 反复拿到旧面板的原因。首次安装不重载（本次加载本来就没走 SW）。
+            var hadController = !!navigator.serviceWorker.controller;
+            var reloaded = false;
+            navigator.serviceWorker.addEventListener('controllerchange', function () {
+                if (!hadController || reloaded) return;
+                reloaded = true;
+                location.reload();
+            });
         });
     }
     </script>

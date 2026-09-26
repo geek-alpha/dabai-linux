@@ -292,6 +292,246 @@ export interface VrHud {
   trigger: (id: string) => void;
 }
 
+/** VR 沉浸态信息层（toast + 字幕，vr-ui 挂载） */
+export interface VrUi {
+  active: boolean;
+  toastMesh: ThreeNS.Mesh | null;
+  subMesh: ThreeNS.Mesh | null;
+  show: () => void;
+  hide: () => void;
+  update: (dt: number) => void;
+}
+
+/** VR 工具栏图标（从 DOM 的 svg path 直接转 Path2D，保证与原按钮同源） */
+export interface VrToolbarIcon {
+  path: Path2D;
+  mode: 'fill' | 'stroke';
+  sw: number;
+  tx: number;
+  ty: number;
+}
+
+/** VR 工具栏按钮（画布像素坐标，命中用） */
+export interface VrToolbarItem {
+  id: string;
+  title: string;
+  icons: VrToolbarIcon[];
+  vw: number;
+  vh: number;
+  text: string;
+  active: boolean;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+/** VR 世界内舞台工具栏（vr-toolbar 挂载；#stage-tools 的重建） */
+export interface VrToolbar {
+  active: boolean;
+  collapsed: boolean;
+  mesh: ThreeNS.Mesh | null;
+  tex: ThreeNS.CanvasTexture | null;
+  cv: HTMLCanvasElement | null;
+  ctx: CanvasRenderingContext2D | null;
+  items: VrToolbarItem[];
+  hoverId: string;
+  flash: VrHudFlash | null;
+  _ray: ThreeNS.Raycaster;
+  _v3: ThreeNS.Vector3;
+  _q: ThreeNS.Quaternion;
+  show: () => void;
+  hide: () => void;
+  markDirty: () => void;
+  update: (dt: number) => void;
+  hitTest: (origin: ThreeNS.Vector3, dir: ThreeNS.Vector3, snap?: boolean) => string | null;
+  trigger: (id: string) => void;
+  /** 呼出居中菜单（面板定在正前方 + 焦点环，给只有确认键的玩家用） */
+  menuOpen: boolean;
+  /** 当前焦点按钮 id（十字键步进 / 射线命中） */
+  focusId: string;
+  /** 呼出/收起居中菜单 */
+  toggleMenu: () => void;
+}
+
+/** VR 射线锁定命中结果（vr-ray 挂载） */
+export interface VrRayHit {
+  panel: { id: string; trigger: (id: string) => void };
+  id: string;
+  score: number;
+}
+
+/** 凝视进度（vr-ray 统一引擎写，反馈层只读）：panelId='' 表示当前没锁到任何目标 */
+export interface VrDwell {
+  panelId: string;
+  id: string;
+  /** 0~1：视线在当前目标上攒了多少，满 1 即触发 */
+  p: number;
+}
+
+/** VR 射线锁定仲裁（vr-ray 挂载：跨面板互斥，面板外一圈磁力带也算指向） */
+export interface VrRay {
+  panels: any[];
+  register: (p: any) => void;
+  pick: (origin: any, dir: any, loose: boolean) => VrRayHit | null;
+  /** 锁定的是指定面板就返回按钮 id，否则空串（各面板 hover/focus 用） */
+  pickMine: (id: string, origin: any, dir: any, loose: boolean) => string;
+  /** 凝视进度：任意面板的任意目标都可被凝视触发（面板不必各自实现计时） */
+  dwell: VrDwell;
+  /** 每帧一次：视线 → 仲裁锁定 → 计时 → 满阈值触发 */
+  update: (now: number) => void;
+}
+
+/** VR 对话大屏（vr-chat 挂载：#messages 的世界内镜像） */
+export interface VrChat {
+  active: boolean;
+  /** 收起成一条细状态条（不挡视线） */
+  collapsed: boolean;
+  mesh: ThreeNS.Mesh | null;
+  tex: ThreeNS.CanvasTexture | null;
+  cv: HTMLCanvasElement | null;
+  ctx: CanvasRenderingContext2D | null;
+  /** 已镜像的消息条数 */
+  count: number;
+  /** 视线焦点（'toggle' = 顶栏/状态条；空 = 没看屏幕） */
+  focusId: string;
+  dirty: boolean;
+  _ray: ThreeNS.Raycaster;
+  _v3: ThreeNS.Vector3;
+  _q: ThreeNS.Quaternion;
+  show: () => void;
+  hide: () => void;
+  markDirty: () => void;
+  update: (dt: number) => void;
+  hitTest: (origin: ThreeNS.Vector3, dir: ThreeNS.Vector3, snap?: boolean) => string | null;
+  trigger: (id: string) => void;
+}
+
+/** VR 语音面板按钮（画布像素坐标 + 圆形容器） */
+export interface VrVoiceButton {
+  id: string;
+  text: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+/** VR 语音控制带（vr-voice 挂载：寄宿在 vr-chat 面板底部，不再自建浮空面板） */
+export interface VrVoice {
+  active: boolean;
+  /** 语音带高度（画布像素）：宿主在画布底部预留这么多 */
+  bandH: number;
+  cv: HTMLCanvasElement | null;
+  ctx: CanvasRenderingContext2D | null;
+  buttons: VrVoiceButton[];
+  hoverId: string;
+  focusId: string;
+  flash: VrHudFlash | null;
+  /** 手柄扳机按住中（press 模式：松开扳机即发送） */
+  hold: boolean;
+  /** 本次录音起始时刻（面板显示录音计时） */
+  recStart: number;
+  show: () => void;
+  hide: () => void;
+  markDirty: () => void;
+  /** 宿主每帧调：模式/录音状态轮询 + 手柄 selectend 补绑；true = 带内容变了，宿主该重绘 */
+  tick: () => boolean;
+  /** 宿主绘制：把语音带贴到宿主画布底部（dy = 宿主画布高 - bandH） */
+  drawBand: (ctx: CanvasRenderingContext2D, dy: number) => void;
+  /** 宿主命中：宿主画布坐标 → 语音按钮 id（含磁力带） */
+  hitBand: (px: number, py: number, loose: boolean, inside: boolean) => string | null;
+  /** 手柄扳机按下（宿主分派）：true = 已消费（press 模式的按住说话） */
+  pressDown: (id: string) => boolean;
+  trigger: (id: string) => void;
+}
+
+/** VR 世界内在线音乐面板（vr-music 挂载：#musicModal 的世界内重建） */
+export interface VrMusic {
+  active: boolean;
+  /** 面板呼出中（工具栏 music-btn 切换；收起时 mesh 隐藏） */
+  open: boolean;
+  mesh: ThreeNS.Mesh | null;
+  tex: ThreeNS.CanvasTexture | null;
+  cv: HTMLCanvasElement | null;
+  ctx: CanvasRenderingContext2D | null;
+  buttons: VrHudButton[];
+  hoverId: string;
+  flash: VrHudFlash | null;
+  dirty: boolean;
+  _ray: ThreeNS.Raycaster;
+  _v3: ThreeNS.Vector3;
+  _q: ThreeNS.Quaternion;
+  show: () => void;
+  hide: () => void;
+  markDirty: () => void;
+  update: (dt: number) => void;
+  hitTest: (origin: ThreeNS.Vector3, dir: ThreeNS.Vector3, snap?: boolean) => string | null;
+  trigger: (id: string) => void;
+  /** 呼出/收起（vr-toolbar 的 music-btn 调它） */
+  toggle: () => void;
+}
+
+/** VR 世界内在线视频面板（vr-video 挂载：#videoModal 的世界内重建） */
+export interface VrVideo {
+  active: boolean;
+  /** 面板呼出中（工具栏 video-btn 切换；收起时 mesh 隐藏） */
+  open: boolean;
+  mesh: ThreeNS.Mesh | null;
+  tex: ThreeNS.CanvasTexture | null;
+  cv: HTMLCanvasElement | null;
+  ctx: CanvasRenderingContext2D | null;
+  buttons: VrHudButton[];
+  hoverId: string;
+  flash: VrHudFlash | null;
+  dirty: boolean;
+  _ray: ThreeNS.Raycaster;
+  _v3: ThreeNS.Vector3;
+  _q: ThreeNS.Quaternion;
+  show: () => void;
+  hide: () => void;
+  markDirty: () => void;
+  update: (dt: number) => void;
+  hitTest: (origin: ThreeNS.Vector3, dir: ThreeNS.Vector3, snap?: boolean) => string | null;
+  trigger: (id: string) => void;
+  /** 呼出/收起（vr-toolbar 的 video-btn 调它） */
+  toggle: () => void;
+}
+
+/** VR 沉浸态特效层（欢呼 / 彩带 / 评级大字 / 频闪 / 震动，vr-fx 挂载） */
+export interface VrFx {
+  active: boolean;
+  /** 累计欢呼次数（与 App.holo.count 同语义，VR 侧独立计数） */
+  readonly count: number;
+  /** 手动欢呼（level 1~5，<=0 不做事） */
+  celebrate: (level: number, opts?: { combo?: number }) => void;
+  /** 彩带（5 级庆祝） */
+  confetti: () => void;
+  /** 世界微抖 1~3（DOM 版的舞台抖动在头显里没有落点，这里配手柄触觉） */
+  shake: (power?: number) => void;
+  /** 频闪一次（最多 3 次闪烁，光敏安全） */
+  strobe: () => void;
+  /** 失败鼓励：不欢呼，给一次「被看见」的呼吸 */
+  encourage: () => void;
+  show: () => void;
+  hide: () => void;
+  update: (dt: number) => void;
+}
+
+/** VR 沉浸态全息投影 + 舞台灯光（41_holo_stage 常驻层的世界内重建，vr-holo 挂载） */
+export interface VrHolo {
+  active: boolean;
+  /** 当前空间状态（与 #status-badge 同源：idle/thinking/listening/speaking/offline） */
+  readonly state: string;
+  /** 欢呼亮度提升（level 1~5；ttl = 220 + lv*160，与 41 的 data-cheer 一致） */
+  setCheer: (level: number) => void;
+  /** 失败鼓励：底座呼吸一次（#holo-fx.hf-dim） */
+  dim: () => void;
+  show: () => void;
+  hide: () => void;
+  update: (dt: number) => void;
+}
+
 /** 任务树节点状态 */
 export type TaskStatus = 'pending' | 'queued' | 'confirming' | 'running' | 'done' | 'error' | 'cancelled';
 
@@ -1082,9 +1322,11 @@ export interface AppKernel {
   /* 聊天全屏静默总闸（00_quiet 挂载）：全屏时停掉非聊天框的一切渲染 */
   chatQuiet: boolean;
   setQuiet: (on: boolean) => void;
+  /* VR 沉浸会话的静默来源（00_quiet 挂载）：与 setQuiet 同义，但退出时互不覆盖 */
+  setVrQuiet: (on: boolean) => void;
   onQuiet: (fn: (on: boolean) => void) => void;
   syncQuietLoop: () => void;
-  quietSnapshot: () => { quiet: boolean; loopStopped: boolean; hooks: number };
+  quietSnapshot: () => { quiet: boolean; loopStopped: boolean; hooks: number; fullscreen: boolean; vr: boolean };
 
   /* ---------- 语音 / VAD（11_voice_record + 12_vad_auto 挂载） ---------- */
   voiceMode: VoiceMode;
@@ -1097,6 +1339,8 @@ export interface AppKernel {
   vadStream: MediaStream | null;
   vadState: 'idle' | 'recording';
   vadLoop: () => void;
+  /** XR 沉浸会话的 VAD 驱动入口（12_vad_auto 挂载，animate 每帧调用） */
+  vadXrTick: () => void;
   startVADMode: () => Promise<boolean>;
   stopVADMode: () => void;
   vadIsVoice: () => number;
@@ -1433,6 +1677,45 @@ export interface AppKernel {
   /* ---------- VR HUD（vr-hud 挂载） ---------- */
   vrHud: VrHud;
   updateVrHud: (dt: number) => void;
+
+  /* ---------- VR 信息层（vr-ui 挂载：toast + 字幕） ---------- */
+  vrUi?: VrUi;
+  updateVrUi?: (dt: number) => void;
+
+  /* ---------- VR 舞台工具栏（vr-toolbar 挂载：#stage-tools 的世界内重建） ---------- */
+  vrToolbar?: VrToolbar;
+  updateVrToolbar?: (dt: number) => void;
+
+  /* ---------- VR 射线锁定仲裁（vr-ray 挂载：跨面板互斥） ---------- */
+  vrRay?: VrRay;
+  _vrRayPick?: (origin: any, dir: any, loose?: boolean) => VrRayHit | null;
+  /** 凝视点击引擎（vr-ray 内置）：每帧一次，视线停够时长即触发锁定目标 */
+  updateVrRay?: (now: number) => void;
+
+  /* ---------- VR 对话大屏（vr-chat 挂载：#messages 的世界内镜像） ---------- */
+  vrChat?: VrChat;
+  updateVrChat?: (dt: number) => void;
+
+  /* ---------- VR 语音带（vr-voice 挂载：寄宿在 vr-chat 底部，按住说话/自动对话/打断） ---------- */
+  vrVoice?: VrVoice;
+
+  /* ---------- VR 在线音乐面板（vr-music 挂载：榜单/歌单/播放控制） ---------- */
+  vrMusic?: VrMusic;
+  updateVrMusic?: (dt: number) => void;
+
+  /* ---------- VR 在线视频面板（vr-video 挂载：搜索/热门/收藏/历史 + 语音关键词） ---------- */
+  vrVideo?: VrVideo;
+  updateVrVideo?: (dt: number) => void;
+  /** vr-video 挂载：websocket 收到语音识别结果（transcript）时回调；面板非「待听」状态会自行忽略 */
+  _vrVideoVoiceHook?: ((text: string) => void) | null;
+
+  /* ---------- VR 特效层（vr-fx 挂载：欢呼/彩带/评级大字/频闪/震动） ---------- */
+  vrFx?: VrFx;
+  updateVrFx?: (dt: number) => void;
+
+  /* ---------- VR 全息投影 + 舞台灯光（vr-holo 挂载） ---------- */
+  vrHolo?: VrHolo;
+  updateVrHolo?: (dt: number) => void;
 
   /* ---------- 情绪驱动动作系统（emotion_controller / motion_blender / mixamo_retarget 挂载） ---------- */
   pad: PADState;
@@ -1846,7 +2129,6 @@ export interface AppKernel {
   updateTaskBigScreen?: any;
 
   /* ---- js/vr/webxr-vr.js ---- */
-  _accumHeadShake?: any;
   _aiDrivenWalk?: any;
   _ensureVrShake?: any;
   _enterWebXR?: any;
@@ -1862,16 +2144,22 @@ export interface AppKernel {
   _setupXRControllers?: any;
   _stdPadPressed?: any;
   _upVec?: any;
-  _vrFixedRotY?: number | null;
+  updateXRFaceUser?: any;
   _vrHudSide?: { x: number; z: number } | null;
   _vrScreenWorldObjs?: any;
+  _vrBoardZoom?: (delta: number) => void;
+  /** 大屏大小/距离调节通道（vr-chat 控制带与手柄摇杆共用）：scale 是乘在 VR_BOARD_SCALE 上的倍率 */
+  _vrBoardCtl?: {
+    get: () => { dist: number; scale: number };
+    step: (kind: 'dist' | 'scale', delta: number) => void;
+    reset: () => void;
+  };
   _xrCaptureWorld?: any;
   _xrControllers?: any;
   _xrEyeOffY?: any;
-  _xrHeadPitchPrev?: any;
+  _xrEyeRay?: any;
+  _xrCtrlRay?: any;
   _xrHeadPos?: any;
-  _xrHeadPosPrev?: any;
-  _xrHeadYawPrev?: any;
   _xrHeightState?: any;
   _xrLookDownTimer?: any;
   _xrLookUpTimer?: any;
@@ -1887,7 +2175,6 @@ export interface AppKernel {
   _xrSavedAutonomy?: any;
   _xrSavedCamera?: any;
   _xrSession?: any;
-  _xrShakeSmooth?: any;
   _xrShiftWorld?: any;
   _xrSnapBackCamera?: any;
   _xrTmpQuat?: any;
@@ -1902,7 +2189,6 @@ export interface AppKernel {
   hideVrOverlay?: any;
   showVrOverlay?: any;
   updateXRControllers?: any;
-  updateXRFaceUser?: any;
   updateXRHeight?: any;
   vrDecayTimer?: any;
   xrPresenting?: any;

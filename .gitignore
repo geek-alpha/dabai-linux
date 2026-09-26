@@ -283,3 +283,7 @@ web/_restpose_check.html
 /_tmp_*
 /_head_*.py
 tools/_tmp_*.py
+
+# 技能运行时凭据
+skills/baidu-drive/.session_id
+skills/lark/.device_code

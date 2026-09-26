@@ -1767,7 +1767,7 @@ export default (function init(App: AppKernel) {
     }
     if (App.currentAction) return; // 各动作自己负责结束
     // 注：VR 模式下不再禁用随机动作——非 VR 可用的 POSE/WALK/TURN/DANCE 在 VR 中同样解锁；
-    // TURN 与面向用户逻辑的冲突已由 updateXRFaceUser 对 TURN 的跳过处理消解。
+    // VR 中角色朝向固定，TURN 自行控制 rotation.y，两者不再冲突。
     App.nextActionTimer -= dt;
     if (App.nextActionTimer <= 0) {
       // 统一调度：动作库已就绪（动态模式：配置加载完即就绪，动作按需加载+预取）

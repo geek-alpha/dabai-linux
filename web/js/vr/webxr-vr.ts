@@ -25,6 +25,33 @@ export default function initWebXR(App: AppKernel) {
   App._xrWorldShift = null; // 世界统一平移向量（进入 WebXR 时设置，退出时还原）
   App._xrUserOrigin = new THREE.Vector3();
   App._xrHeadPos = new THREE.Vector3();
+  // ---------------- 视野升降偏移 → 交互射线 ----------------
+  // updateXRHeight 把高度偏移只加在左右眼矩阵上（纯视觉），cameraXR.matrixWorld 和手柄位姿都不含它。
+  // 于是「升高 5 米俯视」时视觉世界整体下沉，射线却还从真实眼高/手位出发 —— 看到的面板与射线打中
+  // 的点差一整个偏移量（实测 off=5 时偏 0.95m，面板才 0.34m 宽，必然点不中）。
+  // 规则：VR 交互射线（视线 / 手柄 / 戳角色）的原点都叠加这个偏移，绘制的射线视觉同步叠加，
+  // 让「看到什么就能按到什么」在任何高度都成立。
+  App._xrEyeRay = function _xrEyeRay(origin, dir) {
+    const r = App.renderer;
+    if (!r || !r.xr || !r.xr.isPresenting) return false;
+    try {
+      const c = r.xr.getCamera();
+      if (!c) return false;
+      origin.setFromMatrixPosition(c.matrixWorld);
+      origin.y += App._xrEyeOffY || 0;
+      c.getWorldDirection(dir);
+      return true;
+    } catch (_) { return false; }
+  };
+  App._xrCtrlRay = function _xrCtrlRay(c, origin, dir, quat) {
+    try {
+      c.updateMatrixWorld(true);
+      origin.setFromMatrixPosition(c.matrixWorld);
+      origin.y += App._xrEyeOffY || 0;
+      dir.set(0, 0, -1).applyQuaternion(c.getWorldQuaternion(quat));
+      return true;
+    } catch (_) { return false; }
+  };
   App._xrRaycaster = new THREE.Raycaster();
   App._xrTmpQuat = new THREE.Quaternion();
   App._upVec = new THREE.Vector3(0, 1, 0);
@@ -36,12 +63,9 @@ export default function initWebXR(App: AppKernel) {
   App._xrHeightState = 'idle'; // 'idle' | 'rising' | 'lowering'
   App._xrLookDownTimer = 0; // 低头看地面持续累计时长（秒）
   App._xrLookUpTimer = 0; // 抬头看天空持续累计时长（秒）
-  // ---------------- VR 固定朝向 / 面板侧向锚点 ----------------
-  // VR 模式角色位置与朝向固定：不再注视归位、不再追踪用户转头转身。
-  // _vrFixedRotY = 进入 VR 时的角色朝向（面向进入站位），转圈/跳舞等临时
-  // 动作结束后由 updateXRFaceUser 平滑拉回；_vrHudSide = 快捷面板固定的
-  // 角色侧向（用户看向角色时的右手侧），整场会话不变。
-  App._vrFixedRotY = null;
+  // ---------------- 面板侧向锚点 ----------------
+  // VR 模式角色位置固定，朝向保持进入时的角度，不随头显转动；
+  // _vrHudSide = 快捷面板固定的角色侧向（用户看向角色时的右手侧），整场会话不变。
   App._vrHudSide = null;
 
   // ---------------- 能力检测 ----------------
@@ -67,7 +91,7 @@ export default function initWebXR(App: AppKernel) {
     if (hint) {
       hint.textContent = false
         ? '左摇杆移动 · 右摇杆转身 · 头显自由环视 · 点「退出 VR」返回游戏'
-        : '左摇杆移动 · 右摇杆转身/缩放 · 扳机戳一戳 · 低头/抬头1秒升降视野 · 面板在角色右侧';
+        : '左摇杆移动 · 右摇杆转身/缩放 · 扳机戳一戳 · 低头/抬头1秒升降视野 · 面板在角色右侧 · b176';
     }
   };
   App.hideVrOverlay = function hideVrOverlay() {
@@ -122,84 +146,6 @@ export default function initWebXR(App: AppKernel) {
     }
   };
 
-  // 头显晃动累积（WebXR）：晃动强度绑定头显真实运动，而非摇杆——
-  // 头部左右转动（yaw 角速度）→ 左右摆动强度；头部俯仰（pitch 角速度）→
-  // 上下弹跳强度；头显位置快速移动（线速度，如走动/身体起伏）辅助叠加。
-  // 平稳化：速率先一阶低通滤掉帧间毛刺，再用 sqrt 压缩高角速度的增益，
-  // 最后对每帧增量做上限钳制 —— 剧烈甩头不会瞬间拉满强度，只平滑爬升；
-  // 停止晃动后仍由衰减定时器（24 秒平息）负责回落。
-  App._accumHeadShake = function _accumHeadShake(dt) {
-    const vs: any = App.vrShake;
-    if (!vs) return;
-    const renderer = App.renderer;
-    if (!renderer || !renderer.xr || !renderer.xr.isPresenting) return;
-    let xrCam;
-    try { xrCam = renderer.xr.getCamera(); } catch (_) {}
-    if (!xrCam) return;
-    // 头显前向向量 → 水平朝向角 yaw / 俯仰角 pitch
-    const fwd = App._xrTmpVecA;
-    try { xrCam.getWorldDirection(fwd); } catch (_) { return; }
-    const yaw = Math.atan2(fwd.x, fwd.z);
-    const pitch = Math.asin(THREE.MathUtils.clamp(fwd.y, -1, 1));
-    // 头显线速度（位移变化率）
-    const pos = App._xrTmpVecB;
-    try { pos.setFromMatrixPosition(xrCam.matrixWorld); } catch (_) {}
-    let moving = false;
-    if (App._xrHeadYawPrev !== undefined && App._xrHeadPitchPrev !== undefined) {
-      // yaw 角度环绕处理（-179°↔+179° 不产生假大角速度）
-      let dy = yaw - App._xrHeadYawPrev;
-      while (dy > Math.PI) dy -= Math.PI * 2;
-      while (dy < -Math.PI) dy += Math.PI * 2;
-      const yawRate = Math.abs(dy) / Math.max(dt, 1e-4);
-      const pitchRate = Math.abs(pitch - App._xrHeadPitchPrev) / Math.max(dt, 1e-4);
-      const prevPos = App._xrHeadPosPrev;
-      const linX = prevPos ? Math.abs(pos.x - prevPos.x) / Math.max(dt, 1e-4) : 0;
-      const linY = prevPos ? Math.abs(pos.y - prevPos.y) / Math.max(dt, 1e-4) : 0;
-      const linZ = prevPos ? Math.abs(pos.z - prevPos.z) / Math.max(dt, 1e-4) : 0;
-      const lin = linX + linY + linZ;
-      // 一阶低通：平滑速率（约 8Hz 截止），滤掉帧间毛刺；持续晃动时逐渐趋近真实值
-      const sm = App._xrShakeSmooth || (App._xrShakeSmooth = { yaw: 0, pitch: 0, lin: 0 });
-      const lp = Math.min(1, dt * 8);
-      sm.yaw += (yawRate - sm.yaw) * lp;
-      sm.pitch += (pitchRate - sm.pitch) * lp;
-      sm.lin += (lin - sm.lin) * lp;
-      // sqrt 非线性压缩：4rad/s 才接近满增益，剧烈转动不线性放大
-      const yawN = Math.sqrt(Math.min(1, sm.yaw / 4));
-      const pitchN = Math.sqrt(Math.min(1, sm.pitch / 4));
-      const linN = Math.sqrt(Math.min(1, sm.lin / 2));
-      const linYN = Math.sqrt(Math.min(1, linY / 1.5));
-      // 触发阈值：摇头/点头这类"刻意晃动"才累积强度。
-      // 点头（上下晃动）阈值放低——抬头低头 ≥14°/s 即触发，普通 VR 观看很少持续超过；
-      // 摇头（左右晃动）仍要求 ≥28°/s，避免日常转头（10~25°/s）误触发持续摆动。
-      // 旧版上/下阈值过严且增益过小：一次 0.5 秒的点头只能累积强度 ~0.4，
-      // 映射到弹跳仅 ±2mm，肉眼完全不可见——本版提高增益让一次点头就能跳起来。
-      const SHAKE_YAW_TRIG = Math.sqrt(Math.min(1, 0.5 / 4));     // 摇头：平滑 yaw 速率 ≥0.5rad/s(≈28.6°/s)
-      const SHAKE_PITCH_TRIG = Math.sqrt(Math.min(1, 0.25 / 4)); // 点头：平滑 pitch 速率 ≥0.25rad/s(≈14.3°/s)
-      const SHAKE_LIN_TRIG = Math.sqrt(Math.min(1, 0.5 / 2));    // 水平线速 ≥0.5 m/s
-      const SHAKE_LINY_TRIG = Math.sqrt(Math.min(1, 0.22 / 1.5)); // 垂直线速 ≥0.22 m/s（身体起伏即触发）
-      // 每帧增量钳制（约每秒 +18）：一次 0.5 秒的点头即可累积强度 2~3，持续点头达 10+，
-      // 映射到弹跳 ±3~9cm，肉眼清晰可见
-      const MAX_FRAME = 0.2;
-      if (yawN > SHAKE_YAW_TRIG || linN > SHAKE_LIN_TRIG) {
-        const g = Math.min(MAX_FRAME, (Math.max(0, yawN - SHAKE_YAW_TRIG) * 40 + Math.max(0, linN - SHAKE_LIN_TRIG) * 30) * dt);
-        vs.leftRight = Math.min(100, vs.leftRight + g);
-        moving = true;
-      }
-      if (pitchN > SHAKE_PITCH_TRIG || linYN > SHAKE_LINY_TRIG) {
-        const g = Math.min(MAX_FRAME, (Math.max(0, pitchN - SHAKE_PITCH_TRIG) * 60 + Math.max(0, linYN - SHAKE_LINY_TRIG) * 45) * dt);
-        vs.upDown = Math.min(100, vs.upDown + g);
-        moving = true;
-      }
-    }
-    App._xrHeadYawPrev = yaw;
-    App._xrHeadPitchPrev = pitch;
-    if (!App._xrHeadPosPrev) App._xrHeadPosPrev = new THREE.Vector3();
-    App._xrHeadPosPrev.copy(pos);
-    if (moving) {
-      vs.lastActive = Date.now();
-      vs.stopNotified = false;
-    }
-  };
 
   App.enterXrMode = async function enterXrMode(mode) {
     if (App.xrMode !== 'off') App.exitXrMode();
@@ -232,6 +178,10 @@ export default function initWebXR(App: AppKernel) {
       (App as any).exitXrMode(true); // 静默回滚（不弹"已关闭"提示）
       return ok;
     }
+    // 沉浸会话已接管：页面 DOM 在头显里一个像素都不渲染，普通模式那套氛围层
+    // （街机数据流 / 施法计时 / 全息采样 / 任务大屏截图 / 速率 HUD）全在空转。
+    // 必须在这里开静默 —— 此刻 xrPresenting 已为 true，总闸不会去停 XR 的帧循环。
+    if (App.setVrQuiet) App.setVrQuiet(true);
     const gyroBtn = App.$('gyro-btn');
     if (gyroBtn) gyroBtn.classList.add('active');
     return true;
@@ -243,6 +193,9 @@ export default function initWebXR(App: AppKernel) {
     const wasGameXR = false;
     App.xrMode = 'off';
     if (mode === 'webxr') App._exitWebXR();
+    // 退出沉浸会话 = 退回普通 DOM 视图：解除 VR 这个来源
+    // （全屏来源若仍成立，合成态保持静默，各模块不会被白叫醒一次）
+    if (App.setVrQuiet) App.setVrQuiet(false);
     // 恢复进入 VR 前的相机状态（关键：matrixAutoUpdate 在 WebXR 会话中被
     // three.js 置 false 且退出时不恢复，若不重置为 true，相机矩阵停留在 VR
     // 最后姿态，机位卡死无法脱离）
@@ -261,12 +214,7 @@ export default function initWebXR(App: AppKernel) {
     App._xrHeightState = 'idle';
     App._xrLookDownTimer = 0;
     App._xrLookUpTimer = 0;
-    // 重置头显晃动跟踪（避免下次进入用旧帧差分产生瞬时假晃动）
-    App._xrHeadYawPrev = undefined;
-    App._xrHeadPitchPrev = undefined;
-    App._xrHeadPosPrev = null;
-    App._xrShakeSmooth = null;
-    // 停止晃动衰减定时器并清空晃动数据
+    // 停止晃动衰减定时器并清空晃动数据（头显累积源已移除，仅戳角色反馈会加值）
     if (App.vrDecayTimer) { clearInterval(App.vrDecayTimer); App.vrDecayTimer = null; }
     App.vrShake = null;
     // 退出部位聚焦（防止聚焦 target 残留影响普通模式相机）
@@ -274,8 +222,7 @@ export default function initWebXR(App: AppKernel) {
       App.focusPart.active = false;
       App.focusPart.time = 0;
     }
-    // 清除 VR 固定朝向/面板侧向锚点（下次进入重新确定）
-    App._vrFixedRotY = null;
+    // 清除 VR 面板侧向锚点（下次进入重新确定）
     App._vrHudSide = null;
     const gyroBtn = App.$('gyro-btn');
     if (gyroBtn) gyroBtn.classList.remove('active');
@@ -428,8 +375,7 @@ export default function initWebXR(App: AppKernel) {
         App._xrUserOrigin.add(ws);
         App._xrHeadPos.add(ws);
       }
-      // 角色朝向固定锚点：进入时的朝向（面向进入站位），此后不再追踪用户
-      App._vrFixedRotY = App.smoothRotY != null ? App.smoothRotY : 0;
+      // 角色朝向不设锚点：进入后保持进入时的朝向，不跟随头显转动
       // 快捷面板固定的角色侧向：用户看向角色时的右手侧（进入视角确定，整场不变）
       {
         const fx = App.modelGroup.position.x - App._xrUserOrigin.x;
@@ -467,10 +413,13 @@ export default function initWebXR(App: AppKernel) {
       try {
         renderer.xr.setReferenceSpaceType(refType);
       } catch (_) {}
-      // 降低 XR 渲染分辨率（默认 1.0 = 头显原生）：VR 里帧率优先，
-      // 0.85 档约省 28% 像素，肉眼几乎无差别，但能显著稳住 72/90Hz，
-      // 减少"偶尔卡顿/不自然"（渲染负载是 VR 掉帧最常见的原因）
-      try { renderer.xr.setFramebufferScaleFactor(0.85); } catch (_) {}
+      // XR 渲染分辨率：1.0 = 头显原生（不要降！0.85 看着只省 28% 像素，
+      // 实际是整幅画面线性分辨率砍 15%，文字/细边全部发虚——用户反馈"整体都糊"的元凶）。
+      // 掉帧优先从 foveation 和场景负载上省，不从全局清晰度上省。
+      try { renderer.xr.setFramebufferScaleFactor(1.0); } catch (_) {}
+      // 固定注视点渲染：只对周边视野降采样，中心（注视区）保持全采样。
+      // 0.2 = 轻档：既省一部分片元，周边也不至于明显软化（0.4 时边缘糊得看得出来）。
+      try { renderer.xr.setFoveation(0.2); } catch (_) {}
       // 必须等待 three.js 完成会话接管（makeXRCompatible + 参考空间 + 渲染层）。
       // setSession 是异步的：若不 await 就置 App.xrPresenting=true，中途失败时
       // 没有任何帧循环驱动 → 进入 VR 后画面永久卡住。
@@ -620,6 +569,7 @@ export default function initWebXR(App: AppKernel) {
     const origin = App._xrRaycaster.ray.origin;
     const dir = App._xrRaycaster.ray.direction;
     origin.setFromMatrixPosition(c.matrixWorld);
+    origin.y += App._xrEyeOffY || 0; // 戳角色也要跟着视觉高度，否则升高后手在“真实高度”戳空气
     dir.set(0, 0, -1).applyQuaternion(c.getWorldQuaternion(App._xrTmpQuat));
     App._xrRaycaster.far = 5;
     const hits = App._xrRaycaster.intersectObjects([App.currentAvatar], true);
@@ -674,8 +624,23 @@ export default function initWebXR(App: AppKernel) {
       const xrCam = renderer.xr.getCamera();
       if (xrCam) App._xrHeadPos.setFromMatrixPosition(xrCam.matrixWorld);
     } catch (_) {}
-    // 头显晃动 → 晃动强度（摇头/点头/头部移动累积；摇杆移动不再产生晃动）
-    if (App._accumHeadShake) App._accumHeadShake(dt);
+    // 绘制的射线与落点同步叠加视野升降偏移：命中测试用的是偏移后的原点，
+    // 视觉不跟上的话「线压在按钮上」与「按下命中」会对不上。
+    // ray/dot 是手柄的子对象，偏移量必须换算到局部系：直接写 position.y 会被手柄自身的
+    // 俯仰/侧倾旋转到别的方向，握姿一歪视觉起点就与命中原点错开。
+    {
+      const eyeOff = App._xrEyeOffY || 0;
+      for (let i = 0; i < App._xrControllers.length; i++) {
+        const c = App._xrControllers[i];
+        const ud = c.userData;
+        if (!ud.ray && !ud.dot) continue;
+        c.updateMatrixWorld(true);
+        const inv = c.getWorldQuaternion(App._xrTmpQuat).invert();
+        const off = App._xrTmpVecA.set(0, eyeOff, 0).applyQuaternion(inv);
+        if (ud.ray) ud.ray.position.copy(off);
+        if (ud.dot) { ud.dot.position.x = off.x; ud.dot.position.y = off.y; } // z 留给命中距离
+      }
+    }
     // 摇杆输入：优先四轴手柄（左摇杆移动/右摇杆转身缩放）；
     // 仅两轴手柄时兜底按钮缩放（常见 A/B 键），保证无右摇杆也能缩放。
     // 读取双通道：XRInputSource.gamepad（XR 帧回调内有效）+ renderer.xr.getGamepad(i)
@@ -750,8 +715,11 @@ export default function initWebXR(App: AppKernel) {
     if (!App._xrWorldObjs) App._xrCaptureWorld();
     if (!App._xrWorldObjs) return;
     // 缩放（右摇杆 Y：上推(Y=-1) 拉近 / 下推(Y=+1) 推远）—— 手机在 VR 眼镜里摸不到
-    // 屏幕，手柄缩放是唯一可用的缩放通道
-    if (zoomY !== 0 && App.modelGroup) {
+    // 屏幕，手柄缩放是唯一可用的缩放通道。VR 沉浸时大屏是 HUD 锁定的（每帧钉在视线
+    // 正前方），平移世界改不动它 —— 缩放交给它调锁定距离，屏幕才会真的近/远。
+    if (zoomY !== 0 && App.xrPresenting && App._vrBoardZoom) {
+      App._vrBoardZoom(zoomY * 1.5 * dt);
+    } else if (zoomY !== 0 && App.modelGroup) {
       const toChar = App._xrTmpVecA.subVectors(App.modelGroup.position, App._xrUserOrigin);
       toChar.y = 0;
       const dist = toChar.length();
@@ -807,7 +775,6 @@ export default function initWebXR(App: AppKernel) {
       App._xrUserOrigin.x += wx;
       App._xrUserOrigin.z += wz;
     }
-    // 角色面向用户（由 animate 相机分支调用 updateXRFaceUser 处理平滑）
   };
 
   App._xrCaptureWorld = function _xrCaptureWorld() {
@@ -879,14 +846,8 @@ export default function initWebXR(App: AppKernel) {
     let origin;
     let dir;
     if (App.xrPresenting && App.renderer && App.renderer.xr) {
-      try {
-        const xrCam = App.renderer.xr.getCamera();
-        if (xrCam) {
-          origin = new THREE.Vector3().setFromMatrixPosition(xrCam.matrixWorld);
-          dir = new THREE.Vector3();
-          xrCam.getWorldDirection(dir);
-        }
-      } catch (_) {}
+      const eo = new THREE.Vector3(), ed = new THREE.Vector3();
+      if (App._xrEyeRay(eo, ed)) { origin = eo; dir = ed; }
     }
     if (!origin || !dir) {
       // 兜底：与相机 YXZ 旋转一致（yaw 水平、pitch 俯仰）
@@ -912,30 +873,36 @@ export default function initWebXR(App: AppKernel) {
       App.showToast('没戳到~ 对准角色再试');
     }
   };
-
-  // 角色朝向固定（在 animate 相机分支调用）。
-  // VR 模式角色朝向不再追踪用户头部，固定为进入 VR 时的朝向（_vrFixedRotY）；
-  // 本函数只负责一件事：TURN/DANCE 等临时动作结束后，把朝向平滑拉回固定锚点。
-  // 帧率无关平滑：指数衰减率按 dt 归一（半衰期约 0.17s），并钳制最大转向角速度。
-App.updateXRFaceUser = function updateXRFaceUser(dt) {
+  // 角色朝向用户头显（在 animate 相机分支调用，VR 中唯一写 smoothRotY 的地方）。
+  // 只取水平方位角：头显高度/俯仰不参与，抬头低头不会让角色前倾后仰。
+  // 三层抗抖：方位角死区（±1.1° 内不动）→ 指数平滑（半衰期约 0.15s）→ 角速度钳制（≤3rad/s）。
+  // 头显跟踪噪声在 2 米距离下角度偏差不到 0.5°，被死区直接吃掉，不会放大成可见摆动。
+  // 参数标定（node 模拟，90Hz）：90° 转身 1.3s 到位、零超调；20° 小跟随 0.6s 内对齐。
+  App.updateXRFaceUser = function updateXRFaceUser(dt) {
     const avatar = App.currentAvatar || App.modelGroup;
-    if (!avatar) return;
-    // TURN/DANCE 动作期间暂停：转圈和跳舞自行控制 rotation.y
+    const hp = App._xrHeadPos;
+    if (!avatar || !hp) return;
+    // TURN/DANCE 自行控制 rotation.y，期间不干预，动作结束后自动追回
     if (App.currentAction && (App.currentAction.type === App.ActionType.TURN || App.currentAction.type === App.ActionType.DANCE)) return;
-    const anchor = App._vrFixedRotY;
-    if (anchor == null) return; // 无锚点（非大厅 VR）时保持现状，不转向
-    let diff = anchor - App.smoothRotY;
+    const dx = hp.x - App.modelGroup.position.x;
+    const dz = hp.z - App.modelGroup.position.z;
+    // 贴脸时方位角对头显平移极敏感（10cm 位移能转 40°），保持现状避免抽风
+    if (dx * dx + dz * dz < 0.09) return;
+    const target = Math.atan2(dx, dz); // 模型前向 +Z，与 computeBodyFaceCam 同一约定
+    let diff = target - App.smoothRotY;
     while (diff > Math.PI) diff -= Math.PI * 2;
     while (diff < -Math.PI) diff += Math.PI * 2;
+    if (Math.abs(diff) < 0.02) return; // ≈1.1° 死区
     const dtSafe = Math.min(dt || 1 / 60, 0.05);
-    const k = 1 - Math.pow(0.5, dtSafe * 4); // 半衰期约 0.17s（60fps 基准下 ≈0.045/帧）
-    const maxStep = 3.2 * dtSafe; // 最大转向角速度 3.2 rad/s（约 183°/s），快速转头也不瞬跳
+    const k = 1 - Math.pow(0.5, dtSafe * 4.5);
+    const maxStep = 3.0 * dtSafe;
     let step = diff * k;
     if (step > maxStep) step = maxStep;
     else if (step < -maxStep) step = -maxStep;
     App.smoothRotY += step;
     avatar.rotation.y = App.smoothRotY;
   };
+
 
 
   // WebXR 视野升降（低头看地面持续 1 秒 → 缓缓升高俯视角色；抬头看天空持续 1 秒 → 缓缓降低）：

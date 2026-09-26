@@ -480,6 +480,10 @@ export default (function init(App: AppKernel) {
       case 'transcript':
         App.removeTyping();
         App.addUserMsg(msg.text, true);
+        // VR 视频面板待听中：这句识别结果当搜索关键词（面板非待听状态会自行忽略）
+        if (App._vrVideoVoiceHook) {
+          try { App._vrVideoVoiceHook(msg.text || ''); } catch (_) { /* 钩子异常不影响对话 */ }
+        }
         // 不触发大厅 RL 系统（约会/表情/参与），否则大厅角色会"听到玩家说话"而乱入
         // 记录用户活跃时间（语音消息也算，供 RL 统一状态取数）
         App._lastUserMessageTime = Date.now();

@@ -25,5 +25,19 @@
     ],
     "require_admin": true
   },
+  "_baidu_note": "百度网盘官方 MCP（github.com/baidu-netdisk/mcp）。baidu-netdisk 是 SSE→stdio 桥，token 读 /home/wxf/baidu-mcp/.access_token 或 env BAIDU_NETDISK_ACCESS_TOKEN；baidu-netdisk-upload 只做本地大文件上传，同一个 token。",
+  "baidu-netdisk": {
+    "command": "/home/wxf/baidu-mcp/.venv/bin/python",
+    "args": [
+      "/home/wxf/baidu-mcp/sse_proxy.py"
+    ]
+  },
+  "baidu-netdisk-upload": {
+    "command": "/home/wxf/baidu-mcp/.venv/bin/python",
+    "args": [
+      "/home/wxf/baidu-mcp/src/baidu-netdisk/fileupload_tool.py"
+    ],
+    "cwd": "/home/wxf/baidu-mcp/src/baidu-netdisk"
+  },
   "_removed_playwright": "已撤：浏览器内核在 1GB 的 Pi 3 上会烧到硬关机（实测空载 63°C，chromium 一开直冲 85°C）。读网页用 read_web。真要临时用就现场传 command/args + allow_heavy=true，用完立刻 mcp_disconnect。"
 }

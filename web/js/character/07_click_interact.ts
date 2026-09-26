@@ -416,6 +416,26 @@ export default (function init(App: AppKernel) {
     if (App.updateXRControllers) App.updateXRControllers(dt);
     // VR 世界内快捷面板（状态/视频遥控）：锚定角色右侧定位 + 节流重绘
     if (App.updateVrHud) App.updateVrHud(dt);
+    // VR 信息层（toast/字幕）：同一帧定位到视线前方，保持与非 VR 一致的信息反馈
+    if (App.updateVrUi) App.updateVrUi(dt);
+    // VR 舞台工具栏：跟随头显右前方定位 + 状态轮询重绘（#stage-tools 的世界内重建）
+    if (App.updateVrToolbar) App.updateVrToolbar(dt);
+    // VR 对话大屏：锚定角色左手侧 + 轮询 #messages 重绘（对话内容的 VR 落点）
+    if (App.updateVrChat) App.updateVrChat(dt);
+    // VR 在线音乐面板：呼出时软锚定在视线正前方 + 播放状态重绘
+    if (App.updateVrMusic) App.updateVrMusic(dt);
+    // VR 在线视频面板：呼出时软锚定在视线正前方 + 缩略图/翻页重绘
+    if (App.updateVrVideo) App.updateVrVideo(dt);
+    // VR 凝视点击（统一引擎）：视线在任意面板的任意目标上停够时长即触发
+    if (App.updateVrRay) App.updateVrRay(performance.now());
+    // VR 语音 VAD：跟 XR 帧循环走 —— 头显里 DOM 的 rAF 不保证回调，
+    // 只靠 rAF 自调度的自动对话会「戴上头显就听不见你说话」
+    if (App.xrPresenting && App.vadXrTick) App.vadXrTick();
+
+    // VR 特效层：彩带/评级大字/频闪/世界微抖（41_holo_stage 的世界内重建）
+    if (App.updateVrFx) App.updateVrFx(dt);
+    // VR 全息投影 + 舞台灯光：底座/光锥/扫描/色差/噪点/框标 + 染色/追光/侧射/轮廓光
+    if (App.updateVrHolo) App.updateVrHolo(dt);
 
     // 恋爱养成系统更新（优先级高于普通互动RL）
     if (App.datingSystemActive && App._datingSystem) {
@@ -468,7 +488,7 @@ export default (function init(App: AppKernel) {
       // 叠加在站位上），常规轨道相机逻辑全部跳过 —— 否则 requestSession 的异步
       // 等待期间轨道分支会继续 lerp 相机，进入后视角错位/画面跳变
       if (App.xrPresenting) {
-        // 角色朝向固定，仅在临时动作结束后拉回固定锚点
+        // 角色朝向用户头显：面对面交谈（只跟水平方位，晃动累积源已移除）
         if (App.updateXRFaceUser) App.updateXRFaceUser(dt);
         // 视野升降：低头看地面1秒→缓缓升高俯视角色；抬头看天空1秒→缓缓降低（修改 XR 左右眼矩阵 Y 分量）
         if (App.updateXRHeight) App.updateXRHeight(dt);
@@ -1065,8 +1085,8 @@ export default (function init(App: AppKernel) {
   // 避免"转头动作结束后头部一直偏着不复位"的观感
   App.computeHeadLookAt = function computeHeadLookAt(modelRoot) {
     if (!modelRoot || App.fpvMode) return null;
-    // VR（WebXR）中主相机 position 冻结在进入时的站位（头显姿态只写矩阵不写 position），
-    // 用真实头部位置（_xrHeadPos，每帧从 XR 相机矩阵更新）让头部注视始终跟随用户。
+    // VR（WebXR）中主相机 position 冻结在进入时的站位，用真实头部位置（_xrHeadPos）
+    // 让头部注视跟随用户 —— 身体朝向由 updateXRFaceUser 负责，这里只管头。
     // 复用临时向量避免每帧 clone 触发 GC 微卡顿（VR 90Hz 每帧调用）
     const camPos = (App.xrPresenting && App._xrHeadPos) ? App._xrHeadPos : App.camera.position;
     if (!App._headLookTmpVec) App._headLookTmpVec = new THREE.Vector3();
@@ -1607,16 +1627,17 @@ export default (function init(App: AppKernel) {
       App.wasMutualGaze = true;
     }
     if (!App.mutualGaze) App.wasMutualGaze = false;
-    // VR 中朝向由 updateXRFaceUser 独占，微摆动归零，避免 smoothRotY 每帧被两个系统搅动
+    // VR 中朝向固定不动，微摆动归零，避免 smoothRotY 每帧被搅动
     const bodyMicroWobble = (App.mutualGaze || App.xrPresenting || App.xrMode === 'webxr') ? 0 : Math.sin(t * 0.35) * 0.008;
     // 行走时身体直接面向移动方向，避免相机角度变化导致漂移；停止后 smoothWalkFaceOff 自动过渡回看相机
     const isTurning = App.currentAction && App.currentAction.type === App.ActionType.TURN;
-    // VR（WebXR）：App.camera.position 在 XR 会话中不随头显更新（冻结在进入时的站位），
-    // 若仍拉向 camFaceY 会与 updateXRFaceUser（用真实头部位置）争夺 smoothRotY，
-    // 造成角色朝向在两个目标间抖动。VR 中朝向完全交给 updateXRFaceUser 负责。
+    // VR（WebXR）：App.camera.position 冻结在进入时的站位，拉向 camFaceY 会随头显抖动，
+    // 因此 VR 中朝向保持 smoothRotY 自持（targetY = smoothRotY，rotYDiff 恒 0）。
     const vrActive = App.xrPresenting || App.xrMode === 'webxr';
     const baseTargetY = isTurning ? App.smoothRotY : (vrActive ? App.smoothRotY : camFaceY + App.smoothWalkFaceOff);
-    const targetY = isTurning ? App.smoothRotY : baseTargetY + App.gyroYaw * 0.15 + bodyMicroWobble;
+    // VR 中陀螺仪偏置项归零：否则每帧把 smoothRotY 往 smoothRotY + gyroYaw*0.15 推，
+    // 头一动角色朝向就漂
+    const targetY = isTurning ? App.smoothRotY : baseTargetY + (vrActive ? 0 : App.gyroYaw * 0.15 + bodyMicroWobble);
     const targetX = App.gyroPitch * 0.15;
     // 自适应旋转平滑：心有灵犀 / 行走转身都要柔和自然
     // 归一化角度差到 [-PI, PI]，确保走最短路径（修复转身后不自动回看的问题）
@@ -1632,7 +1653,7 @@ export default (function init(App: AppKernel) {
       // 大厅行走：与游戏模式 _applyPlayerMovement 相同的朝向逻辑 ——
       // 面向每帧实际移动方向（atan2(dx, dz)），最短角度路径快速转向（8.0*dt），
       // 转向先于位移完成，角色绝不倒退/侧向行走
-      // （VR：行走位置照常移动，但朝向完全交给 updateXRFaceUser 独占，避免两个系统争抢 smoothRotY）
+      // （VR：行走位置照常移动，朝向保持不动）
       const walkDx = newX - prevX;
       const walkDz = newZ - prevZ;
       if (Math.abs(walkDx) > 0.0001 || Math.abs(walkDz) > 0.0001) {
@@ -1653,14 +1674,7 @@ export default (function init(App: AppKernel) {
     }
     App.modelGroup.rotation.y = App.smoothRotY;
     App.modelGroup.rotation.x = App.smoothRotX;
-    // VR模式：头显左右晃动（摇头）→ 角色整体左右摆动（强度0-100，可叠加累积）
     App.modelGroup.rotation.z = 0;
-    if (App.vrShake && App.xrMode === 'webxr' && App.vrShake.leftRight > 0) {
-      const vrS = App.vrShake;
-      const swayAmp = Math.min(0.3, 0.02 + vrS.leftRight * 0.005); // 强度5 → ±0.045，强度30 → ±0.17（上限±0.3）
-      const swayFreq = 5; // 固定摆动速度（约 0.8Hz），不随强度变化
-      App.modelGroup.rotation.z = Math.sin(t * swayFreq + 0.8) * swayAmp;
-    }
     // 渐强因子 + 速度因子：提前到 walkBob 之前计算（原声明在函数后部，
     // walkBob 先引用 sf 会触发 TDZ 报错，导致行走时整个动画中断）
     if (walkProgress > 0) {

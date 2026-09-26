@@ -43,7 +43,16 @@ import init_30_task_big_screen from "./js/ui/30_task_big_screen.ts";
 import init_31_tool_chain from './js/ui/31_tool_chain.ts';
 import init_34_game_fx from './js/ui/34_game_fx.ts';
 import init_ai_autonomy from './js/ai/init-ai-autonomy.ts';
+import init_32_vr_ray from './js/vr/vr-ray.ts';
 import init_32_vr_hud from './js/vr/vr-hud.ts';
+import init_32_vr_ui from './js/vr/vr-ui.ts';
+import init_32_vr_toolbar from './js/vr/vr-toolbar.ts';
+import init_32_vr_chat from './js/vr/vr-chat.ts';
+import init_32_vr_music from './js/vr/vr-music.ts';
+import init_32_vr_video from './js/vr/vr-video.ts';
+import init_32_vr_fx from './js/vr/vr-fx.ts';
+import init_32_vr_holo from './js/vr/vr-holo.ts';
+import init_32_vr_voice from './js/vr/vr-voice.ts';
 import init_33_stage_wheel from './js/ui/33_stage_wheel.ts';
 import init_35_arcade_fx from './js/ui/35_arcade_fx.ts';
 import init_36_layout_sync from './js/ui/36_layout_sync.ts';
@@ -100,7 +109,25 @@ init_30_task_big_screen(App);
 init_31_tool_chain(App);
 init_34_game_fx(App);
 init_ai_autonomy(App);
+// VR 射线锁定仲裁最先 init：后面每块 VR 面板都要在 init 时把命中口径注册进来
+init_32_vr_ray(App);
 init_32_vr_hud(App);
+// VR 信息层（toast/字幕）跟在 HUD 之后：两者都包裹 enterXrMode/exitXrMode，
+// 后者包在外层，进入时先显示 HUD 再显示信息层
+init_32_vr_ui(App);
+// VR 工具栏最后 init：它包裹手柄 select / _xrPadClick，在外层才能优先命中
+// （顺序：工具栏 → vr-hud 视频面板 → 戳角色）
+init_32_vr_toolbar(App);
+// VR 在线音乐面板跟在工具栏之后（外层）：呼出时立在视线正前方，射线先问它
+init_32_vr_music(App);
+// VR 在线视频面板（搜索/热门/收藏/历史 + 语音关键词）跟在音乐面板之后（外层）
+init_32_vr_video(App);
+// VR 对话大屏跟在工具栏之后（外层）：它也包裹手柄 select / _xrPadClick，
+// 放外层时射线先问顶栏/状态条，未命中再回落到工具栏 → vr-hud → 戳角色
+init_32_vr_chat(App);
+// VR 语音面板再包一层（最外层）：手柄扳机按下时先问语音面板，未命中才回落到
+// 工具栏 → vr-hud → 对话大屏 → 戳角色（语音是头显里最高频的入口）
+init_32_vr_voice(App);
 init_33_stage_wheel(App);
 init_35_arcade_fx(App);
 init_36_layout_sync(App);
@@ -112,6 +139,12 @@ init_39_cast_fx(App);
 // 全息舞台放最后：它要装饰 App.game.onToolResult 与 App.arcade.pulse，
 // 必须等这两条链路（34 / 35 / 38 / 39）都挂好，否则包在空对象上
 init_41_holo_stage(App);
+// VR 特效层放全息舞台之后：它要包 App.holo.* / App.game.onToolResult /
+// App.arcade.pulse，必须等 41 挂好这些出口，否则包在空对象上
+init_32_vr_fx(App);
+// VR 全息投影 + 舞台灯光再放 vr-fx 之后：它包 vr-fx 的 celebrate/encourage 拿
+// 欢呼亮度，必须等 fx 把这两个出口接到内部函数上，否则包在空函数上
+init_32_vr_holo(App);
 
 // DEBUG expose
 Object.defineProperty(window, '_App', { get: () => App });
