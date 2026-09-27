@@ -1755,6 +1755,80 @@ def speech_to_text(wav_path: str) -> str:
     raise RuntimeError(f"语音识别失败: {last_err}")
 
 
+# ---------- ASR 幻觉 / 噪声结果过滤 ----------
+# 实测（tools/_vad_asr_probe.py）：云端 ASR 对非人声会幻觉出短文本 ——
+# 0.4s 低幅白噪 → 「嗯。」，1.2s 白噪 → 「¿Qué?」，纯静音 → 空文本。
+# VAD 被环境噪音误触发时，这些幻觉会被当作用户说话：凭空插一句、还打断 AI 当前轮。
+# 判据落在音频本身（真实有声时长）而不是词表 —— 词表列不全，能量不会说谎。
+ASR_SHORT_TEXT_MAX_CHARS = 2      # 极短结果（1-2 字符）单独一档
+ASR_SHORT_TEXT_MIN_VOICED_MS = 400.0  # 极短结果要求的有声时长：噪声撑不满，真人短应答能过
+ASR_HALLUCINATION_PHRASES = {
+    "谢谢观看", "谢谢大家观看", "请不吝点赞", "字幕由", "字幕组提供", "字幕组",
+    "thankyouforwatching", "thanksforwatching", "subtitle", "que",
+}
+_ASR_FRAME_MS = 20
+_ASR_VOICED_FLOOR_DBFS = -70.0    # 绝对下限：只挡「几乎无信号的增益底噪」
+# 这个值必须远低于真人轻声。定在 -55dBFS 时实测：-50/-55dBFS 的类人声被判「有声不足
+# 250ms」，轻声说话被吞。低电平下能量判据本就近乎失效（相对阈值也跟着峰值下降），
+# 宁可漏挡噪声 —— 词表与单 ASCII 字符那两条才是挡幻觉的主力。
+_ASR_VOICED_REL_DB = -40.0        # 相对峰值：低于峰值 40dB 的帧算静音
+
+
+def _voiced_ms_in_wav(wav_path: str) -> float:
+    """统计 16k 单声道 WAV 里「确实有声」的毫秒数；无法判定时返回 -1（调用方放行）。
+
+    阈值取「相对峰值 -30dB」与「-50dBFS 绝对下限」中的高者：相对量适应麦克风增益差异，
+    绝对量挡住整段极静（增益被拉满的底噪）却仍被 ASR 编出文字的情况。
+    """
+    import array
+    try:
+        with wave.open(wav_path, "rb") as w:
+            if w.getnchannels() != 1 or w.getsampwidth() != 2:
+                return -1.0
+            rate = w.getframerate() or 16000
+            raw = w.readframes(w.getnframes())
+    except Exception:
+        return -1.0
+    samples = array.array("h")
+    samples.frombytes(raw[:len(raw) - len(raw) % 2])
+    step = max(1, int(rate * _ASR_FRAME_MS / 1000))
+    if len(samples) < step:
+        return 0.0
+    rms_list = []
+    for i in range(0, len(samples) - step + 1, step):
+        acc = 0
+        for v in samples[i:i + step]:
+            acc += v * v
+        rms_list.append((acc / step) ** 0.5)
+    peak = max(rms_list)
+    if peak <= 0:
+        return 0.0
+    thr = max(peak * 10 ** (_ASR_VOICED_REL_DB / 20.0),
+              32768 * 10 ** (_ASR_VOICED_FLOOR_DBFS / 20.0))
+    return sum(1 for r in rms_list if r > thr) * _ASR_FRAME_MS
+
+
+def _asr_result_is_noise(text: str, voiced_ms: float) -> bool:
+    """ASR 结果是否为噪声幻觉（应当忽略，不算用户输入）。"""
+    import unicodedata
+    norm = re.sub(r"[\W_]+", "", text or "").lower()
+    # 折叠变音符：幻觉里的 "¿Qué?" 去标点后是 "qué"，得与词表里的 "que" 等价
+    norm = "".join(c for c in unicodedata.normalize("NFKD", norm)
+                   if not unicodedata.combining(c))
+    if not norm:
+        return True
+    if norm in ASR_HALLUCINATION_PHRASES:
+        return True
+    if len(norm) == 1 and norm.isascii():
+        return True  # 单个 ASCII 字符（N / A / 1）不可能是中文语音输入
+    # 极短结果（1-2 字符）单独一档，门槛比长句严：噪声幻觉的主力形态就是「嗯。」「¿Qué?」
+    # 这种一两个字，而真人说「嗯/好的」时音频里有清晰人声，撑得过 400ms。
+    # 长句一律放行 —— 宁可偶尔多一次幻觉，也不能把真人说话吞掉。
+    if len(norm) <= ASR_SHORT_TEXT_MAX_CHARS:
+        return 0 <= voiced_ms < ASR_SHORT_TEXT_MIN_VOICED_MS
+    return False
+
+
 # ---------- 路由 ----------
 _INDEX_CACHE: tuple = (0, "")
 
@@ -7658,6 +7732,12 @@ async def websocket_endpoint(ws: WebSocket):
                             text = await asyncio.to_thread(speech_to_text, tmp_wav)
                 except Exception as e:
                     print(f"[STT] ffmpeg/识别异常: {e}")
+                # 噪声/幻觉判定必须在清理临时文件之前做（判据要读 wav 能量）
+                noise = False
+                voiced_ms = -1.0
+                if text:
+                    voiced_ms = _voiced_ms_in_wav(tmp_wav)
+                    noise = _asr_result_is_noise(text, voiced_ms)
                 # 清理临时文件
                 for p in (tmp_in.name, tmp_in.name.replace(".opus", ".webm"), tmp_wav):
                     try:
@@ -7674,6 +7754,14 @@ async def websocket_endpoint(ws: WebSocket):
                     # STT 失败 → 恢复 last_response_done，避免 +86400 残留导致被动事件被永久抑制（定时播报卡死）
                     state.last_response_done = time.time()
                     await safe_send_json(ws, {"type": "restart_vad", "reason": "音频转码失败，正在重建语音模式…"})
+                    continue
+                if noise:
+                    # 不是用户说话：静默忽略，既不插一句也不打断 AI
+                    # （「我什么都没说，它突然冒出一个字」的根因就在这条路径）
+                    print(f"[STT] 噪声/幻觉结果已忽略: {text!r}（有声 {voiced_ms:.0f}ms）")
+                    state._stt_fail_count = 0
+                    state._stt_cooldown_until = 0
+                    state.last_response_done = time.time()
                     continue
                 if not text:
                     state._stt_fail_count += 1

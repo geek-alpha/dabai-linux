@@ -220,7 +220,13 @@ export default (function init(App: AppKernel) {
     vadPreRoll.set(inp.subarray(0, first), vadPreRollWrite);
     if (inp.length > first) vadPreRoll.set(inp.subarray(first), 0);
     vadPreRollWrite = (vadPreRollWrite + inp.length) % capN;
-    if (vadPcmActive) { vadPcmChunks.push(new Float32Array(inp)); vadPcmSpeechSamples += inp.length; }
+    if (vadPcmActive) {
+      vadPcmChunks.push(new Float32Array(inp));
+      // 无条件累计采集样本：这里只做「录音够不够长」的粗筛。
+      // 曾按 RMS 阈值只累计有声帧，结果真人说话也被整条丢弃 —— 那个阈值没有实机校准，
+      // 麦克风增益一低就一帧都不过线，表现成「它听不见我」。噪声幻觉交给服务端挡。
+      vadPcmSpeechSamples += inp.length;
+    }
   }
 
   /** 释放 PCM 采集（stopVADMode / 重建时调用） */
@@ -785,6 +791,8 @@ export default (function init(App: AppKernel) {
       // 过严会把短促回答整条丢掉 → 表现为"它没听到我说话"
       if (vadPcmSpeechSamples / rate * 1000 < VAD_PCM_MIN_SPEECH_MS) {
         vadPcmSpeechSamples = 0;
+        // 丢弃时把徽章从「聆听中」放回在线：否则状态会一直卡在聆听中
+        if (App.currentState === App.State.LISTENING) App.setState(App.State.IDLE);
         return;
       }
       vadPcmSpeechSamples = 0;

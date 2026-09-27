@@ -25,6 +25,8 @@ COMMON_DIRS = frozenset({
     ".ruff_cache", ".pytest_cache", ".mypy_cache", ".pytest_libs", "site-packages",
     ".tox", ".eggs", "vendor", "third_party",
     "codex_logs", "audio_cache", "undefined",
+    # Godot 的导入缓存目录，全是自动生成的二进制与元数据
+    ".godot",
     # 整体拷进来的外部工程，不是大白的代码
     "godot-dabai", "mmd_tools_new",
 })

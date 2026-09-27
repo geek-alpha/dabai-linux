@@ -29,6 +29,10 @@ DB_PATH = BASE_DIR / "chat_memory.db"
 SUMMARY_THRESHOLD = 20
 # 摘要间隔：每隔多少条消息生成一次摘要
 SUMMARY_INTERVAL = 10
+# 强制摘要冷却（秒）：_has_unsaved_work_round 在每轮上下文构建时都会跑，
+# 工具轮次几乎每轮都有 tool 消息 → 判定恒为 True → 每轮都强制摘要一次。
+# 冷却期内跳过，交给正常路径（每 SUMMARY_INTERVAL*2 条）接管。
+FORCE_SUMMARY_COOLDOWN = 120
 # 检索时返回的最近消息数
 RECENT_MESSAGE_COUNT = 10
 # 检索时返回的最大摘要数
@@ -102,6 +106,15 @@ HIERARCHICAL_PACKING = True
 # 实测单任务打到 60~107 轮工具调用。现按 128k 上下文窗口上调到能装下
 # 「最近 5~8 轮 + 自包含摘要 + 最近真实工具结果」的规模；仍远小于提示词预算。
 SHORT_TERM_MAX_TOKENS = 8000             # 短期窗口（最近轮次）预算
+# 摘要触发改为 token 驱动（2026-09-28）：原判据「未摘要区间 ≥ SUMMARY_INTERVAL*2 条」
+# 与真实体积无关——短期窗口预算 8000 token 通常装得下 20 条普通对话，窗口还没满就
+# 摘要一次，纯浪费 LLM 调用（实测平均 8s、峰值 50s+）。改为「未摘要区间打包后 token
+# 量 > 短期窗口预算」才摘要：只有装不进窗口的旧消息才需要固化，信息不丢，频率由体积
+# 决定。口径必须用打包后（见 _summary_trigger_tokens），用原始 token 会反向变频繁。
+SUMMARY_TOKEN_TRIGGER = SHORT_TERM_MAX_TOKENS
+# 单次摘要喂给 LLM 的对话文本字符上限：token 触发阈值只保证「装不进短期窗口」，
+# 不保证区间小（用户粘贴长文时单条就能超阈值）。超出时保留头尾、省略中间。
+_SUMMARY_DIALOG_MAX_CHARS = 30000
 SHORT_TERM_MAX_CHARS_PER_ROUND = 1200    # 单轮历史最大字符（超出截断加 …）
 # 2026-08-31 修复「前两轮就忘」：短期窗口对最近 N 个用户轮「保底保留」——
 # token 预算只约束更旧轮，保证最近几轮对话绝不被工具长文挤掉。
@@ -234,6 +247,29 @@ def estimate_tokens(text: str) -> int:
     punct = sum(map(len, rest_no_words.split()))
     est = cjk + sum((len(w) + 3) // 4 for w in words) + (punct + 1) // 2
     return int(est * 1.1) + 1
+
+
+def _summary_trigger_tokens(msgs: list) -> int:
+    """未摘要区间「打包后」的 token 估算——口径必须与短期窗口一致。
+
+    短期窗口打包时会截断（单条工具结果 500 字符、单条 tool_call 参数 300 字符、
+    单轮正文 1200 字符），原始 token 与打包后差 3~4 倍（实测 4 个真实会话：
+    原始 16000 token 的区间打包后只剩 3710~5900）。用原始 token 判触发会让
+    工具密集会话比旧判据（每 20 条）更频繁——实测 44 次 vs 33 次。
+    这里按同样的截断规则估算，判据才等价于「区间装不进短期窗口」。
+    """
+    total = 0
+    for m in msgs or []:
+        role = m.get("role")
+        c = str(m.get("content") or "")
+        c = c[:SHORT_TERM_MAX_CHARS_PER_TOOL if role == "tool"
+              else SHORT_TERM_MAX_CHARS_PER_ROUND]
+        total += estimate_tokens(c)
+        tc = m.get("tool_calls")
+        if tc:
+            s = tc if isinstance(tc, str) else json.dumps(tc, ensure_ascii=False)
+            total += estimate_tokens(s[:SHORT_TERM_MAX_CHARS_PER_TOOL_CALL])
+    return total
 
 
 def _clean_think_markers(text: str) -> str:
@@ -1950,7 +1986,7 @@ class ChatMemory:
         def _get_messages_since(start_id):
             conn = _get_db()
             rows = conn.execute(
-                "SELECT id, role, content FROM messages "
+                "SELECT id, role, content, tool_calls FROM messages "
                 "WHERE session_id=? AND id > ? "
                 "AND (source != 'auto' OR role = 'assistant') ORDER BY id",
                 (self.session_id, start_id),
@@ -1959,7 +1995,7 @@ class ChatMemory:
             return [dict(r) for r in rows]
 
         msgs = await asyncio.to_thread(_get_messages_since, last_end)
-        if len(msgs) >= SUMMARY_INTERVAL * 2:
+        if _summary_trigger_tokens(msgs) > SUMMARY_TOKEN_TRIGGER:
             await self._generate_summary(msgs)
 
     async def _force_summary_body(self, include_auto: bool, auto_prefix: tuple):
@@ -2009,7 +2045,7 @@ class ChatMemory:
         msgs = await asyncio.to_thread(_get_msgs)
         if not msgs:
             return
-        await self._generate_summary(msgs[-SUMMARY_INTERVAL * 2:])
+        await self._generate_summary(msgs)
 
     async def _has_unsaved_work_round(self) -> bool:
         """未摘要区间内是否出现过「带工具执行或完成汇报」的内容。
@@ -2034,6 +2070,16 @@ class ChatMemory:
                 (self.session_id,),
             ).fetchone()
             last_end = row["m"] if row and row["m"] is not None else 0
+            # 冷却：摘要生成是 LLM 调用（实测平均 8s、峰值 50s+），而本判定每轮
+            # 上下文构建都会跑。工具轮次几乎每轮都有 tool 消息，判定恒为 True，
+            # 于是每轮对话都强制摘要一次（实测 28% 的摘要只覆盖 <15 条消息、
+            # 20 次间隔 <60 秒、最短 5 秒）。冷却期内直接跳过。
+            last_at = conn.execute(
+                "SELECT MAX(created_at) AS t FROM summaries WHERE session_id=?",
+                (self.session_id,),
+            ).fetchone()["t"]
+            if last_at and time.time() - last_at < FORCE_SUMMARY_COOLDOWN:
+                return False
             rows = conn.execute(
                 "SELECT role, tool_calls, content FROM messages "
                 "WHERE session_id=? AND id > ? "
@@ -2064,7 +2110,7 @@ class ChatMemory:
 
         # 构建简要对话文本
         dialog_text = ""
-        for m in messages[-SUMMARY_INTERVAL * 2:]:
+        for m in messages:
             content = (m["content"] or "").strip()
             if not content:
                 continue  # 静默工具轮等空消息不参与摘要
@@ -2076,6 +2122,11 @@ class ChatMemory:
                 dialog_text += f"事件: {content}\n"
             else:
                 dialog_text += f"{role_tag}: {content[:200]}\n"
+
+        if len(dialog_text) > _SUMMARY_DIALOG_MAX_CHARS:
+            _half = _SUMMARY_DIALOG_MAX_CHARS // 2
+            dialog_text = (dialog_text[:_half] + "\n…（中间省略）…\n"
+                           + dialog_text[-_half:])
 
         # 获取前一次摘要，传递给 LLM 做增量式补充。剥掉原文索引块：它是给模型的
         # 指针、不是摘要内容，混进去只会被 LLM 当正文改写（哈希一改指针就断了）。

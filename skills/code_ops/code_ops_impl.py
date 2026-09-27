@@ -77,6 +77,7 @@ CODE_EXTS = {
     ".go", ".rs", ".c", ".h", ".cpp", ".hpp", ".cc", ".cs", ".rb", ".php",
     ".swift", ".sh", ".ps1", ".bat", ".cmd", ".md", ".yaml", ".yml", ".toml",
     ".ini", ".cfg", ".sql", ".xml", ".gradle",
+    ".gd", ".tscn", ".tres", ".gdshader", ".godot",
 }
 
 DEF_PATTERNS = {
@@ -131,9 +132,19 @@ DEF_PATTERNS = {
     ".sh": [
         r"^\s*([A-Za-z_]\w*)\s*\(\)\s*\{?",
     ],
+    ".gd": [
+        r"^\s*func\s+([A-Za-z_]\w*)",
+        r"^\s*class_name\s+([A-Za-z_]\w*)",
+        r"^\s*class\s+([A-Za-z_]\w*)",
+        r"^\s*signal\s+([A-Za-z_]\w*)",
+        r"^\s*enum\s+([A-Za-z_]\w*)",
+    ],
 }
 
 _JS_EXTS = {".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs", ".vue", ".svelte"}
+_GD_EXTS = {".gd"}
+# Godot 场景/资源/工程配置：以 res:// 路径互相引用，用同一套解析
+_GD_RES_EXTS = {".tscn", ".tres", ".godot"}
 
 
 # ---------- 通用工具 ----------
@@ -1304,6 +1315,17 @@ def _js_resolve(imp: str, from_dir: Path, root: Path):
     return hits[0] if hits else None
 
 
+def _gd_resolve(imp: str, from_dir: Path, root: Path):
+    """Godot 的 res:// 或相对路径 → 项目内文件。res:// 即项目根。"""
+    imp = imp.strip().strip("'\"")
+    if imp.startswith("res://"):
+        p = root / imp[len("res://"):].replace("/", os.sep)
+    else:
+        p = from_dir / imp
+    p = p.resolve()
+    return p if p.is_file() and _within(root, p) else None
+
+
 def _imports_of(fp: Path, text=None):
     """取一个文件的 import 列表。
 
@@ -1325,6 +1347,16 @@ def _imports_of(fp: Path, text=None):
     elif suffix in _JS_EXTS:
         for m in re.finditer(r"(?:require\s*\(\s*|from\s+)(['\"])([^'\"]+)\1", text):
             out.append(m.group(2))
+    elif suffix in _GD_EXTS:
+        # preload("res://x.gd") / load("x.tscn") / extends "res://base.gd"
+        for m in re.finditer(r"(?:preload|load)\s*\(\s*['\"]([^'\"]+)['\"]", text):
+            out.append(m.group(1))
+        for m in re.finditer(r"^\s*extends\s+['\"]([^'\"]+)['\"]", text, re.M):
+            out.append(m.group(1))
+    elif suffix in _GD_RES_EXTS:
+        # 场景/资源的 ext_resource 与 project.godot 的 res:// 引用
+        for m in re.finditer(r'path="(res://[^"]+)"', text):
+            out.append(m.group(1))
     return out
 
 
@@ -1370,6 +1402,9 @@ def _dep_map_of(root: Path, targets, texts=None) -> dict:
             elif fp.suffix.lower() in _JS_EXTS:
                 r = _js_resolve(imp, fp.parent, root)
                 resolved = [r] if r else []
+            elif fp.suffix.lower() in _GD_EXTS | _GD_RES_EXTS:
+                r = _gd_resolve(imp, fp.parent, root)
+                resolved = [r] if r else []
             else:
                 resolved = []
             deps += [_rel(root, c) for c in resolved]
@@ -1406,7 +1441,8 @@ def code_deps(args: dict) -> str:
                 return f"文件不存在：{f}"
     else:
         targets = list(_iter_files(root, set(CODE_EXTS) & (
-            {".py", ".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs"}), False))
+            {".py", ".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs"} |
+            _GD_EXTS | {".tscn", ".tres"}), False))
     if not targets:
         return "没有可分析的代码文件。"
     dep_map = _dep_map_of(root, targets)
@@ -1861,6 +1897,35 @@ _MAP_FUNC_MIN = 60
 _MAP_CC_MIN = 11
 
 
+def _gd_func_cc(text):
+    """GDScript 函数块的复杂度估算：缩进定块尾，分支关键字计 CC。
+
+    GDScript 没有 radon 官方口径，按 if/elif/for/while/and/or/match 计数
+    给量级——用来看「哪个函数最难读」，精确 CC 值不必当真（三元 if 会多计）。
+    """
+    lines = text.splitlines()
+    out = []
+    for i, ln in enumerate(lines):
+        m = re.match(r"^\s*func\s+([A-Za-z_]\w*)", ln)
+        if not m:
+            continue
+        ind = len(ln) - len(ln.lstrip())
+        end = len(lines)          # 1-based 块尾行号，默认到文件末
+        for j in range(i + 1, len(lines)):
+            nxt = lines[j]
+            if not nxt.strip() or nxt.lstrip().startswith("#"):
+                continue
+            if len(nxt) - len(nxt.lstrip()) <= ind:
+                end = j
+                break
+        cc = 1
+        for body_ln in lines[i:end]:
+            code = body_ln.split("#", 1)[0]
+            cc += len(re.findall(r"\b(?:if|elif|for|while|and|or|match)\b", code))
+        out.append((cc, i + 1, end, m.group(1)))
+    return out
+
+
 def _entry_points(root: Path, hits, cap: int = 10):
     """把 package.json 声明与遍历得到的入口证据合并排序。
 
@@ -1891,13 +1956,35 @@ def _entry_points(root: Path, hits, cap: int = 10):
         for c in cands:
             p = (root / c).resolve()
             if p.is_file():
-                declared.append(_rel(root, p))
+                declared.append((_rel(root, p), "package.json 声明"))
+
+    proj = root / "project.godot"
+    if proj.is_file():
+        # Godot 的权威入口声明：run/main_scene 指向启动场景，
+        # 场景里挂的脚本才是真正的入口代码
+        try:
+            ptext = proj.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            ptext = ""
+        m = re.search(r'^run/main_scene\s*=\s*"res://([^"]+)"', ptext, re.M)
+        if m:
+            scene = root / m.group(1).replace("/", os.sep)
+            if scene.is_file():
+                declared.append((_rel(root, scene), "project.godot 主场景"))
+                try:
+                    stext = scene.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    stext = ""
+                for sm in re.finditer(r'path="(res://[^"]+\.gd)"', stext):
+                    s = root / sm.group(1)[len("res://"):].replace("/", os.sep)
+                    if s.is_file():
+                        declared.append((_rel(root, s), "主场景脚本"))
 
     out, seen = [], set()
-    for rel in declared:
+    for rel, why in declared:
         if rel not in seen:
             seen.add(rel)
-            out.append((rel, "package.json 声明"))
+            out.append((rel, why))
     for rel, why in hits:
         if rel not in seen:
             seen.add(rel)
@@ -1930,6 +2017,8 @@ def _git_churn(root: Path, commits: int, cap: int = 8):
         a, d, path = parts[0].strip(), parts[1].strip(), parts[2].strip()
         if not path:
             continue
+        if path.endswith((".import", ".uid")):
+            continue   # Godot 自动生成的导入元数据，不是人写的热点
         counts[path] = counts.get(path, 0) + 1
         for box, val in ((adds, a), (dels, d)):
             try:
@@ -2006,6 +2095,11 @@ def code_map(args: dict) -> str:
                     span = end - ln + 1
                     if cc >= _MAP_CC_MIN or span >= _MAP_FUNC_MIN:
                         funcs.append((cc, span, rel, name, ln))
+        elif fp.suffix.lower() in _GD_EXTS:
+            for cc, ln, end, name in _gd_func_cc(text):
+                span = end - ln + 1
+                if cc >= _MAP_CC_MIN or span >= _MAP_FUNC_MIN:
+                    funcs.append((cc, span, rel, name, ln))
 
     out = [f"项目全貌：{root}",
            f"代码文件 {len(loc_rel)} 个，约 {sum(loc_rel.values())} 行；"
