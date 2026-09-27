@@ -287,3 +287,7 @@ tools/_tmp_*.py
 # 技能运行时凭据
 skills/baidu-drive/.session_id
 skills/lark/.device_code
+
+# 拓竹切片工作目录与切片器输出（本机 3D 打印中间产物，单个 gcode 可到 68MB）
+/temp/
+/result.json

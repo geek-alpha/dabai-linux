@@ -1,0 +1,100 @@
+{
+  "name": "bambu_lab",
+  "title": "拓竹 3D 打印（A1 机型/局域网 FTPS/离线打印）",
+  "version": "1.0.0",
+  "description": "拓竹 A1 经验库：FTPS 必补 prot_p（缺了报 EOFError）、禁重试轰炸、上传后回读 md5；机型只读 printer_model；断网走 SD 卡。",
+  "author": "dabai",
+  "enabled": true,
+  "disclosure": "on_demand",
+  "prompt": "【技能 拓竹 3D 打印】用户有拓竹 A1（不是 A1 mini，单色 AMS lite，0.4 喷嘴）。要连打印机/传文件/查状态 → bambu_ftp（action=probe 先探活，list 列 /cache，size 探存在，upload/download/delete/md5）。要确认某个 3mf 是按哪台机器切的 → bambu_model_check（读 printer_model / printer_settings_id，禁止凭印象断言机型）。打印机失联 → bambu_net_probe（单次探测，绝不循环重连）。\n★三条硬纪律：①FTPS 登录后必须 prot_p()，缺了它所有数据操作报 EOFError（看着像数据通道坏了，其实是 PROT C 被拒）；②端口超时/RST 时禁止重试轰炸，连续重试会把 990/8883 一起拖死、整机从 ARP 表消失，正确动作是停手、冷却、改走离线通道（SD 卡/屏幕）；③上传后必须回读算 md5 对齐，SIZE 显示完整不代表内容完整。详细踩坑记录见 SKILL.md。",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "bambu_ftp",
+        "description": "拓竹打印机局域网 FTPS 操作（990 隐式 TLS，用户 bblp / 访问码）。action=probe 探活(登录+prot_p)、list 列目录、size 探文件存在与字节数、upload 上传、download 下载、delete 删除、md5 回读校验。内建硬约束：强制 prot_p()、单次连接、失败即退不重试。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "enum": [
+                "probe",
+                "list",
+                "size",
+                "upload",
+                "download",
+                "delete",
+                "md5"
+              ],
+              "description": "操作类型"
+            },
+            "path": {
+              "type": "string",
+              "description": "远端路径，如 /cache 或 /cache/bf_final.3mf（list 默认 /cache）"
+            },
+            "local": {
+              "type": "string",
+              "description": "本地文件路径（upload/download/md5 用）"
+            },
+            "host": {
+              "type": "string",
+              "description": "打印机 IP，省略则读 data/bambu_lab.json"
+            },
+            "access_code": {
+              "type": "string",
+              "description": "访问码（屏幕上可查），省略则读配置"
+            },
+            "confirm": {
+              "type": "boolean",
+              "description": "delete 必须显式传 true"
+            }
+          },
+          "required": [
+            "action"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "bambu_model_check",
+        "description": "读 3mf 里的机型与切片信息，确认它是按哪台机器切的：printer_model / printer_settings_id / 喷嘴 / 打印耗时 / 耗材用量 / 是否有切好的 plate gcode。判断机型只认这个字段，不凭印象。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "file": {
+              "type": "string",
+              "description": "本地 .3mf 路径（支持逗号分隔多个）"
+            }
+          },
+          "required": [
+            "file"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "bambu_net_probe",
+        "description": "打印机网络单次探测：ping、ARP 表项、990/8883/3000/322 端口各探一次。绝不重连、绝不循环重试——连续重试会把打印机整机打掉线。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "host": {
+              "type": "string",
+              "description": "打印机 IP，省略则读配置"
+            },
+            "ports": {
+              "type": "string",
+              "description": "要探的端口，逗号分隔，默认 990,8883,3000,322"
+            }
+          },
+          "required": []
+        }
+      }
+    }
+  ]
+}
