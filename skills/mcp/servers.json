@@ -39,5 +39,47 @@
     ],
     "cwd": "/home/wxf/baidu-mcp/src/baidu-netdisk"
   },
-  "_removed_playwright": "已撤：浏览器内核在 1GB 的 Pi 3 上会烧到硬关机（实测空载 63°C，chromium 一开直冲 85°C）。读网页用 read_web。真要临时用就现场传 command/args + allow_heavy=true，用完立刻 mcp_disconnect。"
+  "_removed_playwright": "已撤：浏览器内核在 1GB 的 Pi 3 上会烧到硬关机（实测空载 63°C，chromium 一开直冲 85°C）。读网页用 read_web。真要临时用就现场传 command/args + allow_heavy=true，用完立刻 mcp_disconnect。",
+  "bambu": {
+    "command": "npx",
+    "args": [
+      "-y",
+      "bambu-mcp"
+    ],
+    "env": {
+      "BAMBU_ACCESS_CODE": "00000000",
+      "BAMBU_IP": "${file:data/bambu_lab.json#host}",
+      "BAMBU_MODEL": "${file:data/bambu_lab.json#mcp.model_p1s}",
+      "BAMBU_SERIAL": "${file:data/bambu_lab.json#serial}"
+    }
+  },
+  "bambu3d": {
+    "command": "npx",
+    "args": [
+      "-y",
+      "mcp-3d-printer-server"
+    ],
+    "env": {
+      "BAMBU_ACCESS_CODE": "${file:data/bambu_lab.json#access_code}",
+      "BAMBU_IP": "${file:data/bambu_lab.json#host}",
+      "BAMBU_MODEL": "${file:data/bambu_lab.json#mcp.model_a1}",
+      "BAMBU_SERIAL": "${file:data/bambu_lab.json#serial}"
+    }
+  },
+  "bambu2": {
+    "command": "npx",
+    "args": [
+      "-y",
+      "bambu-printer-mcp"
+    ],
+    "env": {
+      "BAMBU_ACCESS_CODE": "${file:data/bambu_lab.json#access_code}",
+      "BAMBU_CLI_FLATTEN": "true",
+      "BAMBU_IP": "${file:data/bambu_lab.json#host}",
+      "BAMBU_MODEL": "${file:data/bambu_lab.json#mcp.model_a1}",
+      "BAMBU_SERIAL": "${file:data/bambu_lab.json#serial}",
+      "MCP_ALLOW_EXECUTABLE_ARG": "1",
+      "SLICER_PATH": "D:\\Bambu Studio\\bambu-studio.exe"
+    }
+  }
 }

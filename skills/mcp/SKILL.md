@@ -83,6 +83,24 @@ key 一律放 headers，别写进 URL 查询串（会进日志）。
 
 `mcp_connect` 传过 command 的会自动写进去，之后 `mcp_call` 直接按名字用。
 
+**凭据别写明文**：`servers.json` 被 git 跟踪，明文密钥会进公开仓库（`secretscan` 只认通用密钥模式，
+`BAMBU_ACCESS_CODE` 这类自定义变量名会静默放行）。env / headers 的值支持两种引用，连接时才解析：
+
+```json
+{
+  "printer": {
+    "command": "npx", "args": ["-y", "bambu-mcp"],
+    "env": {
+      "BAMBU_ACCESS_CODE": "${file:data/bambu_lab.json#access_code}",
+      "BAMBU_IP": "${env:PRINTER_IP}"
+    }
+  }
+}
+```
+
+`${file:相对仓库根的路径#点路径}` 读 JSON 文件（`data/` 已在 .gitignore 里），`${env:变量名}` 读环境变量。
+引用解析不出来直接报错，不会把字面量传给 server；落盘时已知凭据真值会自动换回引用写法。
+
 ## 排错
 
 - 日志：`skills/mcp/logs/<server>.stderr.log`

@@ -16,6 +16,7 @@ import atexit
 import json
 import os
 import queue
+import re
 import shutil
 import signal
 import subprocess
@@ -514,6 +515,7 @@ def load_specs() -> dict:
 
 
 def save_spec(name: str, spec: dict):
+    spec = _mask_secrets(spec, _known_secret_map())
     specs = _load_raw()  # 保留注释键，别把它们冲掉
     if specs.get(name) == spec:
         # 内容没变就别写盘：servers.json 在 skills/ 下，写一次就触发技能热重载，
@@ -587,6 +589,81 @@ _ADMIN_FLAG = "require_admin"
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
+# ---------- 配置里的凭据引用 ----------
+# 第一性原理：servers.json 在 skills/ 下、被 git 跟踪，明文凭据写进去就等于进公开仓库
+# （secretscan 只认通用密钥模式，BAMBU_ACCESS_CODE 这类自定义变量名会静默放行）。
+# 所以配置里只写引用，真值放 data/（.gitignore 已排除）：
+#   ${env:NAME}                → 环境变量
+#   ${file:data/x.json#a.b}    → 仓库内 JSON 文件的点路径取值
+_REF_RE = re.compile(r"\$\{(env|file):([^}]+)\}")
+
+
+def _ref_value(kind: str, arg: str):
+    if kind == "env":
+        val = os.environ.get(arg)
+        if val is None:
+            raise MCPError(f"配置引用了环境变量 ${{{arg}}}，但它没设置。")
+        return val
+    path, _, key = arg.partition("#")
+    full = path if os.path.isabs(path) else os.path.join(_ROOT, path)
+    try:
+        with open(full, "r", encoding="utf-8") as f:
+            node = json.load(f)
+    except Exception as e:
+        raise MCPError(f"配置引用了 {path}，但读不出来：{e}")
+    for part in [p for p in key.split(".") if p]:
+        if not isinstance(node, dict) or part not in node:
+            raise MCPError(f"配置引用了 {path}#{key}，但里面没有 '{part}'。")
+        node = node[part]
+    return node
+
+
+def _expand_refs(value):
+    """递归展开配置里的 ${env:...} / ${file:...} 引用。"""
+    if isinstance(value, str):
+        return _REF_RE.sub(lambda m: str(_ref_value(m.group(1), m.group(2))), value)
+    if isinstance(value, dict):
+        return {k: _expand_refs(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_expand_refs(v) for v in value]
+    return value
+
+
+def _known_secret_map() -> dict:
+    """data/bambu_lab.json 里的真值 → 引用写法。
+
+    只收长度 ≥ 8 的字符串：'a1' / 'P1S' / 'true' 这类短值当凭据换会误伤。
+    """
+    try:
+        with open(os.path.join(_ROOT, "data", "bambu_lab.json"), "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return {}
+    out = {}
+
+    def walk(node, prefix):
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if not str(k).startswith("_"):
+                    walk(v, f"{prefix}.{k}" if prefix else str(k))
+        elif isinstance(node, str) and len(node) >= 8:
+            out[node] = "${file:data/bambu_lab.json#" + prefix + "}"
+
+    walk(data, "")
+    return out
+
+
+def _mask_secrets(value, mapping: dict):
+    """落盘前把已知凭据真值换回引用 —— 现场传明文 env 时别把凭据写进 git 跟踪的文件。"""
+    if isinstance(value, str):
+        return mapping.get(value, value)
+    if isinstance(value, dict):
+        return {k: _mask_secrets(v, mapping) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_mask_secrets(v, mapping) for v in value]
+    return value
+
+
 def admin_guard(name: str, spec: dict = None) -> None:
     """标了 require_admin 的 server：没有未过期的管理员凭证就不许连。
 
@@ -624,7 +701,7 @@ def connect(name: str, spec: dict = None, timeout: float = DEFAULT_TIMEOUT,
             return srv
         if srv is not None:
             srv.stop()
-        cfg = dict(spec or load_specs().get(name) or {})
+        cfg = _expand_refs(dict(spec or load_specs().get(name) or {}))
         url = str(cfg.get("url") or "").strip()
         command = cfg.get("command")
         if not url and not command:
